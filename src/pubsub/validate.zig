@@ -488,7 +488,15 @@ pub fn topicConfig(config: types.TopicConfig, diag: ?*Diagnostics) error{Invalid
 }
 
 /// A subscription update: something to change, and every new value valid.
-pub fn subscriptionUpdate(u: types.SubscriptionUpdate, diag: ?*Diagnostics) error{InvalidArgument}!void {
+/// On an emulator a delivery can only be push or pull: the emulator
+/// refuses the export kinds' mask paths as unknown fields.
+pub fn subscriptionUpdate(u: types.SubscriptionUpdate, emulator: bool, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    if (u.delivery) |d| {
+        if (emulator and d != .pull and d != .push) {
+            return refuse(diag, "the emulator cannot change a subscription's delivery to a BigQuery or Cloud Storage config: it refuses their mask paths as unknown fields", .{});
+        }
+        try delivery(d, u.enable_exactly_once_delivery orelse false, emulator, diag);
+    }
     if (u.ack_deadline_seconds) |s| {
         if (s < min_ack_deadline_seconds or s > max_ack_deadline_seconds) {
             return refuse(diag, "ack deadline {d} s is outside {d}..{d} s", .{ s, min_ack_deadline_seconds, max_ack_deadline_seconds });
@@ -509,8 +517,9 @@ pub fn subscriptionUpdate(u: types.SubscriptionUpdate, diag: ?*Diagnostics) erro
     if (retention) |r| try messageRetention(r, diag);
     if (u.expiration) |e| try expiration(e, retention, diag);
     if (u.labels) |l| try labels(l, diag);
-    const changes_something = u.ack_deadline_seconds != null or u.enable_exactly_once_delivery != null or
-        u.dead_letter_policy != .keep or u.retry_policy != .keep or u.message_retention != .keep or
+    const changes_something = u.delivery != null or u.ack_deadline_seconds != null or
+        u.enable_exactly_once_delivery != null or u.dead_letter_policy != .keep or
+        u.retry_policy != .keep or u.message_retention != .keep or
         u.retain_acked_messages != null or u.expiration != null or u.labels != null;
     if (!changes_something) return refuse(diag, "the update changes nothing", .{});
 }
@@ -836,10 +845,10 @@ test "topic settings: the KMS key's shape and the storage policy" {
 
 test "updates: something must change, and what changes must be valid" {
     var d: Diagnostics = .{};
-    try testing.expectError(error.InvalidArgument, subscriptionUpdate(.{}, &d));
+    try testing.expectError(error.InvalidArgument, subscriptionUpdate(.{}, false, &d));
     try testing.expectEqualStrings("the update changes nothing", d.message());
     try testing.expectError(error.InvalidArgument, topicUpdate(.{}, &d));
-    try subscriptionUpdate(.{ .labels = &.{} }, &d);
+    try subscriptionUpdate(.{ .labels = &.{} }, false, &d);
     // Everything at once.
     try subscriptionUpdate(.{
         .ack_deadline_seconds = 10,
@@ -850,17 +859,31 @@ test "updates: something must change, and what changes must be valid" {
         .retain_acked_messages = false,
         .expiration = .never,
         .labels = &.{},
-    }, &d);
+    }, false, &d);
     try topicUpdate(.{ .labels = &.{}, .message_retention = .clear, .kms_key_name = .clear, .message_storage_policy = .clear }, &d);
-    try subscriptionUpdate(.{ .retry_policy = .clear }, &d);
-    try subscriptionUpdate(.{ .expiration = .default }, &d);
-    try testing.expectError(error.InvalidArgument, subscriptionUpdate(.{ .ack_deadline_seconds = 0 }, &d));
-    try testing.expectError(error.InvalidArgument, subscriptionUpdate(.{ .ack_deadline_seconds = 601 }, &d));
-    try testing.expectError(error.InvalidArgument, subscriptionUpdate(.{ .dead_letter_policy = .{ .set = .{ .topic = "t", .max_delivery_attempts = 4 } } }, &d));
+    try subscriptionUpdate(.{ .retry_policy = .clear }, false, &d);
+    try subscriptionUpdate(.{ .expiration = .default }, false, &d);
+    // A delivery is a change on its own; exactly-once beside a kind in the
+    // same update, and an export kind on an emulator, are refused.
+    try subscriptionUpdate(.{ .delivery = .pull }, false, &d);
+    try subscriptionUpdate(.{ .delivery = .pull }, true, &d);
+    try subscriptionUpdate(.{ .delivery = .{ .push = .{ .endpoint = "https://e.x/h" } } }, true, &d);
+    try subscriptionUpdate(.{ .delivery = .{ .bigquery = .{ .table = "p.d.t" } }, .enable_exactly_once_delivery = false }, false, &d);
+    try testing.expectError(error.InvalidArgument, subscriptionUpdate(.{
+        .delivery = .{ .push = .{ .endpoint = "https://e.x/h" } },
+        .enable_exactly_once_delivery = true,
+    }, false, &d));
+    try testing.expectError(error.InvalidArgument, subscriptionUpdate(.{ .delivery = .{ .bigquery = .{ .table = "p.d.t" } } }, true, &d));
+    try testing.expectEqualStrings("the emulator cannot change a subscription's delivery to a BigQuery or Cloud Storage config: it refuses their mask paths as unknown fields", d.message());
+    try testing.expectError(error.InvalidArgument, subscriptionUpdate(.{ .delivery = .{ .cloud_storage = .{ .bucket = "b" } } }, true, &d));
+    try testing.expectError(error.InvalidArgument, subscriptionUpdate(.{ .delivery = .{ .push = .{ .endpoint = "http://e.x/h" } } }, false, &d));
+    try testing.expectError(error.InvalidArgument, subscriptionUpdate(.{ .ack_deadline_seconds = 0 }, false, &d));
+    try testing.expectError(error.InvalidArgument, subscriptionUpdate(.{ .ack_deadline_seconds = 601 }, false, &d));
+    try testing.expectError(error.InvalidArgument, subscriptionUpdate(.{ .dead_letter_policy = .{ .set = .{ .topic = "t", .max_delivery_attempts = 4 } } }, false, &d));
     try testing.expectError(error.InvalidArgument, subscriptionUpdate(.{
         .message_retention = .{ .set = .fromSeconds(5 * 24 * 3600) },
         .expiration = .{ .after = .fromSeconds(4 * 24 * 3600) },
-    }, &d));
+    }, false, &d));
     try topicUpdate(.{ .kms_key_name = .clear }, &d);
     try testing.expectError(error.InvalidArgument, topicUpdate(.{ .kms_key_name = .{ .set = "nope" } }, &d));
     // The set arms of the other two topic fields, valid and not.

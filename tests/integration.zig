@@ -1840,6 +1840,42 @@ test "delivery: each export kind is created and read back, which is all the emul
     defer page.deinit();
 }
 
+test "delivery update: pull to push and back on the emulator, and an export change is refused before sending" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    // Production's updates, replacing an export kind among them, are gated
+    // behind PUBSUB_TEST_BIGQUERY_TABLE and PUBSUB_TEST_BUCKET.
+    if (f.production) return error.SkipZigTest;
+
+    const topic = try f.createTopic("upd");
+    const sub = try f.createSubscription("upd-sub", .{ .topic_id = topic.id });
+
+    var pushed = sub.update(.{ .delivery = .{ .push = .{ .endpoint = "https://example.com/zigps-hook" } } }) catch |err| return f.fail(err);
+    defer pushed.deinit();
+    try testing.expectEqualStrings("https://example.com/zigps-hook", pushed.value.delivery.push.endpoint);
+
+    var pulled = sub.update(.{ .delivery = .pull }) catch |err| return f.fail(err);
+    defer pulled.deinit();
+    try testing.expectEqual(.pull, std.meta.activeTag(pulled.value.delivery));
+    var read = sub.get() catch |err| return f.fail(err);
+    defer read.deinit();
+    try testing.expectEqual(.pull, std.meta.activeTag(read.value.delivery));
+
+    // The emulator refuses the export kinds' mask paths, so a change to an
+    // export kind, and away from one, is refused here before sending.
+    try testing.expectError(error.InvalidArgument, sub.update(.{ .delivery = .{ .bigquery = .{ .table = "test.d.t" } } }));
+    const bq = try f.createSubscription("upd-bq", .{ .topic_id = topic.id, .delivery = .{ .bigquery = .{ .table = "test.d.t" } } });
+    try testing.expectError(error.InvalidArgument, bq.update(.{ .delivery = .pull }));
+    try testing.expect(std.mem.indexOf(u8, f.diag.message(), "emulator") != null);
+
+    // What is not the delivery still changes on an export subscription.
+    var retried = bq.update(.{ .retry_policy = .{ .set = .{ .minimum = .fromSeconds(1), .maximum = .fromSeconds(5) } } }) catch |err| return f.fail(err);
+    defer retried.deinit();
+    try testing.expectEqual(std.Io.Duration.fromSeconds(5), retried.value.retry_policy.?.maximum);
+    try testing.expectEqualStrings("test.d.t", retried.value.delivery.bigquery.config.table);
+}
+
 const Publisher = pubsub.Publisher;
 
 const PublisherKnobs = struct {

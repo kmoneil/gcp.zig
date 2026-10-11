@@ -361,6 +361,11 @@ pub const SubscriptionInfo = struct {
 /// What `Subscription.update` changes. A field left at its default stays as
 /// it is. The topic, the ordering and the filter cannot be changed.
 pub const SubscriptionUpdate = struct {
+    /// Replaces the delivery whole, whatever it was: one request, no read
+    /// first, and `.pull` clears any kind. On an emulator only push and
+    /// pull work: the emulator refuses the export kinds' mask paths, so a
+    /// change to or from one is refused here before sending.
+    delivery: ?Delivery = null,
     /// 10 to 600.
     ack_deadline_seconds: ?u32 = null,
     enable_exactly_once_delivery: ?bool = null,

@@ -51,7 +51,8 @@ pub fn update(self: Subscription, changes: types.SubscriptionUpdate) Error!Owned
     const c = self.client;
     rpc.begin(c);
     try rpc.checkId(c, "subscription", self.id);
-    try validate.subscriptionUpdate(changes, c.diagnostics);
+    try validate.subscriptionUpdate(changes, c.emulator, c.diagnostics);
+    if (c.emulator and changes.delivery != null) try self.refuseEmulatorExportChange();
     var scratch: std.heap.ArenaAllocator = .init(c.gpa);
     defer scratch.deinit();
     const a = scratch.allocator();
@@ -60,8 +61,26 @@ pub fn update(self: Subscription, changes: types.SubscriptionUpdate) Error!Owned
         .set => |policy| try topicName(a, c, policy.topic),
         .keep, .clear => null,
     };
-    const body = try codec.encodeSubscriptionUpdate(a, changes, dead_letter);
+    const body = try codec.encodeSubscriptionUpdate(a, changes, dead_letter, c.emulator);
     return fetch(c, .{ .method = .PATCH, .path = path, .body = body });
+}
+
+/// On an emulator a delivery update masks the push config alone, since
+/// the emulator refuses the export kinds' mask paths as unknown fields.
+/// That mask would quietly leave an export config in place, so a read
+/// first says what the delivery is, and a change away from an export
+/// kind is refused rather than half-made, as a change to one already was.
+fn refuseEmulatorExportChange(self: Subscription) Error!void {
+    const c = self.client;
+    var info = try self.get();
+    defer info.deinit();
+    switch (info.value.delivery) {
+        .pull, .push => {},
+        .bigquery, .cloud_storage, .other => {
+            if (c.diagnostics) |d| d.print("the emulator cannot change a subscription's delivery away from a BigQuery or Cloud Storage config: it refuses their mask paths as unknown fields", .{});
+            return error.InvalidArgument;
+        },
+    }
 }
 
 /// A dead-letter topic as the server takes it: a full name as given, or an
@@ -1338,6 +1357,119 @@ test "delivery checks hold before any request, by the endpoint's kind" {
     try testing.expectEqualStrings("the push endpoint is not an http(s):// URL", e.diag.message());
     try testing.expectError(error.InvalidArgument, sub.create(.{ .topic_id = "orders", .delivery = .{ .bigquery = .{ .table = "nonsense" } } }));
     try e.expectRequestCount(0);
+}
+
+test "golden: a delivery update replaces the delivery whole, and .pull clears any kind" {
+    const push_body =
+        \\{"name":"projects/p/subscriptions/work","topic":"projects/p/topics/orders","pushConfig":{"pushEndpoint":"https://example.com/hook","attributes":{"x-goog-version":"v1"}}}
+    ;
+    const pull_body =
+        \\{"name":"projects/p/subscriptions/work","topic":"projects/p/topics/orders","pushConfig":{"attributes":{"x-goog-version":"v1"}}}
+    ;
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = push_body } },
+        .{ .respond = .{ .body = pull_body } },
+    }, .{ .token = "ya29.test" });
+    defer h.deinit();
+    const work = h.client.subscription("work");
+    const prod = "https://pubsub.googleapis.com/v1/projects/p/subscriptions/work";
+
+    // One request, no read first: every kind masked, the one given sent.
+    var pushed = try work.update(.{ .delivery = .{ .push = .{ .endpoint = "https://example.com/hook" } } });
+    defer pushed.deinit();
+    try h.expectRequest(0, .PATCH, prod, "{\"subscription\":{\"pushConfig\":{\"pushEndpoint\":\"https://example.com/hook\"}},\"updateMask\":\"pushConfig,bigqueryConfig,cloudStorageConfig\"}");
+    try testing.expectEqualStrings("https://example.com/hook", pushed.value.delivery.push.endpoint);
+
+    var pulled = try work.update(.{ .delivery = .pull });
+    defer pulled.deinit();
+    try h.expectRequest(1, .PATCH, prod, "{\"subscription\":{},\"updateMask\":\"pushConfig,bigqueryConfig,cloudStorageConfig\"}");
+    try testing.expectEqual(.pull, std.meta.activeTag(pulled.value.delivery));
+
+    // Refused before any request: exactly-once set beside a kind in the
+    // same patch, and a config the checks refuse.
+    try testing.expectError(error.InvalidArgument, work.update(.{
+        .delivery = .{ .push = .{ .endpoint = "https://example.com/hook" } },
+        .enable_exactly_once_delivery = true,
+    }));
+    try testing.expectError(error.InvalidArgument, work.update(.{ .delivery = .{ .cloud_storage = .{ .bucket = "gs://b" } } }));
+    try testing.expectError(error.InvalidArgument, work.update(.{ .delivery = .{ .push = .{ .endpoint = "http://example.com/hook" } } }));
+    try h.expectRequestCount(2);
+}
+
+test "on an emulator a delivery update reads first, masks the push config alone, and refuses an export kind either way" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        // To push: the read says it pulls, then the patch.
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/subscriptions/work\",\"pushConfig\":{}}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/subscriptions/work\",\"pushConfig\":{\"pushEndpoint\":\"http://127.0.0.1:9/hook\"}}" } },
+        // Back to pull.
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/subscriptions/work\",\"pushConfig\":{\"pushEndpoint\":\"http://127.0.0.1:9/hook\"}}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/subscriptions/work\",\"pushConfig\":{}}" } },
+        // Away from an export kind: the read answers, and nothing is sent.
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/subscriptions/work\",\"pushConfig\":{},\"bigqueryConfig\":{\"table\":\"test.d.t\"}}" } },
+    }, .{});
+    defer h.deinit();
+    const work = h.client.subscription("work");
+
+    var pushed = try work.update(.{ .delivery = .{ .push = .{ .endpoint = "http://127.0.0.1:9/hook" } } });
+    defer pushed.deinit();
+    try h.expectRequest(0, .GET, base_url, null);
+    try h.expectRequest(1, .PATCH, base_url, "{\"subscription\":{\"pushConfig\":{\"pushEndpoint\":\"http://127.0.0.1:9/hook\"}},\"updateMask\":\"pushConfig\"}");
+
+    var pulled = try work.update(.{ .delivery = .pull });
+    defer pulled.deinit();
+    try h.expectRequest(2, .GET, base_url, null);
+    try h.expectRequest(3, .PATCH, base_url, "{\"subscription\":{},\"updateMask\":\"pushConfig\"}");
+    try testing.expectEqual(.pull, std.meta.activeTag(pulled.value.delivery));
+
+    // Away from an export kind: refused after the read, before any patch.
+    try testing.expectError(error.InvalidArgument, work.update(.{ .delivery = .pull }));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "away from a BigQuery or Cloud Storage config") != null);
+    // To one: refused before even the read.
+    try testing.expectError(error.InvalidArgument, work.update(.{ .delivery = .{ .bigquery = .{ .table = "test.d.t" } } }));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "to a BigQuery or Cloud Storage config") != null);
+    try h.expectRequestCount(5);
+}
+
+test "a delivery update: every allocation failure is OutOfMemory without leaks" {
+    const pulls = "{\"name\":\"projects/p/subscriptions/work\",\"pushConfig\":{}}";
+    const pushes =
+        \\{"name":"projects/p/subscriptions/work","pushConfig":{"pushEndpoint":"http://e.x/h\u0065"}}
+    ;
+    const Run = struct {
+        fn run(gpa: Allocator) !void {
+            // The emulator path reads first, so the sweep covers both
+            // requests and the refusal after a read.
+            var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+                .{ .respond = .{ .body = pulls } },
+                .{ .respond = .{ .body = pushes } },
+                .{ .respond = .{ .body = "{\"pushConfig\":{},\"bigqueryConfig\":{\"table\":\"test.d.t\"}}" } },
+            });
+            defer fake.deinit();
+            var clock: test_util.FakeClock = .{};
+            var diag: Diagnostics = .{};
+            var client: Client = try .init(gpa, clock.io(), .{
+                .project_id = "p",
+                .endpoint = .{ .url = "localhost:8085", .emulator = true },
+                .transport = fake.transport(),
+                .diagnostics = &diag,
+            });
+            defer client.deinit();
+            const work = client.subscription("work");
+            var pushed = try work.update(.{ .delivery = .{ .push = .{ .endpoint = "http://e.x/he" } } });
+            defer pushed.deinit();
+            try testing.expectEqualStrings("http://e.x/he", pushed.value.delivery.push.endpoint);
+            if (work.update(.{ .delivery = .pull })) |_| {
+                return error.TestUnexpectedResult;
+            } else |err| switch (err) {
+                error.InvalidArgument => {},
+                else => |e| return e,
+            }
+            try testing.expectEqual(3, fake.requests.items.len);
+        }
+    };
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
 }
 
 test "create with each delivery kind: every allocation failure is OutOfMemory without leaks" {

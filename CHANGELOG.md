@@ -58,8 +58,18 @@ including the ones that did not change.
   answers as a 503 outage, the filename rules and datetime format, and
   the file batching bounds. A `Subscriber` on a subscription that does
   not pull stops with `error.FailedPrecondition` and the server's words.
-  Changing a subscription's delivery by update follows in the next
-  milestone.
+- pubsub: updating a subscription's delivery.
+  `SubscriptionUpdate.delivery`, when set, replaces the delivery whole:
+  the mask names every kind and the body carries the one given, so
+  whatever the subscription was, it is then what was asked, in one
+  request with no read first, and `.pull` clears any kind (measured in
+  production, 2026-10-10). Setting it beside `enable_exactly_once_delivery
+  = true` is refused before sending, as production refuses the pair. On
+  an emulator, which refuses the export kinds' mask paths as unknown
+  fields, the push config alone is masked, so push and pull work there;
+  a change to a BigQuery or Cloud Storage config is refused before
+  sending, and a change away from one after a read that is the emulator
+  path's alone.
 - auth, core, firestore, secret_manager and storage: unchanged.
 
 ## 0.34.0 (2026-10-06)
