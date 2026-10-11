@@ -381,3 +381,94 @@ test "the replay guide's code, against a scripted transport" {
     try std.testing.expectEqual(null, (try fake.request(4)).body);
     try std.testing.expectEqual(5, fake.requests.items.len);
 }
+
+// snippet: pubsub-delivery-create
+/// Each message of `orders` as a row of `sales.orders`, with its id,
+/// publish time, ordering key and attributes in columns of their own.
+fn tableOfOrders(client: *pubsub.Client) !void {
+    var rows = try client.subscription("orders-to-warehouse").create(.{
+        .topic_id = "orders",
+        .delivery = .{ .bigquery = .{ .table = "my-project.sales.orders", .write_metadata = true } },
+    });
+    defer rows.deinit();
+}
+
+/// Each message POSTed to the shop's webhook, signed as its service
+/// account, the data alone as the body and the metadata in headers.
+fn pushToWebhook(client: *pubsub.Client) !void {
+    var hook = try client.subscription("orders-hook").create(.{
+        .topic_id = "orders",
+        .delivery = .{ .push = .{
+            .endpoint = "https://shop.example/pubsub",
+            .oidc_token = .{ .service_account_email = "pusher@my-project.iam.gserviceaccount.com" },
+            .body = .{ .unwrapped = .{ .write_metadata = true } },
+        } },
+    });
+    defer hook.deinit();
+}
+// end snippet
+
+// snippet: pubsub-delivery-update
+/// Stop pushing, and pull instead. Google says the switch away from
+/// push can take minutes to settle.
+fn pullInstead(client: *pubsub.Client) !void {
+    var pulled = try client.subscription("orders-hook").update(.{ .delivery = .pull });
+    defer pulled.deinit();
+}
+
+/// Rotate the webhook's address. The config is replaced whole, so it
+/// names everything it keeps, the token among it.
+fn moveWebhook(client: *pubsub.Client) !void {
+    var moved = try client.subscription("orders-hook").update(.{ .delivery = .{ .push = .{
+        .endpoint = "https://shop2.example/pubsub",
+        .oidc_token = .{ .service_account_email = "pusher@my-project.iam.gserviceaccount.com" },
+    } } });
+    defer moved.deinit();
+}
+// end snippet
+
+test "the delivery guide's code, against a scripted transport" {
+    var fake: core.testing.FakeTransport = .init(std.testing.allocator, &.{
+        .{ .respond = .{ .body = "{\"name\":\"projects/my-project/subscriptions/orders-to-warehouse\",\"topic\":\"projects/my-project/topics/orders\",\"pushConfig\":{},\"bigqueryConfig\":{\"table\":\"my-project.sales.orders\",\"writeMetadata\":true,\"state\":\"ACTIVE\"}}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/my-project/subscriptions/orders-hook\",\"pushConfig\":{\"pushEndpoint\":\"https://shop.example/pubsub\"}}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/my-project/subscriptions/orders-hook\",\"pushConfig\":{}}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/my-project/subscriptions/orders-hook\",\"pushConfig\":{\"pushEndpoint\":\"https://shop2.example/pubsub\"}}" } },
+    });
+    defer fake.deinit();
+    var tokens: core.testing.FakeTokenProvider = .{};
+    var client = try pubsub.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = tokens.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    const base = "https://pubsub.googleapis.com/v1/projects/my-project/subscriptions/";
+
+    try tableOfOrders(&client);
+    try std.testing.expectEqualStrings(base ++ "orders-to-warehouse", (try fake.request(0)).url);
+    try std.testing.expectEqualStrings(
+        "{\"topic\":\"projects/my-project/topics/orders\",\"enableMessageOrdering\":false,\"bigqueryConfig\":{\"table\":\"my-project.sales.orders\",\"writeMetadata\":true}}",
+        (try fake.request(0)).body.?,
+    );
+
+    try pushToWebhook(&client);
+    try std.testing.expectEqualStrings(
+        "{\"topic\":\"projects/my-project/topics/orders\",\"enableMessageOrdering\":false,\"pushConfig\":{\"pushEndpoint\":\"https://shop.example/pubsub\",\"oidcToken\":{\"serviceAccountEmail\":\"pusher@my-project.iam.gserviceaccount.com\"},\"noWrapper\":{\"writeMetadata\":true}}}",
+        (try fake.request(1)).body.?,
+    );
+
+    // The update masks every kind: the delivery is replaced whole.
+    try pullInstead(&client);
+    try std.testing.expectEqualStrings(base ++ "orders-hook", (try fake.request(2)).url);
+    try std.testing.expectEqualStrings(
+        "{\"subscription\":{},\"updateMask\":\"pushConfig,bigqueryConfig,cloudStorageConfig\"}",
+        (try fake.request(2)).body.?,
+    );
+
+    try moveWebhook(&client);
+    try std.testing.expectEqualStrings(
+        "{\"subscription\":{\"pushConfig\":{\"pushEndpoint\":\"https://shop2.example/pubsub\",\"oidcToken\":{\"serviceAccountEmail\":\"pusher@my-project.iam.gserviceaccount.com\"}}},\"updateMask\":\"pushConfig,bigqueryConfig,cloudStorageConfig\"}",
+        (try fake.request(3)).body.?,
+    );
+    try std.testing.expectEqual(4, fake.requests.items.len);
+}

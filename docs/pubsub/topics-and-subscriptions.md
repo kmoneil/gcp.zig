@@ -48,6 +48,9 @@ defer created.deinit();
   31 days, `.never` never does, and `.after` sets the time, at least a
   day.
 - **`labels`**: up to 64.
+- **`delivery`**: how messages are handed over: pulled (the default),
+  POSTed to an endpoint, written to BigQuery or batched into Cloud
+  Storage. Its own page: [Delivery](delivery.md).
 
 Every rule is checked before anything is sent. The emulator takes
 several settings production refuses, such as ack deadlines of 1 to 9 s,
