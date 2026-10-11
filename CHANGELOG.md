@@ -39,6 +39,27 @@ including the ones that did not change.
   succeeds if the earlier attempt had landed. A `Subscriber` on a
   detached subscription stops with `error.FailedPrecondition`. The
   emulator has no detach.
+- pubsub: a subscription's delivery, on create and on read. Pub/Sub can
+  deliver itself instead of being pulled from: `SubscriptionConfig.delivery`
+  is `.pull` (the default; nothing existing changes), `.push`
+  (`PushConfig`: the endpoint, an OIDC token, and the body as Pub/Sub's
+  JSON envelope or the data alone with its metadata in headers),
+  `.bigquery` (`BigQueryConfig`: each message as a row of a table) or
+  `.cloud_storage` (`CloudStorageConfig`: messages batched into files in
+  a bucket), one kind at a time, so "two at once" cannot be written.
+  `SubscriptionInfo.delivery` (`DeliveryInfo`) reads the config back
+  with, for the export kinds, the server's word on whether it can write
+  (`ExportState`); a kind this library does not model, Bigtable today,
+  reads as `.other` without failing. The emulator checks almost none of
+  this, so the rules measured in production on 2026-10-10 are checked
+  before sending: an `https://` endpoint (`http://` only against an
+  emulator, where pushes are tested), no exactly-once delivery beside
+  any kind but pull, a table of three parts, the bucket shape production
+  answers as a 503 outage, the filename rules and datetime format, and
+  the file batching bounds. A `Subscriber` on a subscription that does
+  not pull stops with `error.FailedPrecondition` and the server's words.
+  Changing a subscription's delivery by update follows in the next
+  milestone.
 - auth, core, firestore, secret_manager and storage: unchanged.
 
 ## 0.34.0 (2026-10-06)

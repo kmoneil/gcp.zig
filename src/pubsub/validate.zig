@@ -53,6 +53,17 @@ pub const max_backoff: std.Io.Duration = .fromSeconds(600);
 /// A dead-letter policy's deliveries before a message is forwarded.
 pub const min_delivery_attempts = 5;
 pub const max_delivery_attempts = 100;
+/// A Cloud Storage subscription closes a file after 1 to 10 minutes...
+pub const min_storage_duration: std.Io.Duration = .fromSeconds(60);
+pub const max_storage_duration: std.Io.Duration = .fromSeconds(600);
+/// ...or after 1,000 bytes to 10 GiB, or 1,000 messages or more, 0 meaning
+/// no such limit. Production names these bounds in its refusals.
+pub const min_storage_bytes = 1000;
+pub const max_storage_bytes = 10 * 1024 * 1024 * 1024;
+pub const min_storage_messages = 1000;
+/// A Cloud Storage filename prefix and suffix together ("the maximum
+/// allowed is 992", production, 2026-10-10).
+pub const max_filename_chars = 992;
 
 /// The exact size of the body `Topic.publish` would send, without encoding
 /// anything. Callers splitting large batches can compare it with
@@ -283,8 +294,182 @@ pub fn storagePolicy(policy: types.MessageStoragePolicy, diag: ?*Diagnostics) er
     }
 }
 
+/// A subscription's delivery, by the rules measured in production on
+/// 2026-10-10 (`_plan/zig-pubsub-delivery-settings-spec.md`, section 2).
+/// The emulator checks almost none of them, so what passes it would still
+/// fail in production without these.
+pub fn delivery(d: types.Delivery, exactly_once: bool, emulator: bool, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    if (exactly_once and d != .pull) {
+        return refuse(diag, "exactly-once delivery works only when the subscriber pulls; production refuses it beside any other kind", .{});
+    }
+    switch (d) {
+        .pull => {},
+        .push => |p| try pushConfig(p, emulator, diag),
+        .bigquery => |b| try bigQueryConfig(b, diag),
+        .cloud_storage => |s| try cloudStorageConfig(s, diag),
+    }
+}
+
+/// A push config: an `https://` endpoint, or `http://` on an emulator
+/// endpoint only, which is how a push is tested locally and what the
+/// emulator's own page advises.
+pub fn pushConfig(p: types.PushConfig, emulator: bool, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    if (!std.unicode.utf8ValidateSlice(p.endpoint)) return refuse(diag, "the push endpoint is not valid UTF-8", .{});
+    const scheme: usize = if (std.mem.startsWith(u8, p.endpoint, "https://"))
+        "https://".len
+    else if (emulator and std.mem.startsWith(u8, p.endpoint, "http://"))
+        "http://".len
+    else if (emulator)
+        return refuse(diag, "the push endpoint is not an http(s):// URL", .{})
+    else
+        return refuse(diag, "the push endpoint is not an https:// URL, which production requires", .{});
+    if (p.endpoint.len == scheme) return refuse(diag, "the push endpoint has no host", .{});
+    if (p.oidc_token) |t| {
+        try serviceAccount(t.service_account_email, "the OIDC token's service account", diag);
+        if (!std.unicode.utf8ValidateSlice(t.audience)) return refuse(diag, "the OIDC audience is not valid UTF-8", .{});
+    }
+}
+
+/// A BigQuery config: a table of three parts, `project.dataset.table` or
+/// `project:dataset.table`, each part non-empty. A project of the colon
+/// form (`example.com:proj`) keeps its dots.
+pub fn bigQueryConfig(b: types.BigQueryConfig, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    try bigQueryTable(b.table, diag);
+    if (b.service_account_email) |email| try serviceAccount(email, "the config's service account", diag);
+}
+
+fn bigQueryTable(table: []const u8, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    const malformed = "the BigQuery table is not project.dataset.table or project:dataset.table";
+    if (!std.unicode.utf8ValidateSlice(table)) return refuse(diag, "the BigQuery table is not valid UTF-8", .{});
+    for (table) |c| if (c <= ' ' or c == 0x7f) return refuse(diag, malformed, .{});
+    var rest = table;
+    var parts_needed: usize = 3;
+    if (std.mem.indexOfScalar(u8, table, ':')) |colon| {
+        if (colon == 0) return refuse(diag, malformed, .{});
+        rest = table[colon + 1 ..];
+        if (std.mem.indexOfScalar(u8, rest, ':') != null) return refuse(diag, malformed, .{});
+        parts_needed = 2;
+    }
+    var parts = std.mem.splitScalar(u8, rest, '.');
+    var count: usize = 0;
+    while (parts.next()) |part| : (count += 1) {
+        if (part.len == 0) return refuse(diag, malformed, .{});
+    }
+    if (count < parts_needed) return refuse(diag, malformed, .{});
+}
+
+/// A Cloud Storage config: the bucket's shape (production answers a
+/// malformed name as a 503 outage, which nothing in the answer explains),
+/// the filename parts, and the batching bounds, each by production's
+/// measured refusals.
+pub fn cloudStorageConfig(s: types.CloudStorageConfig, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    if (s.bucket.len == 0) return refuse(diag, "the bucket is empty", .{});
+    if (!std.unicode.utf8ValidateSlice(s.bucket)) return refuse(diag, "the bucket is not valid UTF-8", .{});
+    for (s.bucket) |c| {
+        if (c == '/') return refuse(diag, "the bucket is a name alone: no gs:// and no '/' (production answers one as an outage)", .{});
+        if (c <= ' ' or c == 0x7f) return refuse(diag, "the bucket holds whitespace or a control character", .{});
+    }
+    const prefix_chars = try filenamePart(s.filename_prefix, "prefix", diag);
+    const suffix_chars = try filenamePart(s.filename_suffix, "suffix", diag);
+    if (std.mem.endsWith(u8, s.filename_suffix, "/")) {
+        return refuse(diag, "the filename suffix ends with '/', which production refuses", .{});
+    }
+    if (prefix_chars + suffix_chars > max_filename_chars) {
+        return refuse(diag, "the filename prefix and suffix hold {d} characters together; the limit is {d}", .{ prefix_chars + suffix_chars, max_filename_chars });
+    }
+    try filenameDatetimeFormat(s.filename_datetime_format, diag);
+    if (s.max_duration) |d| {
+        if (d.nanoseconds < min_storage_duration.nanoseconds or d.nanoseconds > max_storage_duration.nanoseconds) {
+            return refuse(diag, "the file batching duration is outside 1 to 10 minutes", .{});
+        }
+    }
+    if (s.max_bytes != 0 and (s.max_bytes < min_storage_bytes or s.max_bytes > max_storage_bytes)) {
+        return refuse(diag, "the file batching bytes are outside {d} to {d}, with 0 for no such limit", .{ min_storage_bytes, max_storage_bytes });
+    }
+    if (s.max_messages != 0 and s.max_messages < min_storage_messages) {
+        return refuse(diag, "the file batching messages are under {d}, with 0 for no such limit", .{min_storage_messages});
+    }
+    // The wire carries an int64; production took its maximum.
+    if (s.max_messages > std.math.maxInt(i64)) {
+        return refuse(diag, "the file batching messages are over the wire's int64", .{});
+    }
+    if (s.service_account_email) |email| try serviceAccount(email, "the config's service account", diag);
+}
+
+/// Counts a prefix or suffix in characters, refusing control characters,
+/// which production refuses as "disallowed unicode characters".
+fn filenamePart(text: []const u8, comptime what: []const u8, diag: ?*Diagnostics) error{InvalidArgument}!usize {
+    const chars = std.unicode.utf8CountCodepoints(text) catch
+        return refuse(diag, "the filename " ++ what ++ " is not valid UTF-8", .{});
+    for (text) |c| if (c < ' ' or c == 0x7f) {
+        return refuse(diag, "the filename " ++ what ++ " holds a control character", .{});
+    };
+    return chars;
+}
+
+/// Production's rules for the filename datetime format, measured
+/// 2026-10-10: each of a year (`YYYY` or `YY`), `MM`, `DD`, `hh`, `mm` and
+/// `ss` exactly once, in any order; at most one `T` and at most one of `Z`
+/// and `+00:00`; between them only `-`, `_`, `:` and `/`. A space or a dot
+/// is refused. Empty means Pub/Sub's default.
+pub fn filenameDatetimeFormat(format: []const u8, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    if (format.len == 0) return;
+    var counts: [8]u32 = @splat(0);
+    const year = 0;
+    const t_count = 6;
+    const zone = 7;
+    var i: usize = 0;
+    while (i < format.len) {
+        const rest = format[i..];
+        const matchers = [_][]const u8{ "YYYY", "YY", "MM", "DD", "hh", "mm", "ss" };
+        const which: [7]usize = .{ year, year, 1, 2, 3, 4, 5 };
+        const matched = for (matchers, which) |matcher, slot| {
+            if (std.mem.startsWith(u8, rest, matcher)) {
+                counts[slot] += 1;
+                i += matcher.len;
+                break true;
+            }
+        } else false;
+        if (matched) continue;
+        if (std.mem.startsWith(u8, rest, "+00:00")) {
+            counts[zone] += 1;
+            i += "+00:00".len;
+            continue;
+        }
+        switch (rest[0]) {
+            'T' => counts[t_count] += 1,
+            'Z' => counts[zone] += 1,
+            '-', '_', ':', '/' => {},
+            else => return refuse(diag, "the datetime format takes YYYY or YY, MM, DD, hh, mm, ss, T, Z, +00:00 and the separators '-', '_', ':' and '/'; byte 0x{x:0>2} is none of them", .{rest[0]}),
+        }
+        i += 1;
+    }
+    for (counts[0..6], [_][]const u8{ "year (YYYY or YY)", "MM", "DD", "hh", "mm", "ss" }) |count, name| {
+        if (count != 1) return refuse(diag, "the datetime format needs each of a year (YYYY or YY), MM, DD, hh, mm and ss exactly once; {s} is there {d} times", .{ name, count });
+    }
+    if (counts[t_count] > 1) return refuse(diag, "the datetime format holds more than one T", .{});
+    if (counts[zone] > 1) return refuse(diag, "the datetime format holds more than one of Z and +00:00", .{});
+}
+
+/// A service account for OIDC or for export: the shape of an address. The
+/// server alone knows whether it exists and what it may do.
+pub fn serviceAccount(email: []const u8, comptime what: []const u8, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    const malformed = what ++ " is not of the shape of an address";
+    if (!std.unicode.utf8ValidateSlice(email)) return refuse(diag, malformed, .{});
+    for (email) |c| if (c <= ' ' or c == 0x7f) return refuse(diag, malformed, .{});
+    const at = std.mem.indexOfScalar(u8, email, '@') orelse return refuse(diag, malformed, .{});
+    const domain = email[at + 1 ..];
+    if (at == 0 or domain.len == 0) return refuse(diag, malformed, .{});
+    if (std.mem.indexOfScalar(u8, domain, '@') != null) return refuse(diag, malformed, .{});
+    const dot = std.mem.indexOfScalar(u8, domain, '.') orelse return refuse(diag, malformed, .{});
+    if (dot == 0 or dot == domain.len - 1) return refuse(diag, malformed, .{});
+}
+
 /// Every setting of a new subscription, before anything is sent.
-pub fn subscriptionConfig(config: types.SubscriptionConfig, diag: ?*Diagnostics) error{InvalidArgument}!void {
+/// `emulator` relaxes only what testing against one needs: an `http://`
+/// push endpoint.
+pub fn subscriptionConfig(config: types.SubscriptionConfig, emulator: bool, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    try delivery(config.delivery, config.enable_exactly_once_delivery, emulator, diag);
     try subscriptionDeadline(config.ack_deadline_seconds, diag);
     try filter(config.filter, diag);
     if (config.dead_letter_policy) |p| try deadLetterPolicy(p, diag);
@@ -586,13 +771,13 @@ test "labels: the rules at their boundaries" {
 test "subscription settings: each rule at its boundary" {
     var d: Diagnostics = .{};
     const base: types.SubscriptionConfig = .{ .topic_id = "t" };
-    try subscriptionConfig(base, &d);
+    try subscriptionConfig(base, false, &d);
 
     var c = base;
     c.filter = test_util.repeat("x", max_filter_bytes);
-    try subscriptionConfig(c, &d);
+    try subscriptionConfig(c, false, &d);
     c.filter = test_util.repeat("x", max_filter_bytes + 1);
-    try testing.expectError(error.InvalidArgument, subscriptionConfig(c, &d));
+    try testing.expectError(error.InvalidArgument, subscriptionConfig(c, false, &d));
 
     for ([_]u8{ 5, 100 }) |n| try deadLetterPolicy(.{ .topic = "dead", .max_delivery_attempts = n }, &d);
     for ([_]u8{ 0, 4, 101 }) |n| try testing.expectError(error.InvalidArgument, deadLetterPolicy(.{ .topic = "dead", .max_delivery_attempts = n }, &d));
@@ -624,10 +809,10 @@ test "subscription settings: each rule at its boundary" {
     c = base;
     c.message_retention = .fromSeconds(3 * 24 * 3600);
     c.expiration = .{ .after = .fromSeconds(2 * 24 * 3600) };
-    try testing.expectError(error.InvalidArgument, subscriptionConfig(c, &d));
+    try testing.expectError(error.InvalidArgument, subscriptionConfig(c, false, &d));
     c = base;
     c.ack_deadline_seconds = 9;
-    try testing.expectError(error.InvalidArgument, subscriptionConfig(c, &d));
+    try testing.expectError(error.InvalidArgument, subscriptionConfig(c, false, &d));
 }
 
 test "topic settings: the KMS key's shape and the storage policy" {
@@ -715,6 +900,201 @@ test "snapshot settings: the subscription's two forms, labels, and an update tha
     try snapshotUpdate(.{ .labels = &.{} }, &d);
     try snapshotUpdate(.{ .labels = &.{.{ .key = "env", .value = "prod" }} }, &d);
     try testing.expectError(error.InvalidArgument, snapshotUpdate(.{ .labels = &.{.{ .key = "Bad Key", .value = "v" }} }, &d));
+}
+
+test "delivery checks: the push endpoint by target, exactly-once beside a kind, and the OIDC account" {
+    var d: Diagnostics = .{};
+    const push: types.Delivery = .{ .push = .{ .endpoint = "https://example.com/hook" } };
+    try delivery(push, false, false, &d);
+    try delivery(push, false, true, &d);
+    // Exactly-once works only with pull, on any target.
+    try delivery(.pull, true, false, &d);
+    try testing.expectError(error.InvalidArgument, delivery(push, true, false, &d));
+    try testing.expectError(error.InvalidArgument, delivery(.{ .bigquery = .{ .table = "p.d.t" } }, true, false, &d));
+    try testing.expectError(error.InvalidArgument, delivery(.{ .cloud_storage = .{ .bucket = "b" } }, true, true, &d));
+    try testing.expect(std.mem.indexOf(u8, d.message(), "exactly-once") != null);
+    var c: types.SubscriptionConfig = .{ .topic_id = "t", .delivery = push, .enable_exactly_once_delivery = true };
+    try testing.expectError(error.InvalidArgument, subscriptionConfig(c, false, &d));
+    c.enable_exactly_once_delivery = false;
+    try subscriptionConfig(c, false, &d);
+
+    // http:// is for the emulator alone; production holds push to https://.
+    const insecure: types.Delivery = .{ .push = .{ .endpoint = "http://127.0.0.1:8085/hook" } };
+    try delivery(insecure, false, true, &d);
+    try testing.expectError(error.InvalidArgument, delivery(insecure, false, false, &d));
+    try testing.expectEqualStrings("the push endpoint is not an https:// URL, which production requires", d.message());
+    for ([_][]const u8{ "", "https://", "http://", "HTTPS://example.com", "ftp://example.com", "example.com/hook", "https:/example.com" }) |endpoint| {
+        try testing.expectError(error.InvalidArgument, pushConfig(.{ .endpoint = endpoint }, true, &d));
+        try testing.expectError(error.InvalidArgument, pushConfig(.{ .endpoint = endpoint }, false, &d));
+    }
+    try testing.expectError(error.InvalidArgument, pushConfig(.{ .endpoint = "https://e.x/\xff" }, false, &d));
+
+    // The OIDC account needs the shape of an address, and its audience UTF-8.
+    try pushConfig(.{ .endpoint = "https://e.x/h", .oidc_token = .{ .service_account_email = "sa@p.iam.gserviceaccount.com", .audience = "zigps" } }, false, &d);
+    for ([_][]const u8{ "", "sa", "sa@", "@d.com", "sa@nodot", "sa@d.com@x.com", "sa @d.com", "sa@d.", "sa@.d", "s\xffa@d.com" }) |email| {
+        try testing.expectError(error.InvalidArgument, pushConfig(.{ .endpoint = "https://e.x/h", .oidc_token = .{ .service_account_email = email } }, false, &d));
+    }
+    try testing.expectError(error.InvalidArgument, pushConfig(.{ .endpoint = "https://e.x/h", .oidc_token = .{ .service_account_email = "sa@p.d", .audience = "\xff" } }, false, &d));
+}
+
+test "BigQuery table names: production's verdicts, 2026-10-10" {
+    var d: Diagnostics = .{};
+    // Shapes production served (refusing them only at the missing table).
+    for ([_][]const u8{ "extractctl.zigps_nope.t", "extractctl:zigps_nope.t", "a.b.c.d", "extractctl.zigps-nope.t", "example.com:p.d.t" }) |table| {
+        try bigQueryConfig(.{ .table = table }, &d);
+    }
+    try testing.expectError(error.InvalidArgument, bigQueryConfig(.{ .table = "p.d.\xff" }, &d));
+    try testing.expect(std.mem.indexOf(u8, d.message(), "not valid UTF-8") != null);
+    // Shapes it refused as invalid, and a few of the same kind.
+    for ([_][]const u8{ "zigps_nope.t", "extractctl.zigps_nope", "nonsense", ".zigps_nope.t", "extractctl..t", "", ":d.t", "p:d", "p:d.t:x", "p.d.t ", "p.d\t.t" }) |table| {
+        try testing.expectError(error.InvalidArgument, bigQueryConfig(.{ .table = table }, &d));
+    }
+    try testing.expect(std.mem.indexOf(u8, d.message(), "project.dataset.table") != null);
+    try testing.expectError(error.InvalidArgument, bigQueryConfig(.{ .table = "p.d.t", .service_account_email = "nope" }, &d));
+}
+
+test "Cloud Storage config: the bucket's shape, the filename parts and the batching bounds" {
+    var d: Diagnostics = .{};
+    try cloudStorageConfig(.{ .bucket = "zigps-b" }, &d);
+    // Upper case passed production's checks: only the 503 trap is held here.
+    try cloudStorageConfig(.{ .bucket = "UPPER.name" }, &d);
+    for ([_][]const u8{ "", "gs://zigps-b", "zigps-b/logs", "b b", "b\nb", "\xff" }) |bucket| {
+        try testing.expectError(error.InvalidArgument, cloudStorageConfig(.{ .bucket = bucket }, &d));
+    }
+
+    // Filename parts: a suffix must not end in '/', control characters are
+    // refused, and prefix and suffix together hold at most 992 characters.
+    try cloudStorageConfig(.{ .bucket = "b", .filename_prefix = "a/b/", .filename_suffix = ".txt" }, &d);
+    try testing.expectError(error.InvalidArgument, cloudStorageConfig(.{ .bucket = "b", .filename_suffix = "logs/" }, &d));
+    try testing.expectError(error.InvalidArgument, cloudStorageConfig(.{ .bucket = "b", .filename_prefix = "a\nb" }, &d));
+    try testing.expectError(error.InvalidArgument, cloudStorageConfig(.{ .bucket = "b", .filename_suffix = "a\x7f" }, &d));
+    try testing.expectError(error.InvalidArgument, cloudStorageConfig(.{ .bucket = "b", .filename_prefix = "\xc3" }, &d));
+    try cloudStorageConfig(.{ .bucket = "b", .filename_prefix = test_util.repeat("x", 500), .filename_suffix = test_util.repeat("y", 492) }, &d);
+    try testing.expectError(error.InvalidArgument, cloudStorageConfig(.{ .bucket = "b", .filename_prefix = test_util.repeat("x", 500), .filename_suffix = test_util.repeat("y", 493) }, &d));
+    // Characters, not bytes, as production counts them.
+    try cloudStorageConfig(.{ .bucket = "b", .filename_prefix = test_util.repeat("é", 992) }, &d);
+
+    // Batching: the bounds production names, 0 meaning no such limit.
+    try cloudStorageConfig(.{ .bucket = "b", .max_duration = .fromSeconds(60) }, &d);
+    try cloudStorageConfig(.{ .bucket = "b", .max_duration = .fromSeconds(600) }, &d);
+    try testing.expectError(error.InvalidArgument, cloudStorageConfig(.{ .bucket = "b", .max_duration = .fromMilliseconds(59_999) }, &d));
+    try testing.expectError(error.InvalidArgument, cloudStorageConfig(.{ .bucket = "b", .max_duration = .fromSeconds(601) }, &d));
+    try cloudStorageConfig(.{ .bucket = "b", .max_bytes = min_storage_bytes }, &d);
+    try cloudStorageConfig(.{ .bucket = "b", .max_bytes = max_storage_bytes }, &d);
+    try testing.expectError(error.InvalidArgument, cloudStorageConfig(.{ .bucket = "b", .max_bytes = min_storage_bytes - 1 }, &d));
+    try testing.expectError(error.InvalidArgument, cloudStorageConfig(.{ .bucket = "b", .max_bytes = max_storage_bytes + 1 }, &d));
+    try cloudStorageConfig(.{ .bucket = "b", .max_messages = min_storage_messages }, &d);
+    // Production took an int64's maximum; more cannot travel.
+    try cloudStorageConfig(.{ .bucket = "b", .max_messages = std.math.maxInt(i64) }, &d);
+    try testing.expectError(error.InvalidArgument, cloudStorageConfig(.{ .bucket = "b", .max_messages = @as(u64, std.math.maxInt(i64)) + 1 }, &d));
+    try testing.expectError(error.InvalidArgument, cloudStorageConfig(.{ .bucket = "b", .max_messages = min_storage_messages - 1 }, &d));
+    try testing.expectError(error.InvalidArgument, cloudStorageConfig(.{ .bucket = "b", .service_account_email = "not an address" }, &d));
+}
+
+test "datetime format: production's verdict on every string measured, 2026-10-10" {
+    // Passed production's checks (each stopped only at the missing bucket).
+    const accepted = [_][]const u8{
+        "YYYY-MM-DD/hh_mm_ssZ",
+        "YYYYMMDDhhmmss",
+        "YYYY-MM-DDThh:mm:ss+00:00",
+        "YYYY-MM-DDThh:mm:ssZ",
+        "YYYY/MM/DD/hh/mm/ss",
+        "YYYY-MM-DD-hh-mm-ss-",
+        "-YYYY-MM-DD-hh-mm-ss",
+        "ssmmhhDDMMYYYY",
+        "",
+    };
+    for (accepted) |format| try filenameDatetimeFormat(format, null);
+    // Refused, with production's reason beside each.
+    var d: Diagnostics = .{};
+    const refused = [_][]const u8{
+        "YY-MM-DD hh:mm:ss", // a space
+        "YYYY-MM-DD", // no hh
+        "hh:mm:ss", // no year
+        "YYYY-MM-DD-hh-mm", // no ss
+        "YYYY-YYYY-MM-DD-hh-mm-ss", // two years
+        "YYYY-MM-DD-hh-mm-ss-ss", // two ss
+        "YYYY.MM.DD.hh.mm.ss", // dots
+        "yyyy-mm-dd-hh-mm-ss", // no year (lower case)
+        "YYYY-MM-DDThh:mm:ssZZ", // two Z
+        "YYYY-MM-DDTThh:mm:ss", // two T
+        "YYYY-MM-DD_hh:mm:ss_x", // an x
+        "YYYY-MM-DD hh:mm:ssZ+00:00", // two timezone offsets (and a space)
+    };
+    for (refused) |format| try testing.expectError(error.InvalidArgument, filenameDatetimeFormat(format, &d));
+    // The documented short year, which the probe did not reach.
+    try filenameDatetimeFormat("YY-MM-DDThh:mm:ssZ", null);
+    try testing.expectError(error.InvalidArgument, filenameDatetimeFormat("YYY-MM-DDThh:mm:ssZ", &d));
+}
+
+/// An independent reading of the datetime rules: maximal runs of each
+/// matcher letter, where only a run of exactly `YY` or `YYYY` is a year,
+/// in place of the check's greedy scan. Verdicts must agree.
+fn referenceDatetimeVerdict(format: []const u8) bool {
+    if (format.len == 0) return true;
+    var counts: [8]u32 = @splat(0); // year MM DD hh mm ss T zone
+    var i: usize = 0;
+    while (i < format.len) {
+        const c = format[i];
+        const slot: ?usize = switch (c) {
+            'Y' => 0,
+            'M' => 1,
+            'D' => 2,
+            'h' => 3,
+            'm' => 4,
+            's' => 5,
+            else => null,
+        };
+        if (slot) |s| {
+            var run: usize = 1;
+            while (i + run < format.len and format[i + run] == c) run += 1;
+            if (c == 'Y') {
+                if (run != 2 and run != 4) return false;
+                counts[0] += 1;
+            } else {
+                if (run % 2 != 0) return false;
+                counts[s] += @intCast(run / 2);
+            }
+            i += run;
+        } else if (std.mem.startsWith(u8, format[i..], "+00:00")) {
+            counts[7] += 1;
+            i += "+00:00".len;
+        } else {
+            switch (c) {
+                'T' => counts[6] += 1,
+                'Z' => counts[7] += 1,
+                '-', '_', ':', '/' => {},
+                else => return false,
+            }
+            i += 1;
+        }
+    }
+    for (counts[0..6]) |n| if (n != 1) return false;
+    return counts[6] <= 1 and counts[7] <= 1;
+}
+
+fn datetimeFormatProperty(_: void, input: []const u8) !void {
+    var g: test_util.ByteGen = .init(input);
+    const tokens = [_][]const u8{ "YYYY", "YY", "MM", "DD", "hh", "mm", "ss", "T", "Z", "+00:00", "-", "_", ":", "/", "Y", "M", "m", "x", " ", ".", "é", "\x00", "+00:0" };
+    var buf: [128]u8 = undefined;
+    var len: usize = 0;
+    for (0..g.intRange(u8, 0, 14)) |_| {
+        const token = g.pick([]const u8, &tokens);
+        if (len + token.len > buf.len) break;
+        @memcpy(buf[len..][0..token.len], token);
+        len += token.len;
+    }
+    const format = buf[0..len];
+    const accepted = if (filenameDatetimeFormat(format, null)) |_| true else |_| false;
+    try testing.expectEqual(referenceDatetimeVerdict(format), accepted);
+}
+
+test "fuzz datetime format: the check agrees with a run-based reference" {
+    try test_util.fuzzBytes({}, datetimeFormatProperty, .{ .corpus = &.{
+        "",
+        "\x0e\x00\x0a\x02\x0b\x03\x0c\x04\x0d\x05\x06\x07\x08\x09\x01",
+        "\x05\x01\x01\x0a\x0a\x09",
+    } });
 }
 
 test "a seek's target: a time a timestamp can hold, or a snapshot's id or full name" {

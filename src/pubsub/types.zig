@@ -192,9 +192,112 @@ pub const Expiration = union(enum) {
     after: std.Io.Duration,
 };
 
+/// How a subscription's messages are handed over: the subscriber pulls, or
+/// Pub/Sub itself POSTs each message to an endpoint, writes it as a row of
+/// a BigQuery table, or batches messages into files in a Cloud Storage
+/// bucket. One kind at a time, chosen at creation and changeable by update.
+pub const Delivery = union(enum) {
+    /// The subscriber asks for messages, as `pull` and `Subscriber` do.
+    pull,
+    push: PushConfig,
+    bigquery: BigQueryConfig,
+    cloud_storage: CloudStorageConfig,
+};
+
+pub const PushConfig = struct {
+    /// Where each message is POSTed: an `https://` URL. On an emulator
+    /// endpoint `http://` works too, which is how a push is tested locally.
+    endpoint: []const u8,
+    /// Signs each request as this service account, which the endpoint
+    /// can verify. Null sends no `Authorization` header.
+    oidc_token: ?OidcToken = null,
+    body: Body = .wrapped,
+
+    pub const Body = union(enum) {
+        /// Pub/Sub's JSON envelope around the message.
+        wrapped,
+        /// The message's data alone.
+        unwrapped: struct {
+            /// Its id, publish time, ordering key and attributes as
+            /// `x-goog-pubsub-*` headers.
+            write_metadata: bool = false,
+        },
+    };
+};
+
+pub const OidcToken = struct {
+    /// An account in the subscription's project. The caller needs
+    /// `iam.serviceAccounts.actAs` on it.
+    service_account_email: []const u8,
+    /// What the token is for. Empty: the endpoint's URL.
+    audience: []const u8 = "",
+};
+
+pub const BigQueryConfig = struct {
+    /// `project.dataset.table`, or with `:` after the project.
+    table: []const u8,
+    /// `.none` needs the table to have a `data` column.
+    schema: Schema = .none,
+    /// Write the message's id, publish time, ordering key and attributes
+    /// into columns of their own.
+    write_metadata: bool = false,
+    /// With `.topic`: fields the table lacks are dropped rather than
+    /// refused.
+    drop_unknown_fields: bool = false,
+    /// Writes as this account in place of Pub/Sub's service agent.
+    service_account_email: ?[]const u8 = null,
+
+    pub const Schema = enum { none, topic, table };
+};
+
+pub const CloudStorageConfig = struct {
+    /// The bucket's name alone, no `gs://`.
+    bucket: []const u8,
+    filename_prefix: []const u8 = "",
+    /// Must not end in `/`.
+    filename_suffix: []const u8 = "",
+    /// Such as `YYYY-MM-DD/hh_mm_ssZ`. Empty: Pub/Sub's default.
+    filename_datetime_format: []const u8 = "",
+    format: Format = .text,
+    /// A file is closed after this long, 1 to 10 minutes. Null: 5.
+    max_duration: ?std.Io.Duration = null,
+    /// Or at this many bytes, 1,000 to 10 GiB. 0: no such limit.
+    max_bytes: u64 = 0,
+    /// Or at this many messages, 1,000 or more. 0: no such limit.
+    max_messages: u64 = 0,
+    /// Writes as this account in place of Pub/Sub's service agent.
+    service_account_email: ?[]const u8 = null,
+
+    pub const Format = union(enum) {
+        /// Messages as they are, newline-separated.
+        text,
+        avro: struct { write_metadata: bool = false, use_topic_schema: bool = false },
+    };
+};
+
+/// What `SubscriptionInfo.delivery` reads: the config and, for the export
+/// kinds, the server's word on whether it can write. When an export
+/// cannot, the subscription's own `state` reads `.resource_error` and its
+/// messages wait in the backlog.
+pub const DeliveryInfo = union(enum) {
+    pull,
+    push: PushConfig,
+    bigquery: struct { config: BigQueryConfig, state: ExportState },
+    cloud_storage: struct { config: CloudStorageConfig, state: ExportState },
+    /// A kind this client does not model, such as a Bigtable subscription.
+    other,
+};
+
+/// `.unknown` when the server says nothing, as the emulator does, or says
+/// something new.
+pub const ExportState = enum { active, permission_denied, not_found, schema_mismatch, location_restriction, unknown };
+
 pub const SubscriptionConfig = struct {
     /// Id of a topic in the same project.
     topic_id: []const u8,
+    /// Any kind but `.pull` refuses exactly-once delivery, and only
+    /// `.pull` answers `pull` and lease calls.
+    delivery: Delivery = .pull,
     /// 10 to 600 seconds, or 0 for Pub/Sub's default: 10, or 60 with
     /// exactly-once delivery.
     ack_deadline_seconds: u32 = 0,
@@ -226,6 +329,7 @@ pub const SubscriptionInfo = struct {
     name: []const u8,
     /// Full topic name, or `_deleted-topic_` after the topic was deleted.
     topic: []const u8,
+    delivery: DeliveryInfo = .pull,
     ack_deadline_seconds: u32,
     enable_message_ordering: bool,
     enable_exactly_once_delivery: bool = false,

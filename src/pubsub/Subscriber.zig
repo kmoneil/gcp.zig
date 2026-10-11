@@ -1135,10 +1135,19 @@ const FakePubSub = struct {
     /// Detached, as production's subscription is seconds after a detach:
     /// pull, acknowledge and modifyAckDeadline are refused in its words.
     detached: bool = false,
+    /// A subscription that does not pull: every pull is refused as
+    /// production refuses a push subscription's.
+    push_subscription: bool = false,
 
     const detached_reply: Response = .{
         .status = 400,
         .body = "{\"error\":{\"code\":400,\"message\":\"This method is not supported on detached subscriptions.\",\"status\":\"FAILED_PRECONDITION\"}}",
+    };
+
+    /// Production's refusal of a pull on a push subscription, 2026-10-10.
+    const push_reply: Response = .{
+        .status = 400,
+        .body = "{\"error\":{\"code\":400,\"message\":\"This method is not supported for this subscription type.\",\"status\":\"FAILED_PRECONDITION\"}}",
     };
 
     const Msg = struct {
@@ -1391,6 +1400,7 @@ const FakePubSub = struct {
             f.empty_pulls -= 1;
             return .{ .status = 200, .body = "{\"receivedMessages\":[]}" };
         }
+        if (f.push_subscription) return push_reply;
         // A held pull, as the real server does when there is nothing yet.
         while (f.pending.items.len == 0) {
             if (f.detached) return detached_reply;
@@ -2566,6 +2576,22 @@ test "Subscriber: a detach stops run with FailedPrecondition and the server's wo
         try expectAccounted(counts);
         try testing.expectEqual(0, h.fake.ackedCount());
     }
+}
+
+test "Subscriber: a subscription that does not pull stops run with FailedPrecondition and the server's words" {
+    // A push, BigQuery or Cloud Storage subscription refuses its first
+    // pull; the `Subscriber` needs no code of its own for them.
+    var h: Harness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    var diag: Diagnostics = .{};
+    h.subscriber.caller_diag = &diag;
+    h.fake.push_subscription = true;
+    try testing.expectError(error.FailedPrecondition, h.subscriber.run(h.handler.handler()));
+    try testing.expectEqual(400, diag.http_status);
+    try testing.expectEqualStrings("FAILED_PRECONDITION", diag.status());
+    try testing.expectEqualStrings("This method is not supported for this subscription type.", diag.message());
+    try testing.expectEqual(0, h.subscriber.stats().received);
 }
 
 fn chaosProperty(_: void, input: []const u8) !void {
