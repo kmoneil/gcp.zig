@@ -56,7 +56,10 @@ jobs:
       - name: Start the Pub/Sub emulator
         run: |
           docker network create emulators
+          # host-gateway: the push delivery test runs a listener on the
+          # runner, which the emulator reaches only through the host.
           docker run -d --name pubsub --network emulators -p 8085:8085 \
+            --add-host=host.docker.internal:host-gateway \
             gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators \
             gcloud beta emulators pubsub start --project=test --host-port=0.0.0.0:8085
           for _ in $(seq 1 90); do
@@ -105,6 +108,7 @@ jobs:
         timeout-minutes: 10
         env:
           PUBSUB_EMULATOR_HOST: 127.0.0.1:8085
+          PUBSUB_TEST_PUSH_HOST: host.docker.internal
           STORAGE_EMULATOR_HOST: http://127.0.0.1:4443
           FIRESTORE_EMULATOR_HOST: 127.0.0.1:8087
         run: zig build test-integration --summary all

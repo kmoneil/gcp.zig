@@ -1571,8 +1571,11 @@ const PushListener = struct {
 
     const Request = struct { head: []u8, body: []u8 };
 
-    fn start(gpa: Allocator) !PushListener {
-        const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    /// Locally the emulator shares the loopback. In CI it lives in a
+    /// container and reaches the runner only through a gateway address,
+    /// so the listener binds every interface there.
+    fn start(gpa: Allocator, bind_all: bool) !PushListener {
+        const address: std.Io.net.IpAddress = .{ .ip4 = if (bind_all) .unspecified(0) else .loopback(0) };
         const server = try address.listen(testing.io, .{ .reuse_address = true });
         return .{ .gpa = gpa, .server = server, .port = server.socket.address.getPort() };
     }
@@ -1674,18 +1677,24 @@ test "push delivery: the emulator POSTs to a loopback listener, wrapped and unwr
     // Production requires https:// and cannot reach a loopback listener.
     if (f.production) return error.SkipZigTest;
 
-    var listener = try PushListener.start(testing.allocator);
+    // The address the emulator reaches this test at: the shared loopback
+    // locally, and in CI, where the emulator is a container,
+    // PUBSUB_TEST_PUSH_HOST names the host gateway (ci.yml sets
+    // host.docker.internal).
+    const push_host = f.env.get("PUBSUB_TEST_PUSH_HOST");
+    var listener = try PushListener.start(testing.allocator, push_host != null);
     defer listener.deinit();
     var serving = try testing.io.concurrent(PushListener.run, .{ &listener, testing.io });
     defer serving.cancel(testing.io) catch {};
 
     const topic = try f.createTopic("push");
     const a = f.arena.allocator();
+    const host = push_host orelse "127.0.0.1";
     const wrapped = try f.createSubscription("push-wrapped", .{ .topic_id = topic.id, .delivery = .{ .push = .{
-        .endpoint = try a.print("http://127.0.0.1:{d}/wrapped", .{listener.port}),
+        .endpoint = try a.print("http://{s}:{d}/wrapped", .{ host, listener.port }),
     } } });
     _ = try f.createSubscription("push-unwrapped", .{ .topic_id = topic.id, .delivery = .{ .push = .{
-        .endpoint = try a.print("http://127.0.0.1:{d}/unwrapped", .{listener.port}),
+        .endpoint = try a.print("http://{s}:{d}/unwrapped", .{ host, listener.port }),
         .body = .{ .unwrapped = .{ .write_metadata = true } },
     } } });
 
