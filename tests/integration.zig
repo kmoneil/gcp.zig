@@ -1589,16 +1589,29 @@ const PushListener = struct {
         l.server.deinit(testing.io);
     }
 
-    /// Serves until canceled. Cancellation must land in `accept`, so cancel
-    /// only while nothing is being pushed.
+    /// Serves until canceled, each connection on a task of its own, since
+    /// the pusher keeps connections open between pushes. This task stays
+    /// in `accept`, where the cancel can land: a canceled read surfaces as
+    /// `ReadFailed` and consumes the cancel, so a connection served here
+    /// inline would leave the loop blocking in `accept` forever (the same
+    /// trap `FaultProxy.run` documents).
     fn run(l: *PushListener, io: std.Io) std.Io.Cancelable!void {
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
         while (true) {
             const stream = l.server.accept(io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 else => return,
             };
-            l.serve(io, stream) catch {};
+            group.concurrent(io, serveTask, .{ l, io, stream }) catch {
+                // No task for it: serve on this one, as a lone pusher allows.
+                serveTask(l, io, stream);
+            };
         }
+    }
+
+    fn serveTask(l: *PushListener, io: std.Io, stream: std.Io.net.Stream) void {
+        l.serve(io, stream) catch {};
     }
 
     fn serve(l: *PushListener, io: std.Io, stream: std.Io.net.Stream) !void {
@@ -1739,10 +1752,20 @@ test "push delivery: the emulator POSTs to a loopback listener, wrapped and unwr
     try testing.expectEqualStrings("pushed", unwrapped_push.body);
     try testing.expect(containsIgnoreCase(unwrapped_push.head, "x-goog-pubsub-message-id:"));
 
-    // The 204s acknowledged: nothing is delivered again, past the 10 s
-    // deadline an unacknowledged push would come back after.
-    try testing.io.sleep(.fromMilliseconds(13_000), .awake);
-    try testing.expectEqual(2, listener.count());
+    // The 204s acknowledge: deliveries stop. Push is at least once, so a
+    // duplicate may still land (CI saw one); quiet means no new push for a
+    // whole redelivery window, the 10 s ack deadline with slack. A push
+    // nothing acknowledges comes back every deadline, and never settles.
+    var settled = listener.count();
+    var rounds: usize = 0;
+    while (true) {
+        try testing.io.sleep(.fromMilliseconds(13_000), .awake);
+        const count_now = listener.count();
+        if (count_now == settled) break;
+        settled = count_now;
+        rounds += 1;
+        try testing.expect(rounds < 5);
+    }
 }
 
 test "delivery: each export kind is created and read back, which is all the emulator does with them" {
