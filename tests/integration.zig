@@ -1876,6 +1876,72 @@ test "delivery update: pull to push and back on the emulator, and an export chan
     try testing.expectEqualStrings("test.d.t", retried.value.delivery.bigquery.config.table);
 }
 
+test "delivery in production: export kinds with their states, switches by update, and the measured refusals" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    // Needs a real table and bucket, both granted to Pub/Sub's service
+    // agent (`_plan/zig-pubsub-delivery-settings-spec.md`, question 8):
+    //   PUBSUB_TEST_BIGQUERY_TABLE=project.dataset.table
+    //   PUBSUB_TEST_BUCKET=bucket
+    if (!f.production) return error.SkipZigTest;
+    const table = f.env.get("PUBSUB_TEST_BIGQUERY_TABLE") orelse return error.SkipZigTest;
+    const bucket = f.env.get("PUBSUB_TEST_BUCKET") orelse return error.SkipZigTest;
+
+    const topic = try f.createTopic("deliver");
+    const sub = try f.createSubscription("deliver-sub", .{
+        .topic_id = topic.id,
+        .ack_deadline_seconds = 600,
+        .delivery = .{ .bigquery = .{ .table = table, .write_metadata = true } },
+    });
+    var rows = sub.get() catch |err| return f.fail(err);
+    defer rows.deinit();
+    try testing.expectEqualStrings(table, rows.value.delivery.bigquery.config.table);
+    try testing.expect(rows.value.delivery.bigquery.config.write_metadata);
+    try testing.expectEqual(.active, rows.value.delivery.bigquery.state);
+
+    // One update switches the kind, the delivery replaced whole.
+    var files = sub.update(.{ .delivery = .{ .cloud_storage = .{
+        .bucket = bucket,
+        .filename_prefix = "zigps/",
+        .filename_datetime_format = "YYYY-MM-DD/hh_mm_ssZ",
+        .max_duration = .fromSeconds(60),
+    } } }) catch |err| return f.fail(err);
+    defer files.deinit();
+    try testing.expectEqualStrings(bucket, files.value.delivery.cloud_storage.config.bucket);
+    try testing.expectEqualStrings("zigps/", files.value.delivery.cloud_storage.config.filename_prefix);
+    try testing.expectEqual(.active, files.value.delivery.cloud_storage.state);
+
+    var pushed = sub.update(.{ .delivery = .{ .push = .{ .endpoint = "https://example.com/zigps-hook" } } }) catch |err| return f.fail(err);
+    defer pushed.deinit();
+    try testing.expectEqualStrings("https://example.com/zigps-hook", pushed.value.delivery.push.endpoint);
+
+    // A push subscription refuses a pull, which is also what stops a
+    // Subscriber run on one.
+    try testing.expectError(error.FailedPrecondition, sub.pull(.{ .return_immediately = true }));
+    try testing.expectEqualStrings("This method is not supported for this subscription type.", f.diag.message());
+
+    var pulled = sub.update(.{ .delivery = .pull }) catch |err| return f.fail(err);
+    defer pulled.deinit();
+    try testing.expectEqual(.pull, std.meta.activeTag(pulled.value.delivery));
+
+    // The refusals measured on 2026-10-10, in production's words: a
+    // missing table says only "permission", a missing bucket names the
+    // service agent and what to grant.
+    const a = f.arena.allocator();
+    const missing_table = try a.print("{s}.zigps_no_such_dataset.t", .{f.client.project_id});
+    try testing.expectError(error.PermissionDenied, f.client.subscription(f.id("no-table")).create(.{
+        .topic_id = topic.id,
+        .delivery = .{ .bigquery = .{ .table = missing_table } },
+    }));
+    const missing_bucket = try a.print("{s}-no-such-bucket", .{&f.prefix});
+    try testing.expectError(error.FailedPrecondition, f.client.subscription(f.id("no-bucket")).create(.{
+        .topic_id = topic.id,
+        .delivery = .{ .cloud_storage = .{ .bucket = missing_bucket } },
+    }));
+    try testing.expect(std.mem.indexOf(u8, f.diag.message(), "service-") != null);
+}
+
 const Publisher = pubsub.Publisher;
 
 const PublisherKnobs = struct {

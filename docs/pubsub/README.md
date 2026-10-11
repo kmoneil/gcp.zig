@@ -44,6 +44,7 @@ Against production, pass a `.token_provider` as well:
 | [Subscribing](subscribing.md) | `Subscriber`, a worker loop that extends leases, bounds work and shuts down cleanly; exactly-once delivery |
 | [Publishing](publishing.md) | `Publisher`, which batches messages from many tasks; ordering keys; compression |
 | [Topics and subscriptions](topics-and-subscriptions.md) | Dead letters, retry policies, filters, retention, expiration and labels; updates; IAM |
+| [Delivery](delivery.md) | Push, BigQuery and Cloud Storage subscriptions: Pub/Sub delivers itself; the body options, the export states, and changing kind |
 | [Replaying and purging](replay.md) | Snapshots, seeking back to replay or ahead to purge, what a running subscriber sees, and detaching a subscription |
 
 **On this page:** [Handles and calls](#handles-and-calls) ·
@@ -129,6 +130,8 @@ emulator does not fail later in production.
 | IAM calls (0.8.36) | 501 `UNIMPLEMENTED`, `error.Unimplemented` | the policy |
 
 [Topics and subscriptions](topics-and-subscriptions.md#what-the-emulator-and-production-do)
-lists how the two treat settings and updates, and
+lists how the two treat settings and updates,
+[Delivery](delivery.md#what-the-emulator-and-production-do) how they
+treat push and the export kinds, and
 [Replaying and purging](replay.md#what-the-emulator-and-production-do)
 how they treat snapshots, seeks and detach.
