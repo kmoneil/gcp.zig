@@ -202,18 +202,23 @@ const SubscriptionBody = struct {
 
 /// The `subscriptions.patch` body: the fields `update` sets, and a mask
 /// naming them, and the ones it clears, which the body leaves out. Only
-/// top-level fields are named; a policy is replaced whole.
+/// top-level fields are named; a policy is replaced whole. A delivery
+/// masks every kind and sends the one given, so whatever the subscription
+/// was, it is then what was asked; on an emulator, which refuses the
+/// export kinds' mask paths, the push config alone is masked.
 pub fn encodeSubscriptionUpdate(
     arena: Allocator,
     update: types.SubscriptionUpdate,
     dead_letter_topic: ?[]const u8,
+    emulator: bool,
 ) Allocator.Error![]u8 {
-    return render(arena, SubscriptionUpdateBody{ .update = update, .dead_letter_topic = dead_letter_topic });
+    return render(arena, SubscriptionUpdateBody{ .update = update, .dead_letter_topic = dead_letter_topic, .emulator = emulator });
 }
 
 const SubscriptionUpdateBody = struct {
     update: types.SubscriptionUpdate,
     dead_letter_topic: ?[]const u8,
+    emulator: bool,
 
     fn write(self: SubscriptionUpdateBody, jw: *Stringify) Stringify.Error!void {
         const u = self.update;
@@ -221,6 +226,14 @@ const SubscriptionUpdateBody = struct {
         try jw.beginObject();
         try jw.objectField("subscription");
         try jw.beginObject();
+        if (u.delivery) |d| {
+            mask.add("pushConfig");
+            if (!self.emulator) {
+                mask.add("bigqueryConfig");
+                mask.add("cloudStorageConfig");
+            }
+            try writeDelivery(jw, d);
+        }
         if (u.ack_deadline_seconds) |s| {
             mask.add("ackDeadlineSeconds");
             try jw.objectField("ackDeadlineSeconds");
@@ -446,7 +459,7 @@ const SnapshotUpdateBody = struct {
 /// An update mask: the camelCase paths an update names, comma-separated in
 /// one JSON string, as the REST API takes a `FieldMask`.
 const Mask = struct {
-    paths: [8][]const u8 = undefined,
+    paths: [11][]const u8 = undefined,
     len: usize = 0,
 
     fn add(m: *Mask, path: []const u8) void {
@@ -1818,7 +1831,7 @@ test "golden: subscription update bodies name what they set and what they clear"
             .retain_acked_messages = true,
             .expiration = .never,
             .labels = &.{},
-        }, "projects/o/topics/dead"),
+        }, "projects/o/topics/dead", false),
     );
     // Back to the default expiration: named, and left out.
     try testing.expectEqualStrings(
@@ -1826,7 +1839,44 @@ test "golden: subscription update bodies name what they set and what they clear"
         try encodeSubscriptionUpdate(a, .{
             .retry_policy = .{ .set = .{ .minimum = .zero, .maximum = .fromSeconds(2) } },
             .expiration = .default,
-        }, null),
+        }, null, false),
+    );
+
+    // A delivery masks every kind and sends the one given: whatever the
+    // subscription was, it is then what was asked. `.pull` sends none.
+    try testing.expectEqualStrings(
+        "{\"subscription\":{\"pushConfig\":{\"pushEndpoint\":\"https://example.com/hook\"}}," ++
+            "\"updateMask\":\"pushConfig,bigqueryConfig,cloudStorageConfig\"}",
+        try encodeSubscriptionUpdate(a, .{ .delivery = .{ .push = .{ .endpoint = "https://example.com/hook" } } }, null, false),
+    );
+    try testing.expectEqualStrings(
+        "{\"subscription\":{},\"updateMask\":\"pushConfig,bigqueryConfig,cloudStorageConfig\"}",
+        try encodeSubscriptionUpdate(a, .{ .delivery = .pull }, null, false),
+    );
+    try testing.expectEqualStrings(
+        "{\"subscription\":{\"bigqueryConfig\":{\"table\":\"p.d.t\",\"writeMetadata\":true}}," ++
+            "\"updateMask\":\"pushConfig,bigqueryConfig,cloudStorageConfig\"}",
+        try encodeSubscriptionUpdate(a, .{ .delivery = .{ .bigquery = .{ .table = "p.d.t", .write_metadata = true } } }, null, false),
+    );
+    try testing.expectEqualStrings(
+        "{\"subscription\":{\"cloudStorageConfig\":{\"bucket\":\"b\",\"maxBytes\":\"1000\"}}," ++
+            "\"updateMask\":\"pushConfig,bigqueryConfig,cloudStorageConfig\"}",
+        try encodeSubscriptionUpdate(a, .{ .delivery = .{ .cloud_storage = .{ .bucket = "b", .max_bytes = 1000 } } }, null, false),
+    );
+    // On an emulator the push config alone is masked, since the emulator
+    // refuses the other two paths as unknown fields; the delivery still
+    // rides beside other changes.
+    try testing.expectEqualStrings(
+        "{\"subscription\":{\"pushConfig\":{\"pushEndpoint\":\"http://127.0.0.1:9/hook\"},\"ackDeadlineSeconds\":30}," ++
+            "\"updateMask\":\"pushConfig,ackDeadlineSeconds\"}",
+        try encodeSubscriptionUpdate(a, .{
+            .delivery = .{ .push = .{ .endpoint = "http://127.0.0.1:9/hook" } },
+            .ack_deadline_seconds = 30,
+        }, null, true),
+    );
+    try testing.expectEqualStrings(
+        "{\"subscription\":{},\"updateMask\":\"pushConfig\"}",
+        try encodeSubscriptionUpdate(a, .{ .delivery = .pull }, null, true),
     );
 }
 
@@ -2278,6 +2328,37 @@ fn updateMaskProperty(_: void, input: []const u8) !void {
     var u: types.SubscriptionUpdate = .{};
     var want: std.ArrayList([]const u8) = .empty;
     var body_fields: std.ArrayList([]const u8) = .empty;
+    switch (g.intRange(u8, 0, 4)) {
+        0 => {},
+        1 => u.delivery = .pull,
+        2 => {
+            u.delivery = .{ .push = .{ .endpoint = "https://e.x/h" } };
+            try body_fields.append(a, "pushConfig");
+        },
+        3 => {
+            u.delivery = .{ .bigquery = .{ .table = "p.d.t" } };
+            try body_fields.append(a, "bigqueryConfig");
+        },
+        else => {
+            u.delivery = .{ .cloud_storage = .{ .bucket = "b" } };
+            try body_fields.append(a, "cloudStorageConfig");
+        },
+    }
+    // `update` never sends an export kind to an emulator, so the encoder
+    // is never asked to.
+    const emulator = switch (u.delivery orelse .pull) {
+        .pull, .push => g.boolean(),
+        .bigquery, .cloud_storage => false,
+    };
+    if (u.delivery != null) {
+        // The mask names every kind exactly when the update sets a
+        // delivery; on an emulator, the push config alone.
+        try want.append(a, "pushConfig");
+        if (!emulator) {
+            try want.append(a, "bigqueryConfig");
+            try want.append(a, "cloudStorageConfig");
+        }
+    }
     if (g.boolean()) {
         u.ack_deadline_seconds = g.intRange(u32, 10, 600);
         try want.append(a, "ackDeadlineSeconds");
@@ -2351,7 +2432,7 @@ fn updateMaskProperty(_: void, input: []const u8) !void {
         try want.append(a, "labels");
         try body_fields.append(a, "labels");
     }
-    const body = try encodeSubscriptionUpdate(a, u, "projects/p/topics/d");
+    const body = try encodeSubscriptionUpdate(a, u, "projects/p/topics/d", emulator);
     const Parsed = struct { subscription: std.json.ArrayHashMap(std.json.Value), updateMask: []const u8 };
     const parsed = try std.json.parseFromSliceLeaky(Parsed, a, body, .{});
     // The mask names exactly what the update sets or clears, and the body
