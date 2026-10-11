@@ -107,7 +107,9 @@ file collects messages until a limit closes it; then the next begins.
   together hold at most 992 characters.
 - **A file closes** after `max_duration` (1 to 10 minutes, 5 by
   default), at `max_bytes` (1,000 bytes to 10 GiB) or at `max_messages`
-  (1,000 or more), whichever comes first; 0 means no such limit.
+  (1,000 or more), whichever comes first; 0 means no such limit. An ack
+  deadline under `max_duration` is not refused: production raises the
+  deadline to match it (10 s became 600 s, measured 2026-10-11).
 - **`format`**: `.text` (the default) writes messages as they are,
   newline-separated. `.avro` writes Avro records, with `write_metadata`
   and `use_topic_schema` as for BigQuery.
@@ -121,7 +123,10 @@ for the export kinds also the server's word on whether it can write.
 - **`ExportState`**: `.active`, or why not: `.permission_denied`,
   `.not_found`, `.schema_mismatch` or `.location_restriction`. The
   subscription's own `state` reads `.resource_error` meanwhile, and its
-  messages wait in the backlog. The emulator never sends a state, which
+  messages wait in the backlog. These report drift after the fact, a
+  grant revoked or a schema changed: a config that cannot write at
+  create time is refused outright, so a new subscription reads `.active`
+  at once (measured 2026-10-11). The emulator never sends a state, which
   reads `.unknown`.
 - **`.other`** is a kind this client does not model, a Bigtable
   subscription today: it lists and reads without failing, and
@@ -202,12 +207,14 @@ the two roles it wants) or `error.InvalidArgument`.
 
 Pub/Sub's service agent is
 `service-{project number}@gcp-sa-pubsub.iam.gserviceaccount.com`. A
-grant missing at create time refuses a Cloud Storage create outright,
-and shows up on a BigQuery subscription as its `state`.
+grant missing at create time refuses the create outright for both export
+kinds (measured 2026-10-11): Cloud Storage names the agent and the two
+roles, BigQuery says only that the caller does not have permission.
 
 ## What the emulator and production do
 
-Measured on 2026-10-10, with emulator 0.8.36. The client's own checks
+Measured on 2026-10-10 and 2026-10-11, with emulator 0.8.36. The
+client's own checks
 catch the ones marked *checked*.
 
 | Behavior | Emulator | Production |

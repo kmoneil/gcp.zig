@@ -2071,6 +2071,16 @@ test "decode a subscription's delivery: each kind, from captured answers" {
     try testing.expectEqual(.unknown, bq.delivery.bigquery.state);
     try testing.expectEqual(.active, (try decodeSubscription(a, "{\"bigqueryConfig\":{\"table\":\"p.d.t\",\"state\":\"ACTIVE\"}}")).delivery.bigquery.state);
 
+    // A production PATCH answer (2026-10-11): an update to an export kind
+    // echoes a pushConfig holding attributes alone beside the config, and
+    // the state is ACTIVE right away.
+    const patched = try decodeSubscription(a,
+        \\{"name":"projects/extractctl/subscriptions/zigps-x-all","topic":"projects/extractctl/topics/zigps-t","pushConfig":{"attributes":{"x-goog-version":"v1"}},"ackDeadlineSeconds":10,"bigqueryConfig":{"table":"extractctl.zigps_x.msgs","writeMetadata":true,"state":"ACTIVE"},"state":"ACTIVE"}
+    );
+    try testing.expectEqualStrings("extractctl.zigps_x.msgs", patched.delivery.bigquery.config.table);
+    try testing.expect(patched.delivery.bigquery.config.write_metadata);
+    try testing.expectEqual(.active, patched.delivery.bigquery.state);
+
     // Cloud Storage: int64s come as strings from the server, and as
     // numbers from a fake; both are taken.
     const gcs = try decodeSubscription(a,
