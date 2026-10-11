@@ -167,6 +167,7 @@ const SubscriptionBody = struct {
             try jw.objectField("enableExactlyOnceDelivery");
             try jw.write(true);
         }
+        try writeDelivery(jw, c.delivery);
         if (c.filter.len > 0) {
             try jw.objectField("filter");
             try jw.write(c.filter);
@@ -512,6 +513,145 @@ fn writeExpiration(jw: *Stringify, e: types.Expiration) Stringify.Error!void {
     try jw.endObject();
 }
 
+/// The delivery's one config object. `.pull` writes nothing: with none of
+/// the kinds set, a subscription pulls.
+fn writeDelivery(jw: *Stringify, delivery: types.Delivery) Stringify.Error!void {
+    switch (delivery) {
+        .pull => {},
+        .push => |p| {
+            try jw.objectField("pushConfig");
+            try writePushConfig(jw, p);
+        },
+        .bigquery => |b| {
+            try jw.objectField("bigqueryConfig");
+            try writeBigQueryConfig(jw, b);
+        },
+        .cloud_storage => |s| {
+            try jw.objectField("cloudStorageConfig");
+            try writeCloudStorageConfig(jw, s);
+        },
+    }
+}
+
+fn writePushConfig(jw: *Stringify, p: types.PushConfig) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("pushEndpoint");
+    try jw.write(p.endpoint);
+    if (p.oidc_token) |t| {
+        try jw.objectField("oidcToken");
+        try jw.beginObject();
+        try jw.objectField("serviceAccountEmail");
+        try jw.write(t.service_account_email);
+        if (t.audience.len > 0) {
+            try jw.objectField("audience");
+            try jw.write(t.audience);
+        }
+        try jw.endObject();
+    }
+    switch (p.body) {
+        // Left out: the wrapped envelope is the wire's default.
+        .wrapped => {},
+        .unwrapped => |u| {
+            try jw.objectField("noWrapper");
+            try jw.beginObject();
+            if (u.write_metadata) {
+                try jw.objectField("writeMetadata");
+                try jw.write(true);
+            }
+            try jw.endObject();
+        },
+    }
+    try jw.endObject();
+}
+
+fn writeBigQueryConfig(jw: *Stringify, b: types.BigQueryConfig) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("table");
+    try jw.write(b.table);
+    switch (b.schema) {
+        .none => {},
+        .topic => {
+            try jw.objectField("useTopicSchema");
+            try jw.write(true);
+        },
+        .table => {
+            try jw.objectField("useTableSchema");
+            try jw.write(true);
+        },
+    }
+    if (b.write_metadata) {
+        try jw.objectField("writeMetadata");
+        try jw.write(true);
+    }
+    if (b.drop_unknown_fields) {
+        try jw.objectField("dropUnknownFields");
+        try jw.write(true);
+    }
+    if (b.service_account_email) |email| {
+        try jw.objectField("serviceAccountEmail");
+        try jw.write(email);
+    }
+    try jw.endObject();
+}
+
+fn writeCloudStorageConfig(jw: *Stringify, s: types.CloudStorageConfig) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("bucket");
+    try jw.write(s.bucket);
+    if (s.filename_prefix.len > 0) {
+        try jw.objectField("filenamePrefix");
+        try jw.write(s.filename_prefix);
+    }
+    if (s.filename_suffix.len > 0) {
+        try jw.objectField("filenameSuffix");
+        try jw.write(s.filename_suffix);
+    }
+    if (s.filename_datetime_format.len > 0) {
+        try jw.objectField("filenameDatetimeFormat");
+        try jw.write(s.filename_datetime_format);
+    }
+    switch (s.format) {
+        // Left out: newline-separated text is the wire's default.
+        .text => {},
+        .avro => |a| {
+            try jw.objectField("avroConfig");
+            try jw.beginObject();
+            if (a.write_metadata) {
+                try jw.objectField("writeMetadata");
+                try jw.write(true);
+            }
+            if (a.use_topic_schema) {
+                try jw.objectField("useTopicSchema");
+                try jw.write(true);
+            }
+            try jw.endObject();
+        },
+    }
+    if (s.max_duration) |d| {
+        try jw.objectField("maxDuration");
+        try writeDuration(jw, d);
+    }
+    if (s.max_bytes != 0) {
+        try jw.objectField("maxBytes");
+        try writeInt64(jw, s.max_bytes);
+    }
+    if (s.max_messages != 0) {
+        try jw.objectField("maxMessages");
+        try writeInt64(jw, s.max_messages);
+    }
+    if (s.service_account_email) |email| {
+        try jw.objectField("serviceAccountEmail");
+        try jw.write(email);
+    }
+    try jw.endObject();
+}
+
+/// Proto JSON carries an int64 as a string, and the server echoes it as one.
+fn writeInt64(jw: *Stringify, n: u64) Stringify.Error!void {
+    var buf: [20]u8 = undefined;
+    try jw.write(std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable);
+}
+
 fn writeStoragePolicy(jw: *Stringify, policy: types.MessageStoragePolicy) Stringify.Error!void {
     try jw.beginObject();
     try jw.objectField("allowedPersistenceRegions");
@@ -645,9 +785,48 @@ const WireExpiration = struct {
     ttl: ?[]const u8 = null,
 };
 
+const WireOidcToken = struct {
+    serviceAccountEmail: ?[]const u8 = null,
+    audience: ?[]const u8 = null,
+};
+
+const WirePushConfig = struct {
+    pushEndpoint: ?[]const u8 = null,
+    oidcToken: ?WireOidcToken = null,
+    noWrapper: ?struct { writeMetadata: ?bool = null } = null,
+};
+
+const WireBigQueryConfig = struct {
+    table: ?[]const u8 = null,
+    useTopicSchema: ?bool = null,
+    useTableSchema: ?bool = null,
+    writeMetadata: ?bool = null,
+    dropUnknownFields: ?bool = null,
+    serviceAccountEmail: ?[]const u8 = null,
+    state: ?[]const u8 = null,
+};
+
+const WireCloudStorageConfig = struct {
+    bucket: ?[]const u8 = null,
+    filenamePrefix: ?[]const u8 = null,
+    filenameSuffix: ?[]const u8 = null,
+    filenameDatetimeFormat: ?[]const u8 = null,
+    avroConfig: ?struct { writeMetadata: ?bool = null, useTopicSchema: ?bool = null } = null,
+    maxDuration: ?[]const u8 = null,
+    maxBytes: ?u64 = null,
+    maxMessages: ?u64 = null,
+    serviceAccountEmail: ?[]const u8 = null,
+    state: ?[]const u8 = null,
+};
+
 const WireSubscription = struct {
     name: ?[]const u8 = null,
     topic: ?[]const u8 = null,
+    pushConfig: ?WirePushConfig = null,
+    bigqueryConfig: ?WireBigQueryConfig = null,
+    cloudStorageConfig: ?WireCloudStorageConfig = null,
+    /// Presence alone: a kind this client does not model.
+    bigtableConfig: ?struct {} = null,
     ackDeadlineSeconds: ?u32 = null,
     enableMessageOrdering: ?bool = null,
     enableExactlyOnceDelivery: ?bool = null,
@@ -755,6 +934,7 @@ fn subscriptionFromWire(arena: Allocator, w: WireSubscription) DecodeError!types
     return .{
         .name = w.name orelse "",
         .topic = w.topic orelse "",
+        .delivery = try deliveryFromWire(w),
         .ack_deadline_seconds = w.ackDeadlineSeconds orelse 0,
         .enable_message_ordering = w.enableMessageOrdering orelse false,
         .enable_exactly_once_delivery = w.enableExactlyOnceDelivery orelse false,
@@ -785,6 +965,63 @@ fn subscriptionFromWire(arena: Allocator, w: WireSubscription) DecodeError!types
         .state = subscriptionState(w.state),
         .topic_message_retention = try optionalDuration(w.topicMessageRetentionDuration),
     };
+}
+
+/// Production sends at most one kind, and reads a pull subscription as a
+/// `pushConfig` with no endpoint. The emulator can hold two kinds at once;
+/// the first in this fixed order wins: push, BigQuery, Cloud Storage.
+fn deliveryFromWire(w: WireSubscription) DecodeError!types.DeliveryInfo {
+    if (w.pushConfig) |p| {
+        if (nonEmpty(p.pushEndpoint)) |endpoint| return .{ .push = .{
+            .endpoint = endpoint,
+            .oidc_token = if (p.oidcToken) |t| .{
+                .service_account_email = t.serviceAccountEmail orelse "",
+                .audience = t.audience orelse "",
+            } else null,
+            .body = if (p.noWrapper) |n|
+                .{ .unwrapped = .{ .write_metadata = n.writeMetadata orelse false } }
+            else
+                .wrapped,
+        } };
+    }
+    if (w.bigqueryConfig) |b| return .{ .bigquery = .{ .config = .{
+        .table = b.table orelse "",
+        .schema = if (b.useTopicSchema orelse false)
+            .topic
+        else if (b.useTableSchema orelse false)
+            .table
+        else
+            .none,
+        .write_metadata = b.writeMetadata orelse false,
+        .drop_unknown_fields = b.dropUnknownFields orelse false,
+        .service_account_email = nonEmpty(b.serviceAccountEmail),
+    }, .state = exportState(b.state) } };
+    if (w.cloudStorageConfig) |s| return .{ .cloud_storage = .{ .config = .{
+        .bucket = s.bucket orelse "",
+        .filename_prefix = s.filenamePrefix orelse "",
+        .filename_suffix = s.filenameSuffix orelse "",
+        .filename_datetime_format = s.filenameDatetimeFormat orelse "",
+        .format = if (s.avroConfig) |a| .{ .avro = .{
+            .write_metadata = a.writeMetadata orelse false,
+            .use_topic_schema = a.useTopicSchema orelse false,
+        } } else .text,
+        .max_duration = try optionalDuration(s.maxDuration),
+        .max_bytes = s.maxBytes orelse 0,
+        .max_messages = s.maxMessages orelse 0,
+        .service_account_email = nonEmpty(s.serviceAccountEmail),
+    }, .state = exportState(s.state) } };
+    if (w.bigtableConfig != null) return .other;
+    return .pull;
+}
+
+fn exportState(text: ?[]const u8) types.ExportState {
+    const s = text orelse return .unknown;
+    if (std.mem.eql(u8, s, "ACTIVE")) return .active;
+    if (std.mem.eql(u8, s, "PERMISSION_DENIED")) return .permission_denied;
+    if (std.mem.eql(u8, s, "NOT_FOUND")) return .not_found;
+    if (std.mem.eql(u8, s, "SCHEMA_MISMATCH")) return .schema_mismatch;
+    if (std.mem.eql(u8, s, "IN_TRANSIT_LOCATION_RESTRICTION")) return .location_restriction;
+    return .unknown;
 }
 
 pub fn decodeSubscription(arena: Allocator, body: []const u8) DecodeError!types.SubscriptionInfo {
@@ -1688,6 +1925,164 @@ test "decode subscription settings: absent, empty and odd values" {
     try testing.expectError(error.InvalidResponse, decodeSubscription(a, "{\"deadLetterPolicy\":{\"maxDeliveryAttempts\":256}}"));
 }
 
+test "golden: create bodies for each delivery kind" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Push, with everything. The wrapped envelope is the default and is
+    // left out; `noWrapper` says unwrapped.
+    try testing.expectEqualStrings(
+        \\{"topic":"projects/p/topics/t","enableMessageOrdering":false,"pushConfig":{"pushEndpoint":"https://example.com/hook","oidcToken":{"serviceAccountEmail":"sa@p.iam.gserviceaccount.com","audience":"zigps"},"noWrapper":{"writeMetadata":true}}}
+    , try encodeSubscription(a, "projects/p/topics/t", .{ .topic_id = "t", .delivery = .{ .push = .{
+        .endpoint = "https://example.com/hook",
+        .oidc_token = .{ .service_account_email = "sa@p.iam.gserviceaccount.com", .audience = "zigps" },
+        .body = .{ .unwrapped = .{ .write_metadata = true } },
+    } } }, null));
+    // And with the least: an empty audience goes as the endpoint's URL.
+    try testing.expectEqualStrings(
+        \\{"topic":"projects/p/topics/t","enableMessageOrdering":false,"pushConfig":{"pushEndpoint":"https://e.x/h","oidcToken":{"serviceAccountEmail":"sa@p.iam.gserviceaccount.com"}}}
+    , try encodeSubscription(a, "projects/p/topics/t", .{ .topic_id = "t", .delivery = .{ .push = .{
+        .endpoint = "https://e.x/h",
+        .oidc_token = .{ .service_account_email = "sa@p.iam.gserviceaccount.com" },
+    } } }, null));
+
+    // BigQuery, with everything and with the least.
+    try testing.expectEqualStrings(
+        \\{"topic":"projects/p/topics/t","enableMessageOrdering":false,"bigqueryConfig":{"table":"p.d.t","useTopicSchema":true,"writeMetadata":true,"dropUnknownFields":true,"serviceAccountEmail":"w@p.iam.gserviceaccount.com"}}
+    , try encodeSubscription(a, "projects/p/topics/t", .{ .topic_id = "t", .delivery = .{ .bigquery = .{
+        .table = "p.d.t",
+        .schema = .topic,
+        .write_metadata = true,
+        .drop_unknown_fields = true,
+        .service_account_email = "w@p.iam.gserviceaccount.com",
+    } } }, null));
+    try testing.expectEqualStrings(
+        \\{"topic":"projects/p/topics/t","enableMessageOrdering":false,"bigqueryConfig":{"table":"p.d.t","useTableSchema":true}}
+    , try encodeSubscription(a, "projects/p/topics/t", .{ .topic_id = "t", .delivery = .{ .bigquery = .{ .table = "p.d.t", .schema = .table } } }, null));
+
+    // Cloud Storage, with everything: an int64 travels as a string, and
+    // text, the default format, is left out.
+    try testing.expectEqualStrings(
+        \\{"topic":"projects/p/topics/t","enableMessageOrdering":false,"cloudStorageConfig":{"bucket":"zigps-b","filenamePrefix":"logs/","filenameSuffix":".txt","filenameDatetimeFormat":"YYYY-MM-DD/hh_mm_ssZ","avroConfig":{"writeMetadata":true,"useTopicSchema":true},"maxDuration":"300s","maxBytes":"10737418240","maxMessages":"1000","serviceAccountEmail":"w@p.iam.gserviceaccount.com"}}
+    , try encodeSubscription(a, "projects/p/topics/t", .{ .topic_id = "t", .delivery = .{ .cloud_storage = .{
+        .bucket = "zigps-b",
+        .filename_prefix = "logs/",
+        .filename_suffix = ".txt",
+        .filename_datetime_format = "YYYY-MM-DD/hh_mm_ssZ",
+        .format = .{ .avro = .{ .write_metadata = true, .use_topic_schema = true } },
+        .max_duration = .fromSeconds(300),
+        .max_bytes = 10 * 1024 * 1024 * 1024,
+        .max_messages = 1000,
+        .service_account_email = "w@p.iam.gserviceaccount.com",
+    } } }, null));
+    try testing.expectEqualStrings(
+        \\{"topic":"projects/p/topics/t","enableMessageOrdering":false,"cloudStorageConfig":{"bucket":"b"}}
+    , try encodeSubscription(a, "projects/p/topics/t", .{ .topic_id = "t", .delivery = .{ .cloud_storage = .{ .bucket = "b" } } }, null));
+}
+
+test "decode a subscription's delivery: each kind, from captured answers" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Production reads a pull subscription as a pushConfig with no
+    // endpoint, attributes and all (2026-10-10).
+    const pull = try decodeSubscription(a, "{\"name\":\"n\",\"pushConfig\":{\"attributes\":{\"x-goog-version\":\"v1\"}}}");
+    try testing.expectEqual(.pull, std.meta.activeTag(pull.delivery));
+    try testing.expectEqual(.pull, std.meta.activeTag((try decodeSubscription(a, "{\"pushConfig\":{}}")).delivery));
+    try testing.expectEqual(.pull, std.meta.activeTag((try decodeSubscription(a, "{}")).delivery));
+
+    // A push as production creates one, and unwrapped as the emulator
+    // holds it (noWrapper {}).
+    const push = try decodeSubscription(a,
+        \\{"name":"projects/extractctl/subscriptions/zigps-x","topic":"projects/extractctl/topics/zigps-t","pushConfig":{"pushEndpoint":"https://example.com/zigps-push","attributes":{"x-goog-version":"v1"},"oidcToken":{"serviceAccountEmail":"sa@extractctl.iam.gserviceaccount.com","audience":"zigps"}},"ackDeadlineSeconds":10}
+    );
+    try testing.expectEqualStrings("https://example.com/zigps-push", push.delivery.push.endpoint);
+    try testing.expectEqualStrings("sa@extractctl.iam.gserviceaccount.com", push.delivery.push.oidc_token.?.service_account_email);
+    try testing.expectEqualStrings("zigps", push.delivery.push.oidc_token.?.audience);
+    try testing.expectEqual(.wrapped, std.meta.activeTag(push.delivery.push.body));
+    const unwrapped = try decodeSubscription(a, "{\"pushConfig\":{\"pushEndpoint\":\"https://example.com/p3\",\"noWrapper\":{}}}");
+    try testing.expectEqual(null, unwrapped.delivery.push.oidc_token);
+    try testing.expect(!unwrapped.delivery.push.body.unwrapped.write_metadata);
+    const meta = try decodeSubscription(a, "{\"pushConfig\":{\"pushEndpoint\":\"https://example.com/p3\",\"noWrapper\":{\"writeMetadata\":true}}}");
+    try testing.expect(meta.delivery.push.body.unwrapped.write_metadata);
+
+    // BigQuery, as the emulator echoes a create.
+    const bq = try decodeSubscription(a,
+        \\{"name":"projects/test/subscriptions/zigps-x-bq","topic":"projects/test/topics/zigps-t","pushConfig":{},"ackDeadlineSeconds":10,"messageRetentionDuration":"604800s","bigqueryConfig":{"table":"test.d.t","useTopicSchema":true,"writeMetadata":true,"dropUnknownFields":true,"serviceAccountEmail":"w@p.iam.gserviceaccount.com"}}
+    );
+    try testing.expectEqualStrings("test.d.t", bq.delivery.bigquery.config.table);
+    try testing.expectEqual(.topic, bq.delivery.bigquery.config.schema);
+    try testing.expect(bq.delivery.bigquery.config.write_metadata);
+    try testing.expect(bq.delivery.bigquery.config.drop_unknown_fields);
+    try testing.expectEqualStrings("w@p.iam.gserviceaccount.com", bq.delivery.bigquery.config.service_account_email.?);
+    // The emulator sends no state; production says ACTIVE.
+    try testing.expectEqual(.unknown, bq.delivery.bigquery.state);
+    try testing.expectEqual(.active, (try decodeSubscription(a, "{\"bigqueryConfig\":{\"table\":\"p.d.t\",\"state\":\"ACTIVE\"}}")).delivery.bigquery.state);
+
+    // Cloud Storage: int64s come as strings from the server, and as
+    // numbers from a fake; both are taken.
+    const gcs = try decodeSubscription(a,
+        \\{"cloudStorageConfig":{"bucket":"zigps-b","filenamePrefix":"logs/","filenameSuffix":".txt","filenameDatetimeFormat":"YYYY-MM-DD/hh_mm_ssZ","avroConfig":{"writeMetadata":true},"maxDuration":"300s","maxBytes":"1000","maxMessages":1000,"state":"PERMISSION_DENIED"}}
+    );
+    try testing.expectEqualStrings("zigps-b", gcs.delivery.cloud_storage.config.bucket);
+    try testing.expectEqualStrings("logs/", gcs.delivery.cloud_storage.config.filename_prefix);
+    try testing.expectEqualStrings(".txt", gcs.delivery.cloud_storage.config.filename_suffix);
+    try testing.expectEqualStrings("YYYY-MM-DD/hh_mm_ssZ", gcs.delivery.cloud_storage.config.filename_datetime_format);
+    try testing.expect(gcs.delivery.cloud_storage.config.format.avro.write_metadata);
+    try testing.expect(!gcs.delivery.cloud_storage.config.format.avro.use_topic_schema);
+    try testing.expectEqual(std.Io.Duration.fromSeconds(300), gcs.delivery.cloud_storage.config.max_duration.?);
+    try testing.expectEqual(1000, gcs.delivery.cloud_storage.config.max_bytes);
+    try testing.expectEqual(1000, gcs.delivery.cloud_storage.config.max_messages);
+    try testing.expectEqual(.permission_denied, gcs.delivery.cloud_storage.state);
+    const bare = (try decodeSubscription(a, "{\"cloudStorageConfig\":{\"bucket\":\"b\"}}")).delivery.cloud_storage;
+    try testing.expectEqual(.text, std.meta.activeTag(bare.config.format));
+    try testing.expectEqual(null, bare.config.max_duration);
+    try testing.expectEqual(0, bare.config.max_bytes);
+    try testing.expectEqual(null, bare.config.service_account_email);
+
+    // Each state, and one not yet known.
+    for ([_]struct { []const u8, types.ExportState }{
+        .{ "NOT_FOUND", .not_found },
+        .{ "SCHEMA_MISMATCH", .schema_mismatch },
+        .{ "IN_TRANSIT_LOCATION_RESTRICTION", .location_restriction },
+        .{ "STATE_UNSPECIFIED", .unknown },
+        .{ "SOMETHING_NEW", .unknown },
+    }) |case| {
+        const body = try a.print("{{\"bigqueryConfig\":{{\"table\":\"p.d.t\",\"state\":\"{s}\"}}}}", .{case[0]});
+        try testing.expectEqual(case[1], (try decodeSubscription(a, body)).delivery.bigquery.state);
+    }
+
+    // A malformed maxDuration spoils the read, as every other duration does.
+    try testing.expectError(error.InvalidResponse, decodeSubscription(a, "{\"cloudStorageConfig\":{\"bucket\":\"b\",\"maxDuration\":\"5 minutes\"}}"));
+}
+
+test "decode a subscription's delivery: kinds this client does not model, and two at once" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A Bigtable subscription lists without failing.
+    const bigtable = try decodeSubscription(a, "{\"name\":\"n\",\"pushConfig\":{},\"bigtableConfig\":{\"table\":\"projects/p/instances/i/tables/t\",\"state\":\"ACTIVE\"}}");
+    try testing.expectEqual(.other, std.meta.activeTag(bigtable.delivery));
+
+    // Production cannot send two kinds; the emulator keeps both. The first
+    // of a fixed order wins: push, BigQuery, Cloud Storage.
+    const both = try decodeSubscription(a,
+        \\{"pushConfig":{"pushEndpoint":"https://example.com/p"},"bigqueryConfig":{"table":"test.d.t"},"cloudStorageConfig":{"bucket":"b"}}
+    );
+    try testing.expectEqualStrings("https://example.com/p", both.delivery.push.endpoint);
+    const exports = try decodeSubscription(a,
+        \\{"pushConfig":{},"bigqueryConfig":{"table":"test.d.t"},"cloudStorageConfig":{"bucket":"b"}}
+    );
+    try testing.expectEqualStrings("test.d.t", exports.delivery.bigquery.config.table);
+    // A modeled kind wins over one that is not: the read still says what
+    // this client can say.
+    const mixed = try decodeSubscription(a, "{\"cloudStorageConfig\":{\"bucket\":\"b\"},\"bigtableConfig\":{}}");
+    try testing.expectEqualStrings("b", mixed.delivery.cloud_storage.config.bucket);
+}
+
 test "decode a topic with every setting" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -1713,12 +2108,103 @@ test "decode a topic with every setting" {
     try testing.expectEqual(.unknown, (try decodeTopic(a, "{\"state\":\"SOMETHING_NEW\"}")).state);
 }
 
+/// Draws a delivery the checks accept.
+fn genDelivery(g: *ByteGen) types.Delivery {
+    switch (g.intRange(u8, 0, 3)) {
+        0 => return .pull,
+        1 => {
+            var p: types.PushConfig = .{ .endpoint = g.pick([]const u8, &.{
+                "https://example.com/push",
+                "https://h.example/a?b=c",
+                "https://x.test/é",
+            }) };
+            if (g.boolean()) p.oidc_token = .{
+                .service_account_email = "sa@p.iam.gserviceaccount.com",
+                .audience = g.pick([]const u8, &.{ "", "zigps" }),
+            };
+            if (g.boolean()) p.body = .{ .unwrapped = .{ .write_metadata = g.boolean() } };
+            return .{ .push = p };
+        },
+        2 => return .{ .bigquery = .{
+            .table = g.pick([]const u8, &.{ "p.d.t", "example.com:p.d.t", "a.b.c.d" }),
+            .schema = g.pick(types.BigQueryConfig.Schema, &.{ .none, .topic, .table }),
+            .write_metadata = g.boolean(),
+            .drop_unknown_fields = g.boolean(),
+            .service_account_email = if (g.boolean()) "sa@p.iam.gserviceaccount.com" else null,
+        } },
+        else => {
+            var s: types.CloudStorageConfig = .{ .bucket = g.pick([]const u8, &.{ "b", "zigps-bucket", "UPPER.name" }) };
+            s.filename_prefix = g.pick([]const u8, &.{ "", "a/b/", "é" });
+            s.filename_suffix = g.pick([]const u8, &.{ "", ".txt", "_done" });
+            s.filename_datetime_format = g.pick([]const u8, &.{ "", "YYYY-MM-DD/hh_mm_ssZ", "ssmmhhDDMMYYYY", "YYYY-MM-DDThh:mm:ss+00:00" });
+            if (g.boolean()) s.format = .{ .avro = .{ .write_metadata = g.boolean(), .use_topic_schema = g.boolean() } };
+            if (g.boolean()) s.max_duration = .fromSeconds(g.intRange(u16, 60, 600));
+            if (g.boolean()) s.max_bytes = g.intRange(u64, 1000, 10 * 1024 * 1024 * 1024);
+            if (g.boolean()) s.max_messages = g.intRange(u64, 1000, 1 << 40);
+            if (g.boolean()) s.service_account_email = "sa@p.iam.gserviceaccount.com";
+            return .{ .cloud_storage = s };
+        },
+    }
+}
+
+/// `want` as `decodeSubscription` must read it back: the same settings,
+/// with the export state `.unknown`, since a create body carries none.
+fn expectDeliveryMatches(want: types.Delivery, have: types.DeliveryInfo) !void {
+    switch (want) {
+        .pull => try testing.expectEqual(.pull, std.meta.activeTag(have)),
+        .push => |p| {
+            try testing.expectEqualStrings(p.endpoint, have.push.endpoint);
+            try testing.expectEqual(p.oidc_token == null, have.push.oidc_token == null);
+            if (p.oidc_token) |t| {
+                try testing.expectEqualStrings(t.service_account_email, have.push.oidc_token.?.service_account_email);
+                try testing.expectEqualStrings(t.audience, have.push.oidc_token.?.audience);
+            }
+            switch (p.body) {
+                .wrapped => try testing.expectEqual(.wrapped, std.meta.activeTag(have.push.body)),
+                .unwrapped => |u| try testing.expectEqual(u.write_metadata, have.push.body.unwrapped.write_metadata),
+            }
+        },
+        .bigquery => |b| {
+            const got = have.bigquery;
+            try testing.expectEqualStrings(b.table, got.config.table);
+            try testing.expectEqual(b.schema, got.config.schema);
+            try testing.expectEqual(b.write_metadata, got.config.write_metadata);
+            try testing.expectEqual(b.drop_unknown_fields, got.config.drop_unknown_fields);
+            try expectEqualOptionalStrings(b.service_account_email, got.config.service_account_email);
+            try testing.expectEqual(.unknown, got.state);
+        },
+        .cloud_storage => |s| {
+            const got = have.cloud_storage;
+            try testing.expectEqualStrings(s.bucket, got.config.bucket);
+            try testing.expectEqualStrings(s.filename_prefix, got.config.filename_prefix);
+            try testing.expectEqualStrings(s.filename_suffix, got.config.filename_suffix);
+            try testing.expectEqualStrings(s.filename_datetime_format, got.config.filename_datetime_format);
+            switch (s.format) {
+                .text => try testing.expectEqual(.text, std.meta.activeTag(got.config.format)),
+                .avro => |a| try testing.expectEqual(a, got.config.format.avro),
+            }
+            try testing.expectEqual(s.max_duration, got.config.max_duration);
+            try testing.expectEqual(s.max_bytes, got.config.max_bytes);
+            try testing.expectEqual(s.max_messages, got.config.max_messages);
+            try expectEqualOptionalStrings(s.service_account_email, got.config.service_account_email);
+            try testing.expectEqual(.unknown, got.state);
+        },
+    }
+}
+
+fn expectEqualOptionalStrings(want: ?[]const u8, have: ?[]const u8) !void {
+    try testing.expectEqual(want == null, have == null);
+    if (want) |w| try testing.expectEqualStrings(w, have.?);
+}
+
 /// Draws settings the checks accept, as a caller might write them.
 fn genSubscriptionConfig(g: *ByteGen, arena: Allocator) !types.SubscriptionConfig {
     var config: types.SubscriptionConfig = .{ .topic_id = "t" };
+    config.delivery = genDelivery(g);
     config.ack_deadline_seconds = if (g.boolean()) 0 else g.intRange(u32, 10, 600);
     config.enable_message_ordering = g.boolean();
-    config.enable_exactly_once_delivery = g.boolean();
+    // Exactly-once works only when the subscriber pulls.
+    config.enable_exactly_once_delivery = config.delivery == .pull and g.boolean();
     if (g.boolean()) {
         var buf: [256]u8 = undefined;
         config.filter = try arena.dupe(u8, g.utf8(&buf, 256));
@@ -1753,7 +2239,7 @@ fn subscriptionRoundTrip(_: void, input: []const u8) !void {
     defer arena.deinit();
     const a = arena.allocator();
     const config = try genSubscriptionConfig(&g, a);
-    try @import("validate.zig").subscriptionConfig(config, null);
+    try @import("validate.zig").subscriptionConfig(config, false, null);
     // The create body is a subscription resource: read back as one, it
     // says what was asked.
     const dead: ?[]const u8 = if (config.dead_letter_policy) |p| p.topic else null;
@@ -1762,6 +2248,7 @@ fn subscriptionRoundTrip(_: void, input: []const u8) !void {
     try testing.expectEqual(config.ack_deadline_seconds, info.ack_deadline_seconds);
     try testing.expectEqual(config.enable_message_ordering, info.enable_message_ordering);
     try testing.expectEqual(config.enable_exactly_once_delivery, info.enable_exactly_once_delivery);
+    try expectDeliveryMatches(config.delivery, info.delivery);
     try testing.expectEqualStrings(config.filter, info.filter);
     try testing.expectEqual(config.dead_letter_policy == null, info.dead_letter_policy == null);
     if (config.dead_letter_policy) |p| {

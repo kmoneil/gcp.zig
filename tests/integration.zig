@@ -1556,6 +1556,258 @@ test "detach: in production, one whose answer was lost is read back and succeeds
 
 // Publisher.
 
+// Delivery: push, BigQuery and Cloud Storage subscriptions.
+
+/// A tiny HTTP server on the loopback interface that records every request
+/// and answers 204, which acknowledges a pushed message. What lands here is
+/// what the emulator really sends: the loopback listener is the only way to
+/// see that the body option asked for is the body an endpoint gets.
+const PushListener = struct {
+    gpa: Allocator,
+    server: std.Io.net.Server,
+    port: u16,
+    mutex: std.Io.Mutex = .init,
+    requests: std.ArrayList(Request) = .empty,
+
+    const Request = struct { head: []u8, body: []u8 };
+
+    fn start(gpa: Allocator) !PushListener {
+        const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        const server = try address.listen(testing.io, .{ .reuse_address = true });
+        return .{ .gpa = gpa, .server = server, .port = server.socket.address.getPort() };
+    }
+
+    fn deinit(l: *PushListener) void {
+        for (l.requests.items) |r| {
+            l.gpa.free(r.head);
+            l.gpa.free(r.body);
+        }
+        l.requests.deinit(l.gpa);
+        l.server.deinit(testing.io);
+    }
+
+    /// Serves until canceled. Cancellation must land in `accept`, so cancel
+    /// only while nothing is being pushed.
+    fn run(l: *PushListener, io: std.Io) std.Io.Cancelable!void {
+        while (true) {
+            const stream = l.server.accept(io) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return,
+            };
+            l.serve(io, stream) catch {};
+        }
+    }
+
+    fn serve(l: *PushListener, io: std.Io, stream: std.Io.net.Stream) !void {
+        defer stream.close(io);
+        var read_buf: [64 * 1024]u8 = undefined;
+        var reader = stream.reader(io, &read_buf);
+        var write_buf: [256]u8 = undefined;
+        var writer = stream.writer(io, &write_buf);
+        // The pusher may keep its connection and send several requests on it.
+        while (true) {
+            var head: std.Io.Writer.Allocating = .init(l.gpa);
+            defer head.deinit();
+            var content_length: u64 = 0;
+            var first = true;
+            while (true) {
+                const line = reader.interface.takeDelimiterInclusive('\n') catch |err| {
+                    if (first and err == error.EndOfStream) return;
+                    return err;
+                };
+                first = false;
+                try head.writer.writeAll(line);
+                if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+                    const value = std.mem.trim(u8, line["content-length:".len..], " \r\n");
+                    content_length = try std.fmt.parseInt(u64, value, 10);
+                }
+                if (std.mem.eql(u8, line, "\r\n") or std.mem.eql(u8, line, "\n")) break;
+            }
+            if (content_length > 1024 * 1024) return error.RequestTooLarge;
+            var body: std.Io.Writer.Allocating = .init(l.gpa);
+            defer body.deinit();
+            try reader.interface.streamExact64(&body.writer, content_length);
+            {
+                l.mutex.lockUncancelable(io);
+                defer l.mutex.unlock(io);
+                try l.requests.ensureUnusedCapacity(l.gpa, 1);
+                const kept_head = try l.gpa.dupe(u8, head.written());
+                errdefer l.gpa.free(kept_head);
+                const kept_body = try l.gpa.dupe(u8, body.written());
+                l.requests.appendAssumeCapacity(.{ .head = kept_head, .body = kept_body });
+            }
+            try writer.interface.writeAll("HTTP/1.1 204 No Content\r\n\r\n");
+            try writer.interface.flush();
+        }
+    }
+
+    fn count(l: *PushListener) usize {
+        l.mutex.lockUncancelable(testing.io);
+        defer l.mutex.unlock(testing.io);
+        return l.requests.items.len;
+    }
+
+    /// The recorded request whose first line names `path`, or null.
+    fn find(l: *PushListener, path: []const u8) ?Request {
+        l.mutex.lockUncancelable(testing.io);
+        defer l.mutex.unlock(testing.io);
+        for (l.requests.items) |r| {
+            const line_end = std.mem.indexOfScalar(u8, r.head, '\n') orelse continue;
+            if (std.mem.indexOf(u8, r.head[0..line_end], path) != null) return r;
+        }
+        return null;
+    }
+};
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    for (0..haystack.len - needle.len + 1) |i| {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+test "push delivery: the emulator POSTs to a loopback listener, wrapped and unwrapped, and 204 acknowledges" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    // Production requires https:// and cannot reach a loopback listener.
+    if (f.production) return error.SkipZigTest;
+
+    var listener = try PushListener.start(testing.allocator);
+    defer listener.deinit();
+    var serving = try testing.io.concurrent(PushListener.run, .{ &listener, testing.io });
+    defer serving.cancel(testing.io) catch {};
+
+    const topic = try f.createTopic("push");
+    const a = f.arena.allocator();
+    const wrapped = try f.createSubscription("push-wrapped", .{ .topic_id = topic.id, .delivery = .{ .push = .{
+        .endpoint = try a.print("http://127.0.0.1:{d}/wrapped", .{listener.port}),
+    } } });
+    _ = try f.createSubscription("push-unwrapped", .{ .topic_id = topic.id, .delivery = .{ .push = .{
+        .endpoint = try a.print("http://127.0.0.1:{d}/unwrapped", .{listener.port}),
+        .body = .{ .unwrapped = .{ .write_metadata = true } },
+    } } });
+
+    const message_id = try publishOne(&f, topic, .{ .data = "pushed", .attributes = &.{.{ .key = "origin", .value = "zig" }} }, .{});
+
+    // Both subscriptions deliver the one message to their endpoints.
+    const deadline = nowMs() + f.patience() * 1000;
+    while (listener.find("/wrapped") == null or listener.find("/unwrapped") == null) {
+        if (nowMs() > deadline) {
+            std.debug.print("timed out with {d} pushes\n", .{listener.count()});
+            return error.TestTimedOut;
+        }
+        try testing.io.sleep(.fromMilliseconds(100), .awake);
+    }
+
+    // The wrapped body is the JSON envelope: the message with base64 data,
+    // its attributes and id, and the full subscription name.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const envelope_body = listener.find("/wrapped").?.body;
+    const Envelope = struct {
+        message: struct {
+            data: []const u8,
+            attributes: std.json.ArrayHashMap([]const u8) = .{},
+            messageId: []const u8 = "",
+        },
+        subscription: []const u8,
+    };
+    const envelope = try std.json.parseFromSliceLeaky(Envelope, arena.allocator(), envelope_body, .{ .ignore_unknown_fields = true });
+    const decoder = std.base64.standard.Decoder;
+    const data = try arena.allocator().alloc(u8, try decoder.calcSizeForSlice(envelope.message.data));
+    try decoder.decode(data, envelope.message.data);
+    try testing.expectEqualStrings("pushed", data);
+    try testing.expectEqualStrings("zig", envelope.message.attributes.map.get("origin").?);
+    try testing.expectEqualStrings(message_id, envelope.message.messageId);
+    const wrapped_name = try a.print("projects/{s}/subscriptions/{s}", .{ f.client.project_id, wrapped.id });
+    try testing.expectEqualStrings(wrapped_name, envelope.subscription);
+
+    // The unwrapped body is the message's data alone, with its metadata in
+    // x-goog-pubsub-* headers when asked.
+    const unwrapped_push = listener.find("/unwrapped").?;
+    try testing.expectEqualStrings("pushed", unwrapped_push.body);
+    try testing.expect(containsIgnoreCase(unwrapped_push.head, "x-goog-pubsub-message-id:"));
+
+    // The 204s acknowledged: nothing is delivered again, past the 10 s
+    // deadline an unacknowledged push would come back after.
+    try testing.io.sleep(.fromMilliseconds(13_000), .awake);
+    try testing.expectEqual(2, listener.count());
+}
+
+test "delivery: each export kind is created and read back, which is all the emulator does with them" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    // In production an export needs a real table or bucket and a grant;
+    // those cases are gated on PUBSUB_TEST_BIGQUERY_TABLE and
+    // PUBSUB_TEST_BUCKET (milestone 3 of the delivery spec).
+    if (f.production) return error.SkipZigTest;
+
+    const topic = try f.createTopic("export");
+
+    // A push config with everything reads back as it was made.
+    const push = try f.createSubscription("push-full", .{ .topic_id = topic.id, .delivery = .{ .push = .{
+        .endpoint = "https://example.com/zigps-hook",
+        .oidc_token = .{ .service_account_email = "zig-gcp@extractctl.iam.gserviceaccount.com", .audience = "zigps" },
+        .body = .{ .unwrapped = .{ .write_metadata = true } },
+    } } });
+    var pushed = push.get() catch |err| return f.fail(err);
+    defer pushed.deinit();
+    const push_config = pushed.value.delivery.push;
+    try testing.expectEqualStrings("https://example.com/zigps-hook", push_config.endpoint);
+    try testing.expectEqualStrings("zig-gcp@extractctl.iam.gserviceaccount.com", push_config.oidc_token.?.service_account_email);
+    try testing.expectEqualStrings("zigps", push_config.oidc_token.?.audience);
+    try testing.expect(push_config.body.unwrapped.write_metadata);
+
+    // BigQuery: the emulator stores the config unchecked and delivers
+    // nothing; its page says so. The state stays the server's secret.
+    const bq = try f.createSubscription("bq", .{ .topic_id = topic.id, .delivery = .{ .bigquery = .{
+        .table = "test.zigps_dataset.rows",
+        .schema = .topic,
+        .write_metadata = true,
+        .drop_unknown_fields = true,
+    } } });
+    var rows = bq.get() catch |err| return f.fail(err);
+    defer rows.deinit();
+    const bq_config = rows.value.delivery.bigquery.config;
+    try testing.expectEqualStrings("test.zigps_dataset.rows", bq_config.table);
+    try testing.expectEqual(.topic, bq_config.schema);
+    try testing.expect(bq_config.write_metadata);
+    try testing.expect(bq_config.drop_unknown_fields);
+    try testing.expectEqual(.unknown, rows.value.delivery.bigquery.state);
+
+    // Cloud Storage, with every option.
+    const gcs = try f.createSubscription("gcs", .{ .topic_id = topic.id, .delivery = .{ .cloud_storage = .{
+        .bucket = "zigps-no-such-bucket",
+        .filename_prefix = "logs/",
+        .filename_suffix = ".avro",
+        .filename_datetime_format = "YYYY-MM-DD/hh_mm_ssZ",
+        .format = .{ .avro = .{ .write_metadata = true } },
+        .max_duration = .fromSeconds(120),
+        .max_bytes = 2000,
+        .max_messages = 1000,
+    } } });
+    var files = gcs.get() catch |err| return f.fail(err);
+    defer files.deinit();
+    const gcs_config = files.value.delivery.cloud_storage.config;
+    try testing.expectEqualStrings("zigps-no-such-bucket", gcs_config.bucket);
+    try testing.expectEqualStrings("logs/", gcs_config.filename_prefix);
+    try testing.expectEqualStrings(".avro", gcs_config.filename_suffix);
+    try testing.expectEqualStrings("YYYY-MM-DD/hh_mm_ssZ", gcs_config.filename_datetime_format);
+    try testing.expect(gcs_config.format.avro.write_metadata);
+    try testing.expect(!gcs_config.format.avro.use_topic_schema);
+    try testing.expectEqual(std.Io.Duration.fromSeconds(120), gcs_config.max_duration.?);
+    try testing.expectEqual(2000, gcs_config.max_bytes);
+    try testing.expectEqual(1000, gcs_config.max_messages);
+    try testing.expectEqual(.unknown, files.value.delivery.cloud_storage.state);
+
+    // The export kinds list beside the pull ones without failing.
+    var page = f.client.listSubscriptions(.{ .page_size = 100 }) catch |err| return f.fail(err);
+    defer page.deinit();
+}
+
 const Publisher = pubsub.Publisher;
 
 const PublisherKnobs = struct {

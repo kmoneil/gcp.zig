@@ -33,7 +33,7 @@ pub fn create(self: Subscription, config: types.SubscriptionConfig) Error!Owned(
     rpc.begin(c);
     try rpc.checkId(c, "subscription", self.id);
     try rpc.checkId(c, "topic", config.topic_id);
-    try validate.subscriptionConfig(config, c.diagnostics);
+    try validate.subscriptionConfig(config, c.emulator, c.diagnostics);
     var scratch: std.heap.ArenaAllocator = .init(c.gpa);
     defer scratch.deinit();
     const a = scratch.allocator();
@@ -1263,6 +1263,131 @@ test "create and update with settings: every allocation failure is OutOfMemory w
             var updated = try work.update(.{ .labels = &.{.{ .key = "team", .value = "zag" }}, .retry_policy = .clear });
             defer updated.deinit();
             try testing.expectEqualStrings("projects/p/topics/dead", updated.value.dead_letter_policy.?.topic);
+            try testing.expectEqual(replies.len, fake.requests.items.len);
+        }
+    };
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{@as([]const Reply, &script)});
+}
+
+// Delivery: push, BigQuery and Cloud Storage subscriptions.
+
+test "golden: create a push and a BigQuery subscription, and read an export's state" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body =
+        \\{"name":"projects/p/subscriptions/work","topic":"projects/p/topics/orders","pushConfig":{"pushEndpoint":"http://127.0.0.1:9/hook","attributes":{"x-goog-version":"v1"}},"ackDeadlineSeconds":10}
+        } },
+        .{ .respond = .{ .body =
+        \\{"name":"projects/p/subscriptions/work","topic":"projects/p/topics/orders","pushConfig":{},"bigqueryConfig":{"table":"p.sales.orders","writeMetadata":true,"state":"ACTIVE"},"ackDeadlineSeconds":10}
+        } },
+        .{ .respond = .{ .body =
+        \\{"name":"projects/p/subscriptions/work","topic":"projects/p/topics/orders","cloudStorageConfig":{"bucket":"zigps-b","state":"NOT_FOUND"},"state":"RESOURCE_ERROR"}
+        } },
+    }, .{});
+    defer h.deinit();
+    const work = h.client.subscription("work");
+
+    // The harness is an emulator, which takes an http:// endpoint, as its
+    // page advises for testing a push locally.
+    var pushed = try work.create(.{ .topic_id = "orders", .delivery = .{ .push = .{ .endpoint = "http://127.0.0.1:9/hook" } } });
+    defer pushed.deinit();
+    try h.expectRequest(0, .PUT, base_url, "{\"topic\":\"projects/p/topics/orders\",\"enableMessageOrdering\":false,\"pushConfig\":{\"pushEndpoint\":\"http://127.0.0.1:9/hook\"}}");
+    try testing.expectEqualStrings("http://127.0.0.1:9/hook", pushed.value.delivery.push.endpoint);
+
+    var rows = try work.create(.{ .topic_id = "orders", .delivery = .{ .bigquery = .{ .table = "p.sales.orders", .write_metadata = true } } });
+    defer rows.deinit();
+    try h.expectRequest(1, .PUT, base_url, "{\"topic\":\"projects/p/topics/orders\",\"enableMessageOrdering\":false,\"bigqueryConfig\":{\"table\":\"p.sales.orders\",\"writeMetadata\":true}}");
+    try testing.expectEqualStrings("p.sales.orders", rows.value.delivery.bigquery.config.table);
+    try testing.expectEqual(.active, rows.value.delivery.bigquery.state);
+
+    // An export that cannot write: its own state says what is wrong, the
+    // subscription's that something is.
+    var files = try work.get();
+    defer files.deinit();
+    try testing.expectEqual(.not_found, files.value.delivery.cloud_storage.state);
+    try testing.expectEqual(.resource_error, files.value.state);
+    try h.expectRequestCount(3);
+}
+
+test "delivery checks hold before any request, by the endpoint's kind" {
+    // Against production: https:// only, and every rule the emulator
+    // would wave through.
+    var h: Harness = undefined;
+    try h.init(&.{}, .{ .token = "ya29.test" });
+    defer h.deinit();
+    const work = h.client.subscription("work");
+    try testing.expectError(error.InvalidArgument, work.create(.{ .topic_id = "orders", .delivery = .{ .push = .{ .endpoint = "http://example.com/hook" } } }));
+    try testing.expectEqualStrings("the push endpoint is not an https:// URL, which production requires", h.diag.message());
+    try testing.expectError(error.InvalidArgument, work.create(.{
+        .topic_id = "orders",
+        .delivery = .{ .push = .{ .endpoint = "https://example.com/hook" } },
+        .enable_exactly_once_delivery = true,
+    }));
+    try testing.expectError(error.InvalidArgument, work.create(.{ .topic_id = "orders", .delivery = .{ .bigquery = .{ .table = "dataset.t" } } }));
+    try testing.expectError(error.InvalidArgument, work.create(.{ .topic_id = "orders", .delivery = .{ .cloud_storage = .{ .bucket = "gs://b" } } }));
+    try testing.expectError(error.InvalidArgument, work.create(.{ .topic_id = "orders", .delivery = .{ .cloud_storage = .{ .bucket = "b", .filename_datetime_format = "YYYY" } } }));
+    try testing.expectError(error.InvalidArgument, work.create(.{ .topic_id = "orders", .delivery = .{ .cloud_storage = .{ .bucket = "b", .max_bytes = 999 } } }));
+    try h.expectRequestCount(0);
+
+    // On the emulator http:// passes, and the other checks hold there too.
+    var e: Harness = undefined;
+    try e.init(&.{}, .{});
+    defer e.deinit();
+    const sub = e.client.subscription("work");
+    try testing.expectError(error.InvalidArgument, sub.create(.{ .topic_id = "orders", .delivery = .{ .push = .{ .endpoint = "ftp://example.com/hook" } } }));
+    try testing.expectEqualStrings("the push endpoint is not an http(s):// URL", e.diag.message());
+    try testing.expectError(error.InvalidArgument, sub.create(.{ .topic_id = "orders", .delivery = .{ .bigquery = .{ .table = "nonsense" } } }));
+    try e.expectRequestCount(0);
+}
+
+test "create with each delivery kind: every allocation failure is OutOfMemory without leaks" {
+    const Reply = test_util.FakeTransport.Reply;
+    // Escapes make std.json allocate, so the sweep reaches those too.
+    const push_answer =
+        \\{"name":"projects/p/subscriptions/work","topic":"projects/p/topics/t","pushConfig":{"pushEndpoint":"https://e.x/h\u0065","oidcToken":{"serviceAccountEmail":"sa@p.d\u0065","audience":"a"},"noWrapper":{"writeMetadata":true}}}
+    ;
+    const bq_answer =
+        \\{"name":"projects/p/subscriptions/work","topic":"projects/p/topics/t","pushConfig":{},"bigqueryConfig":{"table":"p.d.t\u0065","state":"ACTIVE"}}
+    ;
+    const gcs_answer =
+        \\{"name":"projects/p/subscriptions/work","topic":"projects/p/topics/t","cloudStorageConfig":{"bucket":"b\u0065","avroConfig":{},"maxDuration":"300s","maxBytes":"1000","state":"PERMISSION_DENIED"}}
+    ;
+    const script = [_]Reply{
+        .{ .respond = .{ .body = push_answer } },
+        .{ .respond = .{ .body = bq_answer } },
+        .{ .respond = .{ .body = gcs_answer } },
+    };
+    const Run = struct {
+        fn run(gpa: Allocator, replies: []const Reply) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, replies);
+            defer fake.deinit();
+            var clock: test_util.FakeClock = .{};
+            var token: core.StaticToken = .{ .token = "ya29.token" };
+            var client: Client = try .init(gpa, clock.io(), .{
+                .project_id = "p",
+                .token_provider = token.provider(),
+                .transport = fake.transport(),
+            });
+            defer client.deinit();
+            const work = client.subscription("work");
+            var pushed = try work.create(.{ .topic_id = "orders", .delivery = .{ .push = .{
+                .endpoint = "https://e.x/he",
+                .oidc_token = .{ .service_account_email = "sa@p.de", .audience = "a" },
+                .body = .{ .unwrapped = .{ .write_metadata = true } },
+            } } });
+            defer pushed.deinit();
+            try testing.expect(pushed.value.delivery.push.body.unwrapped.write_metadata);
+            var rows = try work.create(.{ .topic_id = "orders", .delivery = .{ .bigquery = .{ .table = "p.d.te" } } });
+            defer rows.deinit();
+            try testing.expectEqual(.active, rows.value.delivery.bigquery.state);
+            var files = try work.create(.{ .topic_id = "orders", .delivery = .{ .cloud_storage = .{
+                .bucket = "be",
+                .format = .{ .avro = .{} },
+                .max_duration = .fromSeconds(300),
+                .max_bytes = 1000,
+            } } });
+            defer files.deinit();
+            try testing.expectEqual(.permission_denied, files.value.delivery.cloud_storage.state);
             try testing.expectEqual(replies.len, fake.requests.items.len);
         }
     };
