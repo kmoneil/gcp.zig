@@ -2113,12 +2113,16 @@ const Bench = struct {
     client: Client,
 
     fn init(b: *Bench, options: FakePubSub.Options) !void {
+        return b.initIn(testing.allocator, options);
+    }
+
+    fn initIn(b: *Bench, gpa: Allocator, options: FakePubSub.Options) !void {
         b.clock = .{};
-        b.fake = .init(testing.allocator, b.clock.io(), options);
+        b.fake = .init(gpa, b.clock.io(), options);
         errdefer b.fake.deinit();
         b.tokens = .{};
         b.diag = .{};
-        b.client = try .init(testing.allocator, b.clock.io(), .{
+        b.client = try .init(gpa, b.clock.io(), .{
             .project_id = "p",
             .token_provider = b.tokens.provider(),
             .transport = b.fake.transport(),
@@ -4078,10 +4082,16 @@ const ModelDelivery = struct { sub: usize, incarnation: u32, id: u64, attempt: u
 
 fn modelProperty(_: void, input: []const u8) !void {
     var g: test_util.ByteGen = .init(input);
+    // A run is a whole session of calls. The fuzzer makes tens of
+    // thousands a night, and the allocator that looks for leaks, which
+    // records where each allocation was made, was most of a run's cost:
+    // under the fuzzer the session has a plain one. The corpus and the
+    // random runs of every test run keep the one that looks.
+    const gpa = if (@import("builtin").fuzz) std.heap.smp_allocator else testing.allocator;
     var b: Bench = undefined;
-    try b.init(.{ .shuffle = g.boolean() });
+    try b.initIn(gpa, .{ .shuffle = g.boolean() });
     defer b.deinit();
-    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
     const a = scratch.allocator();
 
@@ -4204,9 +4214,10 @@ fn modelProperty(_: void, input: []const u8) !void {
 }
 
 // These two are named apart from the `fuzz` properties on purpose. A run
-// of the model property is a whole session of calls, about 25 ms under
-// the fuzzer (measured 2026-10-12), so at the pubsub fuzz job's count it
-// alone would outlast the job: they have a nightly job of their own.
+// of the model property is a whole session of calls: under the fuzzer,
+// on its plain allocator, the two together cost about 0.6 ms a run
+// (measured 2026-10-12), several times what a codec's property does.
+// They have a nightly job of their own, sized on its own.
 
 test "fake property: after any script of calls each subscription holds exactly what a reference says" {
     try test_util.fuzzBytes({}, modelProperty, .{
@@ -4257,10 +4268,12 @@ test "fake property: after any script of calls each subscription holds exactly w
 /// Any bytes on any route: an answer, never a crash and never a leak.
 fn arbitraryRequest(_: void, input: []const u8) !void {
     var g: test_util.ByteGen = .init(input);
+    // As the model property: a plain allocator under the fuzzer.
+    const gpa = if (@import("builtin").fuzz) std.heap.smp_allocator else testing.allocator;
     var b: Bench = undefined;
-    try b.init(.{});
+    try b.initIn(gpa, .{});
     defer b.deinit();
-    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
     const a = scratch.allocator();
     try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/topics/orders", "{}")).status);
