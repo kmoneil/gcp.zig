@@ -4,8 +4,72 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.36.0 (unreleased)
+## 0.35.0 (2026-10-12)
 
+- pubsub: snapshots. `client.snapshot(id)` is a `Snapshot` handle, as
+  `client.topic` and `client.subscription` are. `create(.{ .subscription
+  = ... })` keeps a subscription's backlog as it stands, and every
+  message published to its topic afterwards, for up to 7 days; `get`,
+  `update` (its labels, which are all Pub/Sub lets a snapshot change),
+  `delete` and the five IAM calls complete it, and
+  `Client.listSnapshots` pages through a project's. A snapshot outlives
+  the subscription it was made of, and the topic too, whose name it then
+  gives as `_deleted-topic_` (measured 2026-10-10). Ids, the
+  subscription's name and labels are checked before sending: the
+  emulator keeps no labels, so it cannot refuse a bad one, and it has no
+  snapshot update and no snapshot IAM. New types: `SnapshotConfig`,
+  `SnapshotInfo`, `SnapshotUpdate`, `SnapshotPage`.
+- pubsub: `Topic.listSubscriptions` and `Topic.listSnapshots` page
+  through what is attached to a topic, by full name (`NamePage`). A
+  detached subscription is not among them, and a name may lie in another
+  project.
+- pubsub: `Subscription.seek(target)` moves a subscription to a time or
+  to a snapshot (`SeekTarget`). A time in the past replays what the
+  subscription or its topic retains, a time ahead purges, and a snapshot
+  restores the backlog it kept. Measured 2026-10-10: a seek back took 2
+  to 50 seconds to show; an ack sent meanwhile for a delivery made
+  before it is answered as taken and then forgotten, with exactly-once
+  delivery too, so the message comes again; and a seek to a future time
+  is no filter on what is published afterwards. A running `Subscriber`
+  needs no restart. Retried as any call is.
+- pubsub: `Subscription.detach()` cuts a subscription off its topic for
+  good. Within seconds everything but a read, an update and a delete of
+  it is `error.FailedPrecondition`, a second detach among it. When that
+  refusal answers a retry, the subscription is read back, and the call
+  succeeds if the earlier attempt had landed. A `Subscriber` on a
+  detached subscription stops with `error.FailedPrecondition`. The
+  emulator has no detach.
+- pubsub: a subscription's delivery, on create and on read. Pub/Sub can
+  deliver itself instead of being pulled from: `SubscriptionConfig.delivery`
+  is `.pull` (the default; nothing existing changes), `.push`
+  (`PushConfig`: the endpoint, an OIDC token, and the body as Pub/Sub's
+  JSON envelope or the data alone with its metadata in headers),
+  `.bigquery` (`BigQueryConfig`: each message as a row of a table) or
+  `.cloud_storage` (`CloudStorageConfig`: messages batched into files in
+  a bucket), one kind at a time, so "two at once" cannot be written.
+  `SubscriptionInfo.delivery` (`DeliveryInfo`) reads the config back
+  with, for the export kinds, the server's word on whether it can write
+  (`ExportState`); a kind this library does not model, Bigtable today,
+  reads as `.other` without failing. The emulator checks almost none of
+  this, so the rules measured in production on 2026-10-10 are checked
+  before sending: an `https://` endpoint (`http://` only against an
+  emulator, where pushes are tested), no exactly-once delivery beside
+  any kind but pull, a table of three parts, the bucket shape production
+  answers as a 503 outage, the filename rules and datetime format, and
+  the file batching bounds. A `Subscriber` on a subscription that does
+  not pull stops with `error.FailedPrecondition` and the server's words.
+- pubsub: updating a subscription's delivery.
+  `SubscriptionUpdate.delivery`, when set, replaces the delivery whole:
+  the mask names every kind and the body carries the one given, so
+  whatever the subscription was, it is then what was asked, in one
+  request with no read first, and `.pull` clears any kind (measured in
+  production, 2026-10-10). Setting it beside `enable_exactly_once_delivery
+  = true` is refused before sending, as production refuses the pair. On
+  an emulator, which refuses the export kinds' mask paths as unknown
+  fields, the push config alone is masked, so push and pull work there;
+  a change to a BigQuery or Cloud Storage config is refused before
+  sending, and a change away from one after a read that is the emulator
+  path's alone.
 - pubsub: schemas. `client.schema(id)` is a `Schema` handle, as
   `client.topic` and `client.snapshot` are. `create(.{ .type = .avro,
   .definition = ... })` stores an Avro or Protocol Buffer definition
@@ -75,74 +139,6 @@ including the ones that did not change.
   `ReceivedMessage.schema()` is to be relied on only for a topic known
   to have a schema. A cleared schema went on being enforced for 89
   seconds, and a deleted one was not refused for up to a minute.
-- auth, core, firestore, secret_manager and storage: unchanged.
-
-## 0.35.0 (unreleased)
-
-- pubsub: snapshots. `client.snapshot(id)` is a `Snapshot` handle, as
-  `client.topic` and `client.subscription` are. `create(.{ .subscription
-  = ... })` keeps a subscription's backlog as it stands, and every
-  message published to its topic afterwards, for up to 7 days; `get`,
-  `update` (its labels, which are all Pub/Sub lets a snapshot change),
-  `delete` and the five IAM calls complete it, and
-  `Client.listSnapshots` pages through a project's. A snapshot outlives
-  the subscription it was made of, and the topic too, whose name it then
-  gives as `_deleted-topic_` (measured 2026-10-10). Ids, the
-  subscription's name and labels are checked before sending: the
-  emulator keeps no labels, so it cannot refuse a bad one, and it has no
-  snapshot update and no snapshot IAM. New types: `SnapshotConfig`,
-  `SnapshotInfo`, `SnapshotUpdate`, `SnapshotPage`.
-- pubsub: `Topic.listSubscriptions` and `Topic.listSnapshots` page
-  through what is attached to a topic, by full name (`NamePage`). A
-  detached subscription is not among them, and a name may lie in another
-  project.
-- pubsub: `Subscription.seek(target)` moves a subscription to a time or
-  to a snapshot (`SeekTarget`). A time in the past replays what the
-  subscription or its topic retains, a time ahead purges, and a snapshot
-  restores the backlog it kept. Measured 2026-10-10: a seek back took 2
-  to 50 seconds to show; an ack sent meanwhile for a delivery made
-  before it is answered as taken and then forgotten, with exactly-once
-  delivery too, so the message comes again; and a seek to a future time
-  is no filter on what is published afterwards. A running `Subscriber`
-  needs no restart. Retried as any call is.
-- pubsub: `Subscription.detach()` cuts a subscription off its topic for
-  good. Within seconds everything but a read, an update and a delete of
-  it is `error.FailedPrecondition`, a second detach among it. When that
-  refusal answers a retry, the subscription is read back, and the call
-  succeeds if the earlier attempt had landed. A `Subscriber` on a
-  detached subscription stops with `error.FailedPrecondition`. The
-  emulator has no detach.
-- pubsub: a subscription's delivery, on create and on read. Pub/Sub can
-  deliver itself instead of being pulled from: `SubscriptionConfig.delivery`
-  is `.pull` (the default; nothing existing changes), `.push`
-  (`PushConfig`: the endpoint, an OIDC token, and the body as Pub/Sub's
-  JSON envelope or the data alone with its metadata in headers),
-  `.bigquery` (`BigQueryConfig`: each message as a row of a table) or
-  `.cloud_storage` (`CloudStorageConfig`: messages batched into files in
-  a bucket), one kind at a time, so "two at once" cannot be written.
-  `SubscriptionInfo.delivery` (`DeliveryInfo`) reads the config back
-  with, for the export kinds, the server's word on whether it can write
-  (`ExportState`); a kind this library does not model, Bigtable today,
-  reads as `.other` without failing. The emulator checks almost none of
-  this, so the rules measured in production on 2026-10-10 are checked
-  before sending: an `https://` endpoint (`http://` only against an
-  emulator, where pushes are tested), no exactly-once delivery beside
-  any kind but pull, a table of three parts, the bucket shape production
-  answers as a 503 outage, the filename rules and datetime format, and
-  the file batching bounds. A `Subscriber` on a subscription that does
-  not pull stops with `error.FailedPrecondition` and the server's words.
-- pubsub: updating a subscription's delivery.
-  `SubscriptionUpdate.delivery`, when set, replaces the delivery whole:
-  the mask names every kind and the body carries the one given, so
-  whatever the subscription was, it is then what was asked, in one
-  request with no read first, and `.pull` clears any kind (measured in
-  production, 2026-10-10). Setting it beside `enable_exactly_once_delivery
-  = true` is refused before sending, as production refuses the pair. On
-  an emulator, which refuses the export kinds' mask paths as unknown
-  fields, the push config alone is masked, so push and pull work there;
-  a change to a BigQuery or Cloud Storage config is refused before
-  sending, and a change away from one after a read that is the emulator
-  path's alone.
 - auth, core, firestore, secret_manager and storage: unchanged.
 
 ## 0.34.0 (2026-10-06)
