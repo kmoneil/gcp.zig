@@ -1751,3 +1751,129 @@ test "seek and detach: every allocation failure is OutOfMemory without leaks" {
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.all, .{});
 }
+
+const mask_card: types.MessageTransform = .{ .kind = .{ .javascript_udf = .{
+    .function_name = "maskCard",
+    .code = "function maskCard(message, metadata) { message.data = message.data.replace(/\\d{12}/, '************'); return message; }",
+} } };
+const mask_card_json =
+    \\{"javascriptUdf":{"functionName":"maskCard","code":"function maskCard(message, metadata) { message.data = message.data.replace(/\\d{12}/, '************'); return message; }"}}
+;
+
+test "golden: a subscription's transforms on create, as read, and replaced and cleared by an update" {
+    const answer = "{\"name\":\"projects/p/subscriptions/worker\",\"topic\":\"projects/p/topics/orders\",\"pushConfig\":{},\"ackDeadlineSeconds\":10,\"state\":\"ACTIVE\"";
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = answer ++ ",\"messageTransforms\":[" ++ mask_card_json ++ "]}" } },
+        .{ .respond = .{ .body = answer ++ ",\"messageTransforms\":[{\"aiInference\":{},\"disabled\":true}," ++ mask_card_json ++ "]}" } },
+        .{ .respond = .{ .body = answer ++ ",\"messageTransforms\":[{\"javascriptUdf\":{\"functionName\":\"drop\",\"code\":\"function drop(m) { return null; }\"},\"disabled\":true}]}" } },
+        .{ .respond = .{ .body = answer ++ "}" } },
+    }, .{});
+    defer h.deinit();
+    const worker = h.client.subscription("worker");
+    const path = "http://localhost:8085/v1/projects/p/subscriptions/worker";
+
+    var created = try worker.create(.{ .topic_id = "orders", .message_transforms = &.{mask_card} });
+    defer created.deinit();
+    try h.expectRequest(0, .PUT, path, "{\"topic\":\"projects/p/topics/orders\",\"enableMessageOrdering\":false,\"messageTransforms\":[" ++ mask_card_json ++ "]}");
+    try testing.expectEqual(1, created.value.message_transforms.len);
+    try testing.expectEqualStrings("maskCard", created.value.message_transforms[0].kind.javascript_udf.function_name);
+    try testing.expectEqualStrings(mask_card.kind.javascript_udf.code, created.value.message_transforms[0].kind.javascript_udf.code);
+    // A subscription with transforms still pulls.
+    try testing.expectEqual(types.DeliveryInfo.pull, created.value.delivery);
+
+    var read = try worker.get();
+    defer read.deinit();
+    try testing.expectEqual(2, read.value.message_transforms.len);
+    try testing.expect(read.value.message_transforms[0].kind == .other);
+    try testing.expect(read.value.message_transforms[0].disabled);
+    try testing.expect(read.value.message_transforms[1].kind == .javascript_udf);
+
+    // On an emulator too, a transforms update is one request: no read
+    // first, as a delivery update needs there.
+    var replaced = try worker.update(.{ .message_transforms = &.{.{
+        .kind = .{ .javascript_udf = .{ .function_name = "drop", .code = "function drop(m) { return null; }" } },
+        .disabled = true,
+    }} });
+    defer replaced.deinit();
+    try h.expectRequest(2, .PATCH, path, "{\"subscription\":{\"messageTransforms\":[{\"javascriptUdf\":{\"functionName\":\"drop\",\"code\":\"function drop(m) { return null; }\"},\"disabled\":true}]},\"updateMask\":\"messageTransforms\"}");
+    try testing.expect(replaced.value.message_transforms[0].disabled);
+
+    var cleared = try worker.update(.{ .ack_deadline_seconds = 30, .message_transforms = &.{} });
+    defer cleared.deinit();
+    try h.expectRequest(3, .PATCH, path, "{\"subscription\":{\"ackDeadlineSeconds\":30},\"updateMask\":\"ackDeadlineSeconds,messageTransforms\"}");
+    try testing.expectEqual(0, cleared.value.message_transforms.len);
+    try h.expectRequestCount(4);
+}
+
+test "a subscription's transforms: what the checks refuse is never sent, and the server's refusals come in its words" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        // Production's words, 2026-10-12.
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Provided message transform configuration is invalid: Failed to create JavaScript UDF: `f`. SyntaxError: Unexpected end of input at f line 1, columns 31-31\",\"status\":\"FAILED_PRECONDITION\"}}" } },
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"The request exceeds the maximum number of enabled message transforms. Maximum enabled transforms: 5. Enabled transforms: 6.\",\"status\":\"INVALID_ARGUMENT\"}}" } },
+    }, .{ .token = "t" });
+    defer h.deinit();
+    const worker = h.client.subscription("worker");
+    const code = "function f(message, metadata) { return message; }";
+    var six: [6]types.MessageTransform = undefined;
+    for (&six, [_][]const u8{ "a", "b", "c", "d", "e", "f" }) |*transform, name| {
+        transform.* = .{ .kind = .{ .javascript_udf = .{ .function_name = name, .code = code } } };
+    }
+
+    try testing.expectError(error.InvalidArgument, worker.create(.{ .topic_id = "orders", .message_transforms = &six }));
+    try testing.expectEqualStrings("6 message transforms are not disabled; the limit is 5", h.diag.message());
+    try testing.expectError(error.InvalidArgument, worker.update(.{ .message_transforms = &.{ six[0], .{ .kind = .other } } }));
+    try testing.expect(std.mem.startsWith(u8, h.diag.message(), "message transform 1 is of a kind this client does not model"));
+    var long: [validate.max_udf_code_bytes + 1]u8 = @splat(' ');
+    try testing.expectError(error.InvalidArgument, worker.update(.{ .message_transforms = &.{.{ .kind = .{ .javascript_udf = .{ .function_name = "f", .code = &long } } }} }));
+    try testing.expectEqualStrings("message transform 0 has 20481 bytes of code; the limit is 20480", h.diag.message());
+    try h.expectRequestCount(0);
+
+    try testing.expectError(error.FailedPrecondition, worker.create(.{
+        .topic_id = "orders",
+        .message_transforms = &.{.{ .kind = .{ .javascript_udf = .{ .function_name = "f", .code = "function f(message, metadata) {" } } }},
+    }));
+    try testing.expect(std.mem.startsWith(u8, h.diag.message(), "Provided message transform configuration is invalid: Failed to create JavaScript UDF: `f`."));
+    // Five that run and one that does not pass the checks, and the server
+    // has the last word.
+    six[5].disabled = true;
+    try testing.expectError(error.InvalidArgument, worker.update(.{ .message_transforms = &six }));
+    try testing.expectEqualStrings("The request exceeds the maximum number of enabled message transforms. Maximum enabled transforms: 5. Enabled transforms: 6.", h.diag.message());
+    try h.expectRequestCount(2);
+}
+
+fn subscriptionTransformsAllocations(gpa: Allocator) !void {
+    const answer = "{\"name\":\"projects/p/subscriptions/worker\",\"topic\":\"projects/p/topics/orders\",\"pushConfig\":{},\"ackDeadlineSeconds\":10";
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+        .{ .respond = .{ .body = answer ++ ",\"messageTransforms\":[" ++ mask_card_json ++ ",{\"aiInference\":{}}]}" } },
+        .{ .respond = .{ .body = answer ++ ",\"messageTransforms\":[" ++ mask_card_json ++ "]}" } },
+        .{ .respond = .{ .body = answer ++ ",\"messageTransforms\":[" ++ mask_card_json ++ "]}" } },
+        .{ .respond = .{ .body = answer ++ "}" } },
+    });
+    defer fake.deinit();
+    var clock: test_util.FakeClock = .{};
+    var client = try Client.init(gpa, clock.io(), .{
+        .project_id = "p",
+        .endpoint = .{ .url = "localhost:8085", .emulator = true },
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    const worker = client.subscription("worker");
+    var disabled = mask_card;
+    disabled.disabled = true;
+    disabled.kind.javascript_udf.function_name = "second";
+    var created = try worker.create(.{ .topic_id = "orders", .message_transforms = &.{ mask_card, disabled } });
+    created.deinit();
+    var read = try worker.get();
+    read.deinit();
+    var replaced = try worker.update(.{ .message_transforms = &.{mask_card} });
+    replaced.deinit();
+    var cleared = try worker.update(.{ .message_transforms = &.{} });
+    cleared.deinit();
+    try testing.expectEqual(4, fake.requests.items.len);
+}
+
+test "allocation failures: a subscription's transforms on create, as read, and in an update" {
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, subscriptionTransformsAllocations, .{});
+}
