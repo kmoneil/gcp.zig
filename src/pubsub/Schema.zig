@@ -9,6 +9,12 @@
 //! no Protocol Buffers: the caller's own encoder makes a message's bytes,
 //! and `validateMessage` asks Pub/Sub whether they fit.
 //!
+//! A schema is never changed, only revised: `commit` adds a revision,
+//! which a read then gives, and the earlier ones stay, each under an id
+//! the server chose, until `deleteRevision` takes one away. A schema holds
+//! 20. A topic takes a message that fits any revision in the range its
+//! settings allow, so one that was valid before a commit stays valid.
+//!
 //! The emulator serves Avro schemas, and answers every call that names a
 //! Protocol Buffer schema `error.Unimplemented`.
 
@@ -20,6 +26,7 @@ const core = @import("core");
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
 const iam = @import("iam.zig");
+const logging = @import("logging.zig");
 const rpc = @import("rpc.zig");
 const types = @import("types.zig");
 const url = @import("url.zig");
@@ -81,6 +88,96 @@ pub fn delete(self: Schema) Error!void {
     defer scratch.deinit();
     const path = try url.schemaPath(scratch.allocator(), c.project_id, self.id, null, "");
     return rpc.executeDiscard(c, .{ .method = .DELETE, .path = path });
+}
+
+/// Commits `definition` as the schema's next revision, the one a read then
+/// gives. Pub/Sub checks it against the revisions before it and refuses
+/// one that is not compatible with them; the emulator checks only that it
+/// parses. The type is the schema's own: another is refused.
+///
+/// A repeat of a commit that landed would spend a second of the schema's
+/// 20 revisions, so a failed attempt is not simply sent again. The latest
+/// revision is read first, and if it already holds this type and
+/// definition it is the answer: the attempt landed, and only its answer
+/// was lost. That read needs `pubsub.schemas.get`; if it fails, the
+/// commit's own failure is returned, and the diagnostics say that it may
+/// have landed. Needs `pubsub.schemas.commit`.
+pub fn commit(self: Schema, definition: types.SchemaDefinition) Error!Owned(types.SchemaInfo) {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkId(c, "schema", self.id);
+    try validate.schemaDefinition(definition, c.diagnostics);
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const path = try url.schemaPath(a, c.project_id, self.id, null, ":commit");
+    const name = try url.resourceName(a, c.project_id, .schemas, self.id);
+    const body = try codec.encodeCommit(a, name, definition);
+    return self.revise(.{ .method = .POST, .path = path, .body = body, .retry = false }, .{ .commit = definition });
+}
+
+/// Makes a new revision that holds what the revision `revision_id` held,
+/// and returns it: the schema's latest is then that definition again, under
+/// a new id, and the revisions in between stay. A revision that is not
+/// there is `error.NotFound`.
+///
+/// As with `commit`, a failed attempt is not simply sent again: the
+/// revision rolled back to and the latest one are read, and if the latest
+/// already holds what the other holds, it is the answer. Needs
+/// `pubsub.schemas.rollback`, and `pubsub.schemas.get` for those reads.
+pub fn rollback(self: Schema, revision_id: []const u8) Error!Owned(types.SchemaInfo) {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkId(c, "schema", self.id);
+    try validate.revisionId(revision_id, c.diagnostics);
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const path = try url.schemaPath(a, c.project_id, self.id, null, ":rollback");
+    const body = try codec.encodeRollback(a, revision_id);
+    return self.revise(.{ .method = .POST, .path = path, .body = body, .retry = false }, .{ .rollback = revision_id });
+}
+
+/// Deletes one revision. The others stay, and a topic whose range began
+/// or ended at this one then uses the next one inward. A schema's only
+/// revision cannot be deleted, which the emulator says as
+/// `error.InvalidArgument`: delete the schema. If a lost first attempt
+/// already deleted it, the retry reports `error.NotFound`. Needs
+/// `pubsub.schemas.delete`.
+pub fn deleteRevision(self: Schema, revision_id: []const u8) Error!void {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkId(c, "schema", self.id);
+    try validate.revisionId(revision_id, c.diagnostics);
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const path = try url.schemaPath(scratch.allocator(), c.project_id, self.id, revision_id, ":deleteRevision");
+    return rpc.executeDiscard(c, .{ .method = .DELETE, .path = path });
+}
+
+/// One page of the schema's revisions, without their definitions unless
+/// `options.view` is `.full`. The emulator lists the oldest first. Needs
+/// `pubsub.schemas.listRevisions`.
+pub fn listRevisions(self: Schema, options: types.SchemaListOptions) Error!Owned(types.SchemaPage) {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkId(c, "schema", self.id);
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const path = try url.schemaRevisionsPath(
+        scratch.allocator(),
+        c.project_id,
+        self.id,
+        codec.schemaViewName(options.view),
+        options.page.page_size,
+        options.page.page_token,
+    );
+    var result: Owned(types.SchemaPage) = try .init(c.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(c, result.arena, .{ .method = .GET, .path = path });
+    result.value = codec.decodeSchemaPage(result.arena.allocator(), body) catch |err|
+        return rpc.decodeFailed(c, err, "schema revision list");
+    return result;
 }
 
 /// Asks Pub/Sub whether `data`, read in `encoding`, fits the schema: its
@@ -154,6 +251,69 @@ fn iamResource(self: Schema) Error!iam.Resource {
     rpc.begin(c);
     try rpc.checkId(c, "schema", self.id);
     return .{ .client = c, .collection = .schemas, .id = self.id };
+}
+
+/// What a call that makes a revision asks for: a definition to commit, or
+/// the id of a revision to hold again.
+const Revision = union(enum) {
+    commit: types.SchemaDefinition,
+    rollback: []const u8,
+};
+
+/// Sends a call that makes a revision. The engine's retry is off for it,
+/// and this loop decides what a failure means: sent again blindly, a call
+/// that landed would make a second revision.
+fn revise(self: Schema, call: rpc.Call, what: Revision) Error!Owned(types.SchemaInfo) {
+    const c = self.client;
+    var attempt: u32 = 0;
+    while (true) {
+        attempt += 1;
+        return fetch(c, call) catch |err| {
+            if (!core.isRetryable(err) or attempt >= c.retry.max_attempts) return err;
+            if (try self.landed(what, err)) |latest| return latest;
+            const delay_ms = c.retry.backoffMs(attempt, core.rpc.entropy(c.io));
+            logging.warn("revising schema {s} failed with {t}; trying again in {d} ms", .{ self.id, err, delay_ms });
+            try c.io.sleep(.fromMilliseconds(delay_ms), .awake);
+            continue;
+        };
+    }
+}
+
+/// An attempt to make a revision failed in a way a second might mend, so
+/// it may have landed with its answer lost. A read says whether it did:
+/// the latest revision then holds what was asked for, and is the answer.
+/// Null when it does not, and the attempt is worth making again.
+fn landed(self: Schema, what: Revision, failure: Error) Error!?Owned(types.SchemaInfo) {
+    // The reads begin calls of their own and take the diagnostics over,
+    // and whatever follows, an answer or another attempt, sets them anew.
+    var held: ?Owned(types.SchemaInfo) = null;
+    defer if (held) |*h| h.deinit();
+    const wanted: types.SchemaDefinition = switch (what) {
+        .commit => |definition| definition,
+        .rollback => |revision_id| target: {
+            held = self.get(.{ .revision_id = revision_id }) catch |err| return self.unsettled(err, failure);
+            break :target .{ .type = held.?.value.type, .definition = held.?.value.definition };
+        },
+    };
+    var latest = self.get(.{}) catch |err| return self.unsettled(err, failure);
+    if (latest.value.type == wanted.type and std.mem.eql(u8, latest.value.definition, wanted.definition)) return latest;
+    latest.deinit();
+    return null;
+}
+
+/// The read that would have settled a failed attempt failed itself. That
+/// the schema or the revision is not there is an answer, and the read's
+/// own; anything else leaves the attempt's failure standing.
+fn unsettled(self: Schema, read_error: Error, failure: Error) Error {
+    switch (read_error) {
+        error.OutOfMemory, error.Canceled, error.NotFound => return read_error,
+        else => {},
+    }
+    if (self.client.diagnostics) |d| d.print(
+        "making a revision failed, and reading the schema to see whether the attempt landed failed with {t}: it may have landed",
+        .{read_error},
+    );
+    return failure;
 }
 
 fn fetch(c: *Client, call: rpc.Call) Error!Owned(types.SchemaInfo) {
@@ -507,4 +667,304 @@ fn schemaAllocations(gpa: std.mem.Allocator) !void {
 
 test "allocation failures: every schema call fails cleanly at each allocation" {
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, schemaAllocations, .{});
+}
+
+const avro_v2: types.SchemaDefinition = .{ .type = .avro, .definition = "{\"type\":\"record\",\"name\":\"M\",\"fields\":[{\"name\":\"note\",\"type\":\"string\",\"default\":\"\"}]}" };
+
+/// The second revision, as a commit answers it and as a read then gives it.
+const stored_v2 =
+    \\{"name":"projects/p/schemas/order-v1","type":"AVRO","definition":"{\"type\":\"record\",\"name\":\"M\",\"fields\":[{\"name\":\"note\",\"type\":\"string\",\"default\":\"\"}]}","revisionId":"6f0519a4","revisionCreateTime":"1970-01-17T11:51:58.808910083Z"}
+;
+const unavailable: test_util.FakeTransport.Reply = .{ .respond = .{ .status = 503, .body = "{\"error\":{\"code\":503,\"message\":\"try again\",\"status\":\"UNAVAILABLE\"}}" } };
+
+test "golden: commit, rollback, deleteRevision and listRevisions send the right requests" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = stored_v2 } },
+        .{ .respond = .{ .body = stored } },
+        .{ .respond = .{ .body = stored_v2 } },
+        .{ .respond = .{ .body = "{\"schemas\":[" ++ stored_basic ++ "],\"nextPageToken\":\"next\"}" } },
+        .{ .respond = .{ .body = "{}" } },
+    }, .{});
+    defer h.deinit();
+    const order = h.client.schema("order-v1");
+    const base = "http://localhost:8085/v1/projects/p/schemas/order-v1";
+
+    var second = try order.commit(avro_v2);
+    defer second.deinit();
+    try h.expectRequest(0, .POST, base ++ ":commit",
+        \\{"schema":{"name":"projects/p/schemas/order-v1","type":"AVRO","definition":"{\"type\":\"record\",\"name\":\"M\",\"fields\":[{\"name\":\"note\",\"type\":\"string\",\"default\":\"\"}]}"}}
+    );
+    try testing.expectEqualStrings("6f0519a4", second.value.revision_id);
+    try testing.expectEqualStrings(avro_v2.definition, second.value.definition);
+
+    // The revision goes in the body, and the answer is a new one.
+    var back = try order.rollback("1b46a16a");
+    defer back.deinit();
+    try h.expectRequest(1, .POST, base ++ ":rollback", "{\"revisionId\":\"1b46a16a\"}");
+    try testing.expectEqualStrings(avro.definition, back.value.definition);
+
+    // The answer, the revision deleted, is not kept.
+    try order.deleteRevision("6f0519a4");
+    try h.expectRequest(2, .DELETE, base ++ "@6f0519a4:deleteRevision", null);
+
+    var page = try order.listRevisions(.{ .page = .{ .page_size = 1 } });
+    defer page.deinit();
+    try h.expectRequest(3, .GET, base ++ ":listRevisions?view=BASIC&pageSize=1", null);
+    try testing.expectEqual(1, page.value.schemas.len);
+    try testing.expectEqualStrings("1b46a16a", page.value.schemas[0].revision_id);
+    try testing.expectEqualStrings("", page.value.schemas[0].definition);
+    var rest = try order.listRevisions(.{ .view = .full, .page = .{ .page_token = page.value.next_page_token } });
+    defer rest.deinit();
+    try h.expectRequest(4, .GET, base ++ ":listRevisions?view=FULL&pageSize=100&pageToken=next", null);
+    try testing.expectEqual(0, rest.value.schemas.len);
+    try h.expectRequestCount(5);
+}
+
+test "a bad id, definition or revision fails before a revision is asked for" {
+    var h: Harness = undefined;
+    try h.init(&.{}, .{});
+    defer h.deinit();
+    try testing.expectError(error.InvalidResourceId, h.client.schema("go").commit(avro));
+    try testing.expectError(error.InvalidResourceId, h.client.schema("a@b").rollback("1b46a16a"));
+    try testing.expectError(error.InvalidResourceId, h.client.schema("1st").deleteRevision("1b46a16a"));
+    try testing.expectError(error.InvalidResourceId, h.client.schema("x y z").listRevisions(.{}));
+
+    const order = h.client.schema("order-v1");
+    try testing.expectError(error.InvalidArgument, order.commit(.{ .type = .avro, .definition = "" }));
+    try testing.expectError(error.InvalidArgument, order.commit(.{ .type = .unknown, .definition = "{}" }));
+    try testing.expectError(error.InvalidArgument, order.rollback(""));
+    try testing.expectError(error.InvalidArgument, order.rollback("1b46a16a:commit"));
+    try testing.expectError(error.InvalidArgument, order.deleteRevision("a/b"));
+    try testing.expectError(error.InvalidArgument, order.deleteRevision("1b46a16a@x"));
+    try testing.expect(std.mem.startsWith(u8, h.diag.message(), "the revision id is empty, or holds"));
+    try h.expectRequestCount(0);
+}
+
+test "refusals: a schema or a revision that is not there, a definition that does not parse, and a schema's only revision" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        // The emulator's words, 2026-10-11.
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"Schema not found\",\"status\":\"NOT_FOUND\"}}" } },
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Could not parse schema definition\",\"status\":\"INVALID_ARGUMENT\"}}" } },
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"Revision not found\",\"status\":\"NOT_FOUND\"}}" } },
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Cannot delete last revision. Please use DeleteSchema.\",\"status\":\"INVALID_ARGUMENT\"}}" } },
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"Schema revision not found\",\"status\":\"NOT_FOUND\"}}" } },
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"Schema not found\",\"status\":\"NOT_FOUND\"}}" } },
+        .{ .respond = .{ .body = "{\"schemas\":[{\"type\":\"AVRO\"}]}" } },
+    }, .{});
+    defer h.deinit();
+    const order = h.client.schema("order-v1");
+
+    try testing.expectError(error.NotFound, order.commit(avro_v2));
+    try testing.expectError(error.InvalidArgument, order.commit(.{ .type = .avro, .definition = "{nope" }));
+    try testing.expectEqualStrings("Could not parse schema definition", h.diag.message());
+    try testing.expectError(error.NotFound, order.rollback("deadbeef"));
+    try testing.expectEqualStrings("Revision not found", h.diag.message());
+    try testing.expectError(error.InvalidArgument, order.deleteRevision("1b46a16a"));
+    try testing.expectEqualStrings("Cannot delete last revision. Please use DeleteSchema.", h.diag.message());
+    try testing.expectError(error.NotFound, order.deleteRevision("1b46a16a"));
+    try testing.expectError(error.NotFound, order.listRevisions(.{}));
+    try testing.expectError(error.InvalidResponse, order.listRevisions(.{}));
+    try testing.expectEqualStrings("the schema revision list response could not be decoded", h.diag.message());
+    // None of them is an answer a second attempt would change, and none
+    // made the client read the schema to find out.
+    try h.expectRequestCount(7);
+}
+
+test "commit: a failed attempt that did not land is made again, after a read that shows it did not" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        unavailable,
+        // The latest revision is still the first.
+        .{ .respond = .{ .body = stored } },
+        .{ .respond = .{ .body = stored_v2 } },
+    }, .{});
+    defer h.deinit();
+    var second = try h.client.schema("order-v1").commit(avro_v2);
+    defer second.deinit();
+    try testing.expectEqualStrings("6f0519a4", second.value.revision_id);
+    const base = "http://localhost:8085/v1/projects/p/schemas/order-v1";
+    try testing.expectEqual(.POST, (try h.fake.request(0)).method);
+    try h.expectRequest(1, .GET, base ++ "?view=FULL", null);
+    try testing.expectEqual(.POST, (try h.fake.request(2)).method);
+    try testing.expectEqualStrings((try h.fake.request(0)).body.?, (try h.fake.request(2)).body.?);
+    try h.expectRequestCount(3);
+    // After the read, and before the second attempt, one backoff.
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expect(h.clock.sleepMs(0) <= 100);
+}
+
+test "commit: a failed attempt that landed is not made again, and the revision it made is the answer" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .fail = error.ConnectionResetByPeer },
+        // The latest revision already holds what was committed.
+        .{ .respond = .{ .body = stored_v2 } },
+    }, .{});
+    defer h.deinit();
+    var second = try h.client.schema("order-v1").commit(avro_v2);
+    defer second.deinit();
+    try testing.expectEqualStrings("6f0519a4", second.value.revision_id);
+    try testing.expectEqualStrings(avro_v2.definition, second.value.definition);
+    // The failure the read settled is not left in the diagnostics, and
+    // nothing was waited for.
+    try testing.expectEqualStrings("", h.diag.message());
+    try h.expectRequestCount(2);
+    try testing.expectEqual(0, h.clock.sleep_count);
+}
+
+test "commit: the same definition under another type is not the commit, and a definition one byte off or one byte longer is not it" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        unavailable,
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/schemas/order-v1\",\"type\":\"PROTOCOL_BUFFER\",\"definition\":\"message M {}\",\"revisionId\":\"aaaaaaaa\"}" } },
+        unavailable,
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/schemas/order-v1\",\"type\":\"AVRO\",\"definition\":\"message M {} \",\"revisionId\":\"bbbbbbbb\"}" } },
+        unavailable,
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/schemas/order-v1\",\"type\":\"AVRO\",\"definition\":\"message N {}\",\"revisionId\":\"dddddddd\"}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/schemas/order-v1\",\"type\":\"AVRO\",\"definition\":\"message M {}\",\"revisionId\":\"cccccccc\"}" } },
+    }, .{});
+    defer h.deinit();
+    var made = try h.client.schema("order-v1").commit(.{ .type = .avro, .definition = "message M {}" });
+    defer made.deinit();
+    try testing.expectEqualStrings("cccccccc", made.value.revision_id);
+    try h.expectRequestCount(7);
+}
+
+test "commit: when the read that would settle a failure is refused, the failure stands and says the commit may have landed" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        unavailable,
+        .{ .respond = .{ .status = 403, .body = "{\"error\":{\"code\":403,\"message\":\"User not authorized to perform this action.\",\"status\":\"PERMISSION_DENIED\"}}" } },
+    }, .{});
+    defer h.deinit();
+    try testing.expectError(error.Unavailable, h.client.schema("order-v1").commit(avro_v2));
+    try testing.expectEqualStrings(
+        "making a revision failed, and reading the schema to see whether the attempt landed failed with PermissionDenied: it may have landed",
+        h.diag.message(),
+    );
+    try h.expectRequestCount(2);
+}
+
+test "commit: a schema that is gone by the read is NotFound, in the read's words" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .fail = error.ConnectionResetByPeer },
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"Schema not found\",\"status\":\"NOT_FOUND\"}}" } },
+    }, .{});
+    defer h.deinit();
+    try testing.expectError(error.NotFound, h.client.schema("order-v1").commit(avro_v2));
+    try testing.expectEqualStrings("Schema not found", h.diag.message());
+    try h.expectRequestCount(2);
+}
+
+test "commit: attempts run out with the last failure, its diagnostics restored after the read, and no read once none is left" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        unavailable,
+        .{ .respond = .{ .body = stored } },
+        .{ .respond = .{ .status = 503, .body = "{\"error\":{\"code\":503,\"message\":\"still down\",\"status\":\"UNAVAILABLE\"}}" } },
+    }, .{ .retry = .{ .max_attempts = 2 } });
+    defer h.deinit();
+    try testing.expectError(error.Unavailable, h.client.schema("order-v1").commit(avro_v2));
+    try testing.expectEqualStrings("still down", h.diag.message());
+    try testing.expectEqual(503, h.diag.http_status);
+    try h.expectRequestCount(3);
+}
+
+test "commit: with retries off, a failure is returned as it is, with no read" {
+    var h: Harness = undefined;
+    try h.init(&.{unavailable}, .{ .retry = .{ .max_attempts = 1 } });
+    defer h.deinit();
+    try testing.expectError(error.Unavailable, h.client.schema("order-v1").commit(avro_v2));
+    try testing.expectEqualStrings("try again", h.diag.message());
+    try h.expectRequestCount(1);
+}
+
+test "rollback: a failed attempt is settled by reading the revision rolled back to and the latest" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        // It landed: the latest holds what the first revision holds.
+        .{ .fail = error.ConnectionResetByPeer },
+        .{ .respond = .{ .body = stored } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/schemas/order-v1\",\"type\":\"AVRO\",\"definition\":\"{\\\"type\\\":\\\"record\\\",\\\"name\\\":\\\"M\\\",\\\"fields\\\":[]}\",\"revisionId\":\"3566a360\"}" } },
+        // It did not: the latest is still the second revision, so it is
+        // asked for again.
+        unavailable,
+        .{ .respond = .{ .body = stored } },
+        .{ .respond = .{ .body = stored_v2 } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/schemas/order-v1\",\"type\":\"AVRO\",\"definition\":\"{\\\"type\\\":\\\"record\\\",\\\"name\\\":\\\"M\\\",\\\"fields\\\":[]}\",\"revisionId\":\"ef37675d\"}" } },
+    }, .{});
+    defer h.deinit();
+    const order = h.client.schema("order-v1");
+    const base = "http://localhost:8085/v1/projects/p/schemas/order-v1";
+
+    var landed_one = try order.rollback("1b46a16a");
+    defer landed_one.deinit();
+    try testing.expectEqualStrings("3566a360", landed_one.value.revision_id);
+    try h.expectRequest(1, .GET, base ++ "@1b46a16a?view=FULL", null);
+    try h.expectRequest(2, .GET, base ++ "?view=FULL", null);
+    try h.expectRequestCount(3);
+
+    var again = try order.rollback("1b46a16a");
+    defer again.deinit();
+    try testing.expectEqualStrings("ef37675d", again.value.revision_id);
+    try h.expectRequest(6, .POST, base ++ ":rollback", "{\"revisionId\":\"1b46a16a\"}");
+    try h.expectRequestCount(7);
+}
+
+test "rollback: a revision that is gone by the read is NotFound, and a refused read leaves the failure standing" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        unavailable,
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"Schema revision not found\",\"status\":\"NOT_FOUND\"}}" } },
+        unavailable,
+        .{ .respond = .{ .body = stored } },
+        .{ .respond = .{ .status = 403, .body = "{\"error\":{\"code\":403,\"message\":\"no\",\"status\":\"PERMISSION_DENIED\"}}" } },
+    }, .{});
+    defer h.deinit();
+    const order = h.client.schema("order-v1");
+    try testing.expectError(error.NotFound, order.rollback("1b46a16a"));
+    try testing.expectEqualStrings("Schema revision not found", h.diag.message());
+    try testing.expectError(error.Unavailable, order.rollback("1b46a16a"));
+    try testing.expect(std.mem.endsWith(u8, h.diag.message(), "failed with PermissionDenied: it may have landed"));
+    try h.expectRequestCount(5);
+}
+
+fn revisionAllocations(gpa: std.mem.Allocator) !void {
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+        // A commit that fails, is read as not landed, and is made again.
+        unavailable,
+        .{ .respond = .{ .body = stored } },
+        .{ .respond = .{ .body = stored_v2 } },
+        // A rollback that fails and is read as landed.
+        .{ .fail = error.ConnectionResetByPeer },
+        .{ .respond = .{ .body = stored } },
+        .{ .respond = .{ .body = stored } },
+        .{ .respond = .{ .body = "{\"schemas\":[" ++ stored ++ "," ++ stored_v2 ++ "],\"nextPageToken\":\"n\"}" } },
+        .{ .respond = .{ .body = stored_v2 } },
+    });
+    defer fake.deinit();
+    var clock: test_util.FakeClock = .{};
+    var client = try Client.init(gpa, clock.io(), .{
+        .project_id = "p",
+        .endpoint = .{ .url = "localhost:8085", .emulator = true },
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    const order = client.schema("order-v1");
+    var second = try order.commit(avro_v2);
+    second.deinit();
+    var back = try order.rollback("1b46a16a");
+    back.deinit();
+    var page = try order.listRevisions(.{ .view = .full, .page = .{ .page_token = "m" } });
+    page.deinit();
+    try order.deleteRevision("6f0519a4");
+    // The calls above used the whole script, so none was skipped.
+    try testing.expectEqual(8, fake.requests.items.len);
+}
+
+test "allocation failures: commit, rollback and their reads fail cleanly at each allocation" {
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, revisionAllocations, .{});
 }

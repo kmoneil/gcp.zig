@@ -2416,3 +2416,97 @@ test "schemas: one is made, read in both views and by its revision, found in its
     schema.delete() catch |err| return f.fail(err);
     try testing.expectError(error.NotFound, schema.get(.{}));
 }
+
+const avro_order_v2 =
+    \\{"type":"record","name":"Order","fields":[{"name":"id","type":"string"},{"name":"quantity","type":"int"},{"name":"note","type":"string","default":""}]}
+;
+
+test "schema revisions: one is committed, read, listed, rolled back to and deleted, and a schema's only one cannot be" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const schema = f.client.schema(f.id("rev"));
+    try f.schemas.append(testing.allocator, schema.id);
+    var first = schema.create(.{ .type = .avro, .definition = avro_order }) catch |err| return f.fail(err);
+    defer first.deinit();
+    const v2: pubsub.SchemaDefinition = .{ .type = .avro, .definition = avro_order_v2 };
+
+    // A schema that is not there has nothing to revise, and a revision
+    // must parse as the first did.
+    try testing.expectError(error.NotFound, f.client.schema(f.id("no-such-schema")).commit(v2));
+    try testing.expectError(error.InvalidArgument, schema.commit(.{ .type = .avro, .definition = "{\"type\":\"record\"" }));
+
+    var second = schema.commit(v2) catch |err| return f.fail(err);
+    defer second.deinit();
+    try testing.expect(second.value.revision_id.len > 0);
+    try testing.expect(!std.mem.eql(u8, first.value.revision_id, second.value.revision_id));
+
+    // A read with no revision gives the latest, and each is still read by
+    // its id.
+    var latest = schema.get(.{}) catch |err| return f.fail(err);
+    defer latest.deinit();
+    try testing.expectEqualStrings(second.value.revision_id, latest.value.revision_id);
+    try testing.expectEqualStrings(second.value.definition, latest.value.definition);
+    var old = schema.get(.{ .revision_id = first.value.revision_id }) catch |err| return f.fail(err);
+    defer old.deinit();
+    try testing.expectEqualStrings(first.value.definition, old.value.definition);
+    schema.validateMessage("{\"id\":\"a\",\"quantity\":1}", .json, first.value.revision_id) catch |err| return f.fail(err);
+    schema.validateMessage("{\"id\":\"a\",\"quantity\":1,\"note\":\"x\"}", .json, second.value.revision_id) catch |err| return f.fail(err);
+
+    // Both are among its revisions, a page of one at a time, without their
+    // definitions in a list's default view.
+    var ids: std.ArrayList([]const u8) = .empty;
+    var token: ?[]const u8 = null;
+    for (0..10) |_| {
+        var page = schema.listRevisions(.{ .page = .{ .page_size = 1, .page_token = token } }) catch |err| return f.fail(err);
+        defer page.deinit();
+        for (page.value.schemas) |s| {
+            try testing.expectEqualStrings("", s.definition);
+            try ids.append(a, try a.dupe(u8, s.revision_id));
+        }
+        token = try a.dupe(u8, page.value.next_page_token orelse break);
+    } else return error.TestUnexpectedResult;
+    try testing.expectEqual(2, ids.items.len);
+    if (!f.production) {
+        // The emulator lists the oldest first.
+        try testing.expectEqualStrings(first.value.revision_id, ids.items[0]);
+        try testing.expectEqualStrings(second.value.revision_id, ids.items[1]);
+    }
+    var whole = schema.listRevisions(.{ .view = .full }) catch |err| return f.fail(err);
+    defer whole.deinit();
+    try testing.expectEqual(2, whole.value.schemas.len);
+    for (whole.value.schemas) |s| try testing.expect(s.definition.len > 0);
+
+    // Back to the first: a new revision that holds what it held.
+    var back = schema.rollback(first.value.revision_id) catch |err| return f.fail(err);
+    defer back.deinit();
+    try testing.expectEqualStrings(first.value.definition, back.value.definition);
+    try testing.expect(!std.mem.eql(u8, first.value.revision_id, back.value.revision_id));
+    try testing.expect(!std.mem.eql(u8, second.value.revision_id, back.value.revision_id));
+    try testing.expectError(error.NotFound, schema.rollback("deadbeef"));
+
+    // The second is deleted, once, and the others stay.
+    schema.deleteRevision(second.value.revision_id) catch |err| return f.fail(err);
+    try testing.expectError(error.NotFound, schema.get(.{ .revision_id = second.value.revision_id }));
+    try testing.expectError(error.NotFound, schema.deleteRevision(second.value.revision_id));
+    var kept = schema.get(.{ .revision_id = first.value.revision_id }) catch |err| return f.fail(err);
+    kept.deinit();
+    var after = schema.get(.{}) catch |err| return f.fail(err);
+    defer after.deinit();
+    try testing.expectEqualStrings(back.value.revision_id, after.value.revision_id);
+
+    // A schema's only revision cannot be deleted: the schema can.
+    const single = f.client.schema(f.id("rev-one"));
+    try f.schemas.append(testing.allocator, single.id);
+    var only = single.create(.{ .type = .avro, .definition = avro_order }) catch |err| return f.fail(err);
+    defer only.deinit();
+    if (single.deleteRevision(only.value.revision_id)) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| if (!f.production) {
+        try testing.expectEqual(error.InvalidArgument, err);
+        try testing.expectEqualStrings("Cannot delete last revision. Please use DeleteSchema.", f.diag.message());
+    }
+    var still = single.get(.{ .view = .basic }) catch |err| return f.fail(err);
+    still.deinit();
+}

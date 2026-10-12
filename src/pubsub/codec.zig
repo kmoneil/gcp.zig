@@ -487,6 +487,47 @@ const ValidateSchemaBody = struct {
     }
 };
 
+/// The `schemas.commit` body: the new revision under `schema`, with the
+/// schema's full name beside its type and definition.
+pub fn encodeCommit(arena: Allocator, name: []const u8, definition: types.SchemaDefinition) Allocator.Error![]u8 {
+    return render(arena, CommitBody{ .name = name, .definition = definition });
+}
+
+const CommitBody = struct {
+    name: []const u8,
+    definition: types.SchemaDefinition,
+
+    fn write(self: CommitBody, jw: *Stringify) Stringify.Error!void {
+        try jw.beginObject();
+        try jw.objectField("schema");
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("type");
+        try jw.write(schemaTypeName(self.definition.type));
+        try jw.objectField("definition");
+        try jw.write(self.definition.definition);
+        try jw.endObject();
+        try jw.endObject();
+    }
+};
+
+/// The `schemas.rollback` body: the revision to go back to.
+pub fn encodeRollback(arena: Allocator, revision_id: []const u8) Allocator.Error![]u8 {
+    return render(arena, RollbackBody{ .revision_id = revision_id });
+}
+
+const RollbackBody = struct {
+    revision_id: []const u8,
+
+    fn write(self: RollbackBody, jw: *Stringify) Stringify.Error!void {
+        try jw.beginObject();
+        try jw.objectField("revisionId");
+        try jw.write(self.revision_id);
+        try jw.endObject();
+    }
+};
+
 /// What a message is checked against: a stored schema by its full name,
 /// with `@revision` after it for one revision, or a definition not stored.
 pub const SchemaRef = union(enum) {
@@ -2831,6 +2872,11 @@ test "golden: a schema's create body, the two validation bodies, and the wire's 
         \\{"schema":{"type":"AVRO","definition":"{\"type\":\"record\",\"name\":\"M\",\"fields\":[]}"},"message":"","encoding":"JSON"}
     , try encodeValidateMessage(a, .{ .definition = avro }, "", .json));
 
+    try testing.expectEqualStrings(
+        \\{"schema":{"name":"projects/p/schemas/order-v1","type":"AVRO","definition":"{\"type\":\"record\",\"name\":\"M\",\"fields\":[]}"}}
+    , try encodeCommit(a, "projects/p/schemas/order-v1", avro));
+    try testing.expectEqualStrings("{\"revisionId\":\"c7cfa2a8\"}", try encodeRollback(a, "c7cfa2a8"));
+
     // What `validate` refuses first still has a word, one the server refuses.
     try testing.expectEqualStrings("TYPE_UNSPECIFIED", schemaTypeName(.unknown));
     try testing.expectEqualStrings("ENCODING_UNSPECIFIED", schemaEncodingName(.unknown));
@@ -2925,6 +2971,13 @@ fn schemaRoundTrip(_: void, input: []const u8) !void {
     const wrapped = try std.json.parseFromSliceLeaky(struct { schema: Sent }, a, try encodeValidateSchema(a, definition), .{});
     try testing.expectEqualStrings(schemaTypeName(definition.type), wrapped.schema.type);
     try testing.expectEqualStrings(text, wrapped.schema.definition);
+    // A commit carries it too, beside the schema's name.
+    const committed = try std.json.parseFromSliceLeaky(struct {
+        schema: struct { name: []const u8, type: []const u8, definition: []const u8 },
+    }, a, try encodeCommit(a, "projects/p/schemas/x", definition), .{});
+    try testing.expectEqualStrings("projects/p/schemas/x", committed.schema.name);
+    try testing.expectEqualStrings(schemaTypeName(definition.type), committed.schema.type);
+    try testing.expectEqualStrings(text, committed.schema.definition);
 
     // With the name and the revision the server adds, it reads back as the
     // schema that was written.

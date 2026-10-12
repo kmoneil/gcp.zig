@@ -27,6 +27,20 @@ including the ones that did not change.
   view is always sent. New types: `SchemaDefinition`, `SchemaInfo`,
   `SchemaType`, `SchemaView`, `SchemaEncoding`, `SchemaGetOptions`,
   `SchemaListOptions`, `SchemaPage`.
+- pubsub: schema revisions. `Schema.commit(definition)` adds a revision,
+  which a read then gives; `rollback(revision_id)` makes a new one that
+  holds what an earlier one held; `deleteRevision` removes one, though
+  never a schema's only one; `listRevisions` pages through them. A
+  repeat of a commit or a rollback that landed would spend one of a
+  schema's 20 revisions, so a failed attempt is not simply sent again:
+  the latest revision is read first, and if it already holds what was
+  asked for it is the answer, the attempt having landed with only its
+  answer lost. If that read fails, the attempt's own failure is
+  returned, and the diagnostics say that it may have landed. Measured
+  on emulator 0.8.36, 2026-10-11: a commit of the definition a schema
+  already has is one more revision, a rollback makes a new revision id,
+  revisions list oldest first, and a commit is checked for whether it
+  parses, not against the revisions before it.
 - auth, core, firestore, secret_manager and storage: unchanged.
 
 ## 0.35.0 (unreleased)
