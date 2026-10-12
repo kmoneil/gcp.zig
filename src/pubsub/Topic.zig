@@ -865,3 +865,140 @@ fn topicSchemaAllocations(gpa: std.mem.Allocator) !void {
 test "allocation failures: a topic's schema on create and in an update" {
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, topicSchemaAllocations, .{});
 }
+
+const redact: types.MessageTransform = .{ .kind = .{ .javascript_udf = .{
+    .function_name = "redact",
+    .code = "function redact(message, metadata) { delete message.attributes['card']; return message; }",
+} } };
+const redact_json =
+    \\{"javascriptUdf":{"functionName":"redact","code":"function redact(message, metadata) { delete message.attributes['card']; return message; }"}}
+;
+
+test "golden: a topic's transforms on create, as read, and replaced and cleared by an update" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/orders\",\"messageTransforms\":[" ++ redact_json ++ "]}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/orders\",\"messageTransforms\":[" ++ redact_json ++
+            ",{\"aiInference\":{\"endpoint\":\"projects/p/locations/us-central1/endpoints/e\"}}" ++
+            ",{\"javascriptUdf\":{\"functionName\":\"stamp\",\"code\":\"function stamp(m) { return m; }\"},\"disabled\":true}]}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/orders\",\"messageTransforms\":[{\"javascriptUdf\":{\"functionName\":\"stamp\",\"code\":\"function stamp(m) { return m; }\"},\"disabled\":true}," ++ redact_json ++ "]}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/orders\"}" } },
+    }, .{});
+    defer h.deinit();
+    const orders = h.client.topic("orders");
+    const path = "http://localhost:8085/v1/projects/p/topics/orders";
+
+    var created = try orders.create(.{ .message_transforms = &.{redact} });
+    defer created.deinit();
+    try h.expectRequest(0, .PUT, path, "{\"messageTransforms\":[" ++ redact_json ++ "]}");
+    try testing.expectEqual(1, created.value.message_transforms.len);
+    try testing.expectEqualStrings("redact", created.value.message_transforms[0].kind.javascript_udf.function_name);
+    try testing.expectEqualStrings(redact.kind.javascript_udf.code, created.value.message_transforms[0].kind.javascript_udf.code);
+    try testing.expect(!created.value.message_transforms[0].disabled);
+
+    // As read: in the server's order, a kind this client does not model
+    // in its place, and each one's switch.
+    var read = try orders.get();
+    defer read.deinit();
+    try testing.expectEqual(3, read.value.message_transforms.len);
+    try testing.expect(read.value.message_transforms[0].kind == .javascript_udf);
+    try testing.expect(read.value.message_transforms[1].kind == .other);
+    try testing.expectEqualStrings("stamp", read.value.message_transforms[2].kind.javascript_udf.function_name);
+    try testing.expect(read.value.message_transforms[2].disabled);
+
+    // An update replaces the list whole, in the order given.
+    const stamp: types.MessageTransform = .{
+        .kind = .{ .javascript_udf = .{ .function_name = "stamp", .code = "function stamp(m) { return m; }" } },
+        .disabled = true,
+    };
+    var replaced = try orders.update(.{ .message_transforms = &.{ stamp, redact } });
+    defer replaced.deinit();
+    try h.expectRequest(2, .PATCH, path, "{\"topic\":{\"messageTransforms\":[{\"javascriptUdf\":{\"functionName\":\"stamp\",\"code\":\"function stamp(m) { return m; }\"},\"disabled\":true}," ++ redact_json ++ "]},\"updateMask\":\"messageTransforms\"}");
+    try testing.expectEqual(2, replaced.value.message_transforms.len);
+    try testing.expect(replaced.value.message_transforms[0].disabled);
+
+    // An empty list clears: named in the mask, and nothing in the body.
+    var cleared = try orders.update(.{ .message_transforms = &.{} });
+    defer cleared.deinit();
+    try h.expectRequest(3, .PATCH, path, "{\"topic\":{},\"updateMask\":\"messageTransforms\"}");
+    try testing.expectEqual(0, cleared.value.message_transforms.len);
+    try h.expectRequestCount(4);
+}
+
+test "a topic's transforms: what the checks refuse is never sent, a list read with a kind not modelled is not written back, and the server's refusals come in its words" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/orders\",\"messageTransforms\":[" ++ redact_json ++ ",{\"aiInference\":{}}]}" } },
+        // Production's words, 2026-10-12.
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Provided message transform configuration is invalid: Failed to create JavaScript UDF: `f`. SyntaxError: Unexpected end of input at f line 1, columns 31-31\",\"status\":\"FAILED_PRECONDITION\"}}" } },
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Provided message transform configuration is invalid: Failed to create JavaScript UDF: `g`. Failed to find function in provided code\",\"status\":\"FAILED_PRECONDITION\"}}" } },
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Pub/Sub failed to apply a message transformation to one or more messages in the publish request. Error: Failed to execute JavaScript UDF: `boom`. Error: no at boom line 1, columns 35-36..\",\"status\":\"INVALID_ARGUMENT\",\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfo\",\"reason\":\"SMT_FAILURE\",\"domain\":\"pubsub.googleapis.com\"}]}}" } },
+    }, .{ .token = "t" });
+    defer h.deinit();
+    const orders = h.client.topic("orders");
+    const f: types.MessageTransform = .{ .kind = .{ .javascript_udf = .{ .function_name = "f", .code = "function f(message, metadata) {" } } };
+
+    try testing.expectError(error.InvalidArgument, orders.create(.{ .message_transforms = &.{.{ .kind = .{ .javascript_udf = .{ .function_name = "", .code = "function f() {}" } } }} }));
+    try testing.expectEqualStrings("message transform 0 has no function name", h.diag.message());
+    try testing.expectError(error.InvalidArgument, orders.create(.{ .message_transforms = &.{ f, redact, f } }));
+    try testing.expectEqualStrings("message transforms 0 and 2 have the same function name", h.diag.message());
+    try testing.expectError(error.InvalidArgument, orders.update(.{ .message_transforms = &.{.{ .kind = .{ .javascript_udf = .{ .function_name = "f", .code = "" } } }} }));
+    try testing.expectEqualStrings("message transform 0 has no code", h.diag.message());
+    try h.expectRequestCount(0);
+
+    // A list as read cannot go back as it is while it holds a kind this
+    // client cannot write: sent without it, the topic would lose it.
+    var read = try orders.get();
+    defer read.deinit();
+    try testing.expectError(error.InvalidArgument, orders.update(.{ .message_transforms = read.value.message_transforms }));
+    try testing.expect(std.mem.startsWith(u8, h.diag.message(), "message transform 1 is of a kind this client does not model"));
+    try h.expectRequestCount(1);
+
+    // Whether the code parses, and holds the function, is the server's
+    // to say.
+    try testing.expectError(error.FailedPrecondition, orders.create(.{ .message_transforms = &.{f} }));
+    try testing.expectEqualStrings("Provided message transform configuration is invalid: Failed to create JavaScript UDF: `f`. SyntaxError: Unexpected end of input at f line 1, columns 31-31", h.diag.message());
+    try testing.expectError(error.FailedPrecondition, orders.update(.{ .message_transforms = &.{.{ .kind = .{ .javascript_udf = .{ .function_name = "g", .code = "function f(message, metadata) { return message; }" } } }} }));
+    try testing.expect(std.mem.endsWith(u8, h.diag.message(), "Failed to find function in provided code"));
+
+    // A function that throws refuses the whole publish, once: it is a bad
+    // request, not an outage.
+    try testing.expectError(error.InvalidArgument, orders.publish(&.{ .{ .data = "a" }, .{ .data = "b" } }, .{}));
+    try testing.expect(std.mem.startsWith(u8, h.diag.message(), "Pub/Sub failed to apply a message transformation to one or more messages in the publish request."));
+    try h.expectRequestCount(4);
+}
+
+fn topicTransformsAllocations(gpa: std.mem.Allocator) !void {
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/orders\",\"messageTransforms\":[" ++ redact_json ++ ",{\"aiInference\":{}},{\"javascriptUdf\":{\"functionName\":\"stamp\",\"code\":\"function stamp(m) {\\n  return m;\\n}\"},\"disabled\":true}]}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/orders\",\"messageTransforms\":[" ++ redact_json ++ "]}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/orders\",\"messageTransforms\":[" ++ redact_json ++ "]}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/orders\"}" } },
+    });
+    defer fake.deinit();
+    var clock: test_util.FakeClock = .{};
+    var client = try Client.init(gpa, clock.io(), .{
+        .project_id = "p",
+        .endpoint = .{ .url = "localhost:8085", .emulator = true },
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    const orders = client.topic("orders");
+    const stamp: types.MessageTransform = .{
+        .kind = .{ .javascript_udf = .{ .function_name = "stamp", .code = "function stamp(m) {\n  return m;\n}" } },
+        .disabled = true,
+    };
+    var created = try orders.create(.{ .message_transforms = &.{ redact, stamp } });
+    created.deinit();
+    var read = try orders.get();
+    read.deinit();
+    var replaced = try orders.update(.{ .message_transforms = &.{redact} });
+    replaced.deinit();
+    var cleared = try orders.update(.{ .message_transforms = &.{} });
+    cleared.deinit();
+    try testing.expectEqual(4, fake.requests.items.len);
+}
+
+test "allocation failures: a topic's transforms on create, as read, and in an update" {
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, topicTransformsAllocations, .{});
+}

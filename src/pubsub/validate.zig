@@ -50,6 +50,12 @@ pub const max_message_retention: std.Io.Duration = .fromSeconds(31 * 24 * 60 * 6
 pub const min_expiration: std.Io.Duration = .fromSeconds(24 * 60 * 60);
 /// Each bound of a retry policy's backoff.
 pub const max_backoff: std.Io.Duration = .fromSeconds(600);
+/// The transforms of a topic or a subscription that are not disabled.
+/// Measured 2026-10-12: production and an emulator refuse a sixth.
+pub const max_enabled_message_transforms = 5;
+/// A JavaScript function's source. Measured 2026-10-12: production takes
+/// 20,480 bytes and refuses 20,481; an emulator takes any.
+pub const max_udf_code_bytes = 20 * 1024;
 /// A dead-letter policy's deliveries before a message is forwarded.
 pub const min_delivery_attempts = 5;
 pub const max_delivery_attempts = 100;
@@ -487,6 +493,7 @@ pub fn subscriptionConfig(config: types.SubscriptionConfig, emulator: bool, diag
     if (config.message_retention) |r| try messageRetention(r, diag);
     try expiration(config.expiration, config.message_retention, diag);
     try labels(config.labels, diag);
+    try messageTransforms(config.message_transforms, diag);
 }
 
 /// Every setting of a new topic, before anything is sent.
@@ -496,6 +503,7 @@ pub fn topicConfig(config: types.TopicConfig, diag: ?*Diagnostics) error{Invalid
     if (config.kms_key_name) |k| try kmsKeyName(k, diag);
     if (config.message_storage_policy) |p| try storagePolicy(p, diag);
     if (config.schema) |s| try schemaSettings(s, diag);
+    try messageTransforms(config.message_transforms, diag);
 }
 
 /// A subscription update: something to change, and every new value valid.
@@ -528,10 +536,12 @@ pub fn subscriptionUpdate(u: types.SubscriptionUpdate, emulator: bool, diag: ?*D
     if (retention) |r| try messageRetention(r, diag);
     if (u.expiration) |e| try expiration(e, retention, diag);
     if (u.labels) |l| try labels(l, diag);
+    if (u.message_transforms) |list| try messageTransforms(list, diag);
     const changes_something = u.delivery != null or u.ack_deadline_seconds != null or
         u.enable_exactly_once_delivery != null or u.dead_letter_policy != .keep or
         u.retry_policy != .keep or u.message_retention != .keep or
-        u.retain_acked_messages != null or u.expiration != null or u.labels != null;
+        u.retain_acked_messages != null or u.expiration != null or u.labels != null or
+        u.message_transforms != null;
     if (!changes_something) return refuse(diag, "the update changes nothing", .{});
 }
 
@@ -554,8 +564,50 @@ pub fn topicUpdate(u: types.TopicUpdate, diag: ?*Diagnostics) error{InvalidArgum
         .set => |s| try schemaSettings(s, diag),
         else => {},
     }
-    if (u.labels == null and u.message_retention == .keep and u.kms_key_name == .keep and u.message_storage_policy == .keep and u.schema == .keep) {
-        return refuse(diag, "the update changes nothing", .{});
+    if (u.message_transforms) |list| try messageTransforms(list, diag);
+    const changes_something = u.labels != null or u.message_retention != .keep or
+        u.kms_key_name != .keep or u.message_storage_policy != .keep or u.schema != .keep or
+        u.message_transforms != null;
+    if (!changes_something) return refuse(diag, "the update changes nothing", .{});
+}
+
+/// A list of transforms, as a create or an update sends it whole: no kind
+/// this client cannot write, at most five that are not disabled, and for
+/// each JavaScript function a name no other has and code that is there, is
+/// UTF-8 and is within the bound. An emulator checks the count alone, so
+/// without these a list production refuses would pass every test against
+/// one. Whether the code parses, and holds the function named, is the
+/// server's to say.
+pub fn messageTransforms(list: []const types.MessageTransform, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    var enabled: usize = 0;
+    for (list, 0..) |transform, i| {
+        if (!transform.disabled) enabled += 1;
+        const udf = switch (transform.kind) {
+            .javascript_udf => |udf| udf,
+            .other => return refuse(diag, "message transform {d} is of a kind this client does not model: it can be read, and a list that holds it cannot be sent, since a list is replaced whole and would lose it", .{i}),
+        };
+        if (udf.function_name.len == 0) return refuse(diag, "message transform {d} has no function name", .{i});
+        if (!std.unicode.utf8ValidateSlice(udf.function_name)) {
+            return refuse(diag, "message transform {d} has a function name that is not valid UTF-8", .{i});
+        }
+        if (udf.code.len == 0) return refuse(diag, "message transform {d} has no code", .{i});
+        if (udf.code.len > max_udf_code_bytes) {
+            return refuse(diag, "message transform {d} has {d} bytes of code; the limit is {d}", .{ i, udf.code.len, max_udf_code_bytes });
+        }
+        if (!std.unicode.utf8ValidateSlice(udf.code)) {
+            return refuse(diag, "message transform {d} has code that is not valid UTF-8", .{i});
+        }
+        // Production's words name no exception for a disabled one: "Each
+        // JavaScript UDF must have a unique function name."
+        for (list[0..i], 0..) |earlier, j| switch (earlier.kind) {
+            .javascript_udf => |other| if (std.mem.eql(u8, other.function_name, udf.function_name)) {
+                return refuse(diag, "message transforms {d} and {d} have the same function name", .{ j, i });
+            },
+            .other => {},
+        };
+    }
+    if (enabled > max_enabled_message_transforms) {
+        return refuse(diag, "{d} message transforms are not disabled; the limit is {d}", .{ enabled, max_enabled_message_transforms });
     }
 }
 
@@ -1278,4 +1330,79 @@ test "a topic's schema settings: the schema's two forms, an encoding, and revisi
     // Through a topic's settings and an update, the same refusals.
     try testing.expectError(error.InvalidArgument, topicConfig(.{ .schema = .{ .schema = "go", .encoding = .json } }, &d));
     try testing.expectError(error.InvalidArgument, topicUpdate(.{ .schema = .{ .set = .{ .schema = "order-v1", .encoding = .unknown } } }, &d));
+}
+
+fn js(name: []const u8, code: []const u8) types.MessageTransform {
+    return .{ .kind = .{ .javascript_udf = .{ .function_name = name, .code = code } } };
+}
+
+test "message transforms: how many run, each function's name and code, and no kind this client cannot write" {
+    var d: Diagnostics = .{};
+    const code = "function f(m) { return m; }";
+    try messageTransforms(&.{}, &d);
+    try messageTransforms(&.{js("f", code)}, &d);
+
+    // Five that run pass and a sixth is refused, as production and an
+    // emulator refuse it. One that is disabled is not counted.
+    var seven = [_]types.MessageTransform{ js("a", code), js("b", code), js("c", code), js("d", code), js("e", code), js("f", code), js("g", code) };
+    try messageTransforms(seven[0..5], &d);
+    try testing.expectError(error.InvalidArgument, messageTransforms(seven[0..6], &d));
+    try testing.expectEqualStrings("6 message transforms are not disabled; the limit is 5", d.message());
+    seven[5].disabled = true;
+    try messageTransforms(seven[0..6], &d);
+    try testing.expectError(error.InvalidArgument, messageTransforms(&seven, &d));
+    seven[0].disabled = true;
+    try messageTransforms(&seven, &d);
+
+    // Production takes 20,480 bytes of code and refuses 20,481, counted
+    // in bytes (measured 2026-10-12).
+    var big: [max_udf_code_bytes + 1]u8 = @splat('x');
+    try messageTransforms(&.{js("f", big[0..max_udf_code_bytes])}, &d);
+    try testing.expectError(error.InvalidArgument, messageTransforms(&.{ js("f", code), js("g", &big) }, &d));
+    try testing.expectEqualStrings("message transform 1 has 20481 bytes of code; the limit is 20480", d.message());
+    @memcpy(big[max_udf_code_bytes - 2 ..], "\u{20ac}");
+    try testing.expectError(error.InvalidArgument, messageTransforms(&.{js("f", &big)}, &d));
+    @memcpy(big[max_udf_code_bytes - 3 .. max_udf_code_bytes], "\u{20ac}");
+    try messageTransforms(&.{js("f", big[0..max_udf_code_bytes])}, &d);
+
+    // A name and code that are there, and are UTF-8.
+    try testing.expectError(error.InvalidArgument, messageTransforms(&.{js("", code)}, &d));
+    try testing.expectEqualStrings("message transform 0 has no function name", d.message());
+    try testing.expectError(error.InvalidArgument, messageTransforms(&.{ js("f", code), js("g", "") }, &d));
+    try testing.expectEqualStrings("message transform 1 has no code", d.message());
+    try testing.expectError(error.InvalidArgument, messageTransforms(&.{js("f\xff", code)}, &d));
+    try testing.expectEqualStrings("message transform 0 has a function name that is not valid UTF-8", d.message());
+    try testing.expectError(error.InvalidArgument, messageTransforms(&.{js("f", "return \xc3")}, &d));
+    try testing.expectEqualStrings("message transform 0 has code that is not valid UTF-8", d.message());
+    try messageTransforms(&.{js("\u{e9}t\u{e9}", "// \u{20ac}")}, &d);
+
+    // No two functions of one name, whether or not either runs.
+    try testing.expectError(error.InvalidArgument, messageTransforms(&.{ js("f", code), js("g", code), js("f", "function f() {}") }, &d));
+    try testing.expectEqualStrings("message transforms 0 and 2 have the same function name", d.message());
+    var twice = [_]types.MessageTransform{ js("g", code), js("g", code) };
+    twice[0].disabled = true;
+    try testing.expectError(error.InvalidArgument, messageTransforms(&twice, &d));
+    try testing.expectEqualStrings("message transforms 0 and 1 have the same function name", d.message());
+    try messageTransforms(&.{ js("f", code), js("F", code) }, &d);
+
+    // A kind this client does not model is only ever read, disabled or not.
+    try testing.expectError(error.InvalidArgument, messageTransforms(&.{ js("f", code), .{ .kind = .other } }, &d));
+    try testing.expect(std.mem.startsWith(u8, d.message(), "message transform 1 is of a kind this client does not model"));
+    try testing.expectError(error.InvalidArgument, messageTransforms(&.{.{ .kind = .other, .disabled = true }}, &d));
+    try testing.expect(std.mem.startsWith(u8, d.message(), "message transform 0 is of a kind this client does not model"));
+
+    // Through the settings and the updates of both resources. An empty
+    // list in an update is a change: it clears.
+    try topicConfig(.{ .message_transforms = &.{js("f", code)} }, &d);
+    try subscriptionConfig(.{ .topic_id = "t", .message_transforms = &.{js("f", code)} }, false, &d);
+    try topicUpdate(.{ .message_transforms = &.{js("f", code)} }, &d);
+    try topicUpdate(.{ .message_transforms = &.{} }, &d);
+    try subscriptionUpdate(.{ .message_transforms = &.{js("f", code)} }, false, &d);
+    try subscriptionUpdate(.{ .message_transforms = &.{} }, true, &d);
+    try testing.expectError(error.InvalidArgument, topicConfig(.{ .message_transforms = &.{js("", code)} }, &d));
+    try testing.expectError(error.InvalidArgument, subscriptionConfig(.{ .topic_id = "t", .message_transforms = &.{js("f", "")} }, false, &d));
+    try testing.expectError(error.InvalidArgument, topicUpdate(.{ .message_transforms = &.{.{ .kind = .other }} }, &d));
+    seven[5].disabled = false;
+    try testing.expectError(error.InvalidArgument, subscriptionUpdate(.{ .message_transforms = seven[1..7] }, false, &d));
+    try testing.expectEqualStrings("6 message transforms are not disabled; the limit is 5", d.message());
 }

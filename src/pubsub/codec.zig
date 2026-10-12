@@ -196,6 +196,10 @@ const SubscriptionBody = struct {
             try jw.objectField("labels");
             try writeLabels(jw, c.labels);
         }
+        if (c.message_transforms.len > 0) {
+            try jw.objectField("messageTransforms");
+            try writeTransforms(jw, c.message_transforms);
+        }
         try jw.endObject();
     }
 };
@@ -289,6 +293,7 @@ const SubscriptionUpdateBody = struct {
             try jw.objectField("labels");
             try writeLabels(jw, labels);
         }
+        if (u.message_transforms) |list| try writeTransformsUpdate(jw, &mask, list);
         try jw.endObject();
         try jw.objectField("updateMask");
         try mask.write(jw);
@@ -327,9 +332,53 @@ const TopicBody = struct {
             try jw.objectField("schemaSettings");
             try writeSchemaSettings(jw, settings);
         }
+        if (c.message_transforms.len > 0) {
+            try jw.objectField("messageTransforms");
+            try writeTransforms(jw, c.message_transforms);
+        }
         try jw.endObject();
     }
 };
+
+/// A list of transforms, in the order they run. `disabled` is written only
+/// when set, and the deprecated `enabled` never. A kind this client does
+/// not model has nothing to write and is written as a transform of no
+/// kind, which the server refuses: the checks refuse such a list first.
+fn writeTransforms(jw: *Stringify, list: []const types.MessageTransform) Stringify.Error!void {
+    try jw.beginArray();
+    for (list) |transform| {
+        try jw.beginObject();
+        switch (transform.kind) {
+            .javascript_udf => |udf| {
+                try jw.objectField("javascriptUdf");
+                try jw.beginObject();
+                try jw.objectField("functionName");
+                try jw.write(udf.function_name);
+                try jw.objectField("code");
+                try jw.write(udf.code);
+                try jw.endObject();
+            },
+            .other => {},
+        }
+        if (transform.disabled) {
+            try jw.objectField("disabled");
+            try jw.write(true);
+        }
+        try jw.endObject();
+    }
+    try jw.endArray();
+}
+
+/// An update's transforms: the list is masked whole, so what is given is
+/// all that holds afterwards. An empty list is named and left out, which
+/// clears it, on topics and subscriptions alike (measured in production
+/// and on an emulator, 2026-10-12).
+fn writeTransformsUpdate(jw: *Stringify, mask: *Mask, list: []const types.MessageTransform) Stringify.Error!void {
+    mask.add("messageTransforms");
+    if (list.len == 0) return;
+    try jw.objectField("messageTransforms");
+    try writeTransforms(jw, list);
+}
 
 /// A topic's `schemaSettings`. The schema must already be a full name:
 /// `Topic` resolves an id before encoding. A bound left null is left out,
@@ -408,6 +457,7 @@ const TopicUpdateBody = struct {
                 try writeSchemaSettings(jw, settings);
             },
         }
+        if (u.message_transforms) |list| try writeTransformsUpdate(jw, &mask, list);
         try jw.endObject();
         try jw.objectField("updateMask");
         try mask.write(jw);
@@ -648,7 +698,7 @@ pub fn schemaViewName(v: types.SchemaView) []const u8 {
 /// An update mask: the camelCase paths an update names, comma-separated in
 /// one JSON string, as the REST API takes a `FieldMask`.
 const Mask = struct {
-    paths: [11][]const u8 = undefined,
+    paths: [12][]const u8 = undefined,
     len: usize = 0,
 
     fn add(m: *Mask, path: []const u8) void {
@@ -966,7 +1016,15 @@ const WireTopic = struct {
     kmsKeyName: ?[]const u8 = null,
     messageStoragePolicy: ?WireStoragePolicy = null,
     schemaSettings: ?WireSchemaSettings = null,
+    messageTransforms: ?[]const WireTransform = null,
     state: ?[]const u8 = null,
+};
+
+/// `enabled`, which is deprecated, is not read: production keeps whatever
+/// it is given there, beside a `disabled` that says the opposite.
+const WireTransform = struct {
+    javascriptUdf: ?struct { functionName: ?[]const u8 = null, code: ?[]const u8 = null } = null,
+    disabled: ?bool = null,
 };
 
 const WireSchemaSettings = struct {
@@ -1050,6 +1108,7 @@ const WireSubscription = struct {
     detached: ?bool = null,
     state: ?[]const u8 = null,
     topicMessageRetentionDuration: ?[]const u8 = null,
+    messageTransforms: ?[]const WireTransform = null,
 };
 
 const WireSubscriptionList = struct {
@@ -1138,8 +1197,25 @@ fn topicFromWire(arena: Allocator, w: WireTopic) DecodeError!types.TopicInfo {
             .enforce_in_transit = policy.enforceInTransit orelse false,
         } else null,
         .schema = schemaSettingsFromWire(w.schemaSettings),
+        .message_transforms = try transformsFromWire(arena, w.messageTransforms),
         .state = topicState(w.state),
     };
+}
+
+/// Each transform, in the server's order. One with no JavaScript function
+/// is of a kind this client does not model, AI inference today, and is
+/// kept as `.other` so that the list's length and order are the server's.
+fn transformsFromWire(arena: Allocator, wire: ?[]const WireTransform) Allocator.Error![]const types.MessageTransform {
+    const list = wire orelse return &.{};
+    const transforms = try arena.alloc(types.MessageTransform, list.len);
+    for (list, transforms) |w, *out| out.* = .{
+        .kind = if (w.javascriptUdf) |udf| .{ .javascript_udf = .{
+            .function_name = udf.functionName orelse "",
+            .code = udf.code orelse "",
+        } } else .other,
+        .disabled = w.disabled orelse false,
+    };
+    return transforms;
 }
 
 /// Settings that name no schema are none: a topic without one may read as
@@ -1207,6 +1283,7 @@ fn subscriptionFromWire(arena: Allocator, w: WireSubscription) DecodeError!types
         .detached = w.detached orelse false,
         .state = subscriptionState(w.state),
         .topic_message_retention = try optionalDuration(w.topicMessageRetentionDuration),
+        .message_transforms = try transformsFromWire(arena, w.messageTransforms),
     };
 }
 
@@ -3245,4 +3322,272 @@ test "fuzz topic schema settings: what a create sends a read gives back, and an 
         "\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00",
         "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
     } });
+}
+
+const upper_udf: types.MessageTransform = .{ .kind = .{ .javascript_udf = .{
+    .function_name = "upper",
+    .code = "function upper(message, metadata) { message.data = message.data.toUpperCase(); return message; }",
+} } };
+
+test "golden: message transforms on create and in an update: a list, a disabled one, and an empty list" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const upper_json =
+        \\{"javascriptUdf":{"functionName":"upper","code":"function upper(message, metadata) { message.data = message.data.toUpperCase(); return message; }"}}
+    ;
+    // In the order given, code escaped as any string is, and `disabled`
+    // only when set.
+    const two = [_]types.MessageTransform{
+        .{ .kind = .{ .javascript_udf = .{ .function_name = "a", .code = "function a(m) {\n  return m;\n}" } } },
+        .{ .kind = .{ .javascript_udf = .{ .function_name = "b", .code = "function b(m) { m.attributes[\"k\"] = 'v'; return m; }" } }, .disabled = true },
+    };
+    const two_json =
+        \\[{"javascriptUdf":{"functionName":"a","code":"function a(m) {\n  return m;\n}"}},{"javascriptUdf":{"functionName":"b","code":"function b(m) { m.attributes[\"k\"] = 'v'; return m; }"},"disabled":true}]
+    ;
+
+    try testing.expectEqualStrings("{\"messageTransforms\":[" ++ upper_json ++ "]}", try encodeTopic(a, .{ .message_transforms = &.{upper_udf} }));
+    try testing.expectEqualStrings(
+        "{\"labels\":{\"env\":\"test\"},\"messageTransforms\":" ++ two_json ++ "}",
+        try encodeTopic(a, .{ .labels = &.{.{ .key = "env", .value = "test" }}, .message_transforms = &two }),
+    );
+    // None is no field at all.
+    try testing.expectEqualStrings("{}", try encodeTopic(a, .{}));
+    try testing.expectEqualStrings(
+        "{\"topic\":\"projects/p/topics/t\",\"enableMessageOrdering\":false,\"messageTransforms\":" ++ two_json ++ "}",
+        try encodeSubscription(a, "projects/p/topics/t", .{ .topic_id = "t", .message_transforms = &two }, null),
+    );
+    try testing.expectEqualStrings(
+        "{\"topic\":\"projects/p/topics/t\",\"enableMessageOrdering\":false}",
+        try encodeSubscription(a, "projects/p/topics/t", .{ .topic_id = "t" }, null),
+    );
+
+    // An update names the list and carries it; an empty one is named and
+    // left out, which clears it.
+    try testing.expectEqualStrings(
+        "{\"topic\":{\"messageTransforms\":[" ++ upper_json ++ "]},\"updateMask\":\"messageTransforms\"}",
+        try encodeTopicUpdate(a, .{ .message_transforms = &.{upper_udf} }),
+    );
+    try testing.expectEqualStrings(
+        "{\"topic\":{},\"updateMask\":\"messageTransforms\"}",
+        try encodeTopicUpdate(a, .{ .message_transforms = &.{} }),
+    );
+    try testing.expectEqualStrings(
+        "{\"topic\":{\"labels\":{},\"messageTransforms\":" ++ two_json ++ "},\"updateMask\":\"labels,schemaSettings,messageTransforms\"}",
+        try encodeTopicUpdate(a, .{ .labels = &.{}, .schema = .clear, .message_transforms = &two }),
+    );
+    try testing.expectEqualStrings(
+        "{\"subscription\":{\"messageTransforms\":[" ++ upper_json ++ "]},\"updateMask\":\"messageTransforms\"}",
+        try encodeSubscriptionUpdate(a, .{ .message_transforms = &.{upper_udf} }, null, false),
+    );
+    try testing.expectEqualStrings(
+        "{\"subscription\":{},\"updateMask\":\"messageTransforms\"}",
+        try encodeSubscriptionUpdate(a, .{ .message_transforms = &.{} }, null, true),
+    );
+    // Everything a subscription update can name, at once: twelve paths.
+    try testing.expectEqualStrings(
+        "{\"subscription\":{\"ackDeadlineSeconds\":30,\"enableExactlyOnceDelivery\":false,\"retainAckedMessages\":false,\"labels\":{}}," ++
+            "\"updateMask\":\"pushConfig,bigqueryConfig,cloudStorageConfig,ackDeadlineSeconds,enableExactlyOnceDelivery,deadLetterPolicy," ++
+            "retryPolicy,messageRetentionDuration,retainAckedMessages,expirationPolicy,labels,messageTransforms\"}",
+        try encodeSubscriptionUpdate(a, .{
+            .delivery = .pull,
+            .ack_deadline_seconds = 30,
+            .enable_exactly_once_delivery = false,
+            .dead_letter_policy = .clear,
+            .retry_policy = .clear,
+            .message_retention = .clear,
+            .retain_acked_messages = false,
+            .expiration = .default,
+            .labels = &.{},
+            .message_transforms = &.{},
+        }, null, false),
+    );
+
+    // A kind this client does not model has nothing to write: it goes as a
+    // transform of no kind, which the server refuses. The checks refuse
+    // such a list before it is ever encoded.
+    try testing.expectEqualStrings(
+        "{\"messageTransforms\":[{},{\"disabled\":true}]}",
+        try encodeTopic(a, .{ .message_transforms = &.{ .{ .kind = .other }, .{ .kind = .other, .disabled = true } } }),
+    );
+}
+
+fn expectUdf(want_name: []const u8, want_code: []const u8, want_disabled: bool, have: types.MessageTransform) !void {
+    try testing.expectEqualStrings(want_name, have.kind.javascript_udf.function_name);
+    try testing.expectEqualStrings(want_code, have.kind.javascript_udf.code);
+    try testing.expectEqual(want_disabled, have.disabled);
+}
+
+test "decode: message transforms from production's answers, a kind not modelled, and what an answer may leave out" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const upper_code = "function upper(message, metadata) { message.data = message.data.toUpperCase(); message.attributes['seen'] = 'yes'; return message; }";
+
+    // Production's answers, 2026-10-12.
+    const topic = try decodeTopic(a,
+        \\{ "name": "projects/extractctl/topics/zigps-x-cc4711-t1", "messageTransforms": [ { "javascriptUdf": { "functionName": "upper", "code": "function upper(message, metadata) { message.data = message.data.toUpperCase(); message.attributes['seen'] = 'yes'; return message; }" } } ] }
+    );
+    try testing.expectEqual(1, topic.message_transforms.len);
+    try expectUdf("upper", upper_code, false, topic.message_transforms[0]);
+
+    const off = try decodeTopic(a,
+        \\{ "name": "projects/extractctl/topics/zigps-x-cc4711-t12", "messageTransforms": [ { "javascriptUdf": { "functionName": "upper", "code": "function upper(message, metadata) { message.data = message.data.toUpperCase(); message.attributes['seen'] = 'yes'; return message; }" }, "disabled": true } ] }
+    );
+    try expectUdf("upper", upper_code, true, off.message_transforms[0]);
+
+    // Production keeps the deprecated `enabled` beside a `disabled` that
+    // says the opposite. `disabled` alone is read.
+    const both = try decodeTopic(a,
+        \\{ "name": "projects/extractctl/topics/zigps-x-cc4711-t13", "messageTransforms": [ { "javascriptUdf": { "functionName": "upper", "code": "function upper(message, metadata) { message.data = message.data.toUpperCase(); message.attributes['seen'] = 'yes'; return message; }" }, "enabled": true, "disabled": true } ] }
+    );
+    try expectUdf("upper", upper_code, true, both.message_transforms[0]);
+    const only_enabled = try decodeTopic(a, "{\"messageTransforms\":[{\"javascriptUdf\":{\"functionName\":\"f\",\"code\":\"c\"},\"enabled\":false}]}");
+    try expectUdf("f", "c", false, only_enabled.message_transforms[0]);
+
+    const subscription = try decodeSubscription(a,
+        \\{ "name": "projects/extractctl/subscriptions/zigps-x-cc4711-s23", "topic": "projects/extractctl/topics/zigps-x-cc4711-t21", "pushConfig": {}, "ackDeadlineSeconds": 10, "messageRetentionDuration": "604800s", "expirationPolicy": { "ttl": "2678400s" }, "state": "ACTIVE", "messageTransforms": [ { "javascriptUdf": { "functionName": "drop", "code": "function drop(message, metadata) { if (message.data === 'drop') return null; return message; }" } } ] }
+    );
+    try testing.expectEqual(1, subscription.message_transforms.len);
+    try expectUdf("drop", "function drop(message, metadata) { if (message.data === 'drop') return null; return message; }", false, subscription.message_transforms[0]);
+    try testing.expectEqual(types.DeliveryInfo.pull, subscription.delivery);
+
+    // A kind this client does not model keeps its place in the list, and
+    // its switch. The shapes are the discovery document's.
+    const mixed = try decodeTopic(a,
+        \\{"messageTransforms":[
+        \\  {"javascriptUdf":{"functionName":"a","code":"function a(m) { return m; }"}},
+        \\  {"aiInference":{"endpoint":"projects/p/locations/us-central1/endpoints/e","unstructuredInference":{"parameters":{}}}},
+        \\  {"compression":{"compressionType":"GZIP"},"disabled":true},
+        \\  {"javascriptUdf":{"functionName":"b","code":"function b(m) { return m; }"},"disabled":true},
+        \\  {}
+        \\]}
+    );
+    try testing.expectEqual(5, mixed.message_transforms.len);
+    try expectUdf("a", "function a(m) { return m; }", false, mixed.message_transforms[0]);
+    try testing.expect(mixed.message_transforms[1].kind == .other);
+    try testing.expect(!mixed.message_transforms[1].disabled);
+    try testing.expect(mixed.message_transforms[2].kind == .other);
+    try testing.expect(mixed.message_transforms[2].disabled);
+    try expectUdf("b", "function b(m) { return m; }", true, mixed.message_transforms[3]);
+    try testing.expect(mixed.message_transforms[4].kind == .other);
+
+    // No list, an empty one and a null are none; a function with a part
+    // left out reads as "" there.
+    try testing.expectEqual(0, (try decodeTopic(a, "{\"name\":\"projects/p/topics/t\"}")).message_transforms.len);
+    try testing.expectEqual(0, (try decodeTopic(a, "{\"messageTransforms\":[]}")).message_transforms.len);
+    try testing.expectEqual(0, (try decodeTopic(a, "{\"messageTransforms\":null}")).message_transforms.len);
+    try testing.expectEqual(0, (try decodeSubscription(a, "{\"name\":\"projects/p/subscriptions/s\"}")).message_transforms.len);
+    try expectUdf("", "", false, (try decodeTopic(a, "{\"messageTransforms\":[{\"javascriptUdf\":{}}]}")).message_transforms[0]);
+    try expectUdf("f", "", false, (try decodeSubscription(a, "{\"messageTransforms\":[{\"javascriptUdf\":{\"functionName\":\"f\"}}]}")).message_transforms[0]);
+    try testing.expectError(error.InvalidResponse, decodeTopic(a, "{\"messageTransforms\":{}}"));
+    try testing.expectError(error.InvalidResponse, decodeTopic(a, "{\"messageTransforms\":[null]}"));
+    try testing.expectError(error.InvalidResponse, decodeSubscription(a, "{\"messageTransforms\":[{\"javascriptUdf\":\"upper\"}]}"));
+
+    // In a list, each resource with its own.
+    const topics = try decodeTopicPage(a,
+        \\{"topics":[{"name":"projects/p/topics/a"},{"name":"projects/p/topics/b","messageTransforms":[{"javascriptUdf":{"functionName":"f","code":"c"}}]}]}
+    );
+    try testing.expectEqual(0, topics.topics[0].message_transforms.len);
+    try expectUdf("f", "c", false, topics.topics[1].message_transforms[0]);
+    const subscriptions = try decodeSubscriptionPage(a,
+        \\{"subscriptions":[{"name":"projects/p/subscriptions/a","messageTransforms":[{"aiInference":{}}]},{"name":"projects/p/subscriptions/b"}]}
+    );
+    try testing.expect(subscriptions.subscriptions[0].message_transforms[0].kind == .other);
+    try testing.expectEqual(0, subscriptions.subscriptions[1].message_transforms.len);
+}
+
+/// A list the checks pass: up to seven transforms, at most five of them
+/// not disabled, each a function of its own name with code of any UTF-8.
+fn genTransforms(g: *ByteGen, arena: Allocator) ![]types.MessageTransform {
+    const list = try arena.alloc(types.MessageTransform, g.intRange(u8, 0, 7));
+    var enabled: usize = 0;
+    for (list, 0..) |*transform, i| {
+        const code = try arena.alloc(u8, 48);
+        const text = g.utf8(code, 48);
+        const disabled = g.boolean() or enabled == 5;
+        if (!disabled) enabled += 1;
+        transform.* = .{
+            .kind = .{ .javascript_udf = .{
+                .function_name = try std.fmt.allocPrint(arena, "{s}{d}", .{ g.pick([]const u8, &.{ "f", "redact_", "$", "\u{e9}t\u{e9}" }), i }),
+                .code = if (text.len == 0) "function f(m) { return m; }" else text,
+            } },
+            .disabled = disabled,
+        };
+    }
+    return list;
+}
+
+fn expectTransformsEqual(want: []const types.MessageTransform, have: []const types.MessageTransform) !void {
+    try testing.expectEqual(want.len, have.len);
+    for (want, have) |w, h| try expectUdf(w.kind.javascript_udf.function_name, w.kind.javascript_udf.code, w.disabled, h);
+}
+
+fn transformsRoundTrip(_: void, input: []const u8) !void {
+    var g: ByteGen = .init(input);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const list = try genTransforms(&g, a);
+    try @import("validate.zig").messageTransforms(list, null);
+
+    // What a create sends, a read gives back, on a topic and on a
+    // subscription.
+    const topic = try decodeTopic(a, try encodeTopic(a, .{ .message_transforms = list }));
+    try expectTransformsEqual(list, topic.message_transforms);
+    const subscription = try decodeSubscription(a, try encodeSubscription(a, "projects/p/topics/t", .{ .topic_id = "t", .message_transforms = list }, null));
+    try expectTransformsEqual(list, subscription.message_transforms);
+
+    // An update names `messageTransforms` in its mask exactly when a list
+    // is given, an empty one included, and carries it exactly when it
+    // holds something.
+    const given: ?[]const types.MessageTransform = switch (g.intRange(u8, 0, 2)) {
+        0 => null,
+        1 => &.{},
+        else => list,
+    };
+    const with_labels = g.boolean();
+    if (given == null and !with_labels) return;
+    const labels: ?[]const types.Label = if (with_labels) &.{} else null;
+    const Sent = struct { messageTransforms: ?[]const WireTransform = null, labels: ?std.json.Value = null };
+    const topic_update = try std.json.parseFromSliceLeaky(
+        struct { topic: Sent, updateMask: []const u8 },
+        a,
+        try encodeTopicUpdate(a, .{ .labels = labels, .message_transforms = given }),
+        .{},
+    );
+    const subscription_update = try std.json.parseFromSliceLeaky(
+        struct { subscription: Sent, updateMask: []const u8 },
+        a,
+        try encodeSubscriptionUpdate(a, .{ .labels = labels, .message_transforms = given }, null, g.boolean()),
+        .{},
+    );
+    for ([_]struct { Sent, []const u8 }{
+        .{ topic_update.topic, topic_update.updateMask },
+        .{ subscription_update.subscription, subscription_update.updateMask },
+    }) |update| {
+        const sent, const mask = update;
+        var named: usize = 0;
+        var paths = std.mem.splitScalar(u8, mask, ',');
+        while (paths.next()) |path| {
+            if (std.mem.eql(u8, path, "messageTransforms")) named += 1;
+        }
+        try testing.expectEqual(@intFromBool(given != null), named);
+        const carried = given != null and given.?.len > 0;
+        try testing.expectEqual(carried, sent.messageTransforms != null);
+        if (carried) try expectTransformsEqual(given.?, try transformsFromWire(a, sent.messageTransforms));
+    }
+}
+
+test "fuzz message transforms: what a create sends a read gives back, and an update's mask names the list exactly when one is given" {
+    try test_util.fuzzBytes({}, transformsRoundTrip, .{
+        .corpus = &.{
+            "",
+            // One function, given in an update beside labels.
+            "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x01\x00",
+            // Seven, so the sixth and seventh are disabled; an empty list given.
+            "\x07" ++ &@as([7 * 17]u8, @splat(0)) ++ "\x01\x00\x01",
+            "\x03\x00\x00\x00\x00\x00\x00\x00\x08\x01\x22\x02\x41\x04\x00\x00\x00\xe9\x01\x00\x00\x00\x00\x00\x00\x00\x01\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+        },
+    });
 }

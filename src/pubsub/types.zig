@@ -164,6 +164,10 @@ pub const TopicConfig = struct {
     /// Every message published to the topic must fit this schema. Null:
     /// the topic takes any bytes.
     schema: ?SchemaSettings = null,
+    /// Run on every message published to the topic, in this order, before
+    /// its schema is checked and before it is stored. At most 5 that are
+    /// not disabled.
+    message_transforms: []const MessageTransform = &.{},
 };
 
 pub const TopicInfo = struct {
@@ -175,6 +179,8 @@ pub const TopicInfo = struct {
     message_storage_policy: ?MessageStoragePolicy = null,
     /// Null: the topic has no schema.
     schema: ?SchemaSettings = null,
+    /// In the order they run.
+    message_transforms: []const MessageTransform = &.{},
     state: State = .active,
 
     /// An unrecognized value from the server is `.unknown`.
@@ -201,6 +207,9 @@ pub const TopicUpdate = struct {
     /// are then what is given, and a bound left null is open. `.clear`:
     /// the topic takes any bytes again.
     schema: Change(SchemaSettings) = .keep,
+    /// Replaces the whole list; `&.{}` removes every transform. Pub/Sub
+    /// says a change takes a few minutes to hold.
+    message_transforms: ?[]const MessageTransform = null,
 };
 
 pub const TopicPage = struct {
@@ -369,6 +378,9 @@ pub const SubscriptionConfig = struct {
     expiration: Expiration = .default,
     /// As for `TopicConfig.labels`.
     labels: []const Label = &.{},
+    /// Run on every message on its way to a subscriber, in this order,
+    /// after the filter. At most 5 that are not disabled.
+    message_transforms: []const MessageTransform = &.{},
 };
 
 pub const SubscriptionInfo = struct {
@@ -395,6 +407,8 @@ pub const SubscriptionInfo = struct {
     state: State = .active,
     /// Set when the topic keeps messages itself.
     topic_message_retention: ?std.Io.Duration = null,
+    /// In the order they run.
+    message_transforms: []const MessageTransform = &.{},
 
     /// An unrecognized value from the server is `.unknown`.
     pub const State = enum { active, resource_error, unknown };
@@ -426,6 +440,9 @@ pub const SubscriptionUpdate = struct {
     expiration: ?Expiration = null,
     /// Replaces every label; `&.{}` removes them all.
     labels: ?[]const Label = null,
+    /// Replaces the whole list; `&.{}` removes every transform. Pub/Sub
+    /// says a change takes a few minutes to hold.
+    message_transforms: ?[]const MessageTransform = null,
 };
 
 fn findLabel(labels: []const Label, key: []const u8) ?[]const u8 {
@@ -600,6 +617,34 @@ pub const SchemaSettings = struct {
     pub fn isDeleted(self: SchemaSettings) bool {
         return std.mem.eql(u8, self.schema, deleted);
     }
+};
+
+/// One step a topic or a subscription runs each message through: Google
+/// calls it a single message transform. Pub/Sub runs it. An emulator keeps
+/// it and runs nothing, so a message goes through one untouched there.
+pub const MessageTransform = struct {
+    kind: Kind,
+    /// Kept in the list, and not run.
+    disabled: bool = false,
+
+    pub const Kind = union(enum) {
+        javascript_udf: JavaScriptUdf,
+        /// A kind this client does not model, such as AI inference. Only
+        /// ever read: a list that holds one is refused before sending,
+        /// since a list is replaced whole and would lose it.
+        other,
+    };
+};
+
+/// A JavaScript function Pub/Sub calls with each message.
+pub const JavaScriptUdf = struct {
+    /// The function in `code` to call: `function name(message, metadata)`,
+    /// where `message.data` is a string and `message.attributes` a map of
+    /// strings. No two functions of a list share a name.
+    function_name: []const u8,
+    /// At most 20,480 bytes. The function returns the message, changed or
+    /// not; returns null to drop it; or throws to refuse it.
+    code: []const u8,
 };
 
 test "ReceivedMessage.attribute finds the first match" {

@@ -77,6 +77,8 @@ pub const SchemaPage = @import("types.zig").SchemaPage;
 pub const SchemaEncoding = @import("types.zig").SchemaEncoding;
 pub const SchemaSettings = @import("types.zig").SchemaSettings;
 pub const MessageSchema = @import("types.zig").MessageSchema;
+pub const MessageTransform = @import("types.zig").MessageTransform;
+pub const JavaScriptUdf = @import("types.zig").JavaScriptUdf;
 
 /// Parses a `publish_time` (RFC 3339) to nanoseconds since the Unix epoch.
 pub const parseTimestamp = core.timestamp.parse;

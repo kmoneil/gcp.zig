@@ -2702,3 +2702,223 @@ test "a topic with a schema: what fits is taken and says what it fit, what does 
         try testing.expect(still.value.schema.?.isDeleted());
     }
 }
+
+// Message transforms. Production runs them; the emulator keeps them and
+// runs none (emulator 0.8.36, 2026-10-12), so a message goes through one
+// untouched there, none is dropped and none is refused.
+
+const upper_transform: pubsub.MessageTransform = .{ .kind = .{ .javascript_udf = .{
+    .function_name = "upper",
+    .code = "function upper(message, metadata) { message.data = message.data.toUpperCase(); message.attributes['seen'] = 'yes'; return message; }",
+} } };
+const drop_transform: pubsub.MessageTransform = .{ .kind = .{ .javascript_udf = .{
+    .function_name = "drop",
+    .code = "function drop(message, metadata) { if (message.data === 'drop') return null; return message; }",
+} } };
+const boom_transform: pubsub.MessageTransform = .{ .kind = .{ .javascript_udf = .{
+    .function_name = "boom",
+    .code = "function boom(message, metadata) { throw new Error('no'); }",
+} } };
+const via_transform: pubsub.MessageTransform = .{ .kind = .{ .javascript_udf = .{
+    .function_name = "via",
+    .code = "function via(message, metadata) { message.attributes['via'] = 'subscription'; return message; }",
+} } };
+
+/// What a test of transforms wants of a message: its data, and the
+/// attributes the test's functions write.
+const Arrived = struct { data: []const u8, seen: ?[]const u8, via: ?[]const u8 };
+
+/// Pulls and acknowledges until `count` messages have arrived, or for
+/// `wait_s` seconds, and returns what came.
+fn pullArrived(f: *Fixture, sub: pubsub.Subscription, count: usize, wait_s: i64) ![]const Arrived {
+    const a = f.arena.allocator();
+    var arrived: std.ArrayList(Arrived) = .empty;
+    const deadline = nowMs() + wait_s * 1000;
+    while (arrived.items.len < count and nowMs() < deadline) {
+        var batch = sub.pull(.{ .max_messages = 10, .return_immediately = true }) catch |err| return f.fail(err);
+        defer batch.deinit();
+        if (batch.value.messages.len == 0) {
+            try testing.io.sleep(.fromMilliseconds(250), .awake);
+            continue;
+        }
+        for (batch.value.messages) |m| {
+            sub.ack(&.{m.ack_id}) catch |err| return f.fail(err);
+            try arrived.append(a, .{
+                .data = try a.dupe(u8, m.data),
+                .seen = if (m.attribute("seen")) |v| try a.dupe(u8, v) else null,
+                .via = if (m.attribute("via")) |v| try a.dupe(u8, v) else null,
+            });
+        }
+    }
+    return arrived.items;
+}
+
+fn hasData(arrived: []const Arrived, data: []const u8) bool {
+    for (arrived) |m| if (std.mem.eql(u8, m.data, data)) return true;
+    return false;
+}
+
+fn expectTransform(want: pubsub.MessageTransform, have: pubsub.MessageTransform) !void {
+    try testing.expectEqualStrings(want.kind.javascript_udf.function_name, have.kind.javascript_udf.function_name);
+    try testing.expectEqualStrings(want.kind.javascript_udf.code, have.kind.javascript_udf.code);
+    try testing.expectEqual(want.disabled, have.disabled);
+}
+
+test "message transforms: a topic's and a subscription's are kept, read back, replaced and cleared" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+
+    const topic = f.client.topic(f.id("smt"));
+    try f.topics.append(testing.allocator, topic.id);
+    var created = topic.create(.{ .message_transforms = &.{upper_transform} }) catch |err| return f.fail(err);
+    defer created.deinit();
+    try testing.expectEqual(1, created.value.message_transforms.len);
+    try expectTransform(upper_transform, created.value.message_transforms[0]);
+    var read = topic.get() catch |err| return f.fail(err);
+    defer read.deinit();
+    try testing.expectEqual(1, read.value.message_transforms.len);
+    try expectTransform(upper_transform, read.value.message_transforms[0]);
+
+    // A list replaces the list, in its order and with each one's switch;
+    // an empty one clears it.
+    var off = drop_transform;
+    off.disabled = true;
+    var replaced = topic.update(.{ .message_transforms = &.{ off, via_transform } }) catch |err| return f.fail(err);
+    defer replaced.deinit();
+    try testing.expectEqual(2, replaced.value.message_transforms.len);
+    try expectTransform(off, replaced.value.message_transforms[0]);
+    try expectTransform(via_transform, replaced.value.message_transforms[1]);
+    var cleared = topic.update(.{ .message_transforms = &.{} }) catch |err| return f.fail(err);
+    defer cleared.deinit();
+    try testing.expectEqual(0, cleared.value.message_transforms.len);
+    var plain = topic.get() catch |err| return f.fail(err);
+    defer plain.deinit();
+    try testing.expectEqual(0, plain.value.message_transforms.len);
+
+    // The same on a subscription, which still pulls.
+    const sub = f.client.subscription(f.id("smt-sub"));
+    try f.subscriptions.append(testing.allocator, sub.id);
+    var subscribed = sub.create(.{ .topic_id = topic.id, .message_transforms = &.{ via_transform, off } }) catch |err| return f.fail(err);
+    defer subscribed.deinit();
+    try testing.expectEqual(2, subscribed.value.message_transforms.len);
+    try expectTransform(via_transform, subscribed.value.message_transforms[0]);
+    try expectTransform(off, subscribed.value.message_transforms[1]);
+    try testing.expectEqual(pubsub.DeliveryInfo.pull, subscribed.value.delivery);
+    var sub_read = sub.get() catch |err| return f.fail(err);
+    defer sub_read.deinit();
+    try testing.expectEqual(2, sub_read.value.message_transforms.len);
+    var sub_replaced = sub.update(.{ .message_transforms = &.{upper_transform} }) catch |err| return f.fail(err);
+    defer sub_replaced.deinit();
+    try testing.expectEqual(1, sub_replaced.value.message_transforms.len);
+    try expectTransform(upper_transform, sub_replaced.value.message_transforms[0]);
+    var sub_cleared = sub.update(.{ .message_transforms = &.{} }) catch |err| return f.fail(err);
+    defer sub_cleared.deinit();
+    try testing.expectEqual(0, sub_cleared.value.message_transforms.len);
+
+    // A list in a page reads as it does alone.
+    var back = topic.update(.{ .message_transforms = &.{upper_transform} }) catch |err| return f.fail(err);
+    defer back.deinit();
+    var token: ?[]const u8 = null;
+    var found = false;
+    var pages: usize = 0;
+    while (!found) : (pages += 1) {
+        if (pages > 200) return error.TestTooManyPages;
+        var page = f.client.listTopics(.{ .page_size = 100, .page_token = token }) catch |err| return f.fail(err);
+        defer page.deinit();
+        for (page.value.topics) |t| {
+            if (!std.mem.endsWith(u8, t.name, topic.id)) continue;
+            found = true;
+            try testing.expectEqual(1, t.message_transforms.len);
+            try expectTransform(upper_transform, t.message_transforms[0]);
+        }
+        token = try f.arena.allocator().dupe(u8, page.value.next_page_token orelse break);
+    }
+    try testing.expect(found);
+}
+
+test "message transforms: production rewrites, drops and refuses with them, and the emulator delivers every message untouched" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+
+    // A topic whose function upper-cases, with a plain subscription and
+    // one that has a function of its own.
+    const topic = f.client.topic(f.id("smt-up"));
+    try f.topics.append(testing.allocator, topic.id);
+    var created = topic.create(.{ .message_transforms = &.{upper_transform} }) catch |err| return f.fail(err);
+    created.deinit();
+    const plain = try f.createSubscription("smt-up-plain", .{ .topic_id = topic.id });
+    const tagged = try f.createSubscription("smt-up-via", .{ .topic_id = topic.id, .message_transforms = &.{via_transform} });
+    var sent = topic.publish(&.{.{ .data = "hello" }}, .{}) catch |err| return f.fail(err);
+    sent.deinit();
+    const from_plain = try pullArrived(&f, plain, 1, f.patience());
+    const from_tagged = try pullArrived(&f, tagged, 1, f.patience());
+    try testing.expectEqual(1, from_plain.len);
+    try testing.expectEqual(1, from_tagged.len);
+    if (f.production) {
+        try testing.expectEqualStrings("HELLO", from_plain[0].data);
+        try testing.expectEqualStrings("yes", from_plain[0].seen.?);
+        try testing.expectEqual(null, from_plain[0].via);
+        try testing.expectEqualStrings("HELLO", from_tagged[0].data);
+        try testing.expectEqualStrings("subscription", from_tagged[0].via.?);
+    } else {
+        try testing.expectEqualStrings("hello", from_plain[0].data);
+        try testing.expectEqual(null, from_plain[0].seen);
+        try testing.expectEqualStrings("hello", from_tagged[0].data);
+        try testing.expectEqual(null, from_tagged[0].via);
+    }
+
+    // A function that returns null drops the message, and the publisher
+    // is still given an id for it: a dropped message looks published.
+    const dropping = f.client.topic(f.id("smt-drop"));
+    try f.topics.append(testing.allocator, dropping.id);
+    var dropping_made = dropping.create(.{ .message_transforms = &.{drop_transform} }) catch |err| return f.fail(err);
+    dropping_made.deinit();
+    const kept = try f.createSubscription("smt-drop-sub", .{ .topic_id = dropping.id });
+    var both = dropping.publish(&.{ .{ .data = "drop" }, .{ .data = "keep" } }, .{}) catch |err| return f.fail(err);
+    defer both.deinit();
+    try testing.expectEqual(2, both.value.message_ids.len);
+    try testing.expect(both.value.message_ids[0].len > 0 and both.value.message_ids[1].len > 0);
+    if (f.production) {
+        const first = try pullArrived(&f, kept, 1, f.patience());
+        try testing.expectEqual(1, first.len);
+        try testing.expectEqualStrings("keep", first[0].data);
+        // Ten seconds more, and the dropped one has still not come.
+        try testing.expectEqual(0, (try pullArrived(&f, kept, 1, 10)).len);
+    } else {
+        const all = try pullArrived(&f, kept, 2, f.patience());
+        try testing.expectEqual(2, all.len);
+        try testing.expect(hasData(all, "drop") and hasData(all, "keep"));
+    }
+
+    // A function that throws refuses the whole publish.
+    const throwing = f.client.topic(f.id("smt-boom"));
+    try f.topics.append(testing.allocator, throwing.id);
+    var throwing_made = throwing.create(.{ .message_transforms = &.{boom_transform} }) catch |err| return f.fail(err);
+    throwing_made.deinit();
+    if (throwing.publish(&.{ .{ .data = "a" }, .{ .data = "b" } }, .{})) |refused| {
+        var r = refused;
+        r.deinit();
+        try testing.expect(!f.production);
+    } else |err| {
+        if (!f.production) return f.fail(err);
+        try testing.expectEqual(error.InvalidArgument, err);
+        try testing.expect(std.mem.startsWith(u8, f.diag.message(), "Pub/Sub failed to apply a message transformation"));
+    }
+
+    // Code that does not parse: production's to refuse, when the topic is
+    // made. The emulator keeps it.
+    const broken = f.client.topic(f.id("smt-bad"));
+    try f.topics.append(testing.allocator, broken.id);
+    const unparsed: pubsub.MessageTransform = .{ .kind = .{ .javascript_udf = .{ .function_name = "f", .code = "function f(message, metadata) {" } } };
+    if (broken.create(.{ .message_transforms = &.{unparsed} })) |made| {
+        var m = made;
+        m.deinit();
+        try testing.expect(!f.production);
+    } else |err| {
+        if (!f.production) return f.fail(err);
+        try testing.expectEqual(error.FailedPrecondition, err);
+        try testing.expect(std.mem.startsWith(u8, f.diag.message(), "Provided message transform configuration is invalid"));
+    }
+}
