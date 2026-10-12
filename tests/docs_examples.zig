@@ -800,3 +800,252 @@ test "the import topics guide's code and the tags example, against a scripted tr
     try std.testing.expectEqualStrings("{\"tags\":{\"my-project/env\":\"prod\"}}", (try fake.request(5)).body.?);
     try std.testing.expectEqual(6, fake.requests.items.len);
 }
+
+// snippet: pubsub-fake
+test "a message that is not acknowledged comes again when its lease lapses" {
+    var clock: pubsub.testing.FakeClock = .{};
+    var fake: pubsub.testing.FakePubSub = .init(std.testing.allocator, clock.io(), .{});
+    defer fake.deinit();
+    // Any token: the fake checks none.
+    var token: pubsub.StaticToken = .{ .token = "unchecked" };
+    var client = try pubsub.Client.init(std.testing.allocator, clock.io(), .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+
+    var topic = try client.topic("orders").create(.{});
+    defer topic.deinit();
+    const worker = client.subscription("orders-worker");
+    var made = try worker.create(.{ .topic_id = "orders", .ack_deadline_seconds = 30 });
+    defer made.deinit();
+    var sent = try client.topic("orders").publish(&.{.{ .data = "hello" }}, .{});
+    defer sent.deinit();
+
+    var first = try worker.pull(.{});
+    defer first.deinit();
+    try std.testing.expectEqualStrings("hello", first.value.messages[0].data);
+
+    // Not acknowledged. Half a minute passes on the test's clock, with no
+    // sleep, and the message comes again.
+    clock.now_ns += 31 * std.time.ns_per_s;
+    var again = try worker.pull(.{});
+    defer again.deinit();
+    try std.testing.expectEqualStrings("hello", again.value.messages[0].data);
+    try worker.ack(&.{again.value.messages[0].ack_id});
+    try std.testing.expectEqual(0, fake.backlog("my-project", "orders-worker"));
+}
+// end snippet
+
+// snippet: pubsub-fake-faults
+/// Two refusals, then the publish lands, once: what the caller's retries
+/// are for.
+fn publishThroughAnOutage(fake: *pubsub.testing.FakePubSub, client: *pubsub.Client) !void {
+    fake.refuseNext(2, 503, .publish);
+    var sent = try client.topic("orders").publish(&.{.{ .data = "hello" }}, .{});
+    defer sent.deinit();
+    try std.testing.expectEqual(3, fake.requestCount(.publish));
+    try std.testing.expectEqual(1, fake.publishedCount("my-project", "orders"));
+}
+
+/// The answer is lost and the publish has landed: sent again, the topic
+/// holds the message twice, as production's would.
+fn publishTwice(fake: *pubsub.testing.FakePubSub, client: *pubsub.Client) !void {
+    const before = fake.publishedCount("my-project", "orders");
+    fake.loseAnswers(1, .publish);
+    var sent = try client.topic("orders").publish(&.{.{ .data = "hello" }}, .{});
+    defer sent.deinit();
+    try std.testing.expectEqual(before + 2, fake.publishedCount("my-project", "orders"));
+}
+// end snippet
+
+// snippet: pubsub-fake-state
+/// What production would learn by writing rows, the test says: here,
+/// that the table is gone.
+fn tableGone(fake: *pubsub.testing.FakePubSub, client: *pubsub.Client) !void {
+    var made = try client.subscription("orders-rows").create(.{
+        .topic_id = "orders",
+        .delivery = .{ .bigquery = .{ .table = "my-project.sales.orders" } },
+    });
+    defer made.deinit();
+    fake.setExportState("my-project", "orders-rows", .not_found);
+
+    var read = try client.subscription("orders-rows").get();
+    defer read.deinit();
+    try std.testing.expectEqual(pubsub.ExportState.not_found, read.value.delivery.bigquery.state);
+    try std.testing.expectEqual(.resource_error, read.value.state);
+}
+// end snippet
+
+/// A fake on a clock that stands still, and a production client over it.
+const InMemory = struct {
+    clock: pubsub.testing.FakeClock = .{},
+    fake: pubsub.testing.FakePubSub = undefined,
+    token: pubsub.StaticToken = .{ .token = "none" },
+    client: pubsub.Client = undefined,
+
+    fn init(m: *InMemory) !void {
+        m.fake = .init(std.testing.allocator, m.clock.io(), .{});
+        errdefer m.fake.deinit();
+        m.client = try .init(std.testing.allocator, m.clock.io(), .{
+            .project_id = "my-project",
+            .token_provider = m.token.provider(),
+            .transport = m.fake.transport(),
+        });
+    }
+
+    fn deinit(m: *InMemory) void {
+        m.client.deinit();
+        m.fake.deinit();
+    }
+};
+
+test "the testing guide's code" {
+    var m: InMemory = .{};
+    try m.init();
+    defer m.deinit();
+    var topic = try m.client.topic("orders").create(.{});
+    topic.deinit();
+    try publishThroughAnOutage(&m.fake, &m.client);
+    try publishTwice(&m.fake, &m.client);
+    try std.testing.expectEqual(3, m.fake.publishedCount("my-project", "orders"));
+    try tableGone(&m.fake, &m.client);
+}
+
+test "every Pub/Sub guide's code, against the in-memory Pub/Sub as well" {
+    // Replaying and purging.
+    {
+        var m: InMemory = .{};
+        try m.init();
+        defer m.deinit();
+        const client = &m.client;
+        var topic = try client.topic("orders").create(.{});
+        topic.deinit();
+        for ([_][]const u8{ "orders-worker", "stale-consumer" }) |id| {
+            var sub = try client.subscription(id).create(.{ .topic_id = "orders" });
+            sub.deinit();
+        }
+        var sent = try client.topic("orders").publish(&.{.{ .data = "kept" }}, .{});
+        sent.deinit();
+        try keepBacklog(client);
+        var pulled = try client.subscription("orders-worker").pull(.{});
+        defer pulled.deinit();
+        try client.subscription("orders-worker").ack(&.{pulled.value.messages[0].ack_id});
+        try std.testing.expectEqual(0, m.fake.backlog("my-project", "orders-worker"));
+        // Back to the snapshot: the message is there again.
+        try undoDeploy(client);
+        try std.testing.expectEqual(1, m.fake.backlog("my-project", "orders-worker"));
+        // A purge acknowledges it, and a replay finds nothing kept.
+        try purge(client, m.clock.io());
+        try std.testing.expectEqual(0, m.fake.backlog("my-project", "orders-worker"));
+        try replaySince(client, .{ .nanoseconds = 0 });
+        try std.testing.expectEqual(0, m.fake.backlog("my-project", "orders-worker"));
+        try cutOff(client);
+        var cut = try client.subscription("stale-consumer").get();
+        defer cut.deinit();
+        try std.testing.expect(cut.value.detached);
+    }
+    // Schemas.
+    {
+        var m: InMemory = .{};
+        try m.init();
+        defer m.deinit();
+        const client = &m.client;
+        const v1 = "{\"type\":\"record\",\"name\":\"Order\",\"fields\":[{\"name\":\"id\",\"type\":\"string\"}]}";
+        const v2 = "{\"type\":\"record\",\"name\":\"Order\",\"fields\":[{\"name\":\"id\",\"type\":\"string\"},{\"name\":\"note\",\"type\":\"string\",\"default\":\"\"}]}";
+        try makeOrders(client, v1);
+        try check(client, v1, "{\"id\":\"7\"}");
+        try addField(client, v2);
+        var revisions = try client.schema("order").listRevisions(.{});
+        defer revisions.deinit();
+        try std.testing.expectEqual(2, revisions.value.schemas.len);
+        const bad = revisions.value.schemas[0].revision_id;
+        const good = revisions.value.schemas[1].revision_id;
+        try undo(client, good, bad);
+        var now = try client.schema("order").get(.{});
+        defer now.deinit();
+        try std.testing.expectEqualStrings(v1, now.value.definition);
+        try pin(client, now.value.revision_id);
+
+        var sub = try client.subscription("orders-worker").create(.{ .topic_id = "orders" });
+        sub.deinit();
+        var sent = try client.topic("orders").publish(&.{.{ .data = "{\"id\":\"7\"}" }}, .{});
+        sent.deinit();
+        var pulled = try client.subscription("orders-worker").pull(.{});
+        defer pulled.deinit();
+        var buf: [128]u8 = undefined;
+        var out: std.Io.Writer = .fixed(&buf);
+        try describe(pulled.value.messages[0], &out);
+        var expected: [128]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            try std.fmt.bufPrint(&expected, "projects/my-project/schemas/order revision {s}, as json\n", .{now.value.revision_id}),
+            out.buffered(),
+        );
+        try release(client);
+        var plain = try client.topic("orders").get();
+        defer plain.deinit();
+        try std.testing.expect(plain.value.schema == null);
+    }
+    // Delivery.
+    {
+        var m: InMemory = .{};
+        try m.init();
+        defer m.deinit();
+        const client = &m.client;
+        var topic = try client.topic("orders").create(.{});
+        topic.deinit();
+        try tableOfOrders(client);
+        try pushToWebhook(client);
+        try std.testing.expectError(error.FailedPrecondition, client.subscription("orders-hook").pull(.{ .return_immediately = true }));
+        try pullInstead(client);
+        var empty = try client.subscription("orders-hook").pull(.{ .return_immediately = true });
+        empty.deinit();
+        try moveWebhook(client);
+        var hook = try client.subscription("orders-hook").get();
+        defer hook.deinit();
+        try std.testing.expectEqualStrings("https://shop2.example/pubsub", hook.value.delivery.push.endpoint);
+        var rows = try client.subscription("orders-to-warehouse").get();
+        defer rows.deinit();
+        try std.testing.expectEqual(pubsub.ExportState.active, rows.value.delivery.bigquery.state);
+    }
+    // Message transforms: kept, and run on nothing.
+    {
+        var m: InMemory = .{};
+        try m.init();
+        defer m.deinit();
+        const client = &m.client;
+        const redact_js = "function redact(message, metadata) { return message; }";
+        try redactOrders(client, redact_js);
+        try skipTestOrders(client, "function skipTests(message, metadata) { return null; }");
+        try addStamp(client, redact_js, "function stamp(message, metadata) { return message; }");
+        var topic = try client.topic("orders").get();
+        defer topic.deinit();
+        try std.testing.expectEqual(2, topic.value.message_transforms.len);
+        try std.testing.expect(topic.value.message_transforms[0].disabled);
+        var sent = try client.topic("orders").publish(&.{.{ .data = "a test order" }}, .{});
+        sent.deinit();
+        try std.testing.expectEqual(1, m.fake.backlog("my-project", "orders-billing"));
+        try untransformed(client);
+        var plain = try client.topic("orders").get();
+        defer plain.deinit();
+        try std.testing.expectEqual(0, plain.value.message_transforms.len);
+    }
+    // Import topics, and tags.
+    {
+        var m: InMemory = .{};
+        try m.init();
+        defer m.deinit();
+        const client = &m.client;
+        try importUploads(client);
+        try std.testing.expectEqual(pubsub.IngestionState.active, (try importing(client)).?);
+        m.fake.setIngestionState("my-project", "uploads", .bucket_not_found);
+        try std.testing.expectEqual(pubsub.IngestionState.bucket_not_found, (try importing(client)).?);
+        try importAvro(client);
+        try std.testing.expectEqual(pubsub.IngestionState.active, (try importing(client)).?);
+        try stopImporting(client);
+        try std.testing.expectEqual(null, try importing(client));
+        try makeTagged(client);
+        try std.testing.expectEqualStrings("prod", m.fake.tagValue("projects/my-project/topics/orders", "my-project/env").?);
+    }
+}

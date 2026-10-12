@@ -99,6 +99,19 @@ pub const limits = @import("validate.zig");
 /// way, or to fake the server in your own tests.
 pub const transport = core.transport;
 
+/// What a test of code that uses Pub/Sub can stand on, with no emulator
+/// and no network. **Experimental**: new in 0.37.0, and free to change
+/// between minor versions until it has been used for a while.
+pub const testing = struct {
+    /// Pub/Sub in memory, behind `Client.Options.transport`. It answers
+    /// and refuses as production did when measured, and says so where it
+    /// does not model something.
+    pub const FakePubSub = @import("fake_pubsub.zig").FakePubSub;
+    /// An `Io` whose clock a test moves, for the fake's leases, backoffs
+    /// and retention: nothing lapses until the test says so.
+    pub const FakeClock = core.testing.FakeClock;
+};
+
 test "usage: the spec's example, against a fake server" {
     const std = @import("std");
     const pubsub = @This();
@@ -150,6 +163,8 @@ test {
     _ = @import("errors.zig");
     _ = @import("fake_pubsub.zig");
     _ = @import("fake_filter.zig");
+    _ = @import("emulator_diff.zig");
+    _ = @import("fake_library.zig");
     _ = @import("iam.zig");
     _ = @import("logging.zig");
     _ = @import("rpc.zig");

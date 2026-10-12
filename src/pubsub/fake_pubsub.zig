@@ -6,7 +6,8 @@
 //! from what production did, not from this library's encoder: it parses
 //! request JSON and masks with code of its own, so a body or a mask the
 //! encoder gets wrong is refused or misapplied here as production would.
-//! Test code only.
+//! Exported as `pubsub.testing.FakePubSub`, experimental, for a caller's
+//! own tests: `docs/pubsub/testing.md`.
 //!
 //! What it models:
 //!
@@ -69,7 +70,8 @@
 //!     list and a topic's. One holds what its subscription had not had
 //!     acknowledged, and what its topic is sent after. It lasts seven
 //!     days from the oldest message its subscription has, and outlives
-//!     its subscription and its topic.
+//!     its subscription and its topic. None is taken of a subscription
+//!     whose topic is deleted (measured 2026-10-12).
 //!   - Seek. To a snapshot, the subscription holds again what the
 //!     snapshot holds, through its own filter. To a time, what was
 //!     published before it is acknowledged and what was published from
@@ -2521,6 +2523,10 @@ pub const FakePubSub = struct {
         if (f.snapshots.contains(name)) return alreadyExists(arena, route.id);
         const sub = f.subscriptions.get(of) orelse return notFound(arena, idOf(of));
         if (sub.detached) return detachedRefusal(arena);
+        // Production takes none of a subscription whose topic is gone,
+        // made again under its name or not (measured 2026-10-12). A seek
+        // to one taken before then it still takes.
+        if (sub.topic.deleted) return fail(arena, 400, "FAILED_PRECONDITION", "The operation could not be completed because the requested subscription is attached to a deleted topic.");
 
         // It holds what the subscription has not had acknowledged, and
         // lasts seven days from the oldest message the subscription has:
@@ -8862,6 +8868,59 @@ test "fake property: a filename datetime format is taken or refused as the clien
 
 const client_checks = @import("validate.zig");
 
+test "a topic deleted under a subscription and its snapshot: what production then takes and refuses" {
+    // As production answered on 2026-10-12, step for step
+    // (`production-fake-7.txt`).
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const t = "projects/p/topics/zigps-t";
+    const s = "projects/p/subscriptions/zigps-s";
+    var made = try b.client.topic("zigps-t").create(.{});
+    made.deinit();
+    const sub = b.client.subscription("zigps-s");
+    var made_sub = try sub.create(.{ .topic_id = "zigps-t" });
+    made_sub.deinit();
+    var sent = try b.client.topic("zigps-t").publish(&.{.{ .data = "x1" }}, .{});
+    sent.deinit();
+    try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/snapshots/zigps-na", "{\"subscription\":\"" ++ s ++ "\"}")).status);
+    try b.client.topic("zigps-t").delete();
+
+    // Both read the topic as deleted.
+    const gone_from_sub = "{\"name\":\"projects/p/subscriptions/zigps-s\",\"topic\":\"_deleted-topic_\",\"pushConfig\":{},\"ackDeadlineSeconds\":10,\"messageRetentionDuration\":\"604800s\",\"expirationPolicy\":{\"ttl\":\"2678400s\"},\"state\":\"ACTIVE\"}";
+    const gone_from_snapshot = "{\"name\":\"projects/p/snapshots/zigps-na\",\"topic\":\"_deleted-topic_\",\"expireTime\":\"1970-01-08T00:00:00Z\"}";
+    try testing.expectEqualStrings(gone_from_sub, (try b.raw(a, .GET, s, "")).body);
+    try testing.expectEqualStrings(gone_from_snapshot, (try b.raw(a, .GET, "projects/p/snapshots/zigps-na", "")).body);
+
+    // A snapshot of a subscription whose topic is gone is refused, and
+    // none is made.
+    const attached = "The operation could not be completed because the requested subscription is attached to a deleted topic.";
+    try expectRefused(try b.raw(a, .PUT, "projects/p/snapshots/zigps-nb", "{\"subscription\":\"" ++ s ++ "\"}"), 400, "FAILED_PRECONDITION", attached);
+    try expectRefused(try b.raw(a, .GET, "projects/p/snapshots/zigps-nb", ""), 404, "NOT_FOUND", "Resource not found (resource=zigps-nb).");
+    try testing.expectError(error.FailedPrecondition, b.client.snapshot("zigps-nb").create(.{ .subscription = "zigps-s" }));
+
+    // The subscription still gives what it holds, and still seeks to the
+    // snapshot that was taken of it before: the message comes again.
+    try expectPulled(sub, &.{"x1"}, false);
+    b.advance(11);
+    try testing.expectEqualStrings("{}", (try b.raw(a, .POST, s ++ ":seek", "{\"snapshot\":\"projects/p/snapshots/zigps-na\"}")).body);
+    try expectPulled(sub, &.{"x1"}, false);
+    try expectRefused(try b.raw(a, .POST, s ++ ":seek", "{\"snapshot\":\"projects/p/snapshots/zigps-nb\"}"), 404, "NOT_FOUND", "Resource not found (resource=zigps-nb).");
+
+    // A topic made again under the name is another topic: nothing of the
+    // old one's is its own, and nothing of the above changes.
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/zigps-t\"}", (try b.raw(a, .PUT, t, "{}")).body);
+    try testing.expectEqualStrings(gone_from_sub, (try b.raw(a, .GET, s, "")).body);
+    try testing.expectEqualStrings(gone_from_snapshot, (try b.raw(a, .GET, "projects/p/snapshots/zigps-na", "")).body);
+    try expectRefused(try b.raw(a, .PUT, "projects/p/snapshots/zigps-nc", "{\"subscription\":\"" ++ s ++ "\"}"), 400, "FAILED_PRECONDITION", attached);
+    try testing.expectEqualStrings("{}", (try b.raw(a, .POST, s ++ ":seek", "{\"snapshot\":\"projects/p/snapshots/zigps-na\"}")).body);
+    try testing.expectEqualStrings("{}", (try b.raw(a, .GET, t ++ "/subscriptions", "")).body);
+    try testing.expectEqualStrings("{}", (try b.raw(a, .GET, t ++ "/snapshots", "")).body);
+}
+
 /// A policy's etag, as its JSON has it.
 fn etagOf(a: Allocator, body: []const u8) ![]const u8 {
     const Shape = struct { etag: []const u8 };
@@ -9620,6 +9679,12 @@ fn modelProperty(_: void, input: []const u8) !void {
                 const s = g.intRange(u8, 0, 2);
                 const snapshot = b.client.snapshot(snapshot_ids[slot]);
                 if (ref.taken[slot] != null) try snapshot.delete() else try testing.expectError(error.NotFound, snapshot.delete());
+                ref.taken[slot] = null;
+                // None is taken of a subscription whose topic is gone.
+                if (ref.on[s].made != ref.made[ref.on[s].topic]) {
+                    try testing.expectError(error.FailedPrecondition, snapshot.create(.{ .subscription = sub_ids[s] }));
+                    continue;
+                }
                 var made = try snapshot.create(.{ .subscription = sub_ids[s] });
                 made.deinit();
                 ref.take(slot, s);

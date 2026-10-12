@@ -1062,7 +1062,7 @@ const TransportError = core.transport.Error;
 const Request = core.transport.Request;
 const Response = core.transport.Response;
 
-const FakePubSub = struct {
+const FakeSubscription = struct {
     gpa: Allocator,
     io: std.Io,
     mutex: std.Io.Mutex = .init,
@@ -1158,11 +1158,11 @@ const FakePubSub = struct {
     };
     const Modack = struct { ack_id: []u8, seconds: u32 };
 
-    fn init(gpa: Allocator, io: std.Io) FakePubSub {
+    fn init(gpa: Allocator, io: std.Io) FakeSubscription {
         return .{ .gpa = gpa, .io = io };
     }
 
-    fn deinit(f: *FakePubSub) void {
+    fn deinit(f: *FakeSubscription) void {
         for (f.pending.items) |m| {
             f.gpa.free(m.data);
             f.gpa.free(m.ack_id);
@@ -1190,12 +1190,12 @@ const FakePubSub = struct {
         f.* = undefined;
     }
 
-    fn transport(f: *FakePubSub) Transport {
+    fn transport(f: *FakeSubscription) Transport {
         return .{ .ptr = f, .vtable = &.{ .send = send } };
     }
 
     /// Makes a message available for the next pull.
-    fn publish(f: *FakePubSub, data: []const u8) !void {
+    fn publish(f: *FakeSubscription, data: []const u8) !void {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         try f.log.ensureUnusedCapacity(f.gpa, 1);
@@ -1216,7 +1216,7 @@ const FakePubSub = struct {
     /// new ack id, whether it was acknowledged, out on a lease or still
     /// waiting, and every ack id handed out before is stale. Applied at
     /// once, where production took 2 to 50 seconds.
-    fn seekBack(f: *FakePubSub) !void {
+    fn seekBack(f: *FakeSubscription) !void {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         try f.forgetDeliveries();
@@ -1234,7 +1234,7 @@ const FakePubSub = struct {
     /// A seek ahead of everything: what waits is dropped, and what is out
     /// on a lease is acknowledged by the seek, its ack id stale. What is
     /// published afterwards is delivered: a seek is no standing filter.
-    fn seekAhead(f: *FakePubSub) !void {
+    fn seekAhead(f: *FakeSubscription) !void {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         try f.forgetDeliveries();
@@ -1242,7 +1242,7 @@ const FakePubSub = struct {
 
     /// Drops the backlog, and makes every lease's ack id stale. The caller
     /// holds the mutex.
-    fn forgetDeliveries(f: *FakePubSub) !void {
+    fn forgetDeliveries(f: *FakeSubscription) !void {
         try f.stale.ensureUnusedCapacity(f.gpa, f.leased.count());
         for (f.pending.items) |m| {
             f.gpa.free(m.data);
@@ -1258,7 +1258,7 @@ const FakePubSub = struct {
         f.leased.clearRetainingCapacity();
     }
 
-    fn isStale(f: *const FakePubSub, id: []const u8) bool {
+    fn isStale(f: *const FakeSubscription, id: []const u8) bool {
         for (f.stale.items) |stale_id| {
             if (std.mem.eql(u8, stale_id, id)) return true;
         }
@@ -1267,14 +1267,14 @@ const FakePubSub = struct {
 
     /// Detaches the subscription: from now on a pull, a held one included,
     /// an ack and a lease change are refused.
-    fn detach(f: *FakePubSub) void {
+    fn detach(f: *FakeSubscription) void {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         f.detached = true;
         f.cond.broadcast(f.io);
     }
 
-    fn isDetached(f: *FakePubSub) bool {
+    fn isDetached(f: *FakeSubscription) bool {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         return f.detached;
@@ -1282,20 +1282,20 @@ const FakePubSub = struct {
 
     /// How many acknowledgements took a message off the backlog: an ack
     /// with a stale id is taken, and takes none.
-    fn ackedMessages(f: *FakePubSub) usize {
+    fn ackedMessages(f: *FakeSubscription) usize {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         return f.acked_data.items.len;
     }
 
-    fn backlog(f: *FakePubSub) usize {
+    fn backlog(f: *FakeSubscription) usize {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         return f.pending.items.len + f.leased.count();
     }
 
     /// How many times `ack_id` was released (a lease set to 0 seconds).
-    fn releases(f: *FakePubSub, ack_id: []const u8) usize {
+    fn releases(f: *FakeSubscription, ack_id: []const u8) usize {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         var n: usize = 0;
@@ -1306,7 +1306,7 @@ const FakePubSub = struct {
     }
 
     /// How many leases were extended (a nonzero deadline).
-    fn extensions(f: *FakePubSub) usize {
+    fn extensions(f: *FakeSubscription) usize {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         var n: usize = 0;
@@ -1316,20 +1316,20 @@ const FakePubSub = struct {
         return n;
     }
 
-    fn heldAcks(f: *FakePubSub) usize {
+    fn heldAcks(f: *FakeSubscription) usize {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         return f.held_acks;
     }
 
-    fn ackedCount(f: *FakePubSub) usize {
+    fn ackedCount(f: *FakeSubscription) usize {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         return f.acked.items.len;
     }
 
     fn send(ptr: *anyopaque, req: Request, arena: Allocator) TransportError!Response {
-        const f: *FakePubSub = @ptrCast(@alignCast(ptr));
+        const f: *FakeSubscription = @ptrCast(@alignCast(ptr));
         const settles = std.mem.endsWith(u8, req.url, ":pull") or std.mem.endsWith(u8, req.url, ":acknowledge") or
             std.mem.endsWith(u8, req.url, ":modifyAckDeadline");
         if (settles and f.isDetached()) return detached_reply;
@@ -1356,11 +1356,11 @@ const FakePubSub = struct {
             );
             return .{ .status = 200, .body = body };
         }
-        return .{ .status = 404, .body = "no such route in FakePubSub" };
+        return .{ .status = 404, .body = "no such route in FakeSubscription" };
     }
 
     /// Uses up one of `counter`, under the mutex, if any is left.
-    fn take(f: *FakePubSub, counter: *usize) bool {
+    fn take(f: *FakeSubscription, counter: *usize) bool {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         if (counter.* == 0) return false;
@@ -1368,7 +1368,7 @@ const FakePubSub = struct {
         return true;
     }
 
-    fn failure(f: *FakePubSub, arena: Allocator) TransportError!Response {
+    fn failure(f: *FakeSubscription, arena: Allocator) TransportError!Response {
         const status: []const u8 = if (f.fail_status == 404) "NOT_FOUND" else "UNAVAILABLE";
         const body = try arena.print(
             "{{\"error\":{{\"code\":{d},\"message\":\"scripted failure\",\"status\":\"{s}\"}}}}",
@@ -1377,7 +1377,7 @@ const FakePubSub = struct {
         return .{ .status = f.fail_status, .body = body };
     }
 
-    fn pull(f: *FakePubSub, req: Request, arena: Allocator) TransportError!Response {
+    fn pull(f: *FakeSubscription, req: Request, arena: Allocator) TransportError!Response {
         const Body = struct { maxMessages: u32 = 0 };
         const wanted = std.json.parseFromSliceLeaky(Body, arena, req.body orelse "{}", .{
             .ignore_unknown_fields = true,
@@ -1458,7 +1458,7 @@ const FakePubSub = struct {
         }) catch error.HttpProtocolError;
     }
 
-    fn acknowledge(f: *FakePubSub, req: Request, arena: Allocator) TransportError!Response {
+    fn acknowledge(f: *FakeSubscription, req: Request, arena: Allocator) TransportError!Response {
         const body = try parseIds(req, arena);
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
@@ -1488,7 +1488,7 @@ const FakePubSub = struct {
 
     /// As production answers on an exactly-once subscription. The caller
     /// holds the mutex.
-    fn acknowledgeExactlyOnce(f: *FakePubSub, ids: []const []const u8, arena: Allocator) TransportError!Response {
+    fn acknowledgeExactlyOnce(f: *FakeSubscription, ids: []const []const u8, arena: Allocator) TransportError!Response {
         try f.sweep();
         if (f.transient_acks > 0) {
             f.transient_acks -= 1;
@@ -1517,7 +1517,7 @@ const FakePubSub = struct {
         return .{ .status = 200, .body = "{}" };
     }
 
-    fn wasAcked(f: *const FakePubSub, id: []const u8) bool {
+    fn wasAcked(f: *const FakeSubscription, id: []const u8) bool {
         for (f.acked.items) |acked| {
             if (std.mem.eql(u8, acked, id)) return true;
         }
@@ -1556,13 +1556,13 @@ const FakePubSub = struct {
         return .{ .status = status, .body = out.written() };
     }
 
-    fn nowMs(f: *const FakePubSub) i64 {
+    fn nowMs(f: *const FakeSubscription) i64 {
         return std.Io.Clock.awake.now(f.io).toMilliseconds();
     }
 
     /// Puts a leased message back on the backlog under a new ack id: the
     /// old one is gone for good. The caller holds the mutex.
-    fn lapse(f: *FakePubSub, id: []const u8) !void {
+    fn lapse(f: *FakeSubscription, id: []const u8) !void {
         const entry = f.leased.fetchRemove(id) orelse return;
         f.gpa.free(entry.value.ack_id);
         const fresh = try f.gpa.print("ack-{d}", .{f.next_id});
@@ -1573,7 +1573,7 @@ const FakePubSub = struct {
 
     /// Lapses every lease now, whatever its time: each message comes again
     /// under a new ack id.
-    fn lapseAll(f: *FakePubSub) !void {
+    fn lapseAll(f: *FakeSubscription) !void {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         while (f.leased.count() > 0) {
@@ -1584,7 +1584,7 @@ const FakePubSub = struct {
 
     /// Lapses every exactly-once lease whose time is up. The caller holds
     /// the mutex.
-    fn sweep(f: *FakePubSub) !void {
+    fn sweep(f: *FakeSubscription) !void {
         if (!f.exactly_once) return;
         const now = f.nowMs();
         while (true) {
@@ -1596,7 +1596,7 @@ const FakePubSub = struct {
         }
     }
 
-    fn modifyAckDeadline(f: *FakePubSub, req: Request, arena: Allocator) TransportError!Response {
+    fn modifyAckDeadline(f: *FakeSubscription, req: Request, arena: Allocator) TransportError!Response {
         const body = try parseIds(req, arena);
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
@@ -1620,7 +1620,7 @@ const FakePubSub = struct {
     /// As production answers on an exactly-once subscription: a lapsed,
     /// unknown or acknowledged id is refused, a live one extended or
     /// released. The caller holds the mutex.
-    fn modifyExactlyOnce(f: *FakePubSub, body: AckBody, arena: Allocator) TransportError!Response {
+    fn modifyExactlyOnce(f: *FakeSubscription, body: AckBody, arena: Allocator) TransportError!Response {
         try f.sweep();
         for (body.ackIds) |id| try f.modacks.append(f.gpa, .{ .ack_id = try f.gpa.dupe(u8, id), .seconds = body.ackDeadlineSeconds });
         if (f.refuse_modacks > 0) {
@@ -1646,7 +1646,7 @@ const FakePubSub = struct {
     }
 
     /// How many modifyAckDeadline entries asked for `seconds`.
-    fn modacksOf(f: *FakePubSub, seconds: u32) usize {
+    fn modacksOf(f: *FakeSubscription, seconds: u32) usize {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         var n: usize = 0;
@@ -1657,7 +1657,7 @@ const FakePubSub = struct {
     }
 
     /// Whether any acknowledge request carried `ack_id`.
-    fn ackAttempted(f: *FakePubSub, ack_id: []const u8) bool {
+    fn ackAttempted(f: *FakeSubscription, ack_id: []const u8) bool {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         for (f.ack_attempts.items) |id| {
@@ -1667,7 +1667,7 @@ const FakePubSub = struct {
     }
 
     /// How many messages acknowledged held `data`.
-    fn ackedData(f: *FakePubSub, data: []const u8) usize {
+    fn ackedData(f: *FakeSubscription, data: []const u8) usize {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         var n: usize = 0;
@@ -1786,9 +1786,9 @@ const TestHandler = struct {
     }
 };
 
-/// A subscriber wired to a `FakePubSub`, with fast retries and ticks.
+/// A subscriber wired to a `FakeSubscription`, with fast retries and ticks.
 const Harness = struct {
-    fake: FakePubSub,
+    fake: FakeSubscription,
     handler: TestHandler,
     subscriber: Subscriber,
 
@@ -2150,7 +2150,7 @@ test "Subscriber: acknowledgements go out promptly, not at the lease tick" {
     try h.fake.publish("prompt");
     var running = try testing.io.concurrent(Subscriber.run, .{ &h.subscriber, h.handler.handler() });
     const Acked = struct {
-        fn one(f: *FakePubSub) bool {
+        fn one(f: *FakeSubscription) bool {
             return f.ackedCount() >= 1;
         }
     };
@@ -2174,7 +2174,7 @@ test "Subscriber: an ack refused for now is sent again later, and given up at th
         try h.fake.publish("eventually");
         var running = try testing.io.concurrent(Subscriber.run, .{ &h.subscriber, h.handler.handler() });
         const Acked = struct {
-            fn one(f: *FakePubSub) bool {
+            fn one(f: *FakeSubscription) bool {
                 return f.ackedCount() >= 1;
             }
         };
@@ -2275,7 +2275,7 @@ test "Subscriber: the last flush sends acknowledgements still backing off" {
     try h.fake.publish("backing off");
     var running = try testing.io.concurrent(Subscriber.run, .{ &h.subscriber, h.handler.handler() });
     const Refused = struct {
-        fn once(f: *FakePubSub) bool {
+        fn once(f: *FakeSubscription) bool {
             f.mutex.lockUncancelable(testing.io);
             defer f.mutex.unlock(testing.io);
             return f.ack_calls >= 1;
@@ -2324,7 +2324,7 @@ test "Subscriber: requests that get no answer are tried again later, and nothing
     try h.fake.publish("unanswered");
     var running = try testing.io.concurrent(Subscriber.run, .{ &h.subscriber, h.handler.handler() });
     const Acked = struct {
-        fn one(f: *FakePubSub) bool {
+        fn one(f: *FakeSubscription) bool {
             return f.ackedCount() >= 1;
         }
     };
@@ -2732,7 +2732,7 @@ test "Subscriber: stop returns when the janitor is canceled in the middle of a f
         fn hasReturned(returned: *std.atomic.Value(bool)) bool {
             return returned.load(.acquire);
         }
-        fn ackHeld(fake: *FakePubSub) bool {
+        fn ackHeld(fake: *FakeSubscription) bool {
             return fake.heldAcks() > 0;
         }
     };
@@ -2775,7 +2775,7 @@ test "Subscriber: halt ends the janitor and the puller without any cancel" {
         fn hasReturned(returned: *std.atomic.Value(bool)) bool {
             return returned.load(.acquire);
         }
-        fn pullStarted(fake: *FakePubSub) bool {
+        fn pullStarted(fake: *FakeSubscription) bool {
             fake.mutex.lockUncancelable(fake.io);
             defer fake.mutex.unlock(fake.io);
             return fake.pull_wants.items.len > 0;
@@ -2934,7 +2934,7 @@ test "acks put back keep room for every message in flight" {
 test "acks put back without memory are given up and counted, not lost quietly" {
     const io = testing.io;
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
-    var fake: FakePubSub = .init(testing.allocator, io);
+    var fake: FakeSubscription = .init(testing.allocator, io);
     defer fake.deinit();
     var subscriber: Subscriber = try .init(failing.allocator(), io, .{
         .subscription_id = "worker",
@@ -2998,7 +2998,7 @@ test "run: an Io without concurrency is refused with a word" {
             return .{ .userdata = testing.io.userdata, .vtable = &vtable };
         }
     };
-    var fake: FakePubSub = .init(testing.allocator, testing.io);
+    var fake: FakeSubscription = .init(testing.allocator, testing.io);
     defer fake.deinit();
     var diag: Diagnostics = .{};
     var subscriber: Subscriber = try .init(testing.allocator, Refused.io(), .{
@@ -3043,7 +3043,7 @@ test "run: a janitor that cannot start takes the puller down with it" {
         }
     };
     JanitorRefused.spawned = 0;
-    var fake: FakePubSub = .init(testing.allocator, testing.io);
+    var fake: FakeSubscription = .init(testing.allocator, testing.io);
     defer fake.deinit();
     var diag: Diagnostics = .{};
     var subscriber: Subscriber = try .init(testing.allocator, JanitorRefused.io(), .{
@@ -3076,7 +3076,7 @@ test "run: workers that cannot start stop the subscriber cleanly" {
             return .{ .userdata = testing.io.userdata, .vtable = &vtable };
         }
     };
-    var fake: FakePubSub = .init(testing.allocator, testing.io);
+    var fake: FakeSubscription = .init(testing.allocator, testing.io);
     defer fake.deinit();
     var diag: Diagnostics = .{};
     var subscriber: Subscriber = try .init(testing.allocator, GroupsRefused.io(), .{
@@ -3114,7 +3114,7 @@ test "dispatch: every allocation failure is OutOfMemory, and no message leaks" {
     const Run = struct {
         fn run(gpa: Allocator) !void {
             const io = testing.io;
-            var fake: FakePubSub = .init(testing.allocator, io);
+            var fake: FakeSubscription = .init(testing.allocator, io);
             defer fake.deinit();
             try fake.publish("a");
             try fake.publish("b");
