@@ -504,6 +504,7 @@ pub fn topicConfig(config: types.TopicConfig, diag: ?*Diagnostics) error{Invalid
     if (config.message_storage_policy) |p| try storagePolicy(p, diag);
     if (config.schema) |s| try schemaSettings(s, diag);
     try messageTransforms(config.message_transforms, diag);
+    if (config.ingestion) |i| try ingestion(i, diag);
 }
 
 /// A subscription update: something to change, and every new value valid.
@@ -565,9 +566,13 @@ pub fn topicUpdate(u: types.TopicUpdate, diag: ?*Diagnostics) error{InvalidArgum
         else => {},
     }
     if (u.message_transforms) |list| try messageTransforms(list, diag);
+    switch (u.ingestion) {
+        .set => |i| try ingestion(i, diag),
+        else => {},
+    }
     const changes_something = u.labels != null or u.message_retention != .keep or
         u.kms_key_name != .keep or u.message_storage_policy != .keep or u.schema != .keep or
-        u.message_transforms != null;
+        u.message_transforms != null or u.ingestion != .keep;
     if (!changes_something) return refuse(diag, "the update changes nothing", .{});
 }
 
@@ -609,6 +614,86 @@ pub fn messageTransforms(list: []const types.MessageTransform, diag: ?*Diagnosti
     if (enabled > max_enabled_message_transforms) {
         return refuse(diag, "{d} message transforms are not disabled; the limit is {d}", .{ enabled, max_enabled_message_transforms });
     }
+}
+
+/// An import topic's settings: every field its source requires is there
+/// and is UTF-8, an ARN begins `arn:`, a service account has the shape of
+/// an address, a text delimiter is one byte, and the severity is one this
+/// client can name. Production
+/// then connects to the source and says what it found; an emulator keeps
+/// whatever it is given.
+pub fn ingestion(i: types.Ingestion, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    if (i.log_severity == .unknown) return refuse(diag, "the log severity is .unknown, which is only ever read", .{});
+    switch (i.source) {
+        .aws_kinesis => |k| {
+            try arn(k.stream_arn, "the Kinesis stream ARN", diag);
+            try arn(k.consumer_arn, "the Kinesis consumer ARN", diag);
+            try arn(k.aws_role_arn, "the AWS role ARN", diag);
+            try serviceAccount(k.gcp_service_account, "the import topic's service account", diag);
+        },
+        .cloud_storage => |s| {
+            try required(s.bucket, "the import topic's bucket", diag);
+            // Production takes `gs://` before the name, and reads the
+            // name back without it. A path after the name it refuses
+            // ("not a valid resource name"), where an emulator keeps it
+            // (measured 2026-10-12).
+            const name = if (std.mem.startsWith(u8, s.bucket, "gs://")) s.bucket["gs://".len..] else s.bucket;
+            if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) {
+                return refuse(diag, "the import topic's bucket is not a bucket's name alone: it holds a slash, or nothing after gs://", .{});
+            }
+            switch (s.format) {
+                // Production takes one byte and no more: a bar, a tab,
+                // even NUL, and neither `é` nor `\r\n` (measured
+                // 2026-10-12). An emulator takes one character of any
+                // width, so this is checked here.
+                .text => |t| if (t.delimiter.len != 1 or t.delimiter[0] > 0x7f) {
+                    return refuse(diag, "the text delimiter is not one character of one byte", .{});
+                },
+                .avro, .pubsub_avro => {},
+            }
+            if (s.minimum_object_create_time) |t| {
+                if (!timestamp.inRange(t)) {
+                    return refuse(diag, "the minimum object create time is outside 0001-01-01T00:00:00Z to 9999-12-31T23:59:59.999999999Z", .{});
+                }
+            }
+            if (!std.unicode.utf8ValidateSlice(s.match_glob)) return refuse(diag, "the match glob is not valid UTF-8", .{});
+        },
+        .azure_event_hubs => |e| {
+            try required(e.resource_group, "the Event Hubs resource group", diag);
+            try required(e.namespace, "the Event Hubs namespace", diag);
+            try required(e.event_hub, "the event hub", diag);
+            try required(e.client_id, "the Event Hubs client id", diag);
+            try required(e.tenant_id, "the Event Hubs tenant id", diag);
+            try required(e.subscription_id, "the Event Hubs subscription id", diag);
+            try serviceAccount(e.gcp_service_account, "the import topic's service account", diag);
+        },
+        .aws_msk => |m| {
+            try arn(m.cluster_arn, "the MSK cluster ARN", diag);
+            try required(m.topic, "the MSK topic", diag);
+            try arn(m.aws_role_arn, "the AWS role ARN", diag);
+            try serviceAccount(m.gcp_service_account, "the import topic's service account", diag);
+        },
+        .confluent_cloud => |c| {
+            try required(c.bootstrap_server, "the Confluent Cloud bootstrap server", diag);
+            try required(c.cluster_id, "the Confluent Cloud cluster id", diag);
+            try required(c.topic, "the Confluent Cloud topic", diag);
+            try required(c.identity_pool_id, "the Confluent Cloud identity pool id", diag);
+            try serviceAccount(c.gcp_service_account, "the import topic's service account", diag);
+        },
+    }
+}
+
+/// A field that must be there, and be UTF-8.
+fn required(text: []const u8, comptime what: []const u8, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    if (text.len == 0) return refuse(diag, what ++ " is empty", .{});
+    if (!std.unicode.utf8ValidateSlice(text)) return refuse(diag, what ++ " is not valid UTF-8", .{});
+}
+
+/// An Amazon resource name: there, UTF-8, and beginning `arn:`. The rest
+/// is AWS's to judge, which production asks when the topic is made.
+fn arn(text: []const u8, comptime what: []const u8, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    try required(text, what, diag);
+    if (!std.mem.startsWith(u8, text, "arn:")) return refuse(diag, what ++ " does not begin arn:", .{});
 }
 
 /// A topic's schema settings: a schema named by its id or in full, with no
@@ -1405,4 +1490,153 @@ test "message transforms: how many run, each function's name and code, and no ki
     seven[5].disabled = false;
     try testing.expectError(error.InvalidArgument, subscriptionUpdate(.{ .message_transforms = seven[1..7] }, false, &d));
     try testing.expectEqualStrings("6 message transforms are not disabled; the limit is 5", d.message());
+}
+
+test "an import topic's settings: each source's required fields, ARNs, a service account's shape, and a severity this client can name" {
+    var d: Diagnostics = .{};
+    const account = "importer@my-project.iam.gserviceaccount.com";
+    const kinesis: types.AwsKinesis = .{
+        .stream_arn = "arn:aws:kinesis:us-east-1:111111111111:stream/orders",
+        .consumer_arn = "arn:aws:kinesis:us-east-1:111111111111:stream/orders/consumer/c:1",
+        .aws_role_arn = "arn:aws:iam::111111111111:role/pubsub",
+        .gcp_service_account = account,
+    };
+    const hubs: types.AzureEventHubs = .{
+        .resource_group = "rg",
+        .namespace = "ns",
+        .event_hub = "eh",
+        .client_id = "11111111-1111-1111-1111-111111111111",
+        .tenant_id = "22222222-2222-2222-2222-222222222222",
+        .subscription_id = "33333333-3333-3333-3333-333333333333",
+        .gcp_service_account = account,
+    };
+    const msk: types.AwsMsk = .{
+        .cluster_arn = "arn:aws:kafka:us-east-1:111111111111:cluster/orders/abc",
+        .topic = "orders",
+        .aws_role_arn = "arn:aws:iam::111111111111:role/pubsub",
+        .gcp_service_account = account,
+    };
+    const confluent: types.ConfluentCloud = .{
+        .bootstrap_server = "pkc-xxxx.us-east-1.aws.confluent.cloud:9092",
+        .cluster_id = "lkc-xxxx",
+        .topic = "orders",
+        .identity_pool_id = "pool-xxxx",
+        .gcp_service_account = account,
+    };
+    try ingestion(.{ .source = .{ .aws_kinesis = kinesis } }, &d);
+    try ingestion(.{ .source = .{ .azure_event_hubs = hubs }, .log_severity = .debug }, &d);
+    try ingestion(.{ .source = .{ .aws_msk = msk }, .log_severity = .info }, &d);
+    try ingestion(.{ .source = .{ .confluent_cloud = confluent }, .log_severity = .@"error" }, &d);
+    try ingestion(.{ .source = .{ .cloud_storage = .{ .bucket = "my-uploads" } }, .log_severity = .warning }, &d);
+    // Production takes a bucket written with gs:// before it (measured
+    // 2026-10-12), unlike a Cloud Storage subscription's.
+    try ingestion(.{ .source = .{ .cloud_storage = .{
+        .bucket = "gs://my-uploads",
+        .format = .{ .text = .{ .delimiter = "\t" } },
+        .minimum_object_create_time = .{ .nanoseconds = 0 },
+        .match_glob = "logs/**.txt",
+    } } }, &d);
+    try ingestion(.{ .source = .{ .cloud_storage = .{ .bucket = "b", .format = .avro } } }, &d);
+    try ingestion(.{ .source = .{ .cloud_storage = .{ .bucket = "b", .format = .pubsub_avro } } }, &d);
+
+    // Every field of every source, left out and not UTF-8, by name.
+    inline for (.{
+        .{ kinesis, "aws_kinesis", .{
+            .{ "stream_arn", "the Kinesis stream ARN" },
+            .{ "consumer_arn", "the Kinesis consumer ARN" },
+            .{ "aws_role_arn", "the AWS role ARN" },
+        } },
+        .{ hubs, "azure_event_hubs", .{
+            .{ "resource_group", "the Event Hubs resource group" },
+            .{ "namespace", "the Event Hubs namespace" },
+            .{ "event_hub", "the event hub" },
+            .{ "client_id", "the Event Hubs client id" },
+            .{ "tenant_id", "the Event Hubs tenant id" },
+            .{ "subscription_id", "the Event Hubs subscription id" },
+        } },
+        .{ msk, "aws_msk", .{
+            .{ "cluster_arn", "the MSK cluster ARN" },
+            .{ "topic", "the MSK topic" },
+            .{ "aws_role_arn", "the AWS role ARN" },
+        } },
+        .{ confluent, "confluent_cloud", .{
+            .{ "bootstrap_server", "the Confluent Cloud bootstrap server" },
+            .{ "cluster_id", "the Confluent Cloud cluster id" },
+            .{ "topic", "the Confluent Cloud topic" },
+            .{ "identity_pool_id", "the Confluent Cloud identity pool id" },
+        } },
+    }) |case| {
+        const good, const tag, const fields = case;
+        inline for (fields) |field| {
+            const name, const what = field;
+            var missing = good;
+            @field(missing, name) = "";
+            try testing.expectError(error.InvalidArgument, ingestion(.{ .source = @unionInit(types.Ingestion.Source, tag, missing) }, &d));
+            try testing.expectEqualStrings(what ++ " is empty", d.message());
+            var garbled = good;
+            @field(garbled, name) = "arn:\xff";
+            try testing.expectError(error.InvalidArgument, ingestion(.{ .source = @unionInit(types.Ingestion.Source, tag, garbled) }, &d));
+            try testing.expectEqualStrings(what ++ " is not valid UTF-8", d.message());
+            // An ARN begins arn:, and nothing else is asked of it here.
+            var plain = good;
+            @field(plain, name) = "orders";
+            const verdict = ingestion(.{ .source = @unionInit(types.Ingestion.Source, tag, plain) }, &d);
+            if (comptime std.mem.endsWith(u8, name, "_arn")) {
+                try testing.expectError(error.InvalidArgument, verdict);
+                try testing.expectEqualStrings(what ++ " does not begin arn:", d.message());
+            } else try verdict;
+        }
+        // Each source's service account has the shape of an address.
+        var unaddressed = good;
+        unaddressed.gcp_service_account = "importer";
+        try testing.expectError(error.InvalidArgument, ingestion(.{ .source = @unionInit(types.Ingestion.Source, tag, unaddressed) }, &d));
+        try testing.expectEqualStrings("the import topic's service account is not of the shape of an address", d.message());
+    }
+    var short = kinesis;
+    short.stream_arn = "arn";
+    try testing.expectError(error.InvalidArgument, ingestion(.{ .source = .{ .aws_kinesis = short } }, &d));
+    short.stream_arn = "ARN:aws:kinesis";
+    try testing.expectError(error.InvalidArgument, ingestion(.{ .source = .{ .aws_kinesis = short } }, &d));
+    short.stream_arn = "arn:";
+    try ingestion(.{ .source = .{ .aws_kinesis = short } }, &d);
+
+    // A bucket: a name that is there, a delimiter of one byte, a time a
+    // timestamp can hold, and a glob that is UTF-8.
+    try testing.expectError(error.InvalidArgument, ingestion(.{ .source = .{ .cloud_storage = .{ .bucket = "" } } }, &d));
+    try testing.expectEqualStrings("the import topic's bucket is empty", d.message());
+    try testing.expectError(error.InvalidArgument, ingestion(.{ .source = .{ .cloud_storage = .{ .bucket = "b\xff" } } }, &d));
+    try testing.expectEqualStrings("the import topic's bucket is not valid UTF-8", d.message());
+    for ([_][]const u8{ "my-uploads/logs", "gs://my-uploads/logs", "gs://my-uploads/", "gs://", "/my-uploads", "gs:/my-uploads" }) |bucket| {
+        try testing.expectError(error.InvalidArgument, ingestion(.{ .source = .{ .cloud_storage = .{ .bucket = bucket } } }, &d));
+        try testing.expectEqualStrings("the import topic's bucket is not a bucket's name alone: it holds a slash, or nothing after gs://", d.message());
+    }
+    try ingestion(.{ .source = .{ .cloud_storage = .{ .bucket = "gs:my-uploads" } } }, &d);
+    // Production's verdict on each of these, 2026-10-12, but for the two
+    // of invalid UTF-8, which no request can carry.
+    for ([_][]const u8{ "\n", "|", "\t", "\r", "\x00", "\x7f" }) |delimiter| {
+        try ingestion(.{ .source = .{ .cloud_storage = .{ .bucket = "b", .format = .{ .text = .{ .delimiter = delimiter } } } } }, &d);
+    }
+    for ([_][]const u8{ "", "\r\n", "||", "\u{e9}", "\u{20ac}", "\x80", "\xc3" }) |delimiter| {
+        try testing.expectError(error.InvalidArgument, ingestion(.{ .source = .{ .cloud_storage = .{ .bucket = "b", .format = .{ .text = .{ .delimiter = delimiter } } } } }, &d));
+        try testing.expectEqualStrings("the text delimiter is not one character of one byte", d.message());
+    }
+    const last: std.Io.Timestamp = try timestamp.parse("9999-12-31T23:59:59.999999999Z");
+    try ingestion(.{ .source = .{ .cloud_storage = .{ .bucket = "b", .minimum_object_create_time = last } } }, &d);
+    try testing.expectError(error.InvalidArgument, ingestion(.{ .source = .{ .cloud_storage = .{ .bucket = "b", .minimum_object_create_time = .{ .nanoseconds = last.nanoseconds + 1 } } } }, &d));
+    try testing.expectEqualStrings("the minimum object create time is outside 0001-01-01T00:00:00Z to 9999-12-31T23:59:59.999999999Z", d.message());
+    try testing.expectError(error.InvalidArgument, ingestion(.{ .source = .{ .cloud_storage = .{ .bucket = "b", .match_glob = "\xff" } } }, &d));
+    try testing.expectEqualStrings("the match glob is not valid UTF-8", d.message());
+
+    // A severity that is only ever read, whatever the source.
+    try testing.expectError(error.InvalidArgument, ingestion(.{ .source = .{ .aws_kinesis = kinesis }, .log_severity = .unknown }, &d));
+    try testing.expectEqualStrings("the log severity is .unknown, which is only ever read", d.message());
+
+    // Through a topic's settings and an update, where a clear is a change.
+    try topicConfig(.{ .ingestion = .{ .source = .{ .aws_kinesis = kinesis } } }, &d);
+    try topicUpdate(.{ .ingestion = .{ .set = .{ .source = .{ .aws_msk = msk } } } }, &d);
+    try topicUpdate(.{ .ingestion = .clear }, &d);
+    try testing.expectError(error.InvalidArgument, topicConfig(.{ .ingestion = .{ .source = .{ .cloud_storage = .{ .bucket = "" } } } }, &d));
+    try testing.expectError(error.InvalidArgument, topicUpdate(.{ .ingestion = .{ .set = .{ .source = .{ .aws_kinesis = short }, .log_severity = .unknown } } }, &d));
+    try testing.expectError(error.InvalidArgument, topicUpdate(.{}, &d));
+    try testing.expectEqualStrings("the update changes nothing", d.message());
 }

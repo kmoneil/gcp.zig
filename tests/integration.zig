@@ -2922,3 +2922,162 @@ test "message transforms: production rewrites, drops and refuses with them, and 
         try testing.expect(std.mem.startsWith(u8, f.diag.message(), "Provided message transform configuration is invalid"));
     }
 }
+
+// Import topics. Production connects to the source when the topic is made
+// and refuses what it cannot reach; the emulator keeps whatever it is
+// given, reports no state and imports nothing (emulator 0.8.36,
+// 2026-10-12). No account on another cloud is used: in production the
+// four sources there are tested to their refusals.
+
+fn expectSameSource(want: pubsub.Ingestion.Source, have: pubsub.Ingestion.Source) !void {
+    try testing.expectEqual(std.meta.activeTag(want), std.meta.activeTag(have));
+    switch (want) {
+        .cloud_storage => |w| {
+            const h = have.cloud_storage;
+            try testing.expectEqualStrings(w.bucket, h.bucket);
+            try testing.expectEqual(std.meta.activeTag(w.format), std.meta.activeTag(h.format));
+            if (w.format == .text) try testing.expectEqualStrings(w.format.text.delimiter, h.format.text.delimiter);
+            try testing.expectEqual(w.minimum_object_create_time, h.minimum_object_create_time);
+            try testing.expectEqualStrings(w.match_glob, h.match_glob);
+        },
+        inline else => |w, tag| {
+            const h = @field(have, @tagName(tag));
+            inline for (@typeInfo(@TypeOf(w)).@"struct".field_names) |name| {
+                try testing.expectEqualStrings(@field(w, name), @field(h, name));
+            }
+        },
+    }
+}
+
+test "import topics: each source is kept and read back by the emulator, and refused by production, which cannot reach a made-up one" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const a = f.arena.allocator();
+    // The caller must be able to act as the account: in production, the
+    // test's own.
+    const account = try a.print("zig-gcp@{s}.iam.gserviceaccount.com", .{f.client.project_id});
+    const cases = [_]struct { []const u8, pubsub.Ingestion.Source, anyerror, []const u8 }{
+        .{ "imp-kinesis", .{ .aws_kinesis = .{
+            .stream_arn = "arn:aws:kinesis:us-east-1:111111111111:stream/zigps",
+            .consumer_arn = "arn:aws:kinesis:us-east-1:111111111111:stream/zigps/consumer/c:1",
+            .aws_role_arn = "arn:aws:iam::111111111111:role/zigps",
+            .gcp_service_account = account,
+        } }, error.PermissionDenied, "Cloud Pub/Sub does not have the necessary permissions settings on the ingestion data source" },
+        .{ "imp-gcs", .{ .cloud_storage = .{
+            .bucket = f.id("no-such-bucket"),
+            .format = .{ .text = .{ .delimiter = "|" } },
+            .minimum_object_create_time = .{ .nanoseconds = 1_791_772_433_500_000_000 },
+            .match_glob = "logs/**.txt",
+        } }, error.NotFound, "Cloud Pub/Sub encountered a not-found error while trying to connect to the ingestion data source" },
+        .{ "imp-hubs", .{ .azure_event_hubs = .{
+            .resource_group = "rg",
+            .namespace = "ns",
+            .event_hub = "eh",
+            .client_id = "11111111-1111-1111-1111-111111111111",
+            .tenant_id = "22222222-2222-2222-2222-222222222222",
+            .subscription_id = "33333333-3333-3333-3333-333333333333",
+            .gcp_service_account = account,
+        } }, error.NotFound, "Cloud Pub/Sub encountered a not-found error while trying to connect to the ingestion data source" },
+        .{ "imp-msk", .{ .aws_msk = .{
+            .cluster_arn = "arn:aws:kafka:us-east-1:111111111111:cluster/zigps/abc",
+            .topic = "t",
+            .aws_role_arn = "arn:aws:iam::111111111111:role/zigps",
+            .gcp_service_account = account,
+        } }, error.PermissionDenied, "Cloud Pub/Sub does not have the necessary permissions settings on the ingestion data source" },
+        .{ "imp-confluent", .{ .confluent_cloud = .{
+            .bootstrap_server = "pkc-xxxx.us-east-1.aws.confluent.cloud:9092",
+            .cluster_id = "lkc-xxxx",
+            .topic = "t",
+            .identity_pool_id = "pool-xxxx",
+            .gcp_service_account = account,
+        } }, error.InvalidArgument, "Cloud Pub/Sub received invalid argument/s for the ingestion data source" },
+    };
+    for (cases) |case| {
+        const suffix, const source, const production_error, const production_words = case;
+        const topic = f.client.topic(f.id(suffix));
+        try f.topics.append(testing.allocator, topic.id);
+        if (topic.create(.{ .ingestion = .{ .source = source, .log_severity = .warning } })) |made| {
+            var created = made;
+            defer created.deinit();
+            // Only the emulator takes a source nobody can reach.
+            try testing.expect(!f.production);
+            const kept = created.value.ingestion orelse return error.TestExpectedEqual;
+            try expectSameSource(source, kept.source.?);
+            try testing.expectEqual(pubsub.Ingestion.LogSeverity.warning, kept.log_severity);
+            try testing.expectEqual(pubsub.IngestionState.unknown, kept.state);
+            var read = topic.get() catch |err| return f.fail(err);
+            defer read.deinit();
+            try expectSameSource(source, read.value.ingestion.?.source.?);
+            try testing.expectEqual(pubsub.Ingestion.LogSeverity.warning, read.value.ingestion.?.log_severity);
+        } else |err| {
+            if (!f.production) return f.fail(err);
+            try testing.expectEqual(production_error, err);
+            try testing.expect(std.mem.startsWith(u8, f.diag.message(), production_words));
+        }
+    }
+}
+
+test "import topics on the emulator: an update replaces the settings whole, and a clear makes a standard topic" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    // Production refuses every source this test could name without a
+    // bucket of its own; its turn is the gated test.
+    if (f.production) return error.SkipZigTest;
+
+    const topic = f.client.topic(f.id("imp-upd"));
+    try f.topics.append(testing.allocator, topic.id);
+    const from_bucket: pubsub.Ingestion.Source = .{ .cloud_storage = .{ .bucket = "my-uploads", .format = .pubsub_avro } };
+    var created = topic.create(.{ .ingestion = .{ .source = from_bucket, .log_severity = .debug } }) catch |err| return f.fail(err);
+    defer created.deinit();
+    try expectSameSource(from_bucket, created.value.ingestion.?.source.?);
+    try testing.expectEqual(pubsub.Ingestion.LogSeverity.debug, created.value.ingestion.?.log_severity);
+
+    // Another source, and no word on logs: the old source and its logs
+    // are both gone.
+    const from_msk: pubsub.Ingestion.Source = .{ .aws_msk = .{
+        .cluster_arn = "arn:aws:kafka:us-east-1:111111111111:cluster/zigps/abc",
+        .topic = "t",
+        .aws_role_arn = "arn:aws:iam::111111111111:role/zigps",
+        .gcp_service_account = "zig-gcp@test.iam.gserviceaccount.com",
+    } };
+    var changed = topic.update(.{ .ingestion = .{ .set = .{ .source = from_msk } } }) catch |err| return f.fail(err);
+    defer changed.deinit();
+    try expectSameSource(from_msk, changed.value.ingestion.?.source.?);
+    try testing.expectEqual(pubsub.Ingestion.LogSeverity.disabled, changed.value.ingestion.?.log_severity);
+    var read = topic.get() catch |err| return f.fail(err);
+    defer read.deinit();
+    try expectSameSource(from_msk, read.value.ingestion.?.source.?);
+
+    var standard = topic.update(.{ .ingestion = .clear }) catch |err| return f.fail(err);
+    defer standard.deinit();
+    try testing.expectEqual(null, standard.value.ingestion);
+    // Clearing a topic that has none is taken too, and a standard topic
+    // becomes an import topic by an update.
+    var still = topic.update(.{ .ingestion = .clear }) catch |err| return f.fail(err);
+    defer still.deinit();
+    try testing.expectEqual(null, still.value.ingestion);
+    var again = topic.update(.{ .ingestion = .{ .set = .{ .source = .{ .cloud_storage = .{ .bucket = "my-uploads", .format = .avro } }, .log_severity = .@"error" } } }) catch |err| return f.fail(err);
+    defer again.deinit();
+    try testing.expect(again.value.ingestion.?.source.?.cloud_storage.format == .avro);
+    try testing.expectEqual(pubsub.Ingestion.LogSeverity.@"error", again.value.ingestion.?.log_severity);
+
+    // The emulator's import topic takes a publish like any topic.
+    var sent = topic.publish(&.{.{ .data = "by hand" }}, .{}) catch |err| return f.fail(err);
+    defer sent.deinit();
+    try testing.expectEqual(1, sent.value.message_ids.len);
+
+    // A text delimiter is one byte, which is production's rule: the
+    // emulator would take one wide character, so the client refuses it
+    // before sending, as it refuses two.
+    const tabbed = f.client.topic(f.id("imp-tab"));
+    try f.topics.append(testing.allocator, tabbed.id);
+    var by_tabs = tabbed.create(.{ .ingestion = .{ .source = .{ .cloud_storage = .{ .bucket = "my-uploads", .format = .{ .text = .{ .delimiter = "\t" } } } } } }) catch |err| return f.fail(err);
+    defer by_tabs.deinit();
+    try testing.expectEqualStrings("\t", by_tabs.value.ingestion.?.source.?.cloud_storage.format.text.delimiter);
+    for ([_][]const u8{ "\u{20ac}", "\r\n" }) |delimiter| {
+        try testing.expectError(error.InvalidArgument, tabbed.update(.{ .ingestion = .{ .set = .{ .source = .{ .cloud_storage = .{ .bucket = "my-uploads", .format = .{ .text = .{ .delimiter = delimiter } } } } } } }));
+        try testing.expectEqualStrings("the text delimiter is not one character of one byte", f.diag.message());
+    }
+}

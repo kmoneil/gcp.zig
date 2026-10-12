@@ -168,6 +168,10 @@ pub const TopicConfig = struct {
     /// its schema is checked and before it is stored. At most 5 that are
     /// not disabled.
     message_transforms: []const MessageTransform = &.{},
+    /// Makes an import topic: one that fills itself from a source outside
+    /// Pub/Sub. Production connects to the source when the topic is made,
+    /// and refuses the create if it cannot. Null: a standard topic.
+    ingestion: ?Ingestion = null,
 };
 
 pub const TopicInfo = struct {
@@ -181,6 +185,8 @@ pub const TopicInfo = struct {
     schema: ?SchemaSettings = null,
     /// In the order they run.
     message_transforms: []const MessageTransform = &.{},
+    /// Null: a standard topic.
+    ingestion: ?IngestionInfo = null,
     state: State = .active,
 
     /// An unrecognized value from the server is `.unknown`.
@@ -210,6 +216,9 @@ pub const TopicUpdate = struct {
     /// Replaces the whole list; `&.{}` removes every transform. Pub/Sub
     /// says a change takes a few minutes to hold.
     message_transforms: ?[]const MessageTransform = null,
+    /// `.set` replaces the settings whole: what is left out goes back to
+    /// its default. `.clear`: a standard topic again.
+    ingestion: Change(Ingestion) = .keep,
 };
 
 pub const TopicPage = struct {
@@ -645,6 +654,133 @@ pub const JavaScriptUdf = struct {
     /// At most 20,480 bytes. The function returns the message, changed or
     /// not; returns null to drop it; or throws to refuse it.
     code: []const u8,
+};
+
+/// Where an import topic fills itself from, and what Pub/Sub logs about
+/// it. Each source needs grants outside Pub/Sub, and the caller must be
+/// able to act as the source's `gcp_service_account`, where it has one.
+pub const Ingestion = struct {
+    source: Source,
+    /// Pub/Sub writes what happens at the source to Cloud Logging, at this
+    /// severity and above. `.disabled`: nothing.
+    log_severity: LogSeverity = .disabled,
+
+    pub const Source = union(enum) {
+        aws_kinesis: AwsKinesis,
+        cloud_storage: CloudStorageSource,
+        azure_event_hubs: AzureEventHubs,
+        aws_msk: AwsMsk,
+        confluent_cloud: ConfluentCloud,
+    };
+
+    /// `.unknown` is only ever read.
+    pub const LogSeverity = enum { disabled, debug, info, warning, @"error", unknown };
+};
+
+/// A Kinesis data stream, read through a consumer of it.
+pub const AwsKinesis = struct {
+    stream_arn: []const u8,
+    /// The consumer, in enhanced fan-out mode, that Pub/Sub reads as.
+    consumer_arn: []const u8,
+    /// The AWS role Pub/Sub assumes, as `gcp_service_account`.
+    aws_role_arn: []const u8,
+    gcp_service_account: []const u8,
+};
+
+/// A bucket's objects, each one read once as messages.
+pub const CloudStorageSource = struct {
+    /// The bucket's name alone. Production also takes it with `gs://`
+    /// before it, and reads it back without. Pub/Sub's service agent must
+    /// be able to read the bucket, and to publish to the topic.
+    bucket: []const u8,
+    format: Format = .{ .text = .{} },
+    /// Only objects made at or after this. Null: all.
+    minimum_object_create_time: ?std.Io.Timestamp = null,
+    /// Only objects whose names match. "": all.
+    match_glob: []const u8 = "",
+
+    pub const Format = union(enum) {
+        /// One message a line, or between `delimiter`s: one character of
+        /// one byte, such as a tab or a bar. Production refuses anything
+        /// longer (measured 2026-10-12).
+        text: struct { delimiter: []const u8 = "\n" },
+        /// One message a record of an Avro file.
+        avro,
+        /// As a Cloud Storage subscription writes Avro: the data, and the
+        /// attributes with it.
+        pubsub_avro,
+    };
+};
+
+/// An event hub of an Azure Event Hubs namespace.
+pub const AzureEventHubs = struct {
+    resource_group: []const u8,
+    namespace: []const u8,
+    event_hub: []const u8,
+    /// The app registration Pub/Sub signs in as, through
+    /// `gcp_service_account`.
+    client_id: []const u8,
+    tenant_id: []const u8,
+    subscription_id: []const u8,
+    gcp_service_account: []const u8,
+};
+
+/// A topic of an Amazon MSK cluster.
+pub const AwsMsk = struct {
+    cluster_arn: []const u8,
+    topic: []const u8,
+    /// The AWS role Pub/Sub assumes, as `gcp_service_account`.
+    aws_role_arn: []const u8,
+    gcp_service_account: []const u8,
+};
+
+/// A topic of a Confluent Cloud cluster.
+pub const ConfluentCloud = struct {
+    /// `host:port`.
+    bootstrap_server: []const u8,
+    cluster_id: []const u8,
+    topic: []const u8,
+    /// The identity pool Pub/Sub signs in to, as `gcp_service_account`.
+    identity_pool_id: []const u8,
+    gcp_service_account: []const u8,
+};
+
+/// An import topic's settings as read, with the server's word on whether
+/// it can read the source.
+pub const IngestionInfo = struct {
+    /// Null: a source this client does not model.
+    source: ?Ingestion.Source,
+    log_severity: Ingestion.LogSeverity,
+    /// `.unknown` when the server says nothing, as an emulator does not.
+    state: IngestionState,
+};
+
+/// What Pub/Sub says of an import topic's source. One enum for the five
+/// sources: what all can say, what each alone can, and each one's own
+/// permission error as `.permission_denied`. While it is anything but
+/// `.active`, the topic's own state is `.ingestion_resource_error`.
+pub const IngestionState = enum {
+    active,
+    /// Pub/Sub's service agent may not publish to the topic.
+    publish_permission_denied,
+    /// The region Pub/Sub would import in is one the project's service
+    /// account is not allowed.
+    conflicting_region_constraints,
+    /// Pub/Sub may not read the source.
+    permission_denied,
+    stream_not_found,
+    consumer_not_found,
+    bucket_not_found,
+    /// The bucket holds more objects than an import topic reads: 50 million.
+    too_many_objects,
+    namespace_not_found,
+    event_hub_not_found,
+    subscription_not_found,
+    resource_group_not_found,
+    cluster_not_found,
+    topic_not_found,
+    unreachable_bootstrap_server,
+    unknown,
 };
 
 test "ReceivedMessage.attribute finds the first match" {
