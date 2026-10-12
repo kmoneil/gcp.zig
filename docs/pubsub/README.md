@@ -46,6 +46,7 @@ Against production, pass a `.token_provider` as well:
 | [Topics and subscriptions](topics-and-subscriptions.md) | Dead letters, retry policies, filters, retention, expiration and labels; updates; IAM |
 | [Delivery](delivery.md) | Push, BigQuery and Cloud Storage subscriptions: Pub/Sub delivers itself; the body options, the export states, and changing kind |
 | [Replaying and purging](replay.md) | Snapshots, seeking back to replay or ahead to purge, what a running subscriber sees, and detaching a subscription |
+| [Schemas](schemas.md) | Avro and Protocol Buffer schemas and their revisions; a topic that takes only what fits; asking before publishing; what a subscriber reads off a message |
 
 **On this page:** [Handles and calls](#handles-and-calls) ·
 [Pulling](#pulling) · [Retries](#retries) · [Limits](#limits) ·
@@ -53,13 +54,13 @@ Against production, pass a `.token_provider` as well:
 
 ## Handles and calls
 
-`Topic`, `Subscription` and `Snapshot` are cheap handles: a client
+`Topic`, `Subscription`, `Snapshot` and `Schema` are cheap handles: a client
 pointer and a short id such as `orders`. Creating one sends nothing. The
 operations:
 
-| `Client` | `Topic` | `Subscription` | `Snapshot` |
-| --- | --- | --- | --- |
-| `listTopics`, `listSubscriptions`, `listSnapshots` | `create`, `get`, `update`, `delete`, `publish`, `listSubscriptions`, `listSnapshots`, and the [IAM calls](topics-and-subscriptions.md#iam) | `create`, `get`, `update`, `delete`, `pull`, `ack`, `modifyAckDeadline`, `nack`, and `ackWithResults`, `modifyAckDeadlineWithResults`, `nackWithResults`, [`seek` and `detach`](replay.md), and the [IAM calls](topics-and-subscriptions.md#iam) | [`create`, `get`, `update`, `delete`](replay.md#snapshots), and the [IAM calls](topics-and-subscriptions.md#iam) |
+| `Client` | `Topic` | `Subscription` | `Snapshot` | `Schema` |
+| --- | --- | --- | --- | --- |
+| `listTopics`, `listSubscriptions`, `listSnapshots`, `listSchemas`, and [`validateSchema` and `validateMessage`](schemas.md#asking-before-publishing) | `create`, `get`, `update`, `delete`, `publish`, `listSubscriptions`, `listSnapshots`, and the [IAM calls](topics-and-subscriptions.md#iam) | `create`, `get`, `update`, `delete`, `pull`, `ack`, `modifyAckDeadline`, `nack`, and `ackWithResults`, `modifyAckDeadlineWithResults`, `nackWithResults`, [`seek` and `detach`](replay.md), and the [IAM calls](topics-and-subscriptions.md#iam) | [`create`, `get`, `update`, `delete`](replay.md#snapshots), and the [IAM calls](topics-and-subscriptions.md#iam) | [`create`, `get`, `delete`, `validateMessage`](schemas.md), [`commit`, `rollback`, `listRevisions`, `deleteRevision`](schemas.md#revisions), and the [IAM calls](topics-and-subscriptions.md#iam) |
 
 See [`examples/publish.zig`](../../examples/publish.zig),
 [`examples/publisher.zig`](../../examples/publisher.zig) and
@@ -132,6 +133,8 @@ emulator does not fail later in production.
 [Topics and subscriptions](topics-and-subscriptions.md#what-the-emulator-and-production-do)
 lists how the two treat settings and updates,
 [Delivery](delivery.md#what-the-emulator-and-production-do) how they
-treat push and the export kinds, and
+treat push and the export kinds,
 [Replaying and purging](replay.md#what-the-emulator-and-production-do)
-how they treat snapshots, seeks and detach.
+how they treat snapshots, seeks and detach, and
+[Schemas](schemas.md#what-the-emulator-and-production-do) how they treat
+schemas and the topics that name them.

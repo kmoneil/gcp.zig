@@ -81,7 +81,9 @@ them all. The topic, the ordering and the filter cannot be changed.
 Topics take `labels`, `message_retention` (the topic keeps every
 message, acknowledged or not, so subscriptions can replay them),
 `kms_key_name` and `message_storage_policy` (the regions messages may be
-stored in), and `Topic.update` changes them the same way.
+stored in), and `Topic.update` changes them the same way. A topic can
+also hold every message to a [schema](schemas.md): `schema` names one,
+with an encoding and the revisions a message may fit.
 
 ## What the emulator and production do
 
