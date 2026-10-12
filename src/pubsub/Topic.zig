@@ -22,6 +22,11 @@ id: []const u8,
 
 /// Creates the topic. If a lost first attempt already created it, the retry
 /// reports `error.AlreadyExists`. Every setting is checked first.
+///
+/// With `config.schema`, the topic takes only messages that fit the
+/// schema, and a publish of one that does not is `error.InvalidArgument`.
+/// A schema or a revision that is not there is `error.NotFound`, and
+/// naming a schema needs `pubsub.schemas.attach` on it.
 pub fn create(self: Topic, config: types.TopicConfig) Error!Owned(types.TopicInfo) {
     const c = self.client;
     rpc.begin(c);
@@ -31,12 +36,19 @@ pub fn create(self: Topic, config: types.TopicConfig) Error!Owned(types.TopicInf
     defer scratch.deinit();
     const a = scratch.allocator();
     const path = try url.resourcePath(a, c.project_id, .topics, self.id, "");
-    const body = try codec.encodeTopic(a, config);
+    var full = config;
+    if (config.schema) |settings| full.schema = try schemaInFull(a, c.project_id, settings);
+    const body = try codec.encodeTopic(a, full);
     return fetch(c, .{ .method = .PUT, .path = path, .body = body });
 }
 
 /// Changes what `changes` names, and nothing else, and returns the topic as
 /// it is then. A storage policy is replaced whole, and labels as a set.
+///
+/// A schema's settings are replaced whole too: the encoding and the
+/// revisions are then what `changes.schema` gives, and `.clear` leaves the
+/// topic taking any bytes. Google says a change to them can take a few
+/// minutes to hold.
 pub fn update(self: Topic, changes: types.TopicUpdate) Error!Owned(types.TopicInfo) {
     const c = self.client;
     rpc.begin(c);
@@ -46,8 +58,22 @@ pub fn update(self: Topic, changes: types.TopicUpdate) Error!Owned(types.TopicIn
     defer scratch.deinit();
     const a = scratch.allocator();
     const path = try url.resourcePath(a, c.project_id, .topics, self.id, "");
-    const body = try codec.encodeTopicUpdate(a, changes);
+    var full = changes;
+    switch (changes.schema) {
+        .set => |settings| full.schema = .{ .set = try schemaInFull(a, c.project_id, settings) },
+        else => {},
+    }
+    const body = try codec.encodeTopicUpdate(a, full);
     return fetch(c, .{ .method = .PATCH, .path = path, .body = body });
+}
+
+/// The settings with their schema named in full: as given, or an id in the
+/// client's project.
+fn schemaInFull(arena: std.mem.Allocator, project: []const u8, settings: types.SchemaSettings) std.mem.Allocator.Error!types.SchemaSettings {
+    if (validate.isSchemaName(settings.schema)) return settings;
+    var full = settings;
+    full.schema = try url.resourceName(arena, project, .schemas, settings.schema);
+    return full;
 }
 
 pub fn get(self: Topic) Error!Owned(types.TopicInfo) {
@@ -721,4 +747,121 @@ test "golden: a topic's subscriptions and snapshots, by name and in pages" {
     try testing.expectEqualStrings("the name list response could not be decoded", h.diag.message());
     try testing.expectError(error.InvalidResourceId, h.client.topic("go").listSubscriptions(.{}));
     try h.expectRequestCount(6);
+}
+
+test "golden: a topic's schema is named in full on create and in an update, and cleared by a mask alone" {
+    const with_schema =
+        \\{"name":"projects/p/topics/orders","schemaSettings":{"schema":"projects/p/schemas/order-v1","encoding":"JSON"}}
+    ;
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = with_schema } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/orders\",\"schemaSettings\":{\"schema\":\"projects/other/schemas/order-v1\",\"encoding\":\"BINARY\",\"firstRevisionId\":\"1b46a16a\"}}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/orders\"}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/orders\",\"schemaSettings\":{\"schema\":\"_deleted-schema_\",\"encoding\":\"JSON\"}}" } },
+        .{ .respond = .{ .body = with_schema } },
+    }, .{});
+    defer h.deinit();
+    const orders = h.client.topic("orders");
+    const path = "http://localhost:8085/v1/projects/p/topics/orders";
+
+    // An id is one of the client's own project.
+    var created = try orders.create(.{ .schema = .{ .schema = "order-v1", .encoding = .json } });
+    defer created.deinit();
+    try h.expectRequest(0, .PUT, path,
+        \\{"schemaSettings":{"schema":"projects/p/schemas/order-v1","encoding":"JSON"}}
+    );
+    try testing.expectEqualStrings("projects/p/schemas/order-v1", created.value.schema.?.schema);
+    try testing.expectEqual(types.SchemaEncoding.json, created.value.schema.?.encoding);
+
+    // A full name goes as given, and the settings are replaced whole.
+    var changed = try orders.update(.{ .schema = .{ .set = .{
+        .schema = "projects/other/schemas/order-v1",
+        .encoding = .binary,
+        .first_revision_id = "1b46a16a",
+    } } });
+    defer changed.deinit();
+    try h.expectRequest(1, .PATCH, path,
+        \\{"topic":{"schemaSettings":{"schema":"projects/other/schemas/order-v1","encoding":"BINARY","firstRevisionId":"1b46a16a"}},"updateMask":"schemaSettings"}
+    );
+    try testing.expectEqualStrings("1b46a16a", changed.value.schema.?.first_revision_id.?);
+    try testing.expectEqual(null, changed.value.schema.?.last_revision_id);
+
+    var cleared = try orders.update(.{ .schema = .clear });
+    defer cleared.deinit();
+    try h.expectRequest(2, .PATCH, path, "{\"topic\":{},\"updateMask\":\"schemaSettings\"}");
+    try testing.expectEqual(null, cleared.value.schema);
+
+    var orphan = try orders.get();
+    defer orphan.deinit();
+    try testing.expect(orphan.value.schema.?.isDeleted());
+
+    // An id in an update is one of the client's own project too.
+    var renamed = try orders.update(.{ .schema = .{ .set = .{ .schema = "order-v1", .encoding = .json } } });
+    defer renamed.deinit();
+    try h.expectRequest(4, .PATCH, path,
+        \\{"topic":{"schemaSettings":{"schema":"projects/p/schemas/order-v1","encoding":"JSON"}},"updateMask":"schemaSettings"}
+    );
+    try h.expectRequestCount(5);
+}
+
+test "a topic's schema: what the checks refuse is never sent, and what the server refuses is said in its words" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        // The emulator's words, 2026-10-11.
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"Schema could not be found\",\"status\":\"NOT_FOUND\"}}" } },
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"First revision could not be found\",\"status\":\"NOT_FOUND\"}}" } },
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Could not parse message\",\"status\":\"INVALID_ARGUMENT\"}}" } },
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"Schema associated with topic deleted.\",\"status\":\"NOT_FOUND\"}}" } },
+    }, .{});
+    defer h.deinit();
+    const orders = h.client.topic("orders");
+
+    try testing.expectError(error.InvalidArgument, orders.create(.{ .schema = .{ .schema = "order-v1@1b46a16a", .encoding = .json } }));
+    try testing.expectEqualStrings("the schema is neither a schema id nor projects/{project}/schemas/{id}", h.diag.message());
+    try testing.expectError(error.InvalidArgument, orders.create(.{ .schema = .{ .schema = "order-v1", .encoding = .unknown } }));
+    try testing.expectError(error.InvalidArgument, orders.update(.{ .schema = .{ .set = .{ .schema = "_deleted-schema_", .encoding = .json } } }));
+    try testing.expect(std.mem.startsWith(u8, h.diag.message(), "the schema is _deleted-schema_"));
+    try testing.expectError(error.InvalidArgument, orders.update(.{ .schema = .{ .set = .{ .schema = "order-v1", .encoding = .json, .last_revision_id = "a:b" } } }));
+    try h.expectRequestCount(0);
+
+    try testing.expectError(error.NotFound, orders.create(.{ .schema = .{ .schema = "order-v1", .encoding = .json } }));
+    try testing.expectEqualStrings("Schema could not be found", h.diag.message());
+    try testing.expectError(error.NotFound, orders.update(.{ .schema = .{ .set = .{ .schema = "order-v1", .encoding = .json, .first_revision_id = "deadbeef" } } }));
+    try testing.expectEqualStrings("First revision could not be found", h.diag.message());
+    // A message that does not fit is refused as any bad message is, and a
+    // topic whose schema is gone refuses every one.
+    try testing.expectError(error.InvalidArgument, orders.publish(&.{.{ .data = "{\"quantity\":\"one\"}" }}, .{}));
+    try testing.expectEqualStrings("Could not parse message", h.diag.message());
+    try testing.expectError(error.NotFound, orders.publish(&.{.{ .data = "{}" }}, .{}));
+    try testing.expectEqualStrings("Schema associated with topic deleted.", h.diag.message());
+    try h.expectRequestCount(4);
+}
+
+fn topicSchemaAllocations(gpa: std.mem.Allocator) !void {
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/orders\",\"schemaSettings\":{\"schema\":\"projects/p/schemas/order-v1\",\"encoding\":\"JSON\",\"firstRevisionId\":\"1b46a16a\",\"lastRevisionId\":\"6f0519a4\"}}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/orders\",\"schemaSettings\":{\"schema\":\"projects/p/schemas/order-v1\",\"encoding\":\"BINARY\"}}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/orders\"}" } },
+    });
+    defer fake.deinit();
+    var clock: test_util.FakeClock = .{};
+    var client = try Client.init(gpa, clock.io(), .{
+        .project_id = "p",
+        .endpoint = .{ .url = "localhost:8085", .emulator = true },
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    const orders = client.topic("orders");
+    var created = try orders.create(.{ .schema = .{ .schema = "order-v1", .encoding = .json, .first_revision_id = "1b46a16a", .last_revision_id = "6f0519a4" } });
+    created.deinit();
+    var changed = try orders.update(.{ .schema = .{ .set = .{ .schema = "order-v1", .encoding = .binary } } });
+    changed.deinit();
+    var cleared = try orders.update(.{ .schema = .clear });
+    cleared.deinit();
+    try testing.expectEqual(3, fake.requests.items.len);
+}
+
+test "allocation failures: a topic's schema on create and in an update" {
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, topicSchemaAllocations, .{});
 }

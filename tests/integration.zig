@@ -2510,3 +2510,146 @@ test "schema revisions: one is committed, read, listed, rolled back to and delet
     var still = single.get(.{ .view = .basic }) catch |err| return f.fail(err);
     still.deinit();
 }
+
+/// Pulls until one message arrives, acknowledges it, and returns what a
+/// test of a schema topic wants of it: its data and what the topic wrote
+/// on it.
+const Fitted = struct { data: []const u8, schema: ?pubsub.MessageSchema };
+
+fn pullOne(f: *Fixture, sub: pubsub.Subscription) !Fitted {
+    const a = f.arena.allocator();
+    const deadline = nowMs() + f.patience() * 1000;
+    while (nowMs() < deadline) {
+        var batch = sub.pull(.{ .max_messages = 1, .return_immediately = true }) catch |err| return f.fail(err);
+        defer batch.deinit();
+        if (batch.value.messages.len == 0) {
+            try testing.io.sleep(.fromMilliseconds(250), .awake);
+            continue;
+        }
+        const m = batch.value.messages[0];
+        sub.ack(&.{m.ack_id}) catch |err| return f.fail(err);
+        const s = m.schema();
+        return .{
+            .data = try a.dupe(u8, m.data),
+            .schema = if (s) |x| .{ .name = try a.dupe(u8, x.name), .revision_id = try a.dupe(u8, x.revision_id), .encoding = x.encoding } else null,
+        };
+    }
+    return error.TestTimedOut;
+}
+
+/// Publishes one message, again and again while a change to the topic's
+/// schema settings is still taking hold: Google says that can take
+/// minutes in production. The emulator's changes hold at once.
+fn publishOnceItHolds(f: *Fixture, topic: pubsub.Topic, data: []const u8) !void {
+    const deadline = nowMs() + (if (f.production) @as(i64, 300) else 0) * 1000;
+    while (true) {
+        if (topic.publish(&.{.{ .data = data }}, .{})) |sent| {
+            var s = sent;
+            s.deinit();
+            return;
+        } else |err| {
+            if (nowMs() >= deadline) return f.fail(err);
+            try testing.io.sleep(.fromMilliseconds(5000), .awake);
+        }
+    }
+}
+
+test "a topic with a schema: what fits is taken and says what it fit, what does not is refused, and the settings change, clear and outlive their schema" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const project = f.client.project_id;
+
+    const schema = f.client.schema(f.id("topic-schema"));
+    try f.schemas.append(testing.allocator, schema.id);
+    var stored = schema.create(.{ .type = .avro, .definition = avro_order }) catch |err| return f.fail(err);
+    defer stored.deinit();
+    const schema_name = try a.print("projects/{s}/schemas/{s}", .{ project, schema.id });
+    const revision = stored.value.revision_id;
+
+    // A schema that is not there cannot be named, nor a revision of one
+    // that is.
+    const nowhere = f.client.topic(f.id("schema-nowhere"));
+    try f.topics.append(testing.allocator, nowhere.id);
+    try testing.expectError(error.NotFound, nowhere.create(.{ .schema = .{ .schema = f.id("no-such-schema"), .encoding = .json } }));
+    try testing.expectError(error.NotFound, nowhere.create(.{ .schema = .{ .schema = schema.id, .encoding = .json, .first_revision_id = "deadbeef" } }));
+
+    const topic = f.client.topic(f.id("schema-topic"));
+    try f.topics.append(testing.allocator, topic.id);
+    var created = topic.create(.{ .schema = .{ .schema = schema.id, .encoding = .json } }) catch |err| return f.fail(err);
+    defer created.deinit();
+    try testing.expectEqualStrings(schema_name, created.value.schema.?.schema);
+    try testing.expectEqual(pubsub.SchemaEncoding.json, created.value.schema.?.encoding);
+    try testing.expectEqual(null, created.value.schema.?.first_revision_id);
+    var read = topic.get() catch |err| return f.fail(err);
+    defer read.deinit();
+    try testing.expectEqualStrings(schema_name, read.value.schema.?.schema);
+    const sub = try f.createSubscription("schema-sub", .{ .topic_id = topic.id });
+
+    // What fits is taken. What does not is refused, and takes the message
+    // beside it in the same request with it.
+    const fits = "{\"id\":\"a\",\"quantity\":1}";
+    const misfit = "{\"id\":\"a\",\"quantity\":\"one\"}";
+    try publishOnceItHolds(&f, topic, fits);
+    try testing.expectError(error.InvalidArgument, topic.publish(&.{.{ .data = misfit }}, .{}));
+    try testing.expectError(error.InvalidArgument, topic.publish(&.{ .{ .data = fits }, .{ .data = misfit } }, .{}));
+    // Binary where JSON is the encoding does not fit either.
+    try testing.expectError(error.InvalidArgument, topic.publish(&.{.{ .data = "\x02a\x02" }}, .{}));
+
+    // The one message taken says what it fit, and how it is written.
+    const got = try pullOne(&f, sub);
+    try testing.expectEqualStrings(fits, got.data);
+    try testing.expectEqual(pubsub.SchemaEncoding.json, got.schema.?.encoding);
+    try testing.expectEqualStrings(schema_name, got.schema.?.name);
+    try testing.expectEqualStrings(revision, got.schema.?.revision_id);
+    try expectNoMessages(&f, sub);
+
+    // The settings are replaced whole: the other encoding, and a range.
+    var binary = topic.update(.{ .schema = .{ .set = .{ .schema = schema.id, .encoding = .binary, .first_revision_id = revision, .last_revision_id = revision } } }) catch |err| return f.fail(err);
+    defer binary.deinit();
+    try testing.expectEqual(pubsub.SchemaEncoding.binary, binary.value.schema.?.encoding);
+    try testing.expectEqualStrings(revision, binary.value.schema.?.first_revision_id.?);
+    try testing.expectEqualStrings(revision, binary.value.schema.?.last_revision_id.?);
+    try publishOnceItHolds(&f, topic, "\x02a\x02");
+    const packed_one = try pullOne(&f, sub);
+    try testing.expectEqualStrings("\x02a\x02", packed_one.data);
+    try testing.expectEqual(pubsub.SchemaEncoding.binary, packed_one.schema.?.encoding);
+    // Without the range in the next update, the range is gone.
+    var open = topic.update(.{ .schema = .{ .set = .{ .schema = schema.id, .encoding = .binary } } }) catch |err| return f.fail(err);
+    defer open.deinit();
+    try testing.expectEqual(null, open.value.schema.?.first_revision_id);
+    try testing.expectEqual(null, open.value.schema.?.last_revision_id);
+
+    // Cleared, the topic takes any bytes again, and writes nothing on them.
+    var cleared = topic.update(.{ .schema = .clear }) catch |err| return f.fail(err);
+    defer cleared.deinit();
+    try testing.expectEqual(null, cleared.value.schema);
+    try publishOnceItHolds(&f, topic, "not an order at all");
+    const free = try pullOne(&f, sub);
+    try testing.expectEqualStrings("not an order at all", free.data);
+    try testing.expectEqual(null, free.schema);
+
+    // Set again, then the schema deleted under it: the topic reads as
+    // having lost it, and takes nothing more.
+    var again = topic.update(.{ .schema = .{ .set = .{ .schema = schema_name, .encoding = .json } } }) catch |err| return f.fail(err);
+    again.deinit();
+    schema.delete() catch |err| return f.fail(err);
+    var orphan = topic.get() catch |err| return f.fail(err);
+    defer orphan.deinit();
+    try testing.expect(orphan.value.schema.?.isDeleted());
+    try testing.expectEqual(pubsub.SchemaEncoding.json, orphan.value.schema.?.encoding);
+    if (!f.production) {
+        // The emulator's refusal; production's is unmeasured.
+        try testing.expectError(error.NotFound, topic.publish(&.{.{ .data = fits }}, .{}));
+        try testing.expectEqualStrings("Schema associated with topic deleted.", f.diag.message());
+        // A schema made again under the id is not the one the topic had.
+        var remade = schema.create(.{ .type = .avro, .definition = avro_order }) catch |err| return f.fail(err);
+        remade.deinit();
+        var still = topic.get() catch |err| return f.fail(err);
+        defer still.deinit();
+        try testing.expect(still.value.schema.?.isDeleted());
+    }
+    // What a deleted schema's topic read back cannot be sent as it is.
+    try testing.expectError(error.InvalidArgument, topic.update(.{ .schema = .{ .set = orphan.value.schema.? } }));
+}

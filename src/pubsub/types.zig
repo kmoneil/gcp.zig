@@ -88,6 +88,36 @@ pub const ReceivedMessage = struct {
         }
         return null;
     }
+
+    /// What a topic with a schema wrote on the message when it took it:
+    /// the schema, the revision the message fit, and the encoding, which
+    /// says how to decode `data`. Null for a message from a topic with no
+    /// schema. Pub/Sub sets these three attributes itself, and a publisher
+    /// cannot: a key that starts with `goog` is refused.
+    pub fn schema(self: ReceivedMessage) ?MessageSchema {
+        const encoding = self.attribute("googclient_schemaencoding") orelse return null;
+        return .{
+            .name = self.attribute("googclient_schemaname") orelse "",
+            .revision_id = self.attribute("googclient_schemarevisionid") orelse "",
+            .encoding = if (std.mem.eql(u8, encoding, "JSON"))
+                .json
+            else if (std.mem.eql(u8, encoding, "BINARY"))
+                .binary
+            else
+                .unknown,
+        };
+    }
+};
+
+/// What `ReceivedMessage.schema` reads.
+pub const MessageSchema = struct {
+    /// `projects/{project}/schemas/{id}`.
+    name: []const u8,
+    /// The revision the message was found to fit: read it with
+    /// `Schema.get(.{ .revision_id = ... })` to decode the message as it
+    /// was written.
+    revision_id: []const u8,
+    encoding: SchemaEncoding,
 };
 
 /// A label on a topic, subscription or snapshot.
@@ -123,6 +153,9 @@ pub const TopicConfig = struct {
     kms_key_name: ?[]const u8 = null,
     /// Null: the organization's policy.
     message_storage_policy: ?MessageStoragePolicy = null,
+    /// Every message published to the topic must fit this schema. Null:
+    /// the topic takes any bytes.
+    schema: ?SchemaSettings = null,
 };
 
 pub const TopicInfo = struct {
@@ -132,6 +165,8 @@ pub const TopicInfo = struct {
     message_retention: ?std.Io.Duration = null,
     kms_key_name: ?[]const u8 = null,
     message_storage_policy: ?MessageStoragePolicy = null,
+    /// Null: the topic has no schema.
+    schema: ?SchemaSettings = null,
     state: State = .active,
 
     /// An unrecognized value from the server is `.unknown`.
@@ -154,6 +189,10 @@ pub const TopicUpdate = struct {
     kms_key_name: Change([]const u8) = .keep,
     /// `.clear`: back to the organization's policy.
     message_storage_policy: Change(MessageStoragePolicy) = .keep,
+    /// `.set` replaces the settings whole: the encoding and the revisions
+    /// are then what is given, and a bound left null is open. `.clear`:
+    /// the topic takes any bytes again.
+    schema: Change(SchemaSettings) = .keep,
 };
 
 pub const TopicPage = struct {
@@ -528,6 +567,31 @@ pub const SchemaPage = struct {
 /// server is `.unknown`, which is only ever read.
 pub const SchemaEncoding = enum { json, binary, unknown };
 
+/// A topic's schema: on create, on read and in an update. A message is
+/// taken when it fits a revision the settings allow, tried from the newest
+/// to the oldest.
+pub const SchemaSettings = struct {
+    /// A schema id in the client's project, or
+    /// `projects/{project}/schemas/{id}`, which may lie in another
+    /// project. Read back in full, or as `_deleted-schema_`.
+    schema: []const u8,
+    encoding: SchemaEncoding,
+    /// The oldest revision a message may fit. Null: any.
+    first_revision_id: ?[]const u8 = null,
+    /// The newest. Null: any, those committed later included.
+    last_revision_id: ?[]const u8 = null,
+
+    /// What `schema` reads once the schema is deleted.
+    pub const deleted = "_deleted-schema_";
+
+    /// The schema the topic named is deleted, and the topic refuses every
+    /// publish until its settings are set again or cleared. A schema made
+    /// again under the old id is not the one the topic had.
+    pub fn isDeleted(self: SchemaSettings) bool {
+        return std.mem.eql(u8, self.schema, deleted);
+    }
+};
+
 test "ReceivedMessage.attribute finds the first match" {
     const m: ReceivedMessage = .{
         .ack_id = "a",
@@ -552,4 +616,42 @@ test "compression is off unless asked for, and asks for level 6 from 240 bytes" 
     const c: Compression = .{};
     try std.testing.expectEqual(6, c.level);
     try std.testing.expectEqual(240, c.min_bytes);
+}
+
+test "ReceivedMessage.schema reads what a schema topic wrote, and is null without it" {
+    const base: ReceivedMessage = .{ .ack_id = "a", .message_id = "1", .data = "{}", .attributes = &.{}, .publish_time = "", .ordering_key = "", .delivery_attempt = 0 };
+    try std.testing.expectEqual(null, base.schema());
+
+    // As the emulator delivered one on 2026-10-11, beside an attribute of
+    // the publisher's own.
+    var written = base;
+    written.attributes = &.{
+        .{ .key = "origin", .value = "zig" },
+        .{ .key = "googclient_schemaencoding", .value = "JSON" },
+        .{ .key = "googclient_schemaname", .value = "projects/test/schemas/order-v1" },
+        .{ .key = "googclient_schemarevisionid", .value = "3566a360" },
+    };
+    const s = written.schema().?;
+    try std.testing.expectEqualStrings("projects/test/schemas/order-v1", s.name);
+    try std.testing.expectEqualStrings("3566a360", s.revision_id);
+    try std.testing.expectEqual(SchemaEncoding.json, s.encoding);
+
+    var binary = base;
+    binary.attributes = &.{.{ .key = "googclient_schemaencoding", .value = "BINARY" }};
+    try std.testing.expectEqual(SchemaEncoding.binary, binary.schema().?.encoding);
+    // The encoding alone makes it a schema topic's message: the rest reads
+    // as empty, and an encoding not yet known as `.unknown`.
+    try std.testing.expectEqualStrings("", binary.schema().?.name);
+    try std.testing.expectEqualStrings("", binary.schema().?.revision_id);
+    var later = base;
+    later.attributes = &.{.{ .key = "googclient_schemaencoding", .value = "CBOR" }};
+    try std.testing.expectEqual(SchemaEncoding.unknown, later.schema().?.encoding);
+    // The name and the revision without the encoding are not enough.
+    var half = base;
+    half.attributes = &.{.{ .key = "googclient_schemaname", .value = "projects/test/schemas/order-v1" }};
+    try std.testing.expectEqual(null, half.schema());
+
+    const gone: SchemaSettings = .{ .schema = "_deleted-schema_", .encoding = .binary };
+    try std.testing.expect(gone.isDeleted());
+    try std.testing.expect(!(SchemaSettings{ .schema = "projects/p/schemas/order-v1", .encoding = .json }).isDeleted());
 }
