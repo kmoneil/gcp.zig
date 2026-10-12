@@ -62,6 +62,26 @@
 //!     so is one with the id of an earlier delivery, then and ever after.
 //!     A second ack with the id that acknowledged the message is taken,
 //!     and a lease change on an acknowledged message is not.
+//! - Replay, as production answered on 2026-10-10:
+//!   - Snapshots: create, get, update of the labels, delete, a project's
+//!     list and a topic's. One holds what its subscription had not had
+//!     acknowledged, and what its topic is sent after. It lasts seven
+//!     days from the oldest message its subscription has, and outlives
+//!     its subscription and its topic.
+//!   - Seek. To a snapshot, the subscription holds again what the
+//!     snapshot holds, through its own filter. To a time, what was
+//!     published before it is acknowledged and what was published from
+//!     then on is unacknowledged again, of what the subscription still
+//!     has: what it has not had acknowledged; what it retains
+//!     acknowledged, if it was there to get it; and what its topic
+//!     retains, there or not. **An ack id from before a seek is answered
+//!     and forgotten, with exactly-once delivery too**, as production's
+//!     were, and the message comes again.
+//!   - Detach. The subscription lets go of what it holds, gets nothing
+//!     more, reads `detached`, and refuses all but a read, an update and
+//!     a delete.
+//!   - A topic's retention, which its subscriptions read as
+//!     `topicMessageRetentionDuration`.
 //! - Faults, on command: `refuseNext`, `loseAnswers`, `dropNext`.
 //!
 //! Its clock is the `io` it is given: with `core.testing.FakeClock`, a
@@ -69,13 +89,14 @@
 //! to use from several tasks at once.
 //!
 //! Not modelled yet, and answered 501 with a message that says so, never
-//! guessed at: push and export deliveries, snapshots, seek, detach,
-//! schemas, transforms, import settings, tags and IAM. A filter of a
-//! shape production was not shown, or that production itself fails on,
-//! is answered the same way. Production's
-//! delays (a deleted topic that still takes a publish, the two seconds
-//! before a nacked message comes again) are not modelled at all:
-//! everything holds at once.
+//! guessed at: push and export deliveries, schemas, transforms, import
+//! settings, tags and IAM. A filter of a shape production was not shown,
+//! or that production itself fails on, is answered the same way.
+//! Production's delays are not modelled at all: a deleted topic that
+//! still takes a publish, the two seconds before a nacked message comes
+//! again, the 2 to 50 seconds a seek back took to show, the seven
+//! seconds before a detached subscription refused. Everything holds at
+//! once.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -97,6 +118,8 @@ pub const FakePubSub = struct {
     topics: std.StringArrayHashMapUnmanaged(*Topic) = .empty,
     /// By full name, in name order.
     subscriptions: std.StringArrayHashMapUnmanaged(*Subscription) = .empty,
+    /// By full name, in name order.
+    snapshots: std.StringArrayHashMapUnmanaged(*Snapshot) = .empty,
     next_message_id: u64 = 1,
     next_uid: u64 = 1,
     prng: std.Random.DefaultPrng = .init(0x5eed),
@@ -139,6 +162,9 @@ pub const FakePubSub = struct {
         storage_policy: ?StoragePolicy = null,
         /// Every message published, oldest first.
         messages: std.ArrayList(*const Message) = .empty,
+        /// Deleted, and kept for what still points at it: a topic made
+        /// again under its name is another topic.
+        deleted: bool = false,
     };
 
     const StoragePolicy = struct { regions: []const []const u8, enforce_in_transit: bool };
@@ -154,8 +180,16 @@ pub const FakePubSub = struct {
     const Subscription = struct {
         name: []const u8,
         uid: u64,
-        /// Null once its topic is deleted.
-        topic: ?*Topic,
+        /// Its topic, deleted or not.
+        topic: *Topic,
+        /// How many messages its topic had been sent when it was made:
+        /// it was there for the ones after.
+        joined: usize = 0,
+        /// Detached from its topic: it holds nothing, gets nothing, and
+        /// gives nothing.
+        detached: bool = false,
+        /// Ack ids of entries numbered below this are from before a seek.
+        stale_below: u64 = 1,
         ack_deadline_s: u32 = 10,
         labels: []const Label = &.{},
         retention_s: i64 = 604_800,
@@ -186,7 +220,22 @@ pub const FakePubSub = struct {
         /// tries the filter as the message arrives: what does not pass is
         /// never held, and never comes.
         fn takes(s: *const Subscription, m: *const Message) bool {
+            if (s.detached) return false;
             return if (s.filter) |filter| filter.matches(m.attributes) else true;
+        }
+
+        /// Whether it still has message `m`, the `index`th its topic was
+        /// sent, acknowledged though it is, to give again after a seek to
+        /// a time. It has it if it retains acknowledged messages and was
+        /// there to get it: one older than it keeps messages is let go
+        /// again as any is, when the subscription is next settled. And it
+        /// has it as long as its topic retains messages, there or not:
+        /// production replayed a topic's two messages to a subscription
+        /// made after them.
+        fn retains(s: *const Subscription, m: *const Message, index: usize, wall: i96) bool {
+            if (s.retain_acked and index >= s.joined) return true;
+            const seconds = s.topic.retention_s orelse return false;
+            return wall - m.publish_time.nanoseconds < @as(i96, seconds) * std.time.ns_per_s;
         }
 
         /// Whether the entry's place among the messages of its ordering
@@ -235,6 +284,20 @@ pub const FakePubSub = struct {
         }
     };
 
+    const Snapshot = struct {
+        name: []const u8,
+        /// The topic of the subscription it was taken of.
+        topic: *Topic,
+        labels: []const Label = &.{},
+        /// On the wall clock.
+        expire: std.Io.Timestamp,
+        /// What the subscription had not had acknowledged, oldest first.
+        held: []const *const Message,
+        /// How many messages the topic had been sent by then: every one
+        /// after is the snapshot's too.
+        from: usize,
+    };
+
     const DeadLetter = struct {
         /// The topic's full name. Looked up when a message is forwarded:
         /// it may be deleted in the meantime.
@@ -276,6 +339,7 @@ pub const FakePubSub = struct {
         f.dropped.deinit(f.gpa);
         f.topics.deinit(f.gpa);
         f.subscriptions.deinit(f.gpa);
+        f.snapshots.deinit(f.gpa);
         f.store.deinit();
         f.* = undefined;
     }
@@ -391,7 +455,7 @@ pub const FakePubSub = struct {
 
     const Route = struct {
         project: []const u8,
-        collection: enum { topics, subscriptions },
+        collection: enum { topics, subscriptions, snapshots },
         /// Decoded. "" for the collection itself.
         id: []const u8,
         /// After the id: `:publish`, `/subscriptions`, or "".
@@ -416,6 +480,7 @@ pub const FakePubSub = struct {
         }
         // What production does on its own, it does here before each call.
         try f.settleAll(f.awakeNow());
+        f.expireSnapshots();
         const reply = try f.dispatch(method, route, body, arena);
         if (f.takeFault(lose, call)) return fail(arena, 503, "UNAVAILABLE", "The service is currently unavailable.");
         return reply;
@@ -444,6 +509,7 @@ pub const FakePubSub = struct {
                 };
                 if (method == .POST and std.mem.eql(u8, route.rest, ":publish")) return f.publish(arena, route, body);
                 if (method == .GET and std.mem.eql(u8, route.rest, "/subscriptions")) return f.listTopicSubscriptions(arena, route);
+                if (method == .GET and std.mem.eql(u8, route.rest, "/snapshots")) return f.listTopicSnapshots(arena, route);
                 return notModelled(arena, route.rest);
             },
             .subscriptions => {
@@ -458,6 +524,19 @@ pub const FakePubSub = struct {
                 if (method == .POST and std.mem.eql(u8, route.rest, ":pull")) return f.pull(arena, route, body);
                 if (method == .POST and std.mem.eql(u8, route.rest, ":acknowledge")) return f.acknowledge(arena, route, body);
                 if (method == .POST and std.mem.eql(u8, route.rest, ":modifyAckDeadline")) return f.modifyAckDeadline(arena, route, body);
+                if (method == .POST and std.mem.eql(u8, route.rest, ":seek")) return f.seek(arena, route, body);
+                if (method == .POST and std.mem.eql(u8, route.rest, ":detach")) return f.detach(arena, route);
+                return notModelled(arena, route.rest);
+            },
+            .snapshots => {
+                if (route.id.len == 0) return if (method == .GET and none) f.listSnapshots(arena, route) else notModelled(arena, "this call on snapshots");
+                if (none) return switch (method) {
+                    .PUT => f.createSnapshot(arena, route, body),
+                    .GET => f.getSnapshot(arena, route),
+                    .PATCH => f.updateSnapshot(arena, route, body),
+                    .DELETE => f.deleteSnapshot(arena, route),
+                    .POST => notModelled(arena, "this call on a snapshot"),
+                };
                 return notModelled(arena, route.rest);
             },
         }
@@ -512,10 +591,9 @@ pub const FakePubSub = struct {
         const topic = f.topics.get(name) orelse return notFound(arena, route.id);
         try f.orphans.append(f.gpa, topic);
         _ = f.topics.orderedRemove(name);
-        // Its subscriptions stay, with what they hold, and no topic.
-        for (f.subscriptions.values()) |s| {
-            if (s.topic == topic) s.topic = null;
-        }
+        // Its subscriptions and its snapshots stay, with what they hold,
+        // and read `_deleted-topic_`.
+        topic.deleted = true;
         return ok("{}");
     }
 
@@ -600,7 +678,8 @@ pub const FakePubSub = struct {
         var written: usize = 0;
         var next: ?[]const u8 = null;
         for (f.subscriptions.keys(), f.subscriptions.values()) |name, s| {
-            if (s.topic != topic) continue;
+            // A detached one is its topic's no longer.
+            if (s.topic != topic or s.detached) continue;
             if (page.after) |after| {
                 if (std.mem.order(u8, name, after) == .lt) continue;
             }
@@ -726,7 +805,7 @@ pub const FakePubSub = struct {
             .ok => |o| o,
             .refused => |r| return r,
         };
-        var sub: Subscription = .{ .name = name, .uid = 0, .topic = null };
+        var sub: Subscription = .{ .name = name, .uid = 0, .topic = undefined };
         var topic_name: []const u8 = "";
         var expiration_given = false;
         var deadline_given = false;
@@ -806,6 +885,7 @@ pub const FakePubSub = struct {
         if (f.subscriptions.contains(name)) return alreadyExists(arena, route.id);
         const topic = f.topics.get(topic_name) orelse return notFound(arena, idOf(topic_name));
         sub.topic = topic;
+        sub.joined = topic.messages.items.len;
         sub.uid = f.next_uid;
         f.next_uid += 1;
         const stored = try f.keepSubscription(sub);
@@ -888,7 +968,12 @@ pub const FakePubSub = struct {
         if (expirationRefusal(arena, next.retention_s, next.expiration_ttl_s, expiration_given)) |refusal| return try refusal;
         next.updated = true;
         sub.* = next;
-        return ok(try renderSubscription(arena, sub));
+        // Production's answer to an update leaves `detached` out, though
+        // a read right after says it.
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        writeSubscription(&jw, sub, .after_update) catch return error.OutOfMemory;
+        return ok(out.written());
     }
 
     fn listSubscriptions(f: *FakePubSub, arena: Allocator, route: Route) Allocator.Error!Reply {
@@ -915,7 +1000,7 @@ pub const FakePubSub = struct {
                 jw.objectField("subscriptions") catch return error.OutOfMemory;
                 jw.beginArray() catch return error.OutOfMemory;
             }
-            writeSubscription(&jw, sub) catch return error.OutOfMemory;
+            writeSubscription(&jw, sub, .as_read) catch return error.OutOfMemory;
             written += 1;
         }
         if (written > 0) jw.endArray() catch return error.OutOfMemory;
@@ -958,8 +1043,9 @@ pub const FakePubSub = struct {
             const now = f.awakeNow();
             try f.settleAll(now);
             // Looked up each time round: the subscription may be deleted
-            // while a pull is held.
+            // or detached while a pull is held.
             const sub = f.subscriptions.get(name) orelse return notFound(arena, route.id);
+            if (sub.detached) return detachedRefusal(arena);
             const ready = try f.readyEntries(arena, sub, now);
             if (ready.len > 0) return f.deliver(arena, sub, ready[0..@min(ready.len, max)], now);
             if (now >= hold_until) return ok("{}");
@@ -1212,6 +1298,7 @@ pub const FakePubSub = struct {
             .refused => |r| return .{ .refused = r },
         };
         const sub = f.subscriptions.get(try resourceName(arena, route)) orelse return .{ .refused = try notFound(arena, route.id) };
+        if (sub.detached) return .{ .refused = try detachedRefusal(arena) };
         var ids: []const Value = &.{};
         var seconds: ?i64 = null;
         var it = object.iterator();
@@ -1259,6 +1346,14 @@ pub const FakePubSub = struct {
         const live = try arena.alloc(bool, ids.len);
         var refused: std.ArrayList([]const u8) = .empty;
         each: for (ids, live) |id, *slot| {
+            // From before a seek: answered and forgotten, with
+            // exactly-once delivery too. Production took such acks and
+            // lease changes with 200 for 46 seconds, and delivered the
+            // messages again all the same.
+            if (id.seq < sub.stale_below) {
+                slot.* = false;
+                continue;
+            }
             const index = sub.entries.getIndex(id.seq);
             // Gone, or kept behind an earlier one of its key.
             const acknowledged = if (index) |i| sub.entries.values()[i].acked else true;
@@ -1315,6 +1410,268 @@ pub const FakePubSub = struct {
             } else sub.entries.values()[index].lease_until = now + @as(i96, seconds) * std.time.ns_per_s;
         }
         if (judged.refused.len > 0) return exactlyOnceRefusal(arena, judged.refused);
+        return ok("{}");
+    }
+
+    // Replay: snapshots, seek and detach.
+
+    fn createSnapshot(f: *FakePubSub, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
+        const name = try resourceName(arena, route);
+        if (!isResourceId(route.id)) return invalidName(arena, name);
+        const object = switch (try parseObject(arena, body)) {
+            .ok => |o| o,
+            .refused => |r| return r,
+        };
+        var of: []const u8 = "";
+        var labels: []const Label = &.{};
+        var it = object.iterator();
+        while (it.next()) |field| {
+            const key = field.key_ptr.*;
+            if (isField(key, "name")) continue;
+            if (isField(key, "subscription")) {
+                of = stringOf(field.value_ptr.*) orelse return badValue(arena, key);
+            } else if (isField(key, "labels")) {
+                labels = switch (try labelsOf(arena, field.value_ptr.*)) {
+                    .ok => |l| l,
+                    .refused => |r| return r,
+                };
+            } else if (isField(key, "tags")) {
+                return notModelled(arena, key);
+            } else return unknownName(arena, key);
+        }
+        if (!isResourceName(of, "subscriptions")) return invalidName(arena, of);
+        if (f.snapshots.contains(name)) return alreadyExists(arena, route.id);
+        const sub = f.subscriptions.get(of) orelse return notFound(arena, idOf(of));
+        if (sub.detached) return detachedRefusal(arena);
+
+        // It holds what the subscription has not had acknowledged, and
+        // lasts seven days from the oldest message the subscription has:
+        // production's was seven days after the oldest it retained, to
+        // 3 ms. (Production also counted one acknowledged moments before
+        // on a subscription that retains none; the fake does not.)
+        const store = f.store.allocator();
+        const wall = std.Io.Clock.real.now(f.io).nanoseconds;
+        var oldest = wall;
+        var held: std.ArrayList(*const Message) = .empty;
+        for (sub.entries.values()) |entry| {
+            if (entry.acked) continue;
+            try held.append(store, entry.message);
+            oldest = @min(oldest, entry.message.publish_time.nanoseconds);
+        }
+        if (sub.retain_acked) for (sub.topic.messages.items[sub.joined..]) |m| {
+            if (wall - m.publish_time.nanoseconds < @as(i96, sub.retention_s) * std.time.ns_per_s and sub.takes(m)) oldest = @min(oldest, m.publish_time.nanoseconds);
+        };
+        const snap = try store.create(Snapshot);
+        snap.* = .{
+            .name = try f.keep(name),
+            .topic = sub.topic,
+            .labels = try f.keepLabels(labels),
+            .expire = .{ .nanoseconds = oldest + 7 * std.time.ns_per_day },
+            .held = held.items,
+            .from = sub.topic.messages.items.len,
+        };
+        try f.insertSorted(Snapshot, &f.snapshots, snap);
+        return ok(try renderSnapshot(arena, snap));
+    }
+
+    fn getSnapshot(f: *FakePubSub, arena: Allocator, route: Route) Allocator.Error!Reply {
+        const snap = f.snapshots.get(try resourceName(arena, route)) orelse return notFound(arena, route.id);
+        return ok(try renderSnapshot(arena, snap));
+    }
+
+    fn deleteSnapshot(f: *FakePubSub, arena: Allocator, route: Route) Allocator.Error!Reply {
+        if (!f.snapshots.orderedRemove(try resourceName(arena, route))) return notFound(arena, route.id);
+        return ok("{}");
+    }
+
+    /// Only its labels change: the set is replaced, and with none in the
+    /// body it is cleared.
+    fn updateSnapshot(f: *FakePubSub, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
+        const update = switch (try parseUpdate(arena, body, "snapshot", "UpdateSnapshotRequest")) {
+            .ok => |u| u,
+            .refused => |r| return r,
+        };
+        const snap = f.snapshots.get(try resourceName(arena, route)) orelse return notFound(arena, route.id);
+        var labels = snap.labels;
+        for (update.paths) |path| {
+            const given = fieldOf(update.resource, path);
+            if (isPath(path, "labels")) {
+                labels = if (given) |v| switch (try labelsOf(arena, v)) {
+                    .ok => |l| try f.keepLabels(l),
+                    .refused => |r| return r,
+                } else &.{};
+            } else if (isPath(path, "name")) {
+                return immutable(arena, "UpdateSnapshotRequest", "name", "Snapshot");
+            } else if (isPath(path, "topic")) {
+                return immutable(arena, "UpdateSnapshotRequest", "topic", "Snapshot");
+            } else if (isPath(path, "expireTime")) {
+                return immutable(arena, "UpdateSnapshotRequest", "expire_time", "Snapshot");
+            } else return unknownPath(arena, "UpdateSnapshotRequest", path, "Snapshot");
+        }
+        snap.labels = labels;
+        return ok(try renderSnapshot(arena, snap));
+    }
+
+    fn listSnapshots(f: *FakePubSub, arena: Allocator, route: Route) Allocator.Error!Reply {
+        const page = switch (try pageOf(arena, route.query)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const prefix = try std.fmt.allocPrint(arena, "projects/{s}/snapshots/", .{route.project});
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        jw.beginObject() catch return error.OutOfMemory;
+        var written: usize = 0;
+        var next: ?[]const u8 = null;
+        for (f.snapshots.keys(), f.snapshots.values()) |name, snap| {
+            if (!std.mem.startsWith(u8, name, prefix)) continue;
+            if (page.after) |after| {
+                if (std.mem.order(u8, name, after) == .lt) continue;
+            }
+            if (written == page.size) {
+                next = name;
+                break;
+            }
+            if (written == 0) {
+                jw.objectField("snapshots") catch return error.OutOfMemory;
+                jw.beginArray() catch return error.OutOfMemory;
+            }
+            writeSnapshot(&jw, snap) catch return error.OutOfMemory;
+            written += 1;
+        }
+        if (written > 0) jw.endArray() catch return error.OutOfMemory;
+        if (next) |name| {
+            jw.objectField("nextPageToken") catch return error.OutOfMemory;
+            jw.write(try pageToken(arena, name)) catch return error.OutOfMemory;
+        }
+        jw.endObject() catch return error.OutOfMemory;
+        return ok(out.written());
+    }
+
+    /// The names of a topic's snapshots. A deleted topic has no list.
+    fn listTopicSnapshots(f: *FakePubSub, arena: Allocator, route: Route) Allocator.Error!Reply {
+        const topic = f.topics.get(try resourceName(arena, route)) orelse return notFound(arena, route.id);
+        const page = switch (try pageOf(arena, route.query)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        jw.beginObject() catch return error.OutOfMemory;
+        var written: usize = 0;
+        var next: ?[]const u8 = null;
+        for (f.snapshots.keys(), f.snapshots.values()) |name, snap| {
+            if (snap.topic != topic) continue;
+            if (page.after) |after| {
+                if (std.mem.order(u8, name, after) == .lt) continue;
+            }
+            if (written == page.size) {
+                next = name;
+                break;
+            }
+            if (written == 0) {
+                jw.objectField("snapshots") catch return error.OutOfMemory;
+                jw.beginArray() catch return error.OutOfMemory;
+            }
+            jw.write(name) catch return error.OutOfMemory;
+            written += 1;
+        }
+        if (written > 0) jw.endArray() catch return error.OutOfMemory;
+        if (next) |name| {
+            jw.objectField("nextPageToken") catch return error.OutOfMemory;
+            jw.write(try pageToken(arena, name)) catch return error.OutOfMemory;
+        }
+        jw.endObject() catch return error.OutOfMemory;
+        return ok(out.written());
+    }
+
+    /// A snapshot past its time is gone, as if deleted.
+    fn expireSnapshots(f: *FakePubSub) void {
+        const wall = std.Io.Clock.real.now(f.io).nanoseconds;
+        var i: usize = 0;
+        while (i < f.snapshots.count()) {
+            if (f.snapshots.values()[i].expire.nanoseconds <= wall) f.snapshots.orderedRemoveAt(i) else i += 1;
+        }
+    }
+
+    /// A seek acts on what the subscription holds when it runs, and at
+    /// once. (Production's took 2 to 50 seconds to show, and a seek ahead
+    /// did not stop what was already on its way.) To a snapshot, the
+    /// subscription holds again what the snapshot holds. To a time, what
+    /// was published before it is acknowledged, and what was published
+    /// from then on is unacknowledged again, of what the subscription
+    /// still has: without retention, nothing acknowledged comes back.
+    fn seek(f: *FakePubSub, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
+        const object = switch (try parseObject(arena, body)) {
+            .ok => |o| o,
+            .refused => |r| return r,
+        };
+        const sub = f.subscriptions.get(try resourceName(arena, route)) orelse return notFound(arena, route.id);
+        const Target = union(enum) { snapshot: []const u8, time: std.Io.Timestamp };
+        var target: ?Target = null;
+        var it = object.iterator();
+        while (it.next()) |field| {
+            const key = field.key_ptr.*;
+            const snapshot = isField(key, "snapshot");
+            if (!snapshot and !isField(key, "time")) return unknownName(arena, key);
+            if (target != null) return fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Invalid value (oneof), oneof field 'target' is already set. Cannot set '{s}'", .{key}));
+            const text = stringOf(field.value_ptr.*) orelse return badValue(arena, key);
+            target = if (snapshot) .{ .snapshot = text } else .{ .time = timestamp.parse(text) catch return fail(arena, 400, "INVALID_ARGUMENT", "Invalid value at 'time' (type.googleapis.com/google.protobuf.Timestamp), Field 'time', Illegal timestamp format; timestamps must end with 'Z' or have a valid timezone offset.") };
+        }
+        const to = target orelse return fail(arena, 400, "INVALID_ARGUMENT", "No target was specified in the SeekRequest. Must specify either a time or a snapshot.");
+        if (sub.detached) return detachedRefusal(arena);
+
+        var fresh: std.ArrayList(*const Message) = .empty;
+        switch (to) {
+            .snapshot => |snapshot_name| {
+                if (!isResourceName(snapshot_name, "snapshots")) return invalidName(arena, snapshot_name);
+                const snap = f.snapshots.get(snapshot_name) orelse return notFound(arena, idOf(snapshot_name));
+                if (snap.topic != sub.topic) return fail(arena, 400, "FAILED_PRECONDITION", try std.fmt.allocPrint(arena, "The subscription's topic ({s}) is different from that of the snapshot ({s}); they must match in order for Seek work. Note that if a topic is deleted and then re-created with the same name, it is considered a distinct topic for these purposes.", .{ topicName(sub.topic), topicName(snap.topic) }));
+                // A snapshot serves a subscription that was not there when
+                // it was taken, with that subscription's own filter.
+                for (snap.held) |m| {
+                    if (sub.takes(m)) try fresh.append(arena, m);
+                }
+                for (sub.topic.messages.items[snap.from..]) |m| {
+                    if (sub.takes(m)) try fresh.append(arena, m);
+                }
+            },
+            .time => |time| {
+                var unacknowledged: std.AutoHashMapUnmanaged(*const Message, void) = .empty;
+                for (sub.entries.values()) |entry| {
+                    if (!entry.acked) try unacknowledged.put(arena, entry.message, {});
+                }
+                const wall = std.Io.Clock.real.now(f.io).nanoseconds;
+                for (sub.topic.messages.items, 0..) |m, index| {
+                    if (m.publish_time.nanoseconds < time.nanoseconds) continue;
+                    if (unacknowledged.contains(m) or (sub.takes(m) and sub.retains(m, index, wall))) try fresh.append(arena, m);
+                }
+            },
+        }
+
+        // The subscription has its messages afresh: none out, none
+        // counted as delivered, and every ack id it gave before stale.
+        var entries: std.AutoArrayHashMapUnmanaged(u64, Entry) = .empty;
+        try entries.ensureTotalCapacity(f.gpa, fresh.items.len);
+        sub.stale_below = sub.next_seq;
+        for (fresh.items) |m| {
+            entries.putAssumeCapacity(sub.next_seq, .{ .message = m });
+            sub.next_seq += 1;
+        }
+        sub.entries.deinit(f.gpa);
+        sub.entries = entries;
+        return ok("{}");
+    }
+
+    /// Cuts a subscription from its topic: it lets go of what it holds,
+    /// gets nothing more, and refuses everything but a read, an update
+    /// and a delete. (Production took 7 seconds to refuse; the fake
+    /// refuses at once.)
+    fn detach(f: *FakePubSub, arena: Allocator, route: Route) Allocator.Error!Reply {
+        const sub = f.subscriptions.get(try resourceName(arena, route)) orelse return notFound(arena, route.id);
+        if (sub.detached) return detachedRefusal(arena);
+        sub.detached = true;
+        sub.entries.clearRetainingCapacity();
         return ok("{}");
     }
 
@@ -1396,6 +1753,8 @@ fn parseUrl(arena: Allocator, url: []const u8) Allocator.Error!?FakePubSub.Route
         .topics
     else if (std.mem.eql(u8, collection_text, "subscriptions"))
         .subscriptions
+    else if (std.mem.eql(u8, collection_text, "snapshots"))
+        .snapshots
     else
         return null;
     const id_part = parts.next() orelse return .{ .project = project, .collection = collection, .id = "", .rest = "", .query = query };
@@ -1962,6 +2321,10 @@ fn writeExactlyOnceRefusal(jw: *Stringify, ids: []const []const u8) Stringify.Er
     try jw.endObject();
 }
 
+fn detachedRefusal(arena: Allocator) Allocator.Error!FakePubSub.Reply {
+    return fail(arena, 400, "FAILED_PRECONDITION", "This method is not supported on detached subscriptions.");
+}
+
 /// What this fake has no answer for: said, never guessed at.
 fn notModelled(arena: Allocator, what: []const u8) Allocator.Error!FakePubSub.Reply {
     return fail(arena, 501, "UNIMPLEMENTED", try std.fmt.allocPrint(arena, "fake: {s} is not modelled yet", .{what}));
@@ -2004,20 +2367,48 @@ fn writeTopic(jw: *Stringify, topic: *const FakePubSub.Topic) Stringify.Error!vo
     try jw.endObject();
 }
 
+/// A topic's name as a subscription or a snapshot of it reads it.
+fn topicName(topic: *const FakePubSub.Topic) []const u8 {
+    return if (topic.deleted) "_deleted-topic_" else topic.name;
+}
+
+fn renderSnapshot(arena: Allocator, snap: *const FakePubSub.Snapshot) Allocator.Error![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeSnapshot(&jw, snap) catch return error.OutOfMemory;
+    return out.written();
+}
+
+fn writeSnapshot(jw: *Stringify, snap: *const FakePubSub.Snapshot) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("name");
+    try jw.write(snap.name);
+    try jw.objectField("topic");
+    try jw.write(topicName(snap.topic));
+    var time_buf: [timestamp.max_len]u8 = undefined;
+    try jw.objectField("expireTime");
+    try jw.write(timestamp.format(&time_buf, snap.expire));
+    if (snap.labels.len > 0) {
+        try jw.objectField("labels");
+        try writeLabels(jw, snap.labels);
+    }
+    try jw.endObject();
+}
+
 fn renderSubscription(arena: Allocator, sub: *const FakePubSub.Subscription) Allocator.Error![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     var jw: Stringify = .{ .writer = &out.writer };
-    writeSubscription(&jw, sub) catch return error.OutOfMemory;
+    writeSubscription(&jw, sub, .as_read) catch return error.OutOfMemory;
     return out.written();
 }
 
 /// In the order production writes the fields.
-fn writeSubscription(jw: *Stringify, sub: *const FakePubSub.Subscription) Stringify.Error!void {
+fn writeSubscription(jw: *Stringify, sub: *const FakePubSub.Subscription, how: enum { as_read, after_update }) Stringify.Error!void {
     try jw.beginObject();
     try jw.objectField("name");
     try jw.write(sub.name);
     try jw.objectField("topic");
-    try jw.write(if (sub.topic) |t| t.name else "_deleted-topic_");
+    try jw.write(topicName(sub.topic));
     try jw.objectField("pushConfig");
     try jw.beginObject();
     if (sub.updated) {
@@ -2073,9 +2464,19 @@ fn writeSubscription(jw: *Stringify, sub: *const FakePubSub.Subscription) String
         try writeSeconds(jw, policy.max_s);
         try jw.endObject();
     }
+    if (sub.detached and how == .as_read) {
+        try jw.objectField("detached");
+        try jw.write(true);
+    }
     if (sub.exactly_once) {
         try jw.objectField("enableExactlyOnceDelivery");
         try jw.write(true);
+    }
+    if (sub.topic.retention_s) |seconds| {
+        if (!sub.topic.deleted) {
+            try jw.objectField("topicMessageRetentionDuration");
+            try writeSeconds(jw, seconds);
+        }
     }
     try jw.objectField("state");
     try jw.write("ACTIVE");
@@ -2710,8 +3111,9 @@ test "ack ids and pulls: what production refuses, in its words" {
     remade.deinit();
     try testing.expectError(error.InvalidArgument, b.client.subscription("sub-b").ack(&.{got.value.messages[0].ack_id}));
     // Routes this fake has not got.
-    try testing.expectEqual(501, (try b.raw(a, .POST, "projects/p/subscriptions/sub-a:seek", "{}")).status);
-    try testing.expectEqual(404, (try b.raw(a, .GET, "projects/p/snapshots", "")).status);
+    try testing.expectEqual(501, (try b.raw(a, .POST, "projects/p/subscriptions/sub-a:modifyPushConfig", "{}")).status);
+    try testing.expectEqual(501, (try b.raw(a, .GET, "projects/p/snapshots/snap:getIamPolicy", "")).status);
+    try testing.expectEqual(404, (try b.raw(a, .GET, "projects/p/schemas", "")).status);
 }
 
 test "order: none without an ordering key, so a pull's is the fake's own unless asked for the published one" {
@@ -2733,6 +3135,8 @@ test "order: none without an ordering key, so a pull's is the fake's own unless 
         var last: i32 = -1;
         var pulls: usize = 0;
         while (b.fake.backlog("p", "worker") > 0) : (pulls += 1) {
+            // An ack that did not take would have this go round for ever.
+            try testing.expect(pulls < 3);
             var got = try b.client.subscription("worker").pull(.{ .max_messages = 5 });
             defer got.deinit();
             try testing.expect(got.value.messages.len <= 5);
@@ -3698,6 +4102,27 @@ test "retention: a message older than the subscription keeps messages is gone, o
     try testing.expectEqual(1, b.fake.backlog("p", "week"));
     b.advance(300);
     try testing.expectEqual(0, b.fake.backlog("p", "week"));
+
+    // With ordering, a message acknowledged and kept behind an earlier
+    // one of its key stays acknowledged when the earlier one grows too
+    // old and goes: it does not come again.
+    const kept = b.client.subscription("kept");
+    var kept_made = try kept.create(.{ .topic_id = "orders", .enable_message_ordering = true, .message_retention = .fromSeconds(600) });
+    kept_made.deinit();
+    var k1 = try b.client.topic("orders").publish(&.{.{ .data = "k1" }}, .{ .ordering_key = "k" });
+    k1.deinit();
+    b.advance(300);
+    var k2 = try b.client.topic("orders").publish(&.{.{ .data = "k2" }}, .{ .ordering_key = "k" });
+    k2.deinit();
+    var pair = try kept.pull(.{});
+    defer pair.deinit();
+    try testing.expectEqual(2, pair.value.messages.len);
+    try kept.modifyAckDeadline(&.{pair.value.messages[0].ack_id}, 600);
+    try kept.ack(&.{pair.value.messages[1].ack_id});
+    try testing.expectEqual(1, b.fake.backlog("p", "kept"));
+    b.advance(300);
+    try testing.expectEqual(0, b.fake.backlog("p", "kept"));
+    try expectNothing(kept);
 }
 
 test "exactly-once delivery: an ack or a lease change that comes too late is refused, id by id, in production's words" {
@@ -3790,6 +4215,611 @@ test "exactly-once delivery: an ack or a lease change that comes too late is ref
     try testing.expectEqual(0, b.fake.outstanding("p", "once"));
 }
 
+test "snapshots: made, read, changed, listed and deleted, as production answers, and gone at their time" {
+    var b: Bench = undefined;
+    try b.init(.{ .shuffle = false });
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    for ([_][]const u8{ "zigps-t", "zigps-t2" }) |id| {
+        var made = try b.client.topic(id).create(.{});
+        made.deinit();
+    }
+    for ([_]struct { []const u8, types.SubscriptionConfig }{
+        .{ "zigps-s", .{ .topic_id = "zigps-t", .retain_acked_messages = true, .message_retention = .fromSeconds(600) } },
+        .{ "zigps-plain", .{ .topic_id = "zigps-t" } },
+        .{ "zigps-s2", .{ .topic_id = "zigps-t2" } },
+    }) |case| {
+        var made = try b.client.subscription(case[0]).create(case[1]);
+        made.deinit();
+    }
+    b.advance(100);
+    var sent = try b.client.topic("zigps-t").publish(&.{ .{ .data = "a" }, .{ .data = "b" }, .{ .data = "c" } }, .{});
+    sent.deinit();
+    {
+        var got = try b.client.subscription("zigps-s").pull(.{});
+        defer got.deinit();
+        for (got.value.messages) |m| try b.client.subscription("zigps-s").ack(&.{m.ack_id});
+    }
+    b.advance(20);
+    const of_s = "\"subscription\":\"projects/p/subscriptions/zigps-s\"";
+
+    // Production's answers, 2026-10-10. It lasts seven days from the
+    // oldest message its subscription has, acknowledged ones it retains
+    // included: here the three published at 100 seconds.
+    const snap =
+        \\{"name":"projects/p/snapshots/zigps-snap","topic":"projects/p/topics/zigps-t","expireTime":"1970-01-08T00:01:40Z","labels":{"k":"v"}}
+    ;
+    try testing.expectEqualStrings(snap, (try b.raw(a, .PUT, "projects/p/snapshots/zigps-snap", "{" ++ of_s ++ ",\"labels\":{\"k\":\"v\"}}")).body);
+    try testing.expectEqualStrings(snap, (try b.raw(a, .GET, "projects/p/snapshots/zigps-snap", "")).body);
+    try expectRefused(try b.raw(a, .PUT, "projects/p/snapshots/zigps-snap", "{" ++ of_s ++ "}"), 409, "ALREADY_EXISTS", "Resource already exists in the project (resource=zigps-snap).");
+    try expectRefused(try b.raw(a, .PUT, "projects/p/snapshots/zigps-nosub", "{}"), 400, "INVALID_ARGUMENT", "Invalid resource name given (name=). Refer to https://cloud.google.com/pubsub/docs/pubsub-basics#resource_names for more information.");
+    try expectRefused(try b.raw(a, .PUT, "projects/p/snapshots/zigps-missing", "{\"subscription\":\"projects/p/subscriptions/zigps-nope\"}"), 404, "NOT_FOUND", "Resource not found (resource=zigps-nope).");
+    try expectRefused(try b.raw(a, .PUT, "projects/p/snapshots/1bad", "{" ++ of_s ++ "}"), 400, "INVALID_ARGUMENT", "Invalid resource name given (name=projects/p/snapshots/1bad). Refer to https://cloud.google.com/pubsub/docs/pubsub-basics#resource_names for more information.");
+    try testing.expectEqual(400, (try b.raw(a, .PUT, "projects/p/snapshots/zigps-label", "{" ++ of_s ++ ",\"labels\":{\"K\":\"v\"}}")).status);
+    for ([_]tp.Method{ .GET, .DELETE }) |method| {
+        try expectRefused(try b.raw(a, method, "projects/p/snapshots/zigps-nope", ""), 404, "NOT_FOUND", "Resource not found (resource=zigps-nope).");
+    }
+    try expectRefused(try b.raw(a, .PATCH, "projects/p/snapshots/zigps-nope", "{\"snapshot\":{},\"updateMask\":\"labels\"}"), 404, "NOT_FOUND", "Resource not found (resource=zigps-nope).");
+    try testing.expectEqualStrings("{\"snapshots\":[" ++ snap ++ "]}", (try b.raw(a, .GET, "projects/p/snapshots", "")).body);
+    try testing.expectEqualStrings("{\"snapshots\":[\"projects/p/snapshots/zigps-snap\"]}", (try b.raw(a, .GET, "projects/p/topics/zigps-t/snapshots", "")).body);
+    try testing.expectEqualStrings("{}", (try b.raw(a, .GET, "projects/p/topics/zigps-t2/snapshots", "")).body);
+
+    // Updates: the labels are replaced whole, and nothing else changes.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/snapshots/zigps-snap","topic":"projects/p/topics/zigps-t","expireTime":"1970-01-08T00:01:40Z","labels":{"k2":"v2"}}
+    , (try b.raw(a, .PATCH, "projects/p/snapshots/zigps-snap", "{\"snapshot\":{\"labels\":{\"k2\":\"v2\"}},\"updateMask\":\"labels\"}")).body);
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "{\"snapshot\":{\"expireTime\":\"1970-01-02T00:00:00Z\"},\"updateMask\":\"expireTime\"}", "Invalid update_mask provided in the UpdateSnapshotRequest: the 'expire_time' field in the Snapshot is not mutable." },
+        .{ "{\"snapshot\":{\"topic\":\"projects/p/topics/zigps-t2\"},\"updateMask\":\"topic\"}", "Invalid update_mask provided in the UpdateSnapshotRequest: the 'topic' field in the Snapshot is not mutable." },
+        .{ "{\"snapshot\":{\"labels\":{\"k\":\"v\"}}}", "The update_mask in the UpdateSnapshotRequest must be set, and must contain a non-empty paths list." },
+    }) |case| {
+        try expectRefused(try b.raw(a, .PATCH, "projects/p/snapshots/zigps-snap", case[0]), 400, "INVALID_ARGUMENT", case[1]);
+    }
+    try testing.expectEqual(400, (try b.raw(a, .PATCH, "projects/p/snapshots/zigps-snap", "{\"snapshot\":{\"labels\":{\"K\":\"v\"}},\"updateMask\":\"labels\"}")).status);
+    try testing.expectEqual(400, (try b.raw(a, .PATCH, "projects/p/snapshots/zigps-snap", "{\"snapshot\":{},\"updateMask\":\"nonsense\"}")).status);
+    try testing.expect(std.mem.indexOf(u8, (try b.raw(a, .GET, "projects/p/snapshots/zigps-snap", "")).body, "{\"k2\":\"v2\"}") != null);
+    // With none in the body the labels are cleared, and none are written.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/snapshots/zigps-snap","topic":"projects/p/topics/zigps-t","expireTime":"1970-01-08T00:01:40Z"}
+    , (try b.raw(a, .PATCH, "projects/p/snapshots/zigps-snap", "{\"snapshot\":{},\"updateMask\":\"labels\"}")).body);
+
+    // Through the client, and in pages by name. Of a subscription that
+    // holds the three unacknowledged, it lasts seven days from them too.
+    var made = try b.client.snapshot("zigps-other").create(.{ .subscription = "zigps-plain", .labels = &.{.{ .key = "env", .value = "test" }} });
+    defer made.deinit();
+    try testing.expectEqualStrings("projects/p/snapshots/zigps-other", made.value.name);
+    try testing.expectEqualStrings("projects/p/topics/zigps-t", made.value.topic);
+    try testing.expectEqualStrings("test", made.value.label("env").?);
+    try testing.expectEqual(std.Io.Timestamp{ .nanoseconds = (100 + 7 * 86_400) * std.time.ns_per_s }, made.value.expire_time);
+    var changed = try b.client.snapshot("zigps-other").update(.{ .labels = &.{} });
+    defer changed.deinit();
+    try testing.expectEqual(0, changed.value.labels.len);
+    var page = try b.client.listSnapshots(.{ .page_size = 1 });
+    defer page.deinit();
+    try testing.expectEqual(1, page.value.snapshots.len);
+    try testing.expectEqualStrings("projects/p/snapshots/zigps-other", page.value.snapshots[0].name);
+    var rest = try b.client.listSnapshots(.{ .page_size = 1, .page_token = page.value.next_page_token.? });
+    defer rest.deinit();
+    try testing.expectEqualStrings("projects/p/snapshots/zigps-snap", rest.value.snapshots[0].name);
+    try testing.expectEqual(null, rest.value.next_page_token);
+    var of_topic = try b.client.topic("zigps-t").listSnapshots(.{ .page_size = 1 });
+    defer of_topic.deinit();
+    try testing.expectEqualStrings("projects/p/snapshots/zigps-other", of_topic.value.names[0]);
+    var of_topic_rest = try b.client.topic("zigps-t").listSnapshots(.{ .page_token = of_topic.value.next_page_token.? });
+    defer of_topic_rest.deinit();
+    try testing.expectEqual(1, of_topic_rest.value.names.len);
+    try testing.expectError(error.NotFound, b.client.topic("zigps-nope").listSnapshots(.{}));
+
+    // Of a subscription that holds nothing and retains nothing, it lasts
+    // seven days from when it is taken.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/snapshots/zigps-empty","topic":"projects/p/topics/zigps-t2","expireTime":"1970-01-08T00:02:00Z"}
+    , (try b.raw(a, .PUT, "projects/p/snapshots/zigps-empty", "{\"subscription\":\"projects/p/subscriptions/zigps-s2\"}")).body);
+    try b.client.snapshot("zigps-empty").delete();
+    // Tags are for a later milestone, and say so.
+    try testing.expectEqual(501, (try b.raw(a, .PUT, "projects/p/snapshots/zigps-tagged", "{" ++ of_s ++ ",\"tags\":{\"p/env\":\"prod\"}}")).status);
+
+    // Deleted, it is gone.
+    try b.client.snapshot("zigps-other").delete();
+    try testing.expectError(error.NotFound, b.client.snapshot("zigps-other").delete());
+    try testing.expectError(error.NotFound, b.client.subscription("zigps-plain").seek(.{ .snapshot = "zigps-other" }));
+
+    // It outlives its subscription, and its topic, which it then reads as
+    // deleted. The deleted topic has no list of snapshots.
+    try b.client.subscription("zigps-s").delete();
+    try testing.expect(std.mem.indexOf(u8, (try b.raw(a, .GET, "projects/p/snapshots/zigps-snap", "")).body, "\"topic\":\"projects/p/topics/zigps-t\"") != null);
+    try b.client.topic("zigps-t").delete();
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/snapshots/zigps-snap","topic":"_deleted-topic_","expireTime":"1970-01-08T00:01:40Z"}
+    , (try b.raw(a, .GET, "projects/p/snapshots/zigps-snap", "")).body);
+    try expectRefused(try b.raw(a, .GET, "projects/p/topics/zigps-t/snapshots", ""), 404, "NOT_FOUND", "Resource not found (resource=zigps-t).");
+    // A topic made again under the name is another: the snapshot is not
+    // among its own.
+    var again = try b.client.topic("zigps-t").create(.{});
+    again.deinit();
+    try testing.expectEqualStrings("{}", (try b.raw(a, .GET, "projects/p/topics/zigps-t/snapshots", "")).body);
+
+    // At its time it is gone, to the second.
+    b.advance(7 * 86_400 - 21);
+    try testing.expectEqual(200, (try b.raw(a, .GET, "projects/p/snapshots/zigps-snap", "")).status);
+    b.advance(1);
+    try testing.expectEqual(404, (try b.raw(a, .GET, "projects/p/snapshots/zigps-snap", "")).status);
+    try testing.expectEqualStrings("{}", (try b.raw(a, .GET, "projects/p/snapshots", "")).body);
+
+    // What a subscription retained and has let go for its age does not
+    // count: of one that holds nothing and retains nothing still, a
+    // snapshot lasts seven days from when it is taken.
+    const brief = b.client.subscription("zigps-brief");
+    var brief_made = try brief.create(.{ .topic_id = "zigps-t", .retain_acked_messages = true, .message_retention = .fromSeconds(600) });
+    brief_made.deinit();
+    var old = try b.client.topic("zigps-t").publish(&.{.{ .data = "x" }}, .{});
+    old.deinit();
+    try expectPulled(brief, &.{"x"}, true);
+    b.advance(600);
+    var late = try b.client.snapshot("zigps-late").create(.{ .subscription = "zigps-brief" });
+    defer late.deinit();
+    try testing.expectEqual(std.Io.Timestamp{ .nanoseconds = (604_900 + 600 + 7 * 86_400) * std.time.ns_per_s }, late.value.expire_time);
+}
+
+test "a snapshot of a subscription with ordering holds what is not acknowledged, and not what is acknowledged and kept" {
+    var b: Bench = undefined;
+    try b.init(.{ .shuffle = false });
+    defer b.deinit();
+    const topic = b.client.topic("orders");
+    var topic_made = try topic.create(.{});
+    topic_made.deinit();
+    const ordered = b.client.subscription("ordered");
+    var made = try ordered.create(.{ .topic_id = "orders", .enable_message_ordering = true });
+    made.deinit();
+    var sent = try topic.publish(&.{ .{ .data = "k1" }, .{ .data = "k2" } }, .{ .ordering_key = "k" });
+    sent.deinit();
+    var got = try ordered.pull(.{});
+    defer got.deinit();
+    // The second is acknowledged, and kept behind the first, which is not.
+    try ordered.ack(&.{got.value.messages[1].ack_id});
+    var taken = try b.client.snapshot("first-only").create(.{ .subscription = "ordered" });
+    taken.deinit();
+    try ordered.ack(&.{got.value.messages[0].ack_id});
+    try testing.expectEqual(0, b.fake.backlog("p", "ordered"));
+    try ordered.seek(.{ .snapshot = "first-only" });
+    try expectPulled(ordered, &.{"k1"}, true);
+    try testing.expectEqual(0, b.fake.backlog("p", "ordered"));
+}
+
+/// Pulls everything the subscription has ready and expects exactly these,
+/// in this order: with `Options.shuffle` off, the order published.
+fn expectPulled(sub: anytype, datas: []const []const u8, ack: bool) !void {
+    var got = try sub.pull(.{ .return_immediately = true });
+    defer got.deinit();
+    try testing.expectEqual(datas.len, got.value.messages.len);
+    for (got.value.messages, datas) |m, data| {
+        try testing.expectEqualStrings(data, m.data);
+        if (ack) try sub.ack(&.{m.ack_id});
+    }
+}
+
+test "seek to a snapshot: the subscription holds again what the snapshot holds, and what came after" {
+    var b: Bench = undefined;
+    try b.init(.{ .shuffle = false });
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const topic = b.client.topic("orders");
+    for ([_][]const u8{ "orders", "other" }) |id| {
+        var made = try b.client.topic(id).create(.{});
+        made.deinit();
+    }
+    const worker = b.client.subscription("worker");
+    for ([_]struct { []const u8, types.SubscriptionConfig }{
+        .{ "worker", .{ .topic_id = "orders" } },
+        .{ "elsewhere", .{ .topic_id = "other" } },
+        .{ "once", .{ .topic_id = "orders", .ack_deadline_seconds = 10, .enable_exactly_once_delivery = true } },
+    }) |case| {
+        var made = try b.client.subscription(case[0]).create(case[1]);
+        made.deinit();
+    }
+
+    // As production was put to it: three acknowledged, two more
+    // published and not yet acknowledged when the snapshot is taken, a
+    // sixth after it.
+    var first = try topic.publish(&.{ .{ .data = "a" }, .{ .data = "b" }, .{ .data = "c" } }, .{});
+    first.deinit();
+    try expectPulled(worker, &.{ "a", "b", "c" }, true);
+    var second = try topic.publish(&.{ .{ .data = "d", .attributes = &.{.{ .key = "kind", .value = "order" }} }, .{ .data = "e" } }, .{});
+    second.deinit();
+    var taken = try b.client.snapshot("before").create(.{ .subscription = "worker" });
+    taken.deinit();
+    try expectPulled(worker, &.{ "d", "e" }, true);
+    var third = try topic.publish(&.{.{ .data = "f" }}, .{});
+    third.deinit();
+    try expectPulled(worker, &.{"f"}, true);
+    try testing.expectEqual(0, b.fake.backlog("p", "worker"));
+
+    // The seek brought back d, e and f, each of them acknowledged since.
+    try worker.seek(.{ .snapshot = "before" });
+    try testing.expectEqual(3, b.fake.backlog("p", "worker"));
+    try expectPulled(worker, &.{ "d", "e", "f" }, false);
+    // The snapshot stays, to be sought again: what is out comes back, and
+    // an id from before the seek is answered and forgotten.
+    try expectNothing(worker);
+    b.advance(10);
+    var before_seek = try worker.pull(.{});
+    defer before_seek.deinit();
+    try testing.expectEqual(3, before_seek.value.messages.len);
+    try worker.seek(.{ .snapshot = "before" });
+    try testing.expectEqual(3, b.fake.backlog("p", "worker"));
+    try testing.expectEqual(0, b.fake.outstanding("p", "worker"));
+    try worker.ack(&.{before_seek.value.messages[0].ack_id});
+    try worker.modifyAckDeadline(&.{before_seek.value.messages[1].ack_id}, 30);
+    try worker.nack(&.{before_seek.value.messages[2].ack_id});
+    try testing.expectEqual(3, b.fake.backlog("p", "worker"));
+    try testing.expectEqual(0, b.fake.outstanding("p", "worker"));
+    try expectPulled(worker, &.{ "d", "e", "f" }, true);
+    try testing.expectEqual(200, (try b.raw(a, .GET, "projects/p/snapshots/before", "")).status);
+
+    // With exactly-once delivery too an id from before a seek is taken,
+    // to acknowledge and to change a lease, as production took them: the
+    // message comes again all the same.
+    const once = b.client.subscription("once");
+    var stale = try once.pull(.{});
+    defer stale.deinit();
+    try testing.expectEqual(6, stale.value.messages.len);
+    try once.seek(.{ .snapshot = "before" });
+    try once.ack(&.{stale.value.messages[0].ack_id});
+    try once.modifyAckDeadline(&.{stale.value.messages[5].ack_id}, 30);
+    try testing.expectEqual(3, b.fake.backlog("p", "once"));
+    try testing.expectEqual(0, b.fake.outstanding("p", "once"));
+    // One given since the seek is judged as ever.
+    var fresh = try once.pull(.{});
+    defer fresh.deinit();
+    try testing.expectEqual(3, fresh.value.messages.len);
+    b.advance(10);
+    try testing.expectError(error.InvalidArgument, once.ack(&.{fresh.value.messages[0].ack_id}));
+
+    // A snapshot serves a subscription that was not there when it was
+    // taken, through that subscription's own filter.
+    const late = b.client.subscription("late");
+    var late_made = try late.create(.{ .topic_id = "orders", .filter = "attributes:kind" });
+    late_made.deinit();
+    try expectNothing(late);
+    try late.seek(.{ .snapshot = "before" });
+    try expectPulled(late, &.{"d"}, true);
+
+    // What it refuses, in production's words.
+    try expectRefused(try b.raw(a, .POST, "projects/p/subscriptions/elsewhere:seek", "{\"snapshot\":\"projects/p/snapshots/before\"}"), 400, "FAILED_PRECONDITION", "The subscription's topic (projects/p/topics/other) is different from that of the snapshot (projects/p/topics/orders); they must match in order for Seek work. Note that if a topic is deleted and then re-created with the same name, it is considered a distinct topic for these purposes.");
+    try expectRefused(try b.raw(a, .POST, "projects/p/subscriptions/worker:seek", "{\"snapshot\":\"projects/p/snapshots/nope\"}"), 404, "NOT_FOUND", "Resource not found (resource=nope).");
+    try expectRefused(try b.raw(a, .POST, "projects/p/subscriptions/nope:seek", "{\"snapshot\":\"projects/p/snapshots/before\"}"), 404, "NOT_FOUND", "Resource not found (resource=nope).");
+    try expectRefused(try b.raw(a, .POST, "projects/p/subscriptions/worker:seek", "{}"), 400, "INVALID_ARGUMENT", "No target was specified in the SeekRequest. Must specify either a time or a snapshot.");
+    try expectRefused(try b.raw(a, .POST, "projects/p/subscriptions/worker:seek", "{\"snapshot\":\"projects/p/snapshots/before\",\"time\":\"1970-01-01T00:00:00Z\"}"), 400, "INVALID_ARGUMENT", "Invalid value (oneof), oneof field 'target' is already set. Cannot set 'time'");
+    try expectRefused(try b.raw(a, .POST, "projects/p/subscriptions/worker:seek", "{\"time\":\"1970-01-01T00:00:00Z\",\"snapshot\":\"projects/p/snapshots/before\"}"), 400, "INVALID_ARGUMENT", "Invalid value (oneof), oneof field 'target' is already set. Cannot set 'snapshot'");
+    try expectRefused(try b.raw(a, .POST, "projects/p/subscriptions/worker:seek", "{\"snapshot\":\"before\"}"), 400, "INVALID_ARGUMENT", "Invalid resource name given (name=before). Refer to https://cloud.google.com/pubsub/docs/pubsub-basics#resource_names for more information.");
+    try testing.expectEqual(400, (try b.raw(a, .POST, "projects/p/subscriptions/worker:seek", "{\"subscription\":\"x\"}")).status);
+    try testing.expectEqual(0, b.fake.backlog("p", "worker"));
+
+    // A topic made again under the name is another topic, to a seek too.
+    try topic.delete();
+    var remade = try topic.create(.{});
+    remade.deinit();
+    var newer = try b.client.subscription("newer").create(.{ .topic_id = "orders" });
+    newer.deinit();
+    try testing.expectError(error.FailedPrecondition, b.client.subscription("newer").seek(.{ .snapshot = "before" }));
+    // The old topic's subscription is still that topic's, and seeks.
+    try worker.seek(.{ .snapshot = "before" });
+    try testing.expectEqual(3, b.fake.backlog("p", "worker"));
+}
+
+test "seek to a time: what was published from then on comes again, of what the subscription or its topic retains" {
+    var b: Bench = undefined;
+    try b.init(.{ .shuffle = false });
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const topic = b.client.topic("orders");
+    var topic_made = try topic.create(.{});
+    topic_made.deinit();
+    const keeper = b.client.subscription("keeper");
+    const plain = b.client.subscription("plain");
+    for ([_]struct { []const u8, types.SubscriptionConfig }{
+        .{ "keeper", .{ .topic_id = "orders", .retain_acked_messages = true, .message_retention = .fromSeconds(600) } },
+        .{ "plain", .{ .topic_id = "orders" } },
+        .{ "ordered", .{ .topic_id = "orders", .retain_acked_messages = true, .enable_message_ordering = true } },
+    }) |case| {
+        var made = try b.client.subscription(case[0]).create(case[1]);
+        made.deinit();
+    }
+    const at = struct {
+        fn seconds(s: i64) std.Io.Timestamp {
+            return .{ .nanoseconds = @as(i96, s) * std.time.ns_per_s };
+        }
+    }.seconds;
+
+    // a, b and c at 100 seconds, d and e at 110, f at 120: all pulled and
+    // acknowledged by both.
+    for ([_]struct { i64, []const types.Message }{
+        .{ 100, &.{ .{ .data = "a" }, .{ .data = "b" }, .{ .data = "c" } } },
+        .{ 10, &.{ .{ .data = "d" }, .{ .data = "e" } } },
+        .{ 10, &.{.{ .data = "f" }} },
+    }) |step| {
+        b.advance(step[0]);
+        var sent = try topic.publish(step[1], .{ .ordering_key = "k" });
+        sent.deinit();
+    }
+    b.advance(5);
+    try expectPulled(keeper, &.{ "a", "b", "c", "d", "e", "f" }, true);
+
+    // Back to before everything: a subscription that retains its
+    // acknowledged messages has all six again, as production's had.
+    try keeper.seek(.{ .time = at(0) });
+    try testing.expectEqual(6, b.fake.backlog("p", "keeper"));
+    try expectPulled(keeper, &.{ "a", "b", "c", "d", "e", "f" }, false);
+    // To a time between: what was published at that time and after. The
+    // ones out are out no more.
+    try keeper.seek(.{ .time = at(110) });
+    try testing.expectEqual(0, b.fake.outstanding("p", "keeper"));
+    try expectPulled(keeper, &.{ "d", "e", "f" }, false);
+    try keeper.seek(.{ .time = .{ .nanoseconds = 110 * std.time.ns_per_s + 1 } });
+    try expectPulled(keeper, &.{"f"}, false);
+    // To now, and ahead: everything it holds is acknowledged, pulled or
+    // not. A seek ahead is no standing filter: what is published after
+    // it, though before its time, comes.
+    try keeper.seek(.{ .time = at(0) });
+    try keeper.seek(.{ .time = at(125) });
+    try testing.expectEqual(0, b.fake.backlog("p", "keeper"));
+    var g = try topic.publish(&.{.{ .data = "g" }}, .{});
+    g.deinit();
+    try keeper.seek(.{ .time = at(125 + 3600) });
+    try testing.expectEqual(0, b.fake.backlog("p", "keeper"));
+    var h = try topic.publish(&.{.{ .data = "h" }}, .{});
+    h.deinit();
+    try expectPulled(keeper, &.{"h"}, true);
+    // Times production took: 1970, one with an offset, and one from
+    // before what the subscription retains.
+    try testing.expectEqualStrings("{}", (try b.raw(a, .POST, "projects/p/subscriptions/keeper:seek", "{\"time\":\"1970-01-01T02:01:50+02:00\"}")).body);
+    try expectPulled(keeper, &.{ "d", "e", "f", "g", "h" }, true);
+    try testing.expectEqualStrings("{}", (try b.raw(a, .POST, "projects/p/subscriptions/keeper:seek", "{\"time\":\"1969-12-24T00:00:00Z\"}")).body);
+    try testing.expectEqual(8, b.fake.backlog("p", "keeper"));
+    try expectRefused(try b.raw(a, .POST, "projects/p/subscriptions/keeper:seek", "{\"time\":\"yesterday\"}"), 400, "INVALID_ARGUMENT", "Invalid value at 'time' (type.googleapis.com/google.protobuf.Timestamp), Field 'time', Illegal timestamp format; timestamps must end with 'Z' or have a valid timezone offset.");
+    try testing.expectEqual(8, b.fake.backlog("p", "keeper"));
+
+    // It retains them ten minutes. Past that, held or acknowledged, the
+    // first three are gone, and a seek brings back the rest.
+    try expectPulled(keeper, &.{ "a", "b", "c", "d", "e", "f", "g", "h" }, true);
+    b.advance(600 - 25);
+    try keeper.seek(.{ .time = at(0) });
+    try expectPulled(keeper, &.{ "d", "e", "f", "g", "h" }, true);
+
+    // With ordering a seek back gives a key's messages in order again.
+    const ordered = b.client.subscription("ordered");
+    try expectPulled(ordered, &.{ "a", "b", "c", "d", "e", "f", "g", "h" }, true);
+    try ordered.seek(.{ .time = at(105) });
+    try expectPulled(ordered, &.{ "d", "e", "f", "g", "h" }, true);
+
+    // A subscription that retains nothing, on a topic that retains
+    // nothing: a seek back brings back nothing acknowledged. What it has
+    // not had acknowledged it still has, out no more.
+    var got = try plain.pull(.{});
+    defer got.deinit();
+    try testing.expectEqual(8, got.value.messages.len);
+    for (got.value.messages) |m| {
+        if (!std.mem.eql(u8, m.data, "e")) try plain.ack(&.{m.ack_id});
+    }
+    try testing.expectEqual(1, b.fake.outstanding("p", "plain"));
+    try plain.seek(.{ .time = at(0) });
+    try testing.expectEqual(1, b.fake.backlog("p", "plain"));
+    try testing.expectEqual(0, b.fake.outstanding("p", "plain"));
+    // Its ack from before the seek is answered and forgotten.
+    try plain.ack(&.{got.value.messages[4].ack_id});
+    try expectPulled(plain, &.{"e"}, false);
+    // And a seek to after it acknowledges it.
+    try plain.seek(.{ .time = at(111) });
+    try testing.expectEqual(0, b.fake.backlog("p", "plain"));
+
+    // A subscription retains what it was there to get. One made now, that
+    // retains what is acknowledged, has nothing from before it was made;
+    // of what comes after, it has again what it acknowledged.
+    const newcomer = b.client.subscription("newcomer");
+    var newcomer_made = try newcomer.create(.{ .topic_id = "orders", .retain_acked_messages = true });
+    newcomer_made.deinit();
+    try newcomer.seek(.{ .time = at(0) });
+    try testing.expectEqual(0, b.fake.backlog("p", "newcomer"));
+    var later = try topic.publish(&.{.{ .data = "i" }}, .{});
+    later.deinit();
+    try expectPulled(newcomer, &.{"i"}, true);
+    try newcomer.seek(.{ .time = at(0) });
+    try expectPulled(newcomer, &.{"i"}, true);
+
+    // A seek gives a subscription its messages afresh: their deliveries
+    // are counted from one again. (The fake's own choice: production was
+    // not asked.)
+    const counted = b.client.subscription("counted");
+    var counted_made = try counted.create(.{ .topic_id = "orders", .dead_letter_policy = .{ .topic = "orders" } });
+    counted_made.deinit();
+    var j = try topic.publish(&.{.{ .data = "j" }}, .{});
+    j.deinit();
+    for (1..4) |attempt| {
+        var counted_got = try counted.pull(.{});
+        defer counted_got.deinit();
+        try testing.expectEqual(attempt, counted_got.value.messages[0].delivery_attempt);
+        try counted.nack(&.{counted_got.value.messages[0].ack_id});
+    }
+    try counted.seek(.{ .time = at(0) });
+    var afresh = try counted.pull(.{});
+    defer afresh.deinit();
+    try testing.expectEqual(1, afresh.value.messages[0].delivery_attempt);
+}
+
+test "a topic that retains messages: its subscriptions read how long, and seek back into it, to before they were made" {
+    var b: Bench = undefined;
+    try b.init(.{ .shuffle = false });
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/topics/zigps-keep","messageRetentionDuration":"600s"}
+    , (try b.raw(a, .PUT, "projects/p/topics/zigps-keep", "{\"messageRetentionDuration\":\"600s\"}")).body);
+    // Production's answer, 2026-10-10.
+    const kept_body =
+        \\{"name":"projects/p/subscriptions/zigps-kept","topic":"projects/p/topics/zigps-keep","pushConfig":{},"ackDeadlineSeconds":10,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"topicMessageRetentionDuration":"600s","state":"ACTIVE"}
+    ;
+    try testing.expectEqualStrings(kept_body, (try b.raw(a, .PUT, "projects/p/subscriptions/zigps-kept", "{\"topic\":\"projects/p/topics/zigps-keep\"}")).body);
+    try testing.expectEqualStrings(kept_body, (try b.raw(a, .GET, "projects/p/subscriptions/zigps-kept", "")).body);
+    const kept = b.client.subscription("zigps-kept");
+    const topic = b.client.topic("zigps-keep");
+    b.advance(50);
+    var sent = try topic.publish(&.{ .{ .data = "k1", .attributes = &.{.{ .key = "kind", .value = "order" }} }, .{ .data = "k2" } }, .{});
+    sent.deinit();
+    try expectPulled(kept, &.{ "k1", "k2" }, true);
+
+    // Acknowledged, they are kept by the topic alone, and a seek back
+    // brings them.
+    try kept.seek(.{ .time = .{ .nanoseconds = 0 } });
+    try expectPulled(kept, &.{ "k1", "k2" }, true);
+
+    // A subscription made after them has nothing, until it seeks back to
+    // before it was made: then it has what its filter passes of them.
+    b.advance(10);
+    const late = b.client.subscription("zigps-late");
+    var late_made = try late.create(.{ .topic_id = "zigps-keep", .filter = "attributes:kind" });
+    defer late_made.deinit();
+    try testing.expectEqual(std.Io.Duration.fromSeconds(600), late_made.value.topic_message_retention.?);
+    try expectNothing(late);
+    try late.seek(.{ .time = .{ .nanoseconds = 0 } });
+    try expectPulled(late, &.{"k1"}, true);
+    // A seek to after them brings nothing.
+    try late.seek(.{ .time = .{ .nanoseconds = 51 * std.time.ns_per_s } });
+    try testing.expectEqual(0, b.fake.backlog("p", "zigps-late"));
+
+    // The topic keeps them ten minutes, and to the second.
+    b.advance(600 - 11);
+    try kept.seek(.{ .time = .{ .nanoseconds = 0 } });
+    try testing.expectEqual(2, b.fake.backlog("p", "zigps-kept"));
+    try expectPulled(kept, &.{ "k1", "k2" }, true);
+    b.advance(1);
+    try kept.seek(.{ .time = .{ .nanoseconds = 0 } });
+    try testing.expectEqual(0, b.fake.backlog("p", "zigps-kept"));
+
+    // How long is the topic's to say: changed there, or taken away, the
+    // subscription reads what the topic now has.
+    try testing.expectEqual(200, (try b.raw(a, .PATCH, "projects/p/topics/zigps-keep", "{\"topic\":{\"messageRetentionDuration\":\"1200s\"},\"updateMask\":\"messageRetentionDuration\"}")).status);
+    try testing.expect(std.mem.indexOf(u8, (try b.raw(a, .GET, "projects/p/subscriptions/zigps-kept", "")).body, "\"topicMessageRetentionDuration\":\"1200s\",\"state\"") != null);
+    try kept.seek(.{ .time = .{ .nanoseconds = 0 } });
+    try testing.expectEqual(2, b.fake.backlog("p", "zigps-kept"));
+    try testing.expectEqual(200, (try b.raw(a, .PATCH, "projects/p/topics/zigps-keep", "{\"topic\":{},\"updateMask\":\"messageRetentionDuration\"}")).status);
+    try testing.expect(std.mem.indexOf(u8, (try b.raw(a, .GET, "projects/p/subscriptions/zigps-kept", "")).body, "topicMessageRetentionDuration") == null);
+    // The two it holds, unacknowledged, it still has.
+    try kept.seek(.{ .time = .{ .nanoseconds = 0 } });
+    try testing.expectEqual(2, b.fake.backlog("p", "zigps-kept"));
+    try expectPulled(kept, &.{ "k1", "k2" }, true);
+    try kept.seek(.{ .time = .{ .nanoseconds = 0 } });
+    try testing.expectEqual(0, b.fake.backlog("p", "zigps-kept"));
+    // Deleted, the topic says nothing of it.
+    try testing.expectEqual(200, (try b.raw(a, .PATCH, "projects/p/topics/zigps-keep", "{\"topic\":{\"messageRetentionDuration\":\"600s\"},\"updateMask\":\"messageRetentionDuration\"}")).status);
+    try topic.delete();
+    try testing.expect(std.mem.indexOf(u8, (try b.raw(a, .GET, "projects/p/subscriptions/zigps-kept", "")).body, "\"topic\":\"_deleted-topic_\",\"pushConfig\":{},\"ackDeadlineSeconds\":10,\"messageRetentionDuration\":\"604800s\",\"expirationPolicy\":{\"ttl\":\"2678400s\"},\"state\"") != null);
+}
+
+test "detach: the subscription lets go of what it holds, gets nothing more, and refuses all but a read, an update and a delete" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const topic = b.client.topic("zigps-t");
+    var topic_made = try topic.create(.{});
+    topic_made.deinit();
+    const plain = b.client.subscription("zigps-plain");
+    for ([_][]const u8{ "zigps-plain", "zigps-s" }) |id| {
+        var made = try b.client.subscription(id).create(.{ .topic_id = "zigps-t" });
+        made.deinit();
+    }
+    var sent = try topic.publish(&.{ .{ .data = "z1" }, .{ .data = "z2" } }, .{});
+    sent.deinit();
+    var held = try plain.pull(.{ .max_messages = 1 });
+    defer held.deinit();
+    const words = "This method is not supported on detached subscriptions.";
+
+    // Production's answers, 2026-10-10.
+    try testing.expectEqualStrings("{}", (try b.raw(a, .POST, "projects/p/subscriptions/zigps-plain:detach", "")).body);
+    try expectRefused(try b.raw(a, .POST, "projects/p/subscriptions/zigps-plain:detach", ""), 400, "FAILED_PRECONDITION", words);
+    try expectRefused(try b.raw(a, .POST, "projects/p/subscriptions/zigps-nope:detach", ""), 404, "NOT_FOUND", "Resource not found (resource=zigps-nope).");
+    // It reads as detached, with its topic's name still.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-plain","topic":"projects/p/topics/zigps-t","pushConfig":{},"ackDeadlineSeconds":10,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"detached":true,"state":"ACTIVE"}
+    , (try b.raw(a, .GET, "projects/p/subscriptions/zigps-plain", "")).body);
+    // What it held is gone, and what is published does not reach it.
+    try testing.expectEqual(0, b.fake.backlog("p", "zigps-plain"));
+    var more = try topic.publish(&.{.{ .data = "z3" }}, .{});
+    more.deinit();
+    try testing.expectEqual(0, b.fake.backlog("p", "zigps-plain"));
+    try testing.expectEqual(3, b.fake.backlog("p", "zigps-s"));
+    // A pull, an ack, a lease change, a seek and a snapshot of it are
+    // refused in detach's words. (Production took seven seconds to; the
+    // fake refuses at once.)
+    const id = held.value.messages[0].ack_id;
+    for ([_]struct { []const u8, []const u8 }{
+        .{ ":pull", "{\"maxMessages\":1}" },
+        .{ ":acknowledge", try std.fmt.allocPrint(a, "{{\"ackIds\":[\"{s}\"]}}", .{id}) },
+        .{ ":modifyAckDeadline", try std.fmt.allocPrint(a, "{{\"ackIds\":[\"{s}\"],\"ackDeadlineSeconds\":30}}", .{id}) },
+        .{ ":seek", "{\"time\":\"1970-01-01T00:00:00Z\"}" },
+    }) |call| {
+        try expectRefused(try b.raw(a, .POST, try std.fmt.allocPrint(a, "projects/p/subscriptions/zigps-plain{s}", .{call[0]}), call[1]), 400, "FAILED_PRECONDITION", words);
+    }
+    try expectRefused(try b.raw(a, .PUT, "projects/p/snapshots/zigps-ofdetached", "{\"subscription\":\"projects/p/subscriptions/zigps-plain\"}"), 400, "FAILED_PRECONDITION", words);
+    try testing.expectError(error.FailedPrecondition, plain.pull(.{}));
+    // It is its topic's no longer, and still the project's.
+    try testing.expectEqualStrings("{\"subscriptions\":[\"projects/p/subscriptions/zigps-s\"]}", (try b.raw(a, .GET, "projects/p/topics/zigps-t/subscriptions", "")).body);
+    var all = try b.client.listSubscriptions(.{});
+    defer all.deinit();
+    try testing.expectEqual(2, all.value.subscriptions.len);
+    try testing.expect(all.value.subscriptions[0].detached);
+    try testing.expect(!all.value.subscriptions[1].detached);
+
+    // An update is taken. Its answer leaves `detached` out, as
+    // production's did, though a read right after says it.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-plain","topic":"projects/p/topics/zigps-t","pushConfig":{"attributes":{"x-goog-version":"v1"}},"ackDeadlineSeconds":20,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"state":"ACTIVE"}
+    , (try b.raw(a, .PATCH, "projects/p/subscriptions/zigps-plain", "{\"subscription\":{\"ackDeadlineSeconds\":20},\"updateMask\":\"ackDeadlineSeconds\"}")).body);
+    var read = try plain.get();
+    defer read.deinit();
+    try testing.expect(read.value.detached);
+    try testing.expectEqual(20, read.value.ack_deadline_seconds);
+
+    // Deleted, its name is free, and one made under it is attached.
+    try plain.delete();
+    var again = try plain.create(.{ .topic_id = "zigps-t" });
+    defer again.deinit();
+    try testing.expect(!again.value.detached);
+    var last = try topic.publish(&.{.{ .data = "z4" }}, .{});
+    last.deinit();
+    try testing.expectEqual(1, b.fake.backlog("p", "zigps-plain"));
+
+    // Through the client, with the answer lost on the way back: its
+    // retry is refused, as a second detach is, so it reads the
+    // subscription, finds it detached, and has done what was asked.
+    b.fake.loseAnswers(1, .admin);
+    try b.client.subscription("zigps-s").detach();
+    var other = try b.client.subscription("zigps-s").get();
+    defer other.deinit();
+    try testing.expect(other.value.detached);
+    try testing.expectEqual(0, b.fake.backlog("p", "zigps-s"));
+    try testing.expectError(error.FailedPrecondition, b.client.subscription("zigps-s").detach());
+
+    // With exactly-once delivery it reads `detached` before that, the
+    // order of the fields' numbers, which production's answers follow.
+    var once = try b.client.subscription("zigps-once").create(.{ .topic_id = "zigps-t", .enable_exactly_once_delivery = true });
+    once.deinit();
+    try testing.expectEqualStrings("{}", (try b.raw(a, .POST, "projects/p/subscriptions/zigps-once:detach", "")).body);
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-once","topic":"projects/p/topics/zigps-t","pushConfig":{},"ackDeadlineSeconds":60,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"detached":true,"enableExactlyOnceDelivery":true,"state":"ACTIVE"}
+    , (try b.raw(a, .GET, "projects/p/subscriptions/zigps-once", "")).body);
+}
+
 test "ids of one request: each is judged as the request finds it, before any of them acts" {
     var b: Bench = undefined;
     try b.init(.{ .shuffle = false });
@@ -3830,24 +4860,40 @@ test "ids of one request: each is judged as the request finds it, before any of 
 
 /// What each subscription should hold, said again in as few lines as it
 /// takes: the fake is held to this after every step of a script. Three
-/// subscriptions, each with rules of its own. The first has none. The
-/// second has ordering, a filter that passes what has no `skip`, and a
-/// retry policy of 5 to 20 seconds. The third has ordering, exactly-once
-/// delivery, and dead letters to the first topic after five attempts.
+/// subscriptions, each with rules of its own. The first retains what is
+/// acknowledged. The second has ordering, a filter that passes what has
+/// no `skip`, and a retry policy of 5 to 20 seconds. The third has
+/// ordering, exactly-once delivery, and dead letters to the first topic
+/// after five attempts. Of the two topics the second retains messages,
+/// ten minutes.
 const Reference = struct {
     const Held = struct { id: u64, lease_until: ?i96 = null, deliveries: u32 = 0, not_before: i96 = 0, acked: bool = false };
-    /// What the rules ask of a message: its ordering key, 0 for none, and
-    /// whether the second subscription's filter stops it.
-    const Sent = struct { key: u8 = 0, skip: bool = false };
+    /// What the rules ask of a message: its ordering key, 0 for none,
+    /// whether the second subscription's filter stops it, and which
+    /// topic, of which making, it came to, and when.
+    const Sent = struct { key: u8 = 0, skip: bool = false, topic: u8 = 0, made: u32 = 0, time: i96 = 0 };
+    /// A topic, as one making of it: made again, it is another.
+    const Topic = struct { topic: u8, made: u32 };
+    /// A snapshot: what its subscription had not had acknowledged, and
+    /// the id from which every message to its topic is its own too.
+    const Taken = struct { of: Topic, held: [max_held]u64 = undefined, count: usize = 0, from: u64 };
     const max_held = 256;
+    const topic_retention_s = [2]?i64{ null, 600 };
     const deadline_s = [3]u32{ 10, 20, 10 };
     const ordered = [3]bool{ false, true, true };
     const max_attempts = 5;
 
     held: [3][max_held]Held = undefined,
     counts: [3]usize = @splat(0),
-    /// Which topic a subscription listens to; null once that topic is gone.
-    topic: [3]?u8 = .{ 0, 0, 1 },
+    /// Which topic a subscription listens to, and which making of it.
+    on: [3]Topic = .{ .{ .topic = 0, .made = 0 }, .{ .topic = 0, .made = 0 }, .{ .topic = 1, .made = 0 } },
+    /// How many times each topic has been made again.
+    made: [2]u32 = .{ 0, 0 },
+    /// The first message id a subscription was there for.
+    joined: [3]u64 = .{ 1, 1, 1 },
+    taken: [3]?Taken = .{ null, null, null },
+    /// The fake's clock, as the script moves it.
+    clock: i96 = 0,
     /// By message id.
     sent: [2 * max_held]Sent = undefined,
     /// By message id: which delivery's id acknowledged it on the third
@@ -3856,17 +4902,73 @@ const Reference = struct {
     next_id: u64 = 1,
 
     /// A message comes to a topic, published or forwarded, and gets the
-    /// next id.
-    fn arrive(r: *Reference, topic: u8, what: Sent) u64 {
+    /// next id. The subscriptions of the topic as it is now made get it.
+    fn arrive(r: *Reference, topic: u8, key_of: u8, skip: bool) u64 {
         const id = r.next_id;
         r.next_id += 1;
-        r.sent[id] = what;
+        r.sent[id] = .{ .key = key_of, .skip = skip, .topic = topic, .made = r.made[topic], .time = r.clock };
         for (0..3) |s| {
-            if (r.topic[s] != topic or (s == 1 and what.skip)) continue;
-            r.held[s][r.counts[s]] = .{ .id = id };
-            r.counts[s] += 1;
+            if (r.on[s].topic == topic and r.on[s].made == r.made[topic] and r.passes(s, id)) r.put(s, id);
         }
         return id;
+    }
+
+    fn put(r: *Reference, s: usize, id: u64) void {
+        r.held[s][r.counts[s]] = .{ .id = id };
+        r.counts[s] += 1;
+    }
+
+    /// The second subscription's filter.
+    fn passes(r: *const Reference, s: usize, id: u64) bool {
+        return s != 1 or !r.sent[id].skip;
+    }
+
+    /// Whether a message was sent to the topic a subscription is of.
+    fn sameTopic(r: *const Reference, of: Topic, id: u64) bool {
+        return r.sent[id].topic == of.topic and r.sent[id].made == of.made;
+    }
+
+    /// Takes snapshot `slot` of subscription `s`.
+    fn take(r: *Reference, slot: usize, s: usize) void {
+        r.taken[slot] = .{ .of = r.on[s], .from = r.next_id };
+        const taken = &r.taken[slot].?;
+        for (r.all(s)) |h| {
+            if (h.acked) continue;
+            taken.held[taken.count] = h.id;
+            taken.count += 1;
+        }
+    }
+
+    /// A seek to snapshot `slot`. False when its topic is another.
+    fn seekTo(r: *Reference, s: usize, slot: usize) bool {
+        const taken = r.taken[slot].?;
+        if (taken.of.topic != r.on[s].topic or taken.of.made != r.on[s].made) return false;
+        r.counts[s] = 0;
+        for (taken.held[0..taken.count]) |id| {
+            if (r.passes(s, id)) r.put(s, id);
+        }
+        for (taken.from..r.next_id) |id| {
+            if (r.sameTopic(r.on[s], id) and r.passes(s, id)) r.put(s, id);
+        }
+        return true;
+    }
+
+    /// A seek to a time: of what the subscription still has, what was
+    /// published from then on. It has what is not acknowledged; the
+    /// first subscription what it was there for, a week; and any what its
+    /// topic retains.
+    fn seekAt(r: *Reference, s: usize, time: i96) void {
+        var unacknowledged: [2 * max_held]bool = @splat(false);
+        for (r.all(s)) |h| unacknowledged[h.id] = !h.acked;
+        r.counts[s] = 0;
+        for (1..r.next_id) |id| {
+            const m = r.sent[id];
+            if (!r.sameTopic(r.on[s], id) or m.time < time) continue;
+            const age = r.clock - m.time;
+            const kept = (s == 0 and id >= r.joined[0] and age < 604_800 * std.time.ns_per_s) or
+                if (topic_retention_s[m.topic]) |seconds| age < seconds * std.time.ns_per_s else false;
+            if (unacknowledged[id] or (kept and r.passes(s, id))) r.put(s, id);
+        }
     }
 
     fn all(r: *Reference, s: usize) []Held {
@@ -3898,7 +5000,7 @@ const Reference = struct {
         const gone = s == 2 and h.deliveries >= max_attempts;
         if (gone) {
             r.remove(s, index);
-            _ = r.arrive(0, r.sent[h.id]);
+            _ = r.arrive(0, r.sent[h.id].key, r.sent[h.id].skip);
         } else {
             r.held[s][index].lease_until = null;
             const doublings: u5 = @intCast(@min(h.deliveries - 1, 3));
@@ -4018,10 +5120,17 @@ const sub_ids = [3][]const u8{ "sub0", "sub1", "sub2" };
 const topic_ids = [2][]const u8{ "top0", "top1" };
 const key_names = [3]?[]const u8{ null, "a", "b" };
 
+const snapshot_ids = [3][]const u8{ "snap0", "snap1", "snap2" };
+
+fn makeModelTopic(b: *Bench, topic: u8) !void {
+    var made = try b.client.topic(topic_ids[topic]).create(.{ .message_retention = if (Reference.topic_retention_s[topic]) |seconds| .fromSeconds(seconds) else null });
+    made.deinit();
+}
+
 /// Makes subscription `s` of the model on `topic`, with its rules.
 fn makeModelSubscription(b: *Bench, s: usize, topic: u8) !void {
     var made = try b.client.subscription(sub_ids[s]).create(switch (s) {
-        0 => .{ .topic_id = topic_ids[topic], .ack_deadline_seconds = Reference.deadline_s[0] },
+        0 => .{ .topic_id = topic_ids[topic], .ack_deadline_seconds = Reference.deadline_s[0], .retain_acked_messages = true },
         1 => .{
             .topic_id = topic_ids[topic],
             .ack_deadline_seconds = Reference.deadline_s[1],
@@ -4096,19 +5205,20 @@ fn modelProperty(_: void, input: []const u8) !void {
     const a = scratch.allocator();
 
     var ref: Reference = .{};
-    for (topic_ids) |id| {
-        var made = try b.client.topic(id).create(.{});
-        made.deinit();
-    }
-    for (0..3) |s| try makeModelSubscription(&b, s, ref.topic[s].?);
+    for (0..2) |topic| try makeModelTopic(&b, @intCast(topic));
+    for (0..3) |s| try makeModelSubscription(&b, s, ref.on[s].topic);
     var deliveries: std.ArrayList(ModelDelivery) = .empty;
     var incarnation: [3]u32 = @splat(0);
+    // Deliveries before this one are from before a seek of the
+    // subscription: their ids are answered and forgotten.
+    var stale_before: [3]usize = @splat(0);
     var published: usize = 0;
 
     var steps: usize = 0;
     while (steps < 60 and g.pos < g.bytes.len) : (steps += 1) {
         const now = b.clock.now_ns;
-        switch (g.intRange(u8, 0, 9)) {
+        ref.clock = now;
+        switch (g.intRange(u8, 0, 11)) {
             0, 1 => {
                 const topic = g.intRange(u8, 0, 1);
                 const count = g.intRange(u8, 1, 3);
@@ -4127,7 +5237,7 @@ fn modelProperty(_: void, input: []const u8) !void {
                 defer sent.deinit();
                 // Ids in order, the dead letters' among them.
                 for (sent.value.message_ids, skips[0..count]) |text, skip| {
-                    try testing.expectEqual(ref.arrive(topic, .{ .key = k, .skip = skip }), try std.fmt.parseInt(u64, text, 10));
+                    try testing.expectEqual(ref.arrive(topic, k, skip), try std.fmt.parseInt(u64, text, 10));
                 }
             },
             2, 3, 4 => {
@@ -4136,7 +5246,8 @@ fn modelProperty(_: void, input: []const u8) !void {
             },
             5, 6, 7 => |op| {
                 if (deliveries.items.len == 0) continue;
-                const d = deliveries.items[g.intRange(u16, 0, @intCast(deliveries.items.len - 1))];
+                const which = g.intRange(u16, 0, @intCast(deliveries.items.len - 1));
+                const d = deliveries.items[which];
                 const sub = b.client.subscription(sub_ids[d.sub]);
                 const seconds: u32 = switch (op) {
                     6 => 0,
@@ -4149,6 +5260,12 @@ fn modelProperty(_: void, input: []const u8) !void {
                     try testing.expectError(error.InvalidArgument, result);
                     continue;
                 }
+                // One from before a seek is answered and forgotten, with
+                // exactly-once delivery too.
+                if (which < stale_before[d.sub]) {
+                    try result;
+                    continue;
+                }
                 // Refused only with exactly-once delivery, when it comes
                 // too late.
                 const taken = if (op == 5) ref.ack(d.sub, d.id, d.attempt) else ref.modify(d.sub, d.id, d.attempt, seconds, now);
@@ -4156,7 +5273,43 @@ fn modelProperty(_: void, input: []const u8) !void {
             },
             8 => {
                 b.advance(g.intRange(u8, 1, 15));
+                ref.clock = b.clock.now_ns;
                 ref.settle(b.clock.now_ns);
+            },
+            // A snapshot taken, in place of the one of its name.
+            10 => {
+                const slot = g.intRange(u8, 0, 2);
+                const s = g.intRange(u8, 0, 2);
+                const snapshot = b.client.snapshot(snapshot_ids[slot]);
+                if (ref.taken[slot] != null) try snapshot.delete() else try testing.expectError(error.NotFound, snapshot.delete());
+                var made = try snapshot.create(.{ .subscription = sub_ids[s] });
+                made.deinit();
+                ref.take(slot, s);
+            },
+            // A seek: to a snapshot, to a time some way back, or ahead.
+            11 => {
+                const s = g.intRange(u8, 0, 2);
+                const sub = b.client.subscription(sub_ids[s]);
+                const choice = g.intRange(u8, 0, 4);
+                if (choice < 3) {
+                    const result = sub.seek(.{ .snapshot = snapshot_ids[choice] });
+                    if (ref.taken[choice] == null) {
+                        try testing.expectError(error.NotFound, result);
+                        continue;
+                    }
+                    if (!ref.seekTo(s, choice)) {
+                        try testing.expectError(error.FailedPrecondition, result);
+                        continue;
+                    }
+                    try result;
+                } else {
+                    const back = @as(i96, g.intRange(u8, 0, 60)) * 20 * std.time.ns_per_s;
+                    const time: i96 = if (choice == 3) @max(0, now - back) else now + back;
+                    try sub.seek(.{ .time = .{ .nanoseconds = time } });
+                    ref.seekAt(s, time);
+                }
+                stale_before[s] = deliveries.items.len;
+                if (s == 2) ref.acknowledged_by = @splat(0);
             },
             else => switch (g.intRange(u8, 0, 3)) {
                 // A subscription deleted and made again: it holds nothing.
@@ -4166,7 +5319,8 @@ fn modelProperty(_: void, input: []const u8) !void {
                     try b.client.subscription(sub_ids[s]).delete();
                     try makeModelSubscription(&b, s, topic);
                     ref.counts[s] = 0;
-                    ref.topic[s] = topic;
+                    ref.on[s] = .{ .topic = topic, .made = ref.made[topic] };
+                    ref.joined[s] = ref.next_id;
                     incarnation[s] += 1;
                 },
                 // A topic deleted and made again: its subscriptions keep
@@ -4175,11 +5329,8 @@ fn modelProperty(_: void, input: []const u8) !void {
                 else => {
                     const topic = g.intRange(u8, 0, 1);
                     try b.client.topic(topic_ids[topic]).delete();
-                    var made = try b.client.topic(topic_ids[topic]).create(.{});
-                    made.deinit();
-                    for (&ref.topic) |*t| {
-                        if (t.* == topic) t.* = null;
-                    }
+                    try makeModelTopic(&b, topic);
+                    ref.made[topic] += 1;
                 },
             },
         }
@@ -4194,6 +5345,7 @@ fn modelProperty(_: void, input: []const u8) !void {
     // it should hold, a key's in their order, each acknowledged as it
     // comes, until it holds nothing.
     b.advance(600 + 20 + 1);
+    ref.clock = b.clock.now_ns;
     ref.settle(b.clock.now_ns);
     for (sub_ids, 0..) |id, s| {
         const sub = b.client.subscription(id);
@@ -4227,7 +5379,10 @@ test "fake property: after any script of calls each subscription holds exactly w
         // nack or a lease change of a delivery made so far (5, 6 or 7,
         // two bytes of which, and for 7 how long), the clock moved (8,
         // seconds less one), a subscription made again (9, 0, which, on
-        // which topic) or a topic (9, 2, which).
+        // which topic) or a topic (9, 2, which), a snapshot taken (10,
+        // its slot, of which subscription), and a seek (11, which
+        // subscription, then a slot, or 3 and how far back in steps of
+        // 20 seconds, or 4 and how far ahead).
         .corpus = &.{
             "",
             // Publish, pull, let the lease lapse, ack late, pull again, ack.
@@ -4256,6 +5411,20 @@ test "fake property: after any script of calls each subscription holds exactly w
             // new one, where no subscription of the old listens. Then the
             // other topic made again under the third subscription.
             "\x00\x00\x01\x00\x00\x00\x09\x02\x00\x02\x02\x00\x06\x00\x00\x02\x02\x00\x06\x00\x01\x02\x02\x00\x06\x00\x02\x02\x02\x00\x06\x00\x03\x02\x02\x00\x06\x00\x04\x02\x00\x03\x09\x02\x01\x00\x01\x00\x00\x00\x02\x02\x03",
+            // A snapshot of two that are out, both acknowledged, and a
+            // seek back to it: both again, and an id from before the
+            // seek forgotten.
+            "\x00\x00\x00\x01\x00\x00\x00\x02\x00\x03\x0a\x00\x00\x05\x00\x00\x05\x00\x01\x0b\x00\x00\x02\x00\x03\x05\x00\x00\x02\x00\x03",
+            // The subscription that retains what is acknowledged, sought
+            // back in time: its message again. Then ahead: none.
+            "\x00\x00\x00\x00\x00\x00\x02\x00\x00\x05\x00\x00\x08\x04\x0b\x00\x03\x01\x02\x00\x03\x0b\x00\x04\x01\x02\x00\x03",
+            // The topic that retains messages: acknowledged with
+            // exactly-once delivery, a message comes again after a seek
+            // back, and its old id is forgotten, not refused.
+            "\x00\x00\x01\x00\x00\x00\x02\x02\x00\x05\x00\x00\x0b\x02\x03\x01\x05\x00\x00\x02\x02\x03\x05\x00\x01",
+            // A snapshot of another topic's subscription refuses the
+            // seek, and one never taken is not found.
+            "\x00\x0a\x01\x02\x0b\x00\x01\x0b\x00\x02\x09\x02\x01\x0a\x02\x02\x0b\x02\x02\x0b\x02\x01",
             // Found by the random runs: a backoff still running when the
             // last lease has lapsed, with later messages of its key behind.
             "\xfa\x33\xa2\x88\xe9\x5a\xc3\xa6\x7a\xa3\xb1\x6b\x59\xd6\xa7\x86\xf8\x48\x15\xae\x08\x17\xbe\xdf\xb0\xc2\x11\x8f",
@@ -4280,6 +5449,7 @@ fn arbitraryRequest(_: void, input: []const u8) !void {
     try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/subscriptions/worker", "{\"topic\":\"projects/p/topics/orders\"}")).status);
     try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/subscriptions/rules", "{\"topic\":\"projects/p/topics/orders\",\"enableMessageOrdering\":true,\"enableExactlyOnceDelivery\":true,\"filter\":\"attributes:k OR NOT attributes:k\",\"deadLetterPolicy\":{\"deadLetterTopic\":\"projects/p/topics/orders\"},\"retryPolicy\":{}}")).status);
     try testing.expectEqual(200, (try b.raw(a, .POST, "projects/p/topics/orders:publish", "{\"messages\":[{\"data\":\"eA==\",\"orderingKey\":\"o\"}]}")).status);
+    try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/snapshots/snap", "{\"subscription\":\"projects/p/subscriptions/worker\"}")).status);
     const paths = [_][]const u8{
         "projects/p/topics",                                 "projects/p/topics/orders",
         "projects/p/topics/orders:publish",                  "projects/p/topics/orders/subscriptions",
@@ -4289,6 +5459,10 @@ fn arbitraryRequest(_: void, input: []const u8) !void {
         "projects/p/subscriptions/new",                      "projects/p/topics?pageSize=1&pageToken=",
         "projects/p/subscriptions/rules",                    "projects/p/subscriptions/rules:pull",
         "projects/p/subscriptions/rules:acknowledge",        "projects/p/subscriptions/rules:modifyAckDeadline",
+        "projects/p/snapshots",                              "projects/p/snapshots/snap",
+        "projects/p/snapshots/new",                          "projects/p/topics/orders/snapshots",
+        "projects/p/subscriptions/worker:seek",              "projects/p/subscriptions/rules:seek",
+        "projects/p/subscriptions/worker:detach",            "projects/p/snapshots?pageSize=1&pageToken=",
     };
     const bodies = [_][]const u8{
         "{\"messages\":[{\"data\":\"",                                    "{\"topic\":\"projects/p/topics/orders\",",
@@ -4298,6 +5472,8 @@ fn arbitraryRequest(_: void, input: []const u8) !void {
         "{\"topic\":\"projects/p/topics/orders\",\"filter\":\"",          "{\"topic\":\"projects/p/topics/orders\",\"deadLetterPolicy\":{",
         "{\"topic\":\"projects/p/topics/orders\",\"retryPolicy\":{",      "{\"maxMessages\":3}",
         "{\"messages\":[{\"orderingKey\":\"o\",\"attributes\":{\"k\":\"", "{\"ackIds\":[\"FAKE",
+        "{\"subscription\":\"projects/p/subscriptions/worker\",",         "{\"snapshot\":\"projects/p/snapshots/snap\"}",
+        "{\"time\":\"1970-01-01T00:00:0",                                 "{\"snapshot\":{\"labels\":{",
     };
     for (0..8) |_| {
         const method = g.pick(tp.Method, &.{ .GET, .PUT, .POST, .PATCH, .DELETE });
@@ -4401,6 +5577,29 @@ fn sessionAllocations(gpa: Allocator) !void {
     const both = try std.fmt.allocPrint(a, "{{\"ackIds\":[\"{s}\",\"{s}\"]}}", .{ letters.receivedMessages[0].ackId, letters.receivedMessages[1].ackId });
     for (0..2) |_| try testing.expectEqual(200, (try fake.serve(.POST, base ++ "subscriptions/morgue:acknowledge", both, a)).status);
     try testing.expectEqual(400, (try fake.serve(.POST, base ++ "subscriptions/morgue:modifyAckDeadline", both, a)).status);
+    try testing.expectEqual(0, fake.backlog("p", "morgue"));
+
+    // Replay: a snapshot made, read, changed and listed, a seek to it and
+    // to a time, and a detach.
+    try testing.expectEqual(200, (try fake.serve(.POST, base ++ "topics/dead:publish", "{\"messages\":[{\"data\":\"YQ==\"},{\"data\":\"Yg==\",\"attributes\":{\"CloudPubSubDeadLetterSourceSubscription\":\"rules\"}}]}", a)).status);
+    const replay = [_]struct { tp.Method, []const u8, []const u8 }{
+        .{ .PUT, "snapshots/taken", "{\"subscription\":\"projects/p/subscriptions/morgue\",\"labels\":{\"env\":\"test\"}}" },
+        .{ .GET, "snapshots/taken", "" },
+        .{ .PATCH, "snapshots/taken", "{\"snapshot\":{\"labels\":{\"env\":\"prod\",\"a\":\"b\"}},\"updateMask\":\"labels\"}" },
+        .{ .GET, "snapshots?pageSize=1", "" },
+        .{ .GET, "topics/dead/snapshots", "" },
+        .{ .POST, "subscriptions/morgue:pull", "{\"maxMessages\":5}" },
+        .{ .POST, "subscriptions/morgue:seek", "{\"time\":\"1970-01-01T00:00:00Z\"}" },
+        .{ .POST, "subscriptions/morgue:seek", "{\"snapshot\":\"projects/p/snapshots/taken\"}" },
+        .{ .POST, "subscriptions/morgue:detach", "" },
+        .{ .GET, "subscriptions/morgue", "" },
+        .{ .DELETE, "snapshots/taken", "" },
+    };
+    for (replay) |step| {
+        const method, const path, const body = step;
+        try testing.expectEqual(200, (try fake.serve(method, try std.fmt.allocPrint(a, "{s}{s}", .{ base, path }), body, a)).status);
+        if (std.mem.endsWith(u8, path, ":seek")) try testing.expectEqual(1, fake.backlog("p", "morgue"));
+    }
     try testing.expectEqual(0, fake.backlog("p", "morgue"));
 }
 
