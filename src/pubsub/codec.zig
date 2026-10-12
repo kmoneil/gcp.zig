@@ -323,9 +323,33 @@ const TopicBody = struct {
             try jw.objectField("messageStoragePolicy");
             try writeStoragePolicy(jw, policy);
         }
+        if (c.schema) |settings| {
+            try jw.objectField("schemaSettings");
+            try writeSchemaSettings(jw, settings);
+        }
         try jw.endObject();
     }
 };
+
+/// A topic's `schemaSettings`. The schema must already be a full name:
+/// `Topic` resolves an id before encoding. A bound left null is left out,
+/// which the server reads as open.
+fn writeSchemaSettings(jw: *Stringify, s: types.SchemaSettings) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("schema");
+    try jw.write(s.schema);
+    try jw.objectField("encoding");
+    try jw.write(schemaEncodingName(s.encoding));
+    if (s.first_revision_id) |revision| {
+        try jw.objectField("firstRevisionId");
+        try jw.write(revision);
+    }
+    if (s.last_revision_id) |revision| {
+        try jw.objectField("lastRevisionId");
+        try jw.write(revision);
+    }
+    try jw.endObject();
+}
 
 /// The `topics.patch` body, as for subscriptions.
 pub fn encodeTopicUpdate(arena: Allocator, update: types.TopicUpdate) Allocator.Error![]u8 {
@@ -371,6 +395,17 @@ const TopicUpdateBody = struct {
                 mask.add("messageStoragePolicy");
                 try jw.objectField("messageStoragePolicy");
                 try writeStoragePolicy(jw, policy);
+            },
+        }
+        // The settings are masked whole, so what is given is all that
+        // holds afterwards, and nothing given is no schema.
+        switch (u.schema) {
+            .keep => {},
+            .clear => mask.add("schemaSettings"),
+            .set => |settings| {
+                mask.add("schemaSettings");
+                try jw.objectField("schemaSettings");
+                try writeSchemaSettings(jw, settings);
             },
         }
         try jw.endObject();
@@ -927,7 +962,15 @@ const WireTopic = struct {
     messageRetentionDuration: ?[]const u8 = null,
     kmsKeyName: ?[]const u8 = null,
     messageStoragePolicy: ?WireStoragePolicy = null,
+    schemaSettings: ?WireSchemaSettings = null,
     state: ?[]const u8 = null,
+};
+
+const WireSchemaSettings = struct {
+    schema: ?[]const u8 = null,
+    encoding: ?[]const u8 = null,
+    firstRevisionId: ?[]const u8 = null,
+    lastRevisionId: ?[]const u8 = null,
 };
 
 const WireTopicList = struct {
@@ -1091,8 +1134,28 @@ fn topicFromWire(arena: Allocator, w: WireTopic) DecodeError!types.TopicInfo {
             .allowed_persistence_regions = policy.allowedPersistenceRegions orelse &.{},
             .enforce_in_transit = policy.enforceInTransit orelse false,
         } else null,
+        .schema = schemaSettingsFromWire(w.schemaSettings),
         .state = topicState(w.state),
     };
+}
+
+/// Settings that name no schema are none: a topic without one may read as
+/// `{}`.
+fn schemaSettingsFromWire(wire: ?WireSchemaSettings) ?types.SchemaSettings {
+    const w = wire orelse return null;
+    return .{
+        .schema = nonEmpty(w.schema) orelse return null,
+        .encoding = schemaEncoding(w.encoding),
+        .first_revision_id = nonEmpty(w.firstRevisionId),
+        .last_revision_id = nonEmpty(w.lastRevisionId),
+    };
+}
+
+fn schemaEncoding(text: ?[]const u8) types.SchemaEncoding {
+    const s = text orelse return .unknown;
+    if (std.mem.eql(u8, s, "JSON")) return .json;
+    if (std.mem.eql(u8, s, "BINARY")) return .binary;
+    return .unknown;
 }
 
 pub fn decodeTopic(arena: Allocator, body: []const u8) DecodeError!types.TopicInfo {
@@ -3013,5 +3076,140 @@ test "fuzz schema bodies: a definition reads back as it was written, and a messa
         "\x20\x02{\x02}\x01\x00\x03abc\x01\x01",
         "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
         "\x08\x01\x00\x01\x01\x00\x00\x00\x01\x02\x03\x04\x05",
+    } });
+}
+
+test "golden: a topic's schema settings on create and in an update, set whole and cleared" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        \\{"schemaSettings":{"schema":"projects/p/schemas/order-v1","encoding":"JSON"}}
+    , try encodeTopic(a, .{ .schema = .{ .schema = "projects/p/schemas/order-v1", .encoding = .json } }));
+    try testing.expectEqualStrings(
+        \\{"labels":{"env":"test"},"schemaSettings":{"schema":"projects/other/schemas/order-v1","encoding":"BINARY","firstRevisionId":"1b46a16a","lastRevisionId":"6f0519a4"}}
+    , try encodeTopic(a, .{
+        .labels = &.{.{ .key = "env", .value = "test" }},
+        .schema = .{ .schema = "projects/other/schemas/order-v1", .encoding = .binary, .first_revision_id = "1b46a16a", .last_revision_id = "6f0519a4" },
+    }));
+    // One bound alone: the other stays open.
+    try testing.expectEqualStrings(
+        \\{"schemaSettings":{"schema":"projects/p/schemas/order-v1","encoding":"JSON","lastRevisionId":"6f0519a4"}}
+    , try encodeTopic(a, .{ .schema = .{ .schema = "projects/p/schemas/order-v1", .encoding = .json, .last_revision_id = "6f0519a4" } }));
+
+    try testing.expectEqualStrings(
+        \\{"topic":{"schemaSettings":{"schema":"projects/p/schemas/order-v1","encoding":"BINARY"}},"updateMask":"schemaSettings"}
+    , try encodeTopicUpdate(a, .{ .schema = .{ .set = .{ .schema = "projects/p/schemas/order-v1", .encoding = .binary } } }));
+    try testing.expectEqualStrings(
+        \\{"topic":{},"updateMask":"schemaSettings"}
+    , try encodeTopicUpdate(a, .{ .schema = .clear }));
+    try testing.expectEqualStrings(
+        \\{"topic":{"labels":{},"schemaSettings":{"schema":"projects/p/schemas/order-v1","encoding":"JSON","firstRevisionId":"1b46a16a"}},"updateMask":"labels,schemaSettings"}
+    , try encodeTopicUpdate(a, .{ .labels = &.{}, .schema = .{ .set = .{ .schema = "projects/p/schemas/order-v1", .encoding = .json, .first_revision_id = "1b46a16a" } } }));
+}
+
+test "decode: a topic with a schema, with a range, with its schema deleted, and with none" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The emulator's answers, 2026-10-11.
+    const plain = (try decodeTopic(a,
+        \\{ "name": "projects/test/topics/t", "schemaSettings": { "schema": "projects/test/schemas/order-v1", "encoding": "JSON" } }
+    )).schema.?;
+    try testing.expectEqualStrings("projects/test/schemas/order-v1", plain.schema);
+    try testing.expectEqual(types.SchemaEncoding.json, plain.encoding);
+    try testing.expectEqual(null, plain.first_revision_id);
+    try testing.expectEqual(null, plain.last_revision_id);
+    try testing.expect(!plain.isDeleted());
+
+    const ranged = (try decodeTopic(a,
+        \\{ "name": "projects/test/topics/t", "schemaSettings": { "schema": "projects/test/schemas/order-v1", "encoding": "JSON", "firstRevisionId": "1b46a16a", "lastRevisionId": "1b46a16a" } }
+    )).schema.?;
+    try testing.expectEqualStrings("1b46a16a", ranged.first_revision_id.?);
+    try testing.expectEqualStrings("1b46a16a", ranged.last_revision_id.?);
+
+    const gone = (try decodeTopic(a,
+        \\{ "name": "projects/test/topics/t", "schemaSettings": { "schema": "_deleted-schema_", "encoding": "BINARY" } }
+    )).schema.?;
+    try testing.expect(gone.isDeleted());
+    try testing.expectEqual(types.SchemaEncoding.binary, gone.encoding);
+
+    // No settings, empty ones, a null and ones that name no schema are no
+    // schema; an encoding not yet known, or left out, is `.unknown`; an
+    // empty bound is an open one.
+    try testing.expectEqual(null, (try decodeTopic(a, "{\"name\":\"projects/p/topics/t\"}")).schema);
+    try testing.expectEqual(null, (try decodeTopic(a, "{\"name\":\"projects/p/topics/t\",\"schemaSettings\":{}}")).schema);
+    try testing.expectEqual(null, (try decodeTopic(a, "{\"name\":\"projects/p/topics/t\",\"schemaSettings\":null}")).schema);
+    try testing.expectEqual(null, (try decodeTopic(a, "{\"name\":\"projects/p/topics/t\",\"schemaSettings\":{\"schema\":\"\",\"encoding\":\"JSON\"}}")).schema);
+    try testing.expectEqual(types.SchemaEncoding.unknown, (try decodeTopic(a, "{\"schemaSettings\":{\"schema\":\"projects/p/schemas/s\",\"encoding\":\"CBOR\"}}")).schema.?.encoding);
+    try testing.expectEqual(types.SchemaEncoding.unknown, (try decodeTopic(a, "{\"schemaSettings\":{\"schema\":\"projects/p/schemas/s\"}}")).schema.?.encoding);
+    try testing.expectEqual(null, (try decodeTopic(a, "{\"schemaSettings\":{\"schema\":\"projects/p/schemas/s\",\"encoding\":\"JSON\",\"firstRevisionId\":\"\"}}")).schema.?.first_revision_id);
+    try testing.expectError(error.InvalidResponse, decodeTopic(a, "{\"schemaSettings\":\"order-v1\"}"));
+
+    // In a list, each topic with its own.
+    const page = try decodeTopicPage(a,
+        \\{"topics":[{"name":"projects/p/topics/a"},{"name":"projects/p/topics/b","schemaSettings":{"schema":"projects/p/schemas/s","encoding":"BINARY"}}]}
+    );
+    try testing.expectEqual(null, page.topics[0].schema);
+    try testing.expectEqual(types.SchemaEncoding.binary, page.topics[1].schema.?.encoding);
+}
+
+fn topicSchemaRoundTrip(_: void, input: []const u8) !void {
+    var g: ByteGen = .init(input);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const revisions = [_]?[]const u8{ null, "1b46a16a", "6f0519a4", "a-b_c.d~e", "0" };
+    const settings: types.SchemaSettings = .{
+        .schema = g.pick([]const u8, &.{ "projects/p/schemas/order-v1", "projects/example.com:proj/schemas/a%41+b", "projects/other/schemas/abc" }),
+        .encoding = g.pick(types.SchemaEncoding, &.{ .json, .binary }),
+        .first_revision_id = revisions[g.intRange(u8, 0, revisions.len - 1)],
+        .last_revision_id = revisions[g.intRange(u8, 0, revisions.len - 1)],
+    };
+    try @import("validate.zig").schemaSettings(settings, null);
+
+    // What a create sends, a read gives back.
+    const created = try decodeTopic(a, try encodeTopic(a, .{ .schema = settings }));
+    const have = created.schema.?;
+    try testing.expectEqualStrings(settings.schema, have.schema);
+    try testing.expectEqual(settings.encoding, have.encoding);
+    try expectEqualOptionalStrings(settings.first_revision_id, have.first_revision_id);
+    try expectEqualOptionalStrings(settings.last_revision_id, have.last_revision_id);
+
+    // An update names `schemaSettings` in its mask exactly when it sets or
+    // clears them, and carries them exactly when it sets them.
+    const change: types.Change(types.SchemaSettings) = switch (g.intRange(u8, 0, 2)) {
+        0 => .keep,
+        1 => .clear,
+        else => .{ .set = settings },
+    };
+    const with_labels = g.boolean();
+    if (change == .keep and !with_labels) return;
+    const update = try std.json.parseFromSliceLeaky(struct {
+        topic: struct { schemaSettings: ?WireSchemaSettings = null, labels: ?std.json.Value = null },
+        updateMask: []const u8,
+    }, a, try encodeTopicUpdate(a, .{ .labels = if (with_labels) &.{} else null, .schema = change }), .{});
+    var named = false;
+    var paths = std.mem.splitScalar(u8, update.updateMask, ',');
+    while (paths.next()) |path| {
+        if (std.mem.eql(u8, path, "schemaSettings")) named = true;
+    }
+    try testing.expectEqual(change != .keep, named);
+    try testing.expectEqual(change == .set, update.topic.schemaSettings != null);
+    if (update.topic.schemaSettings) |sent| {
+        try testing.expectEqualStrings(settings.schema, sent.schema.?);
+        try testing.expectEqualStrings(schemaEncodingName(settings.encoding), sent.encoding.?);
+        try expectEqualOptionalStrings(settings.first_revision_id, sent.firstRevisionId);
+        try expectEqualOptionalStrings(settings.last_revision_id, sent.lastRevisionId);
+    }
+}
+
+test "fuzz topic schema settings: what a create sends a read gives back, and an update's mask names them exactly when it changes them" {
+    try test_util.fuzzBytes({}, topicSchemaRoundTrip, .{ .corpus = &.{
+        "",
+        "\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01\x02\x02\x01",
+        "\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00",
+        "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
     } });
 }
