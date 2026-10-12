@@ -323,3 +323,97 @@ test "IAM on a snapshot: read, grant, revoke and test, on the paths Pub/Sub serv
     );
     try h.expectRequestCount(7);
 }
+
+const env_tags = [_]types.Tag{
+    .{ .key = "my-project/env", .value = "prod" },
+    .{ .key = "tagKeys/281478409127147", .value = "tagValues/281479442205542" },
+};
+const env_tags_json =
+    \\"tags":{"my-project/env":"prod","tagKeys/281478409127147":"tagValues/281479442205542"}
+;
+
+test "golden: tags ride on the create of a topic, a subscription and a snapshot" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        // Production returns none of them; an emulator echoes them, which
+        // is read past.
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/orders\",\"tags\":{\"my-project/env\":\"prod\"}}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/subscriptions/orders-worker\",\"topic\":\"projects/p/topics/orders\",\"pushConfig\":{},\"ackDeadlineSeconds\":10}" } },
+        .{ .respond = .{ .body = kept } },
+    }, .{});
+    defer h.deinit();
+
+    var topic = try h.client.topic("orders").create(.{ .tags = &env_tags });
+    defer topic.deinit();
+    try h.expectRequest(0, .PUT, "http://localhost:8085/v1/projects/p/topics/orders", "{" ++ env_tags_json ++ "}");
+    try testing.expectEqualStrings("projects/p/topics/orders", topic.value.name);
+
+    var subscription = try h.client.subscription("orders-worker").create(.{ .topic_id = "orders", .tags = &env_tags });
+    defer subscription.deinit();
+    try h.expectRequest(1, .PUT, "http://localhost:8085/v1/projects/p/subscriptions/orders-worker", "{\"topic\":\"projects/p/topics/orders\",\"enableMessageOrdering\":false," ++ env_tags_json ++ "}");
+
+    var snapshot = try h.client.snapshot("before").create(.{ .subscription = "orders-worker", .tags = &env_tags });
+    defer snapshot.deinit();
+    try h.expectRequest(2, .PUT, "http://localhost:8085/v1/projects/p/snapshots/before", "{\"subscription\":\"projects/p/subscriptions/orders-worker\"," ++ env_tags_json ++ "}");
+    try h.expectRequestCount(3);
+}
+
+test "tags: what the checks refuse is never sent, and a key that is not there, or not the caller's to use, is refused in production's words" {
+    // Production's words, 2026-10-12.
+    const denied = "{\"error\":{\"code\":403,\"message\":\"PERMISSION_DENIED: Permission denied on resource 'extractctl/zigps-no-such-key' (or it may not exist).\",\"status\":\"PERMISSION_DENIED\"}}";
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 403, .body = denied } },
+        .{ .respond = .{ .status = 403, .body = denied } },
+        .{ .respond = .{ .status = 403, .body = denied } },
+    }, .{ .token = "t" });
+    defer h.deinit();
+    const no_namespace = [_]types.Tag{.{ .key = "env", .value = "prod" }};
+    const twice = [_]types.Tag{ .{ .key = "p/env", .value = "prod" }, .{ .key = "p/env", .value = "test" } };
+    const no_value = [_]types.Tag{.{ .key = "p/env", .value = "" }};
+    const mixed = [_]types.Tag{.{ .key = "p/env", .value = "tagValues/281479442205542" }};
+
+    try testing.expectError(error.InvalidArgument, h.client.topic("orders").create(.{ .tags = &no_namespace }));
+    try testing.expectEqualStrings("tag 0 has a key that is neither {organization id or project}/{key name} nor tagKeys/{id}", h.diag.message());
+    try testing.expectError(error.InvalidArgument, h.client.subscription("orders-worker").create(.{ .topic_id = "orders", .tags = &twice }));
+    try testing.expectEqualStrings("tags 0 and 1 have the same key", h.diag.message());
+    try testing.expectError(error.InvalidArgument, h.client.snapshot("before").create(.{ .subscription = "orders-worker", .tags = &no_value }));
+    try testing.expectEqualStrings("tag 0 has a value that is neither a value's short name nor tagValues/{id}", h.diag.message());
+    try testing.expectError(error.InvalidArgument, h.client.topic("orders").create(.{ .tags = &mixed }));
+    try testing.expect(std.mem.startsWith(u8, h.diag.message(), "tag 0 names its key and its value in different forms"));
+    try h.expectRequestCount(0);
+
+    const unknown = [_]types.Tag{.{ .key = "extractctl/zigps-no-such-key", .value = "v" }};
+    try testing.expectError(error.PermissionDenied, h.client.topic("orders").create(.{ .tags = &unknown }));
+    try testing.expectEqualStrings("PERMISSION_DENIED: Permission denied on resource 'extractctl/zigps-no-such-key' (or it may not exist).", h.diag.message());
+    try testing.expectError(error.PermissionDenied, h.client.subscription("orders-worker").create(.{ .topic_id = "orders", .tags = &unknown }));
+    try testing.expectError(error.PermissionDenied, h.client.snapshot("before").create(.{ .subscription = "orders-worker", .tags = &unknown }));
+    try h.expectRequestCount(3);
+}
+
+fn tagsAllocations(gpa: std.mem.Allocator) !void {
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/orders\",\"tags\":{\"my-project/env\":\"prod\"}}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/subscriptions/orders-worker\",\"topic\":\"projects/p/topics/orders\",\"pushConfig\":{},\"ackDeadlineSeconds\":10,\"tags\":{\"my-project/env\":\"prod\"}}" } },
+        .{ .respond = .{ .body = kept } },
+    });
+    defer fake.deinit();
+    var clock: test_util.FakeClock = .{};
+    var client = try Client.init(gpa, clock.io(), .{
+        .project_id = "p",
+        .endpoint = .{ .url = "localhost:8085", .emulator = true },
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    var topic = try client.topic("orders").create(.{ .tags = &env_tags });
+    topic.deinit();
+    var subscription = try client.subscription("orders-worker").create(.{ .topic_id = "orders", .tags = &env_tags });
+    subscription.deinit();
+    var snapshot = try client.snapshot("before").create(.{ .subscription = "orders-worker", .tags = &env_tags });
+    snapshot.deinit();
+    try testing.expectEqual(3, fake.requests.items.len);
+}
+
+test "allocation failures: tags on the three creates" {
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, tagsAllocations, .{});
+}

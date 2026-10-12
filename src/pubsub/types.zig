@@ -172,6 +172,8 @@ pub const TopicConfig = struct {
     /// Pub/Sub. Production connects to the source when the topic is made,
     /// and refuses the create if it cannot. Null: a standard topic.
     ingestion: ?Ingestion = null,
+    /// Resource Manager tags to bind as the topic is made. At most 50.
+    tags: []const Tag = &.{},
 };
 
 pub const TopicInfo = struct {
@@ -390,6 +392,9 @@ pub const SubscriptionConfig = struct {
     /// Run on every message on its way to a subscriber, in this order,
     /// after the filter. At most 5 that are not disabled.
     message_transforms: []const MessageTransform = &.{},
+    /// Resource Manager tags to bind as the subscription is made. At most
+    /// 50.
+    tags: []const Tag = &.{},
 };
 
 pub const SubscriptionInfo = struct {
@@ -503,6 +508,8 @@ pub const SnapshotConfig = struct {
     subscription: []const u8,
     /// The emulator keeps none.
     labels: []const Label = &.{},
+    /// Resource Manager tags to bind as the snapshot is made. At most 50.
+    tags: []const Tag = &.{},
 };
 
 /// A snapshot as the server describes it.
@@ -753,6 +760,20 @@ pub const IngestionInfo = struct {
     log_severity: Ingestion.LogSeverity,
     /// `.unknown` when the server says nothing, as an emulator does not.
     state: IngestionState,
+};
+
+/// A Resource Manager tag, bound to a topic, a subscription or a snapshot
+/// as it is made: for policies and billing, where a label is only a note.
+/// The key and the value must already be there, and the caller needs the
+/// Tag User role on the value. Tags are given once: production returns
+/// none of them on a read (an emulator echoes them, measured 2026-10-12),
+/// and binding or removing one afterwards is Resource Manager's API.
+pub const Tag = struct {
+    /// `{organization id or project id}/{key name}`, or `tagKeys/{id}`.
+    key: []const u8,
+    /// The value's short name, with a key by name; `tagValues/{id}`, with
+    /// a key by id. Production refuses one of each.
+    value: []const u8,
 };
 
 /// What Pub/Sub says of an import topic's source. One enum for the five
