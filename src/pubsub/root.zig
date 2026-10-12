@@ -87,6 +87,7 @@ pub const AwsMsk = @import("types.zig").AwsMsk;
 pub const ConfluentCloud = @import("types.zig").ConfluentCloud;
 pub const IngestionInfo = @import("types.zig").IngestionInfo;
 pub const IngestionState = @import("types.zig").IngestionState;
+pub const Tag = @import("types.zig").Tag;
 
 /// Parses a `publish_time` (RFC 3339) to nanoseconds since the Unix epoch.
 pub const parseTimestamp = core.timestamp.parse;

@@ -3081,3 +3081,51 @@ test "import topics on the emulator: an update replaces the settings whole, and 
         try testing.expectEqualStrings("the text delimiter is not one character of one byte", f.diag.message());
     }
 }
+
+// Tags. Production binds a tag only when its key and value are there and
+// the caller may use them, and returns none on a read; the emulator takes
+// any key and any value (emulator 0.8.36, 2026-10-12).
+
+test "tags: the emulator takes them on the three creates, and production refuses a key that is not there" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const tags = [_]pubsub.Tag{.{ .key = try a.print("{s}/zigps-no-such-key", .{f.client.project_id}), .value = "v" }};
+
+    const topic = f.client.topic(f.id("tag"));
+    try f.topics.append(testing.allocator, topic.id);
+    if (topic.create(.{ .tags = &tags })) |made| {
+        var created = made;
+        created.deinit();
+        try testing.expect(!f.production);
+    } else |err| {
+        if (!f.production) return f.fail(err);
+        try testing.expectEqual(error.PermissionDenied, err);
+        try testing.expect(std.mem.indexOf(u8, f.diag.message(), "(or it may not exist)") != null);
+    }
+
+    const plain = try f.createTopic("tag-plain");
+    const sub = f.client.subscription(f.id("tag-sub"));
+    try f.subscriptions.append(testing.allocator, sub.id);
+    if (sub.create(.{ .topic_id = plain.id, .tags = &tags })) |made| {
+        var created = made;
+        created.deinit();
+        try testing.expect(!f.production);
+    } else |err| {
+        if (!f.production) return f.fail(err);
+        try testing.expectEqual(error.PermissionDenied, err);
+    }
+    if (f.production) return;
+
+    // A snapshot with tags, of the subscription just made.
+    const snapshot = f.client.snapshot(f.id("tag-snap"));
+    try f.snapshots.append(testing.allocator, snapshot.id);
+    var kept = snapshot.create(.{ .subscription = sub.id, .tags = &tags }) catch |err| return f.fail(err);
+    defer kept.deinit();
+    try testing.expect(std.mem.endsWith(u8, kept.value.name, snapshot.id));
+    // Read back, each is what it was made as: the echoed tags are read past.
+    var read = topic.get() catch |err| return f.fail(err);
+    defer read.deinit();
+    try testing.expect(std.mem.endsWith(u8, read.value.name, topic.id));
+}

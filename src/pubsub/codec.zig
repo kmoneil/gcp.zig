@@ -200,6 +200,10 @@ const SubscriptionBody = struct {
             try jw.objectField("messageTransforms");
             try writeTransforms(jw, c.message_transforms);
         }
+        if (c.tags.len > 0) {
+            try jw.objectField("tags");
+            try writeTags(jw, c.tags);
+        }
         try jw.endObject();
     }
 };
@@ -340,9 +344,24 @@ const TopicBody = struct {
             try jw.objectField("ingestionDataSourceSettings");
             try writeIngestion(jw, settings);
         }
+        if (c.tags.len > 0) {
+            try jw.objectField("tags");
+            try writeTags(jw, c.tags);
+        }
         try jw.endObject();
     }
 };
+
+/// Tags, as the map from key to value a create takes. No update writes
+/// them and no decoder reads them: they are input only.
+fn writeTags(jw: *Stringify, tags: []const types.Tag) Stringify.Error!void {
+    try jw.beginObject();
+    for (tags) |tag| {
+        try jw.objectField(tag.key);
+        try jw.write(tag.value);
+    }
+    try jw.endObject();
+}
 
 /// An import topic's settings: one source, and the log severity unless it
 /// is the default. A Cloud Storage source always carries a format, which
@@ -629,6 +648,10 @@ const SnapshotBody = struct {
         if (self.config.labels.len > 0) {
             try jw.objectField("labels");
             try writeLabels(jw, self.config.labels);
+        }
+        if (self.config.tags.len > 0) {
+            try jw.objectField("tags");
+            try writeTags(jw, self.config.tags);
         }
         try jw.endObject();
     }
@@ -4273,4 +4296,56 @@ test "fuzz import topic settings: what a create sends a read gives back, and an 
             "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
         },
     });
+}
+
+test "golden: tags on the three creates are a map from key to value, and no field when there are none" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tags = [_]types.Tag{
+        .{ .key = "my-project/env", .value = "prod" },
+        .{ .key = "tagKeys/281478409127147", .value = "tagValues/281479442205542" },
+        .{ .key = "123456789012/cost \"centre\"", .value = "march\u{e9}" },
+    };
+    const tags_json =
+        \\"tags":{"my-project/env":"prod","tagKeys/281478409127147":"tagValues/281479442205542","123456789012/cost \"centre\"":"marché"}
+    ;
+    try testing.expectEqualStrings("{" ++ tags_json ++ "}", try encodeTopic(a, .{ .tags = &tags }));
+    try testing.expectEqualStrings(
+        "{\"labels\":{\"env\":\"test\"}," ++ tags_json ++ "}",
+        try encodeTopic(a, .{ .labels = &.{.{ .key = "env", .value = "test" }}, .tags = &tags }),
+    );
+    try testing.expectEqualStrings(
+        "{\"topic\":\"projects/p/topics/t\",\"enableMessageOrdering\":false," ++ tags_json ++ "}",
+        try encodeSubscription(a, "projects/p/topics/t", .{ .topic_id = "t", .tags = &tags }, null),
+    );
+    try testing.expectEqualStrings(
+        "{\"subscription\":\"projects/p/subscriptions/s\",\"labels\":{\"k\":\"v\"}," ++ tags_json ++ "}",
+        try encodeSnapshot(a, "projects/p/subscriptions/s", .{ .subscription = "s", .labels = &.{.{ .key = "k", .value = "v" }}, .tags = &tags }),
+    );
+    try testing.expectEqualStrings("{}", try encodeTopic(a, .{}));
+    try testing.expectEqualStrings(
+        "{\"subscription\":\"projects/p/subscriptions/s\"}",
+        try encodeSnapshot(a, "projects/p/subscriptions/s", .{ .subscription = "s" }),
+    );
+}
+
+test "decode: the tags an emulator echoes are read past, on all three resources" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The emulator's answers, 2026-10-12. Production returns no tags.
+    const topic = try decodeTopic(a,
+        \\{ "name": "projects/test/topics/zigps-x-cc470e-t36", "tags": { "test/zigps-no-such-key": "v" } }
+    );
+    try testing.expectEqualStrings("projects/test/topics/zigps-x-cc470e-t36", topic.name);
+    const subscription = try decodeSubscription(a,
+        \\{ "name": "projects/test/subscriptions/zigps-x-cc470e-s39", "topic": "projects/test/topics/zigps-x-cc470e-t21", "pushConfig": { }, "ackDeadlineSeconds": 10, "messageRetentionDuration": "604800s", "tags": { "test/zigps-no-such-key": "v" } }
+    );
+    try testing.expectEqualStrings("projects/test/subscriptions/zigps-x-cc470e-s39", subscription.name);
+    try testing.expectEqual(10, subscription.ack_deadline_seconds);
+    const snapshot = try decodeSnapshot(a,
+        \\{"name":"projects/test/snapshots/s","topic":"projects/test/topics/t","expireTime":"2026-10-17T13:46:36.836Z","tags":{"test/env":"prod"}}
+    );
+    try testing.expectEqualStrings("projects/test/snapshots/s", snapshot.name);
 }

@@ -50,6 +50,8 @@ pub const max_message_retention: std.Io.Duration = .fromSeconds(31 * 24 * 60 * 6
 pub const min_expiration: std.Io.Duration = .fromSeconds(24 * 60 * 60);
 /// Each bound of a retry policy's backoff.
 pub const max_backoff: std.Io.Duration = .fromSeconds(600);
+/// Resource Manager tags bound to one resource as it is made.
+pub const max_tags = 50;
 /// The transforms of a topic or a subscription that are not disabled.
 /// Measured 2026-10-12: production and an emulator refuse a sixth.
 pub const max_enabled_message_transforms = 5;
@@ -494,6 +496,7 @@ pub fn subscriptionConfig(config: types.SubscriptionConfig, emulator: bool, diag
     try expiration(config.expiration, config.message_retention, diag);
     try labels(config.labels, diag);
     try messageTransforms(config.message_transforms, diag);
+    try tags(config.tags, diag);
 }
 
 /// Every setting of a new topic, before anything is sent.
@@ -505,6 +508,7 @@ pub fn topicConfig(config: types.TopicConfig, diag: ?*Diagnostics) error{Invalid
     if (config.schema) |s| try schemaSettings(s, diag);
     try messageTransforms(config.message_transforms, diag);
     if (config.ingestion) |i| try ingestion(i, diag);
+    try tags(config.tags, diag);
 }
 
 /// A subscription update: something to change, and every new value valid.
@@ -683,6 +687,53 @@ pub fn ingestion(i: types.Ingestion, diag: ?*Diagnostics) error{InvalidArgument}
     }
 }
 
+/// Tags to bind as a resource is made: at most 50, no key twice, each of
+/// a form production names, and a key and its value in the same form. An
+/// emulator takes any key and any value,
+/// and production answers a key of no known form only once deployed
+/// against it. Whether the key and the value are there, and the caller
+/// may use them, is the server's to say.
+pub fn tags(list: []const types.Tag, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    if (list.len > max_tags) return refuse(diag, "{d} tags; the limit is {d}", .{ list.len, max_tags });
+    for (list, 0..) |tag, i| {
+        if (!isTagKey(tag.key)) {
+            return refuse(diag, "tag {d} has a key that is neither {{organization id or project}}/{{key name}} nor tagKeys/{{id}}", .{i});
+        }
+        if (!isTagValue(tag.value)) {
+            return refuse(diag, "tag {d} has a value that is neither a value's short name nor tagValues/{{id}}", .{i});
+        }
+        // Production takes both by name or both by id, and refuses one
+        // of each: "Both TagKey and TagValue must be provided in the same
+        // format." (measured 2026-10-12)
+        if (std.mem.startsWith(u8, tag.key, "tagKeys/") != std.mem.startsWith(u8, tag.value, "tagValues/")) {
+            return refuse(diag, "tag {d} names its key and its value in different forms: both go by name, or tagKeys/{{id}} goes with tagValues/{{id}}", .{i});
+        }
+        for (list[0..i], 0..) |earlier, j| {
+            if (std.mem.eql(u8, earlier.key, tag.key)) return refuse(diag, "tags {d} and {d} have the same key", .{ j, i });
+        }
+    }
+}
+
+/// A tag key as production's refusal gives the format (2026-10-12): a
+/// namespace, which is an organization's id or a project's name, then the
+/// key's short name; or `tagKeys/` and an id. Either way two parts that
+/// are there, around one slash, since no short name holds one.
+pub fn isTagKey(key: []const u8) bool {
+    if (!std.unicode.utf8ValidateSlice(key)) return false;
+    const slash = std.mem.indexOfScalar(u8, key, '/') orelse return false;
+    if (slash == 0 or slash == key.len - 1) return false;
+    return std.mem.indexOfScalarPos(u8, key, slash + 1, '/') == null;
+}
+
+/// A tag value: its short name, which holds no slash, or `tagValues/` and
+/// an id.
+pub fn isTagValue(value: []const u8) bool {
+    if (value.len == 0 or !std.unicode.utf8ValidateSlice(value)) return false;
+    const slash = std.mem.indexOfScalar(u8, value, '/') orelse return true;
+    const id = value[slash + 1 ..];
+    return std.mem.eql(u8, value[0..slash], "tagValues") and id.len > 0 and std.mem.indexOfScalar(u8, id, '/') == null;
+}
+
 /// A field that must be there, and be UTF-8.
 fn required(text: []const u8, comptime what: []const u8, diag: ?*Diagnostics) error{InvalidArgument}!void {
     if (text.len == 0) return refuse(diag, what ++ " is empty", .{});
@@ -720,6 +771,7 @@ pub fn snapshotConfig(config: types.SnapshotConfig, diag: ?*Diagnostics) error{I
         return refuse(diag, "the subscription is neither a subscription id nor projects/{{project}}/subscriptions/{{id}}", .{});
     }
     try labels(config.labels, diag);
+    try tags(config.tags, diag);
 }
 
 /// A snapshot update: something to change, and the new labels valid.
@@ -1639,4 +1691,121 @@ test "an import topic's settings: each source's required fields, ARNs, a service
     try testing.expectError(error.InvalidArgument, topicUpdate(.{ .ingestion = .{ .set = .{ .source = .{ .aws_kinesis = short }, .log_severity = .unknown } } }, &d));
     try testing.expectError(error.InvalidArgument, topicUpdate(.{}, &d));
     try testing.expectEqualStrings("the update changes nothing", d.message());
+}
+
+test "tags: fifty at most, no key twice, and keys and values of the forms production names" {
+    var d: Diagnostics = .{};
+    try tags(&.{}, &d);
+    for ([_][]const u8{
+        "my-project/env",
+        "123456789012/cost-center",
+        "tagKeys/281478409127147",
+        "example.com:proj/env",
+        "my-project/co\u{fb}t de revient",
+    }) |key| {
+        try testing.expect(isTagKey(key));
+        const by_id = std.mem.startsWith(u8, key, "tagKeys/");
+        try tags(&.{.{ .key = key, .value = if (by_id) "tagValues/281479442205542" else "prod" }}, &d);
+    }
+    // Production's refusal gives the format (2026-10-12): a namespace and
+    // a key name, or tagKeys/ and an id. A key name holds no slash.
+    for ([_][]const u8{ "", "env", "/env", "my-project/", "/", "my-project/env/eu", "my-project//env", "tagKeys/", "\xff/env" }) |key| {
+        try testing.expect(!isTagKey(key));
+        try testing.expectError(error.InvalidArgument, tags(&.{ .{ .key = "p/ok", .value = "v" }, .{ .key = key, .value = "prod" } }, &d));
+        try testing.expectEqualStrings("tag 1 has a key that is neither {organization id or project}/{key name} nor tagKeys/{id}", d.message());
+    }
+    for ([_][]const u8{ "prod", "tagValues/281479442205542", "Production EU", "\u{e9}t\u{e9}", "tagValues" }) |value| {
+        try testing.expect(isTagValue(value));
+        const by_id = std.mem.startsWith(u8, value, "tagValues/");
+        try tags(&.{.{ .key = if (by_id) "tagKeys/281478409127147" else "p/env", .value = value }}, &d);
+    }
+    // A key and its value go in the same form: both by name, or both by
+    // id. Production refused one of each, either way round.
+    for ([_]types.Tag{
+        .{ .key = "p/env", .value = "tagValues/281479442205542" },
+        .{ .key = "tagKeys/281478409127147", .value = "prod" },
+    }) |mixed| {
+        try testing.expectError(error.InvalidArgument, tags(&.{ .{ .key = "p/team", .value = "a" }, mixed }, &d));
+        try testing.expectEqualStrings("tag 1 names its key and its value in different forms: both go by name, or tagKeys/{id} goes with tagValues/{id}", d.message());
+    }
+    for ([_][]const u8{ "", "tagValues/", "tagValues/1/2", "prod/eu", "tagKeys/1", "/prod", "TagValues/1", "prod\xff" }) |value| {
+        try testing.expect(!isTagValue(value));
+        try testing.expectError(error.InvalidArgument, tags(&.{.{ .key = "p/env", .value = value }}, &d));
+        try testing.expectEqualStrings("tag 0 has a value that is neither a value's short name nor tagValues/{id}", d.message());
+    }
+
+    // Fifty, and not one more.
+    var many: [max_tags + 1]types.Tag = undefined;
+    var keys: [max_tags + 1][8]u8 = undefined;
+    for (&many, &keys, 0..) |*tag, *key, i| {
+        tag.* = .{ .key = try std.fmt.bufPrint(key, "p/k{d}", .{i}), .value = "v" };
+    }
+    try tags(many[0..max_tags], &d);
+    try testing.expectError(error.InvalidArgument, tags(&many, &d));
+    try testing.expectEqualStrings("51 tags; the limit is 50", d.message());
+
+    // No key twice, whatever its values; one value under two keys is fine.
+    try testing.expectError(error.InvalidArgument, tags(&.{ .{ .key = "p/env", .value = "prod" }, .{ .key = "p/team", .value = "a" }, .{ .key = "p/env", .value = "test" } }, &d));
+    try testing.expectEqualStrings("tags 0 and 2 have the same key", d.message());
+    try tags(&.{ .{ .key = "p/env", .value = "prod" }, .{ .key = "p/stage", .value = "prod" }, .{ .key = "p/Env", .value = "prod" } }, &d);
+
+    // Through each of the three creates.
+    const good = [_]types.Tag{.{ .key = "p/env", .value = "prod" }};
+    const bad = [_]types.Tag{.{ .key = "env", .value = "prod" }};
+    try topicConfig(.{ .tags = &good }, &d);
+    try subscriptionConfig(.{ .topic_id = "t", .tags = &good }, false, &d);
+    try snapshotConfig(.{ .subscription = "sub", .tags = &good }, &d);
+    try testing.expectError(error.InvalidArgument, topicConfig(.{ .tags = &bad }, &d));
+    try testing.expectError(error.InvalidArgument, subscriptionConfig(.{ .topic_id = "t", .tags = &bad }, true, &d));
+    try testing.expectError(error.InvalidArgument, snapshotConfig(.{ .subscription = "sub", .tags = &bad }, &d));
+}
+
+fn tagFormProperty(_: void, input: []const u8) !void {
+    var g: test_util.ByteGen = .init(input);
+    const pieces = [_][]const u8{ "/", "tagKeys", "tagValues", "env", "p", "1", "\u{e9}", "\xff", " ", "tagValues/" };
+    // Room for six of the longest piece.
+    var buf: [6 * "tagValues/".len]u8 = undefined;
+    var len: usize = 0;
+    for (0..g.intRange(u8, 0, 6)) |_| {
+        const piece = pieces[g.intRange(u8, 0, pieces.len - 1)];
+        @memcpy(buf[len..][0..piece.len], piece);
+        len += piece.len;
+    }
+    const text = buf[0..len];
+
+    // The reference, from the format production's refusal gives: split at
+    // every slash, and count the parts.
+    var parts: usize = 0;
+    var an_empty_part = false;
+    var it = std.mem.splitScalar(u8, text, '/');
+    while (it.next()) |part| {
+        parts += 1;
+        if (part.len == 0) an_empty_part = true;
+    }
+    const utf8 = std.unicode.utf8ValidateSlice(text);
+    const key = utf8 and parts == 2 and !an_empty_part;
+    const value = utf8 and text.len > 0 and (parts == 1 or (key and std.mem.startsWith(u8, text, "tagValues/")));
+    try testing.expectEqual(key, isTagKey(text));
+    try testing.expectEqual(value, isTagValue(text));
+    // The list's check is the two, tag by tag, and that the two are of
+    // one form: by name, or by id.
+    const key_by_id = std.mem.startsWith(u8, text, "tagKeys/");
+    const value_by_id = std.mem.startsWith(u8, text, "tagValues/");
+    try testing.expectEqual(key and !key_by_id, if (tags(&.{.{ .key = text, .value = "v" }}, null)) |_| true else |_| false);
+    try testing.expectEqual(key and key_by_id, if (tags(&.{.{ .key = text, .value = "tagValues/1" }}, null)) |_| true else |_| false);
+    try testing.expectEqual(value and !value_by_id, if (tags(&.{.{ .key = "p/k", .value = text }}, null)) |_| true else |_| false);
+    try testing.expectEqual(value and value_by_id, if (tags(&.{.{ .key = "tagKeys/1", .value = text }}, null)) |_| true else |_| false);
+}
+
+test "fuzz tags: the check of a key and of a value agrees with a reference that splits at every slash" {
+    try test_util.fuzzBytes({}, tagFormProperty, .{ .corpus = &.{
+        "",
+        "\x03\x04\x00\x03",
+        "\x03\x01\x00\x05",
+        "\x02\x09\x05",
+        "\x05\x04\x00\x03\x00\x03",
+        "\x02\x07\x00",
+        "\x01\x00",
+        "\x06\x02\x00\x05\x00\x05\x06",
+    } });
 }
