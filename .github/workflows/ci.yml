@@ -448,24 +448,45 @@ jobs:
         # (over 6.8 ms a run), until more nights price the corpus.
         # fault-gzip tripled across the three nights (23, 35, 66 minutes
         # at 150) while its corpus prices itself, so it stays put, like
-        # heavy-firestore.
+        # heavy-firestore. The nightlies of 10-10, 10-11 and 10-12 (runs
+        # 38042558767, 38130149878 and 38238027109) were the first three
+        # at those counts, and all 16 jobs finished on each. Again each
+        # count puts its worst night at about 90 minutes. core took 90,
+        # 113 and 114 at 800K and drops to 630K; auth 117, 113 and 112 at
+        # 1100K and drops to 850K; firestore 107, 76 and 111 at 4M and
+        # drops to 3200K; slow-storage 102, 82 and 85 at 4800K and drops
+        # to 4200K; heavy-secret_manager 117, 63 and 71 at 140K and drops
+        # to 110K. pubsub took 68 and 76 at 1300K, then 101 on 10-12, the
+        # first night with the schema properties, and drops to 1150K.
+        # Three jobs ran well under the aim and rise, each by less than a
+        # straight line would give, for a corpus that grows. storage took
+        # 35, 47 and 48 at 800K and rises to 1100K: at the 6.8 ms a run of
+        # 10-09 that is still about 125 minutes. heavy-firestore took 32,
+        # 47 and 47 at 800K and rises to 1400K. slow-auth took 50, 51 and
+        # 50 at 65K and rises to 80K, not further: at 100K it took 134
+        # and 123 minutes on 10-08 and 10-09. The rest sit near the aim
+        # and stay: secret_manager (96 at worst), heavy-pubsub (91),
+        # fault-storage (86), fault-gzip (82), slow-subscriber (76) and
+        # heavy-storage (74). slow-pubsub (51, 34 and 38 at 1900K) stays
+        # too: it has taken three times as long from one night to the
+        # next at an unchanged count.
         include:
-          - { job: core, module: core, filter: fuzz, iterations: 800K }
-          - { job: auth, module: auth, filter: fuzz, iterations: 1100K }
-          - { job: slow-auth, module: auth, filter: slow property, iterations: 65K }
-          - { job: pubsub, module: pubsub, filter: fuzz, iterations: 1300K }
+          - { job: core, module: core, filter: fuzz, iterations: 630K }
+          - { job: auth, module: auth, filter: fuzz, iterations: 850K }
+          - { job: slow-auth, module: auth, filter: slow property, iterations: 80K }
+          - { job: pubsub, module: pubsub, filter: fuzz, iterations: 1150K }
           - { job: slow-pubsub, module: pubsub, filter: slow property Publisher, iterations: 1900K }
           - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 65K }
           - { job: heavy-pubsub, module: pubsub, filter: heavy property, iterations: 9M }
           - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 5500K }
-          - { job: heavy-secret_manager, module: secret_manager, filter: heavy property, iterations: 140K }
-          - { job: storage, module: storage, filter: fuzz, iterations: 800K }
-          - { job: slow-storage, module: storage, filter: slow property, iterations: 4800K }
+          - { job: heavy-secret_manager, module: secret_manager, filter: heavy property, iterations: 110K }
+          - { job: storage, module: storage, filter: fuzz, iterations: 1100K }
+          - { job: slow-storage, module: storage, filter: slow property, iterations: 4200K }
           - { job: heavy-storage, module: storage, filter: heavy property, iterations: 20K }
           - { job: fault-storage, module: storage, filter: fault property parallel|fault property uploadFile resume, iterations: 60K }
           - { job: fault-gzip, module: storage, filter: fault property gzip|fault property compressed, iterations: 150 }
-          - { job: firestore, module: firestore, filter: fuzz, iterations: 4M }
-          - { job: heavy-firestore, module: firestore, filter: heavy property, iterations: 800K }
+          - { job: firestore, module: firestore, filter: fuzz, iterations: 3200K }
+          - { job: heavy-firestore, module: firestore, filter: heavy property, iterations: 1400K }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     # actions: read finds and downloads the corpus an earlier run kept.
