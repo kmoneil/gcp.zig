@@ -103,6 +103,21 @@ producer writes with `Schema.validateMessage` in its tests, and give a
 producer that cannot be trusted a publisher of its own, or one with
 `max_batch_messages = 1`.
 
+### A topic with transforms
+
+A topic's [transforms](transforms.md) run on every publish, and two of
+the things a function may do reach the publisher:
+
+- **A function that throws** refuses the publish as a schema does:
+  `error.InvalidArgument` for the whole request, so for every message of
+  a `Topic.publish` call and every receipt of a `Publisher`'s batch.
+- **A function that returns `null` drops the message, and the publish
+  still succeeds.** Pub/Sub answers a message id for the dropped
+  message, so its receipt resolves like any other. A receipt therefore
+  says that Pub/Sub took the message, not that a subscriber will get
+  it. If that difference matters, have the function mark the message
+  with an attribute and let it through, and filter on the subscription.
+
 ## Compressed publishing
 
 `compression` gzips a publish request's body and sends it with

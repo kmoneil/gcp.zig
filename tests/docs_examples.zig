@@ -611,3 +611,192 @@ test "the delivery guide's code, against a scripted transport" {
     );
     try std.testing.expectEqual(4, fake.requests.items.len);
 }
+
+// snippet: pubsub-transform-topic
+/// Every order leaves the topic without its card number, whoever
+/// subscribes. `redact_js` is the source of a function named `redact`.
+fn redactOrders(client: *pubsub.Client, redact_js: []const u8) !void {
+    var topic = try client.topic("orders").create(.{
+        .message_transforms = &.{.{ .kind = .{ .javascript_udf = .{
+            .function_name = "redact",
+            .code = redact_js,
+        } } }},
+    });
+    defer topic.deinit();
+}
+// end snippet
+
+// snippet: pubsub-transform-subscription
+/// Only this subscriber is spared the test orders: its function returns
+/// null for them, and Pub/Sub acknowledges them unseen.
+fn skipTestOrders(client: *pubsub.Client, skip_js: []const u8) !void {
+    var sub = try client.subscription("orders-billing").create(.{
+        .topic_id = "orders",
+        .message_transforms = &.{.{ .kind = .{ .javascript_udf = .{
+            .function_name = "skipTests",
+            .code = skip_js,
+        } } }},
+    });
+    defer sub.deinit();
+}
+// end snippet
+
+// snippet: pubsub-transform-update
+/// A second function after the first, with the first switched off but
+/// kept. The list is replaced whole, so it names everything it keeps.
+fn addStamp(client: *pubsub.Client, redact_js: []const u8, stamp_js: []const u8) !void {
+    var changed = try client.topic("orders").update(.{ .message_transforms = &.{
+        .{ .kind = .{ .javascript_udf = .{ .function_name = "redact", .code = redact_js } }, .disabled = true },
+        .{ .kind = .{ .javascript_udf = .{ .function_name = "stamp", .code = stamp_js } } },
+    } });
+    defer changed.deinit();
+}
+
+/// Every transform off the topic.
+fn untransformed(client: *pubsub.Client) !void {
+    var plain = try client.topic("orders").update(.{ .message_transforms = &.{} });
+    defer plain.deinit();
+}
+// end snippet
+
+test "the transforms guide's code, against a scripted transport" {
+    const redact_js = "function redact(message, metadata) { const order = JSON.parse(message.data); delete order.card; message.data = JSON.stringify(order); return message; }";
+    const topic = "{\"name\":\"projects/my-project/topics/orders\",\"messageTransforms\":[{\"javascriptUdf\":{\"functionName\":\"redact\",\"code\":\"function redact(message, metadata) { return message; }\"}}]}";
+    var fake: core.testing.FakeTransport = .init(std.testing.allocator, &.{
+        .{ .respond = .{ .body = topic } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/my-project/subscriptions/orders-billing\",\"topic\":\"projects/my-project/topics/orders\",\"pushConfig\":{},\"ackDeadlineSeconds\":10}" } },
+        .{ .respond = .{ .body = topic } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/my-project/topics/orders\"}" } },
+    });
+    defer fake.deinit();
+    var tokens: core.testing.FakeTokenProvider = .{};
+    var client = try pubsub.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = tokens.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    const base = "https://pubsub.googleapis.com/v1/projects/my-project/";
+
+    try redactOrders(&client, redact_js);
+    try std.testing.expectEqualStrings(base ++ "topics/orders", (try fake.request(0)).url);
+    try std.testing.expectEqualStrings(
+        "{\"messageTransforms\":[{\"javascriptUdf\":{\"functionName\":\"redact\",\"code\":\"" ++ redact_js ++ "\"}}]}",
+        (try fake.request(0)).body.?,
+    );
+
+    try skipTestOrders(&client, "function skipTests(message, metadata) { return message.attributes.test ? null : message; }");
+    try std.testing.expectEqualStrings(base ++ "subscriptions/orders-billing", (try fake.request(1)).url);
+    try std.testing.expectEqualStrings(
+        "{\"topic\":\"projects/my-project/topics/orders\",\"enableMessageOrdering\":false,\"messageTransforms\":[{\"javascriptUdf\":{\"functionName\":\"skipTests\",\"code\":\"function skipTests(message, metadata) { return message.attributes.test ? null : message; }\"}}]}",
+        (try fake.request(1)).body.?,
+    );
+
+    try addStamp(&client, "function redact(m) { return m; }", "function stamp(m) { m.attributes.stamped = 'yes'; return m; }");
+    try std.testing.expectEqualStrings(
+        "{\"topic\":{\"messageTransforms\":[{\"javascriptUdf\":{\"functionName\":\"redact\",\"code\":\"function redact(m) { return m; }\"},\"disabled\":true},{\"javascriptUdf\":{\"functionName\":\"stamp\",\"code\":\"function stamp(m) { m.attributes.stamped = 'yes'; return m; }\"}}]},\"updateMask\":\"messageTransforms\"}",
+        (try fake.request(2)).body.?,
+    );
+    try untransformed(&client);
+    try std.testing.expectEqualStrings("{\"topic\":{},\"updateMask\":\"messageTransforms\"}", (try fake.request(3)).body.?);
+    try std.testing.expectEqual(4, fake.requests.items.len);
+}
+
+// snippet: pubsub-import-bucket
+/// A topic that fills itself from a bucket: each new object's lines
+/// become messages. Pub/Sub's service agent must be able to read the
+/// bucket, or the create is refused.
+fn importUploads(client: *pubsub.Client) !void {
+    var topic = try client.topic("uploads").create(.{
+        .ingestion = .{ .source = .{ .cloud_storage = .{
+            .bucket = "my-uploads",
+            .match_glob = "incoming/**.txt",
+        } } },
+    });
+    defer topic.deinit();
+}
+// end snippet
+
+// snippet: pubsub-import-state
+/// Is the topic still importing? `null` for a topic that is not an
+/// import topic at all.
+fn importing(client: *pubsub.Client) !?pubsub.IngestionState {
+    var topic = try client.topic("uploads").get();
+    defer topic.deinit();
+    const settings = topic.value.ingestion orelse return null;
+    return settings.state;
+}
+// end snippet
+
+// snippet: pubsub-import-update
+/// The same bucket, read as Avro from now on, with warnings logged. The
+/// settings are replaced whole, so they name everything they keep.
+fn importAvro(client: *pubsub.Client) !void {
+    var changed = try client.topic("uploads").update(.{ .ingestion = .{ .set = .{
+        .source = .{ .cloud_storage = .{ .bucket = "my-uploads", .format = .avro } },
+        .log_severity = .warning,
+    } } });
+    defer changed.deinit();
+}
+
+/// A standard topic again: it keeps what it holds, and imports no more.
+fn stopImporting(client: *pubsub.Client) !void {
+    var standard = try client.topic("uploads").update(.{ .ingestion = .clear });
+    defer standard.deinit();
+}
+// end snippet
+
+// snippet: pubsub-tags
+/// A topic bound to the tag `env: prod` as it is made. The key and the
+/// value must already be there, in Resource Manager.
+fn makeTagged(client: *pubsub.Client) !void {
+    var topic = try client.topic("orders").create(.{
+        .tags = &.{.{ .key = "my-project/env", .value = "prod" }},
+    });
+    defer topic.deinit();
+}
+// end snippet
+
+test "the import topics guide's code and the tags example, against a scripted transport" {
+    const importing_topic = "{\"name\":\"projects/my-project/topics/uploads\",\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"state\":\"ACTIVE\",\"bucket\":\"my-uploads\",\"textFormat\":{\"delimiter\":\"\\n\"},\"matchGlob\":\"incoming/**.txt\"}}}";
+    const standard_topic = "{\"name\":\"projects/my-project/topics/uploads\"}";
+    var fake: core.testing.FakeTransport = .init(std.testing.allocator, &.{
+        .{ .respond = .{ .body = importing_topic } },
+        .{ .respond = .{ .body = importing_topic } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/my-project/topics/uploads\",\"state\":\"INGESTION_RESOURCE_ERROR\",\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"state\":\"BUCKET_NOT_FOUND\",\"bucket\":\"my-uploads\",\"avroFormat\":{}},\"platformLogsSettings\":{\"severity\":\"WARNING\"}}}" } },
+        .{ .respond = .{ .body = standard_topic } },
+        .{ .respond = .{ .body = standard_topic } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/my-project/topics/orders\"}" } },
+    });
+    defer fake.deinit();
+    var tokens: core.testing.FakeTokenProvider = .{};
+    var client = try pubsub.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = tokens.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    const base = "https://pubsub.googleapis.com/v1/projects/my-project/";
+
+    try importUploads(&client);
+    try std.testing.expectEqualStrings(base ++ "topics/uploads", (try fake.request(0)).url);
+    try std.testing.expectEqualStrings(
+        "{\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"bucket\":\"my-uploads\",\"textFormat\":{\"delimiter\":\"\\n\"},\"matchGlob\":\"incoming/**.txt\"}}}",
+        (try fake.request(0)).body.?,
+    );
+
+    try std.testing.expectEqual(pubsub.IngestionState.active, (try importing(&client)).?);
+    try importAvro(&client);
+    try std.testing.expectEqualStrings(
+        "{\"topic\":{\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"bucket\":\"my-uploads\",\"avroFormat\":{}},\"platformLogsSettings\":{\"severity\":\"WARNING\"}}},\"updateMask\":\"ingestionDataSourceSettings\"}",
+        (try fake.request(2)).body.?,
+    );
+    try stopImporting(&client);
+    try std.testing.expectEqualStrings("{\"topic\":{},\"updateMask\":\"ingestionDataSourceSettings\"}", (try fake.request(3)).body.?);
+    try std.testing.expectEqual(null, try importing(&client));
+
+    try makeTagged(&client);
+    try std.testing.expectEqualStrings(base ++ "topics/orders", (try fake.request(5)).url);
+    try std.testing.expectEqualStrings("{\"tags\":{\"my-project/env\":\"prod\"}}", (try fake.request(5)).body.?);
+    try std.testing.expectEqual(6, fake.requests.items.len);
+}

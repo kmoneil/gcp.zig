@@ -307,3 +307,24 @@ GCP_TEST_PROJECT=my-project GCP_TEST_BUCKET=my-bucket \
     GCP_TEST_TOKEN=$(gcloud auth application-default print-access-token) \
     zig build test-integration-gcp -Dtest-filter="notifications against Google"
 ```
+
+### An import topic against Google
+
+The one test that watches Pub/Sub read a bucket: it uploads an object
+of three lines, makes its topic an [import topic](pubsub/import-topics.md)
+over the bucket, and waits for the three messages, which took 73
+seconds when measured. Besides the variables above it needs a bucket
+that Pub/Sub's service agent,
+`service-{project number}@gcp-sa-pubsub.iam.gserviceaccount.com`, may
+read (`storage.buckets.get`, `storage.objects.list` and
+`storage.objects.get`: Storage Object Viewer and Storage Legacy Bucket
+Reader on the bucket give them), and the project's number. The test
+grants nothing on the bucket. It makes the agent a publisher of its own
+topic, which goes with the topic.
+
+```sh
+GCP_TEST_PROJECT=my-project GCP_TEST_BUCKET=my-bucket GCP_TEST_IMPORT_BUCKET=my-bucket \
+    GCP_TEST_PROJECT_NUMBER=$(gcloud projects describe my-project --format='value(projectNumber)') \
+    GCP_TEST_TOKEN=$(gcloud auth application-default print-access-token) \
+    zig build test-integration-gcp -Dtest-filter="an import topic against Google"
+```

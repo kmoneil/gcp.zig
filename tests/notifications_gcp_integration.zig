@@ -5,6 +5,13 @@
 //! subscription named `zigps-ntf-` and 8 hex digits, and a configuration
 //! for objects under that name, and deletes them all, even when it fails.
 //! With any variable unset, every test skips.
+//!
+//! The import topic test meets Cloud Storage from Pub/Sub's side, and
+//! needs two variables more: GCP_TEST_IMPORT_BUCKET, a bucket Pub/Sub's
+//! service agent may read (storage.buckets.get, storage.objects.list and
+//! storage.objects.get), and GCP_TEST_PROJECT_NUMBER, for that agent's
+//! address. It grants the agent nothing on the bucket: it makes it a
+//! publisher of its own topic, which goes with the topic.
 
 const std = @import("std");
 const pubsub = @import("pubsub");
@@ -210,4 +217,82 @@ test "notifications against Google: a topic Cloud Storage cannot publish to" {
     made_topic.deinit();
     try testing.expectError(error.TopicNotPublishable, bucket.createNotification(.{ .topic = .{ .project = f.project, .topic = &f.name } }));
     try testing.expectEqualStrings("forbidden", f.gcs_diag.status());
+}
+
+test "an import topic against Google: an uploaded object's lines arrive as messages" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const import_bucket = f.env.get("GCP_TEST_IMPORT_BUCKET") orelse return error.SkipZigTest;
+    const number = f.env.get("GCP_TEST_PROJECT_NUMBER") orelse return error.SkipZigTest;
+
+    const topic = f.ps.topic(&f.name);
+    var made_topic = try topic.create(.{});
+    made_topic.deinit();
+    const sub = f.ps.subscription(&f.name);
+    var made_sub = try sub.create(.{ .topic_id = &f.name });
+    made_sub.deinit();
+
+    // Pub/Sub imports as its service agent, which must be a publisher of
+    // the topic. Without that the topic is made all the same, and then
+    // reads `.publish_permission_denied` (measured 2026-10-12).
+    var member_buf: [160]u8 = undefined;
+    const member = try std.fmt.bufPrint(&member_buf, "serviceAccount:service-{s}@gcp-sa-pubsub.iam.gserviceaccount.com", .{number});
+    var policy = try topic.addIamBinding("roles/pubsub.publisher", member);
+    policy.deinit();
+
+    // An object that is there before the topic imports, with no newline
+    // after its last line.
+    var name_buf: [40]u8 = undefined;
+    const object = f.gcs.bucket(import_bucket).object(f.prefixed(&name_buf, "a.txt"));
+    var uploaded = try object.upload("one\ntwo\nthree", .{ .content_type = "text/plain" });
+    uploaded.deinit();
+    defer object.delete(.{}) catch {};
+
+    var glob_buf: [32]u8 = undefined;
+    const glob = f.prefixed(&glob_buf, "**");
+    var importing = try topic.update(.{ .ingestion = .{ .set = .{
+        .source = .{ .cloud_storage = .{ .bucket = import_bucket, .match_glob = glob } },
+    } } });
+    defer importing.deinit();
+    const made = importing.value.ingestion orelse return error.TestExpectedEqual;
+    try testing.expectEqualStrings(import_bucket, made.source.?.cloud_storage.bucket);
+    try testing.expectEqualStrings(glob, made.source.?.cloud_storage.match_glob);
+    try testing.expectEqualStrings("\n", made.source.?.cloud_storage.format.text.delimiter);
+    try testing.expectEqual(pubsub.IngestionState.active, made.state);
+
+    // The three lines, in any order: 73 seconds after the topic was made
+    // to import, when measured.
+    const lines = [_][]const u8{ "one", "two", "three" };
+    var seen = [_]bool{ false, false, false };
+    var count: usize = 0;
+    var waited_ms: u32 = 0;
+    while (count < lines.len and waited_ms < 300_000) {
+        var batch = try sub.pull(.{ .max_messages = 10, .return_immediately = true });
+        defer batch.deinit();
+        for (batch.value.messages) |m| {
+            try sub.ack(&.{m.ack_id});
+            const i = for (lines, 0..) |line, i| {
+                if (std.mem.eql(u8, m.data, line)) break i;
+            } else return error.TestUnexpectedMessage;
+            if (!seen[i]) count += 1;
+            seen[i] = true;
+        }
+        if (batch.value.messages.len == 0) {
+            try testing.io.sleep(.fromMilliseconds(2000), .awake);
+            waited_ms += 2000;
+        }
+    }
+    try testing.expectEqual(lines.len, count);
+
+    var read = try topic.get();
+    defer read.deinit();
+    try testing.expectEqual(pubsub.TopicInfo.State.active, read.value.state);
+    try testing.expectEqual(pubsub.IngestionState.active, read.value.ingestion.?.state);
+    try testing.expectEqual(pubsub.Ingestion.LogSeverity.disabled, read.value.ingestion.?.log_severity);
+
+    // A standard topic again.
+    var standard = try topic.update(.{ .ingestion = .clear });
+    defer standard.deinit();
+    try testing.expectEqual(null, standard.value.ingestion);
 }

@@ -2491,10 +2491,27 @@ test "schema revisions: one is committed, read, listed, rolled back to and delet
     try testing.expect(!std.mem.eql(u8, second.value.revision_id, back.value.revision_id));
     try testing.expectError(error.NotFound, schema.rollback("deadbeef"));
 
-    // The second is deleted, once, and the others stay.
+    // The second is deleted, once, and the others stay. Production went on
+    // serving a deleted revision for a moment on 2026-10-12, so the read
+    // is waited for.
     schema.deleteRevision(second.value.revision_id) catch |err| return f.fail(err);
-    try testing.expectError(error.NotFound, schema.get(.{ .revision_id = second.value.revision_id }));
-    try testing.expectError(error.NotFound, schema.deleteRevision(second.value.revision_id));
+    const Deleted = struct {
+        schema: pubsub.Schema,
+        revision_id: []const u8,
+
+        fn gone(self: @This()) !void {
+            var still = self.schema.get(.{ .revision_id = self.revision_id }) catch |err| return testing.expectEqual(error.NotFound, err);
+            still.deinit();
+            return error.TestExpectedError;
+        }
+
+        fn refused(self: @This()) !void {
+            try testing.expectError(error.NotFound, self.schema.deleteRevision(self.revision_id));
+        }
+    };
+    const deleted: Deleted = .{ .schema = schema, .revision_id = second.value.revision_id };
+    try eventually(&f, f.patience(), deleted, Deleted.gone);
+    try eventually(&f, f.patience(), deleted, Deleted.refused);
     var kept = schema.get(.{ .revision_id = first.value.revision_id }) catch |err| return f.fail(err);
     kept.deinit();
     var after = schema.get(.{}) catch |err| return f.fail(err);

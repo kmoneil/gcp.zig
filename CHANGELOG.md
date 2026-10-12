@@ -4,6 +4,76 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.36.0 (unreleased)
+
+- pubsub: message transforms. A topic or a subscription can run each
+  message through up to five JavaScript functions, which Pub/Sub runs:
+  `message_transforms` on `TopicConfig`, `TopicInfo`,
+  `SubscriptionConfig` and `SubscriptionInfo`, a list of
+  `MessageTransform`, each a kind (`.javascript_udf`, a `JavaScriptUdf`
+  of a function's name and its code) and a `disabled` switch. In
+  `TopicUpdate` and `SubscriptionUpdate` a list replaces the list whole
+  and an empty one clears it. A kind this client does not model, AI
+  inference today, reads as `.other` in its place, and a list that
+  holds one is refused before sending, since it would be lost. Checked
+  before sending, because the emulator checks the count alone: at most
+  five that are not disabled, a function name that is there and that no
+  other has, and code that is there, is UTF-8 and is at most 20,480
+  bytes. Measured in production, 2026-10-12: a function that returns
+  `null` drops the message and the publisher is still given a message
+  id; one that throws refuses the whole publish as
+  `error.InvalidArgument`; code that does not parse is
+  `error.FailedPrecondition` when the topic is made; 20,480 bytes of
+  code are taken and 20,481 refused; a function that runs past its
+  time, or returns what is no message, refuses the publish as a throw
+  does; two functions of one name are refused when either is disabled
+  too, and a disabled one is not counted among the five; a cleared list
+  held after 3 seconds and a new one after 12, with messages
+  transformed and not by turns for a while. The emulator (0.8.36) keeps
+  transforms and runs none, so a test against it sees every message
+  untouched.
+- pubsub: import topics. `TopicConfig.ingestion` makes a topic that
+  fills itself from one of five sources (`Ingestion.Source`): a Cloud
+  Storage bucket (`CloudStorageSource`), a Kinesis stream
+  (`AwsKinesis`), an Azure event hub (`AzureEventHubs`), an Amazon MSK
+  cluster (`AwsMsk`) or a Confluent Cloud cluster (`ConfluentCloud`),
+  with the severity of the logs Pub/Sub writes about it.
+  `TopicInfo.ingestion` (`IngestionInfo`) reads the settings back with
+  one `IngestionState` for all five sources; a source this client does
+  not model reads as an import topic with no source.
+  `TopicUpdate.ingestion` replaces the settings whole, and `.clear`
+  makes a standard topic again. Checked before sending: every field a
+  source requires, an ARN that begins `arn:`, a service account of the
+  shape of an address, a bucket that is a name alone, and a text
+  delimiter of one byte, which is all production takes where the
+  emulator takes one character of any width. Measured in production,
+  2026-10-12: Pub/Sub connects to the source when the topic is made or
+  changed and refuses if it cannot, as `error.PermissionDenied` for a
+  role it may not assume or a bucket it may not read,
+  `error.NotFound` for a bucket or a namespace that is not there, and
+  `error.InvalidArgument` for a Confluent server it cannot reach. From
+  a bucket its service agent could read, an uploaded object's lines
+  arrived as messages about a minute later, once the agent was a
+  publisher of the topic; without that the topic was made, read
+  `.active`, imported nothing and then read
+  `.publish_permission_denied`. The emulator keeps any source as given,
+  reports no state and imports nothing. No account on another cloud was
+  used, so those four sources are tested to their refusals.
+- pubsub: tags. `TopicConfig`, `SubscriptionConfig` and
+  `SnapshotConfig` take `tags` (`Tag`): Resource Manager tags bound as
+  the resource is made. They are on no info type and in no update,
+  since production returns none and Google gives them as immutable.
+  Checked
+  before sending: at most 50, no key twice, a key of a namespace and a
+  name or `tagKeys/{id}`, a value that is a short name or
+  `tagValues/{id}`, and the two in the same form, which production
+  requires. Measured in production, 2026-10-12, with a tag made for the
+  purpose: each of the three is made with it, by names and by ids, and
+  a key or a value that is not there, or not the caller's to use, is
+  `error.PermissionDenied`. The emulator takes any and echoes them,
+  which is read past.
+- auth, core, firestore, secret_manager and storage: unchanged.
+
 ## 0.35.0 (2026-10-12)
 
 - pubsub: snapshots. `client.snapshot(id)` is a `Snapshot` handle, as
