@@ -523,7 +523,10 @@ const ValidateSchemaBody = struct {
 };
 
 /// The `schemas.commit` body: the new revision under `schema`, with the
-/// schema's full name beside its type and definition.
+/// schema's full name beside its type and definition. The name is not
+/// decoration: production commits to the schema the body names, whatever
+/// the path says, and refuses a body without one (measured 2026-10-12).
+/// The emulator ignores it.
 pub fn encodeCommit(arena: Allocator, name: []const u8, definition: types.SchemaDefinition) Allocator.Error![]u8 {
     return render(arena, CommitBody{ .name = name, .definition = definition });
 }
@@ -1300,9 +1303,11 @@ pub fn decodeSnapshotPage(arena: Allocator, body: []const u8) DecodeError!types.
 }
 
 fn schemaFromWire(w: WireSchema) DecodeError!types.SchemaInfo {
+    // Every answer names its schema. Without a name it is none.
+    const name = schemaOf(w.name orelse return error.InvalidResponse);
+    if (name.len == 0) return error.InvalidResponse;
     return .{
-        // Every answer names its schema. Without a name it is none.
-        .name = nonEmpty(w.name) orelse return error.InvalidResponse,
+        .name = name,
         .type = schemaType(w.type),
         // The basic view leaves it out, and so does a schema made from a
         // compiled descriptor set, which this client does not model.
@@ -1313,6 +1318,16 @@ fn schemaFromWire(w: WireSchema) DecodeError!types.SchemaInfo {
         else
             null,
     };
+}
+
+/// A schema's name without the `@revision` production writes after it in
+/// the answers that are about one revision: a commit's, a rollback's, a
+/// read of one and a list of them (measured 2026-10-12). A create's answer
+/// and a plain read carry none, and neither does the emulator's, ever. The
+/// revision has a field of its own, so the name is always the schema's.
+fn schemaOf(name: []const u8) []const u8 {
+    const at = std.mem.indexOfScalar(u8, name, '@') orelse return name;
+    return name[0..at];
 }
 
 fn schemaType(text: ?[]const u8) types.SchemaType {
@@ -2987,6 +3002,24 @@ test "decode: a schema in both views, from the emulator and without what an answ
     try testing.expectEqualStrings("", compiled.definition);
     const nulls = try decodeSchema(a, "{\"name\":\"projects/p/schemas/s\",\"type\":null,\"definition\":null,\"revisionId\":null,\"revisionCreateTime\":null}");
     try testing.expectEqual(null, nulls.revision_create_time);
+
+    // Production's answer to a commit, 2026-10-12: the name carries the
+    // revision, which is read off it, and the time is a real one.
+    const committed = try decodeSchema(a,
+        \\{ "name": "projects/extractctl/schemas/zigps-s-cc3f82-avro@904e53f2", "type": "AVRO", "definition": "{\"type\": \"record\", \"name\": \"M\", \"fields\": []}", "revisionId": "904e53f2", "revisionCreateTime": "2026-10-12T02:01:43.283Z" }
+    );
+    try testing.expectEqualStrings("projects/extractctl/schemas/zigps-s-cc3f82-avro", committed.name);
+    try testing.expectEqualStrings("904e53f2", committed.revision_id);
+    try testing.expectEqual(try timestamp.parse("2026-10-12T02:01:43.283Z"), committed.revision_create_time.?);
+    // And its list of revisions, in the basic view: each named with its
+    // own, the newest first.
+    const revisions = try decodeSchemaPage(a,
+        \\{ "schemas": [ { "name": "projects/extractctl/schemas/zigps-s-cc3f82-avro@1f505a20", "type": "AVRO", "revisionId": "1f505a20", "revisionCreateTime": "2026-10-12T02:01:43.471Z" }, { "name": "projects/extractctl/schemas/zigps-s-cc3f82-avro@904e53f2", "type": "AVRO", "revisionId": "904e53f2", "revisionCreateTime": "2026-10-12T02:01:43.283Z" } ] }
+    );
+    for (revisions.schemas) |r| try testing.expectEqualStrings("projects/extractctl/schemas/zigps-s-cc3f82-avro", r.name);
+    try testing.expectEqualStrings("1f505a20", revisions.schemas[0].revision_id);
+    // A name that is a revision and nothing before it names no schema.
+    try testing.expectError(error.InvalidResponse, decodeSchema(a, "{\"name\":\"@904e53f2\",\"type\":\"AVRO\"}"));
 
     // No name is no schema, and a time that is none is not guessed at.
     try testing.expectError(error.InvalidResponse, decodeSchema(a, "{}"));

@@ -2330,16 +2330,17 @@ test "schemas: one is made, read in both views and by its revision, found in its
     const name = try a.print("projects/{s}/schemas/{s}", .{ project, schema.id });
     var created = schema.create(definition) catch |err| return f.fail(err);
     defer created.deinit();
-    try testing.expect(std.mem.startsWith(u8, created.value.name, name));
+    // The definition is kept byte for byte, by both.
+    try testing.expectEqualStrings(name, created.value.name);
     try testing.expectEqual(pubsub.SchemaType.avro, created.value.type);
     try testing.expect(created.value.revision_id.len > 0);
-    try testing.expect(created.value.definition.len > 0);
-    if (!f.production) {
-        // The emulator names the schema without its revision, keeps the
-        // definition byte for byte, and dates the revision in January 1970.
-        try testing.expectEqualStrings(name, created.value.name);
-        try testing.expectEqualStrings(avro_order, created.value.definition);
-        try testing.expect(created.value.revision_create_time.?.toSeconds() < 366 * 86400);
+    try testing.expectEqualStrings(avro_order, created.value.definition);
+    const made_at = created.value.revision_create_time.?.toSeconds();
+    if (f.production) {
+        try testing.expect(@abs(made_at - std.Io.Clock.real.now(testing.io).toSeconds()) < 600);
+    } else {
+        // The emulator dates every revision in January 1970.
+        try testing.expect(made_at < 366 * 86400);
     }
     const revision = created.value.revision_id;
 
@@ -2383,6 +2384,10 @@ test "schemas: one is made, read in both views and by its revision, found in its
             if (std.mem.startsWith(u8, s.name, name)) try testing.expectEqualStrings("", s.definition);
         }
     }
+
+    // Read by its revision, production's answer names it `name@revision`:
+    // the client gives the schema's own name either way.
+    try testing.expectEqualStrings(name, one.value.name);
 
     // Would a message be taken? Asked of the stored schema, of one revision
     // of it and of the definition alone, in both encodings.
@@ -2463,16 +2468,16 @@ test "schema revisions: one is committed, read, listed, rolled back to and delet
         defer page.deinit();
         for (page.value.schemas) |s| {
             try testing.expectEqualStrings("", s.definition);
+            try testing.expectEqualStrings(first.value.name, s.name);
             try ids.append(a, try a.dupe(u8, s.revision_id));
         }
         token = try a.dupe(u8, page.value.next_page_token orelse break);
     } else return error.TestUnexpectedResult;
     try testing.expectEqual(2, ids.items.len);
-    if (!f.production) {
-        // The emulator lists the oldest first.
-        try testing.expectEqualStrings(first.value.revision_id, ids.items[0]);
-        try testing.expectEqualStrings(second.value.revision_id, ids.items[1]);
-    }
+    // Production lists the newest first, and the emulator the oldest.
+    const newest: usize = if (f.production) 0 else 1;
+    try testing.expectEqualStrings(second.value.revision_id, ids.items[newest]);
+    try testing.expectEqualStrings(first.value.revision_id, ids.items[1 - newest]);
     var whole = schema.listRevisions(.{ .view = .full }) catch |err| return f.fail(err);
     defer whole.deinit();
     try testing.expectEqual(2, whole.value.schemas.len);
@@ -2501,14 +2506,33 @@ test "schema revisions: one is committed, read, listed, rolled back to and delet
     try f.schemas.append(testing.allocator, single.id);
     var only = single.create(.{ .type = .avro, .definition = avro_order }) catch |err| return f.fail(err);
     defer only.deinit();
-    if (single.deleteRevision(only.value.revision_id)) |_| {
-        return error.TestUnexpectedResult;
-    } else |err| if (!f.production) {
-        try testing.expectEqual(error.InvalidArgument, err);
+    if (f.production) {
+        try testing.expectError(error.FailedPrecondition, single.deleteRevision(only.value.revision_id));
+        try testing.expect(std.mem.startsWith(u8, f.diag.message(), "This schema contains only one revision"));
+    } else {
+        try testing.expectError(error.InvalidArgument, single.deleteRevision(only.value.revision_id));
         try testing.expectEqualStrings("Cannot delete last revision. Please use DeleteSchema.", f.diag.message());
     }
     var still = single.get(.{ .view = .basic }) catch |err| return f.fail(err);
     still.deinit();
+
+    if (f.production) {
+        // What only production checks: a revision against the ones before
+        // it, and a rollback to where the schema already is. The emulator
+        // would take both, each as one more revision.
+        const incompatible =
+            \\{"type":"record","name":"Order","fields":[{"name":"id","type":"string"},{"name":"quantity","type":"string"}]}
+        ;
+        try testing.expectError(error.FailedPrecondition, single.commit(.{ .type = .avro, .definition = incompatible }));
+        try testing.expect(std.mem.indexOf(u8, f.diag.message(), "incompatible with previous revision") != null);
+        if (single.rollback(only.value.revision_id)) |r| {
+            var made = r;
+            made.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {
+            try testing.expect(std.mem.startsWith(u8, f.diag.message(), "Cannot rollback to the latest revision"));
+        }
+    }
 }
 
 /// Pulls until one message arrives, acknowledges it, and returns what a
@@ -2635,14 +2659,41 @@ test "a topic with a schema: what fits is taken and says what it fit, what does 
     var again = topic.update(.{ .schema = .{ .set = .{ .schema = schema_name, .encoding = .json } } }) catch |err| return f.fail(err);
     again.deinit();
     schema.delete() catch |err| return f.fail(err);
-    var orphan = topic.get() catch |err| return f.fail(err);
-    defer orphan.deinit();
-    try testing.expect(orphan.value.schema.?.isDeleted());
-    try testing.expectEqual(pubsub.SchemaEncoding.json, orphan.value.schema.?.encoding);
+    // The emulator shows it at once. Production showed it at once in one
+    // run and not yet in another (measured 2026-10-12).
+    const lost_by = nowMs() + f.patience() * 1000;
+    while (true) {
+        var orphan = topic.get() catch |err| return f.fail(err);
+        defer orphan.deinit();
+        if (orphan.value.schema.?.isDeleted()) {
+            try testing.expectEqual(pubsub.SchemaEncoding.json, orphan.value.schema.?.encoding);
+            // What such a topic reads back cannot be sent as it is.
+            try testing.expectError(error.InvalidArgument, topic.update(.{ .schema = .{ .set = orphan.value.schema.? } }));
+            break;
+        }
+        if (nowMs() > lost_by) return error.TestTimedOut;
+        try testing.io.sleep(.fromMilliseconds(2000), .awake);
+    }
+    // And it takes nothing more: at once on the emulator, and in
+    // production after a minute in which publishes were still taken, off
+    // and on.
+    const refused_by = nowMs() + (if (f.production) @as(i64, 300) else 0) * 1000;
+    while (true) {
+        if (topic.publish(&.{.{ .data = fits }}, .{})) |sent| {
+            var taken = sent;
+            taken.deinit();
+            if (nowMs() >= refused_by) return error.TestTimedOut;
+            try testing.io.sleep(.fromMilliseconds(5000), .awake);
+        } else |err| {
+            try testing.expectEqual(error.NotFound, err);
+            try testing.expectEqualStrings(
+                if (f.production) "The schema associated with the topic has been deleted." else "Schema associated with topic deleted.",
+                f.diag.message(),
+            );
+            break;
+        }
+    }
     if (!f.production) {
-        // The emulator's refusal; production's is unmeasured.
-        try testing.expectError(error.NotFound, topic.publish(&.{.{ .data = fits }}, .{}));
-        try testing.expectEqualStrings("Schema associated with topic deleted.", f.diag.message());
         // A schema made again under the id is not the one the topic had.
         var remade = schema.create(.{ .type = .avro, .definition = avro_order }) catch |err| return f.fail(err);
         remade.deinit();
@@ -2650,6 +2701,4 @@ test "a topic with a schema: what fits is taken and says what it fit, what does 
         defer still.deinit();
         try testing.expect(still.value.schema.?.isDeleted());
     }
-    // What a deleted schema's topic read back cannot be sent as it is.
-    try testing.expectError(error.InvalidArgument, topic.update(.{ .schema = .{ .set = orphan.value.schema.? } }));
 }

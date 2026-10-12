@@ -30,10 +30,13 @@ fn makeOrders(client: *pubsub.Client, avro_json: []const u8) !void {
 }
 ```
 
-- **The definition** is the Avro schema as JSON, or a `.proto` source,
-  with one top-level type and no imports, of at most 300 KB. Google
-  takes Avro 1.11, proto2 and proto3. Pub/Sub parses it, and one that
-  does not parse is `error.InvalidArgument` in the server's words.
+- **The definition** is the Avro schema as JSON, or a `.proto` source
+  that begins with a `syntax` or `edition` statement and holds one
+  top-level message and no imports. At most 307,200 bytes: Google says
+  300 KB, and that is where production drew the line when measured.
+  Google takes Avro 1.11, proto2 and proto3. Pub/Sub parses it, keeps
+  it byte for byte, and answers one that does not parse
+  `error.InvalidArgument` in its own words.
 - **`client.schema(id)` is a handle**, as `client.topic` is, with
   `create`, `get`, `delete`, the calls for [revisions](#revisions),
   `validateMessage` and the five
@@ -105,16 +108,23 @@ A schema is never changed, only revised.
 - **`commit`** adds a revision, which `get` then reads. Each has an id
   the server chose, such as `c7cfa2a8`, in `SchemaInfo.revision_id`, and
   `get(.{ .revision_id = ... })` reads one. `listRevisions` pages
-  through them.
+  through them, the newest first. A commit of the definition a schema
+  already has is one more revision all the same.
 - **It must be compatible.** Google's rule for Protocol Buffers is that
   optional fields may be added and removed and nothing else changed, and
   for Avro that the new revision can read the old ones and be read by
-  them. Pub/Sub checks a commit against the revisions before it.
+  them. Pub/Sub checks a commit against the revisions before it, and
+  refuses one that does not fit, or is of another type, as
+  `error.FailedPrecondition`, naming the revision and the field.
 - **`rollback(revision_id)`** makes a new revision that holds what that
   one held: the latest is then the old definition again, under a new id,
-  and the revisions in between stay.
-- **`deleteRevision`** removes one, though never a schema's only one:
-  delete the schema.
+  and the revisions in between stay. A rollback to the latest revision
+  itself is `error.FailedPrecondition`.
+- **`deleteRevision`** removes one, though never a schema's only one,
+  which is `error.FailedPrecondition`: delete the schema.
+- **Twenty is all a schema holds.** A 21st revision is
+  `error.ResourceExhausted`, which the client, as with any quota, tries
+  a few times before it gives up.
 - **A topic takes a message that fits any revision its settings allow**,
   tried from the newest to the oldest. With no bounds, a commit is live
   for the topic at once. `first_revision_id` and `last_revision_id`
@@ -126,7 +136,8 @@ A schema is never changed, only revised.
   it already holds what was asked for, it is the answer: the attempt
   landed, and only its answer was lost. That read needs
   `pubsub.schemas.get`. If it fails, the attempt's own error is
-  returned, and the diagnostics say that it may have landed.
+  returned, and the diagnostics say that it may have landed. A refusal
+  for quota is not read for: it is an answer, and nothing landed.
 
 ## What a subscriber sees
 
@@ -143,9 +154,17 @@ fn describe(message: pubsub.ReceivedMessage, out: *std.Io.Writer) !void {
 
 Pub/Sub writes three attributes on each message a schema topic takes:
 the schema's name, the revision the message fit, and the encoding.
-`ReceivedMessage.schema()` reads them, and is null for a message from a
-topic with no schema. A publisher cannot set them itself: an attribute
-key that starts with `goog` is refused.
+`ReceivedMessage.schema()` reads them, and is null for a message that
+has none.
+
+They are only as trustworthy as the topic. This client refuses to
+publish an attribute whose key starts with `goog`, but Pub/Sub itself
+takes the three `googclient_schema...` keys from any publisher. Measured
+on 2026-10-12: on a topic with no schema they arrived exactly as a
+publisher had forged them, and on a topic with one, Pub/Sub overwrote
+the encoding and the revision and left a forged name in place. So read
+them on subscriptions of topics you know to have a schema, and take the
+schema's name from the topic's settings, not from the message.
 
 A message is checked when it is published and never again. What a
 subscription already holds stays as it was written, whatever is then
@@ -175,16 +194,22 @@ fn release(client: *pubsub.Client) !void {
 - **An update replaces the settings whole.** The encoding and the bounds
   are then what was given, and a bound left out is open. `.clear` takes
   the schema off the topic. Google says a change can take a few minutes
-  to hold.
+  to hold. When measured, a change of encoding held within a second,
+  and a clear took 89 seconds, in which the topic went on refusing what
+  its old schema refused.
 - **A deleted revision** at either end of a topic's range moves the
-  range one inward. If every revision in the range is gone, the topic
-  refuses every publish.
+  range one inward, by Google's account; the settings go on reading as
+  they were written. If every revision in the range is gone, the topic
+  refuses every publish, `error.InvalidArgument`. That took about a
+  minute to hold, with publishes taken and refused by turns meanwhile.
 - **A deleted schema** leaves its topics reading `_deleted-schema_`,
   which `SchemaSettings.isDeleted()` answers, and refusing every
-  publish. A schema made again under the same id is not the one a topic
-  had. So take a schema off its topics before deleting it, and never
-  send back what such a topic reads: that name is refused before
-  sending.
+  publish, `error.NotFound`. Neither is instant in production: in one
+  run a read still named the schema a second later, and in another
+  publishes were taken, off and on, for a minute. A schema made again
+  under the same id is not the one a topic had. So take a schema off its
+  topics before deleting it, and never send back what such a topic
+  reads: that name is refused before sending.
 
 ## Permissions
 
@@ -204,20 +229,26 @@ reads a revision to decode by needs `pubsub.schemas.get`.
 
 ## What the emulator and production do
 
-Measured on 2026-10-11, with emulator 0.8.36. The production column is
-what Google documents: this project has not measured it yet.
+Measured on 2026-10-11 with emulator 0.8.36, and on 2026-10-12 against
+production. The client's own checks catch the one marked *checked*.
 
-| Behavior | Emulator | Production, as documented |
+| Behavior | Emulator | Production |
 | --- | --- | --- |
 | Avro schemas | served, and messages are checked for real, in both encodings | the same |
 | Protocol Buffer schemas | every call that names one is `error.Unimplemented` | served |
 | A schema's IAM calls | the read is `error.InvalidArgument` | the policy |
+| A schema's name in an answer | always the schema's own | `name@revision` where the answer is about one revision; `SchemaInfo.name` is the schema's own either way |
 | A revision's time | in January 1970 | when it was made |
-| A commit that is not compatible with the revisions before it | taken, if it parses | refused |
-| A commit of the definition a schema already has | one more revision | not documented |
-| Revisions in a list | oldest first | not documented |
+| A commit that is not compatible with the revisions before it | taken, if it parses | `error.FailedPrecondition` |
+| The name in a commit's body | ignored | the schema committed to, whatever the path says; the client sends the handle's own |
+| A commit of the definition a schema already has | one more revision | one more revision |
+| A rollback to the latest revision | one more revision | `error.FailedPrecondition` |
+| A 21st revision | not measured | `error.ResourceExhausted` |
+| Revisions in a list | oldest first | newest first |
 | A list asked for no view | sends definitions; the client always says the view | leaves them out |
-| A schema's only revision, deleted | `error.InvalidArgument` | refused |
-| A topic's schema in an update | changed and cleared, though its page says topic updates are not supported | changed, within minutes |
-| JSON with a field the schema does not have | taken | not documented |
-| A publish to a topic whose schema is deleted | `error.NotFound` | fails |
+| A schema's only revision, deleted | `error.InvalidArgument` | `error.FailedPrecondition` |
+| A definition of more than 307,200 bytes | not measured | `error.InvalidArgument`, with no reason given (*checked*) |
+| A topic's schema in an update | changed and cleared at once, though its page says topic updates are not supported | an encoding changed within a second; a clear took 89 s to hold |
+| JSON with a field the schema does not have | taken | taken |
+| A publish to a topic whose schema is deleted | `error.NotFound`, at once | `error.NotFound`, after up to a minute of publishes still taken |
+| The three schema attributes, written by a publisher | the encoding is overwritten on a schema topic | kept on a topic with no schema; on a schema topic the name is kept |

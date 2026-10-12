@@ -58,6 +58,23 @@ including the ones that did not change.
   the schema does not have is taken; a topic whose schema is deleted
   answers a publish `error.NotFound`, and a schema made again under the
   id is not the one it had.
+- pubsub: what production does with schemas, measured 2026-10-12 and
+  now in the code, the tests and `docs/pubsub/schemas.md`. An answer
+  about one revision names its schema `name@revision`, and
+  `SchemaInfo.name` is the schema's own name either way. Production
+  commits to the schema a commit's body names, whatever the path says;
+  refuses a revision that is not compatible, a rollback to the latest
+  revision and the delete of a schema's only revision as
+  `error.FailedPrecondition`; refuses a 21st revision as
+  `error.ResourceExhausted`, after which the client does not read the
+  schema to see whether a commit landed, since a refusal is an answer;
+  lists revisions newest first; and takes a definition of 307,200 bytes
+  and not one more. A publisher can write the three
+  `googclient_schema...` attributes itself: Pub/Sub keeps them on a
+  topic with no schema, and keeps the name on a topic with one, so
+  `ReceivedMessage.schema()` is to be relied on only for a topic known
+  to have a schema. A cleared schema went on being enforced for 89
+  seconds, and a deleted one was not refused for up to a minute.
 - auth, core, firestore, secret_manager and storage: unchanged.
 
 ## 0.35.0 (unreleased)
