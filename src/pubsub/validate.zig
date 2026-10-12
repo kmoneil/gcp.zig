@@ -53,7 +53,8 @@ pub const max_backoff: std.Io.Duration = .fromSeconds(600);
 /// Resource Manager tags bound to one resource as it is made.
 pub const max_tags = 50;
 /// The transforms of a topic or a subscription that are not disabled.
-/// Measured 2026-10-12: production and an emulator refuse a sixth.
+/// Measured 2026-10-12: production and an emulator refuse a sixth, and
+/// production takes five with seven more that are disabled.
 pub const max_enabled_message_transforms = 5;
 /// A JavaScript function's source. Measured 2026-10-12: production takes
 /// 20,480 bytes and refuses 20,481; an emulator takes any.
@@ -606,7 +607,8 @@ pub fn messageTransforms(list: []const types.MessageTransform, diag: ?*Diagnosti
         if (!std.unicode.utf8ValidateSlice(udf.code)) {
             return refuse(diag, "message transform {d} has code that is not valid UTF-8", .{i});
         }
-        // Production's words name no exception for a disabled one: "Each
+        // Disabled or not: production refuses two of one name when one of
+        // them, or both, are disabled too (measured 2026-10-12). "Each
         // JavaScript UDF must have a unique function name."
         for (list[0..i], 0..) |earlier, j| switch (earlier.kind) {
             .javascript_udf => |other| if (std.mem.eql(u8, other.function_name, udf.function_name)) {

@@ -4,6 +4,7 @@
 
 **On this page:** [Subscription settings](#subscription-settings) ·
 [Updates](#updates) · [Topic settings](#topic-settings) ·
+[Tags](#tags) ·
 [What the emulator and production do](#what-the-emulator-and-production-do) ·
 [IAM](#iam)
 
@@ -83,7 +84,63 @@ message, acknowledged or not, so subscriptions can replay them),
 `kms_key_name` and `message_storage_policy` (the regions messages may be
 stored in), and `Topic.update` changes them the same way. A topic can
 also hold every message to a [schema](schemas.md): `schema` names one,
-with an encoding and the revisions a message may fit.
+with an encoding and the revisions a message may fit. It can run each
+message through [transforms](transforms.md), as a subscription can, and
+it can fill itself from a source outside Pub/Sub, as an
+[import topic](import-topics.md).
+
+## Tags
+
+<!-- snippet: tests/docs_examples.zig#pubsub-tags -->
+```zig
+/// A topic bound to the tag `env: prod` as it is made. The key and the
+/// value must already be there, in Resource Manager.
+fn makeTagged(client: *pubsub.Client) !void {
+    var topic = try client.topic("orders").create(.{
+        .tags = &.{.{ .key = "my-project/env", .value = "prod" }},
+    });
+    defer topic.deinit();
+}
+```
+
+A label is a note on a resource. A **tag** is a key and a value kept in
+Resource Manager, which organization policies, IAM conditions and
+billing can read. `TopicConfig`, `SubscriptionConfig` and
+`SnapshotConfig` take `tags`, which Pub/Sub binds as the resource is
+made.
+
+- **A key** is `{organization id or project id}/{key name}`, or
+  `tagKeys/{id}`. **A value** is its short name, or `tagValues/{id}`.
+  The two go in the same form: both by name, or both by id. At most 50
+  on a resource, and no key twice.
+- **Once, on create.** Tags are in no update, and
+  `TopicInfo`, `SubscriptionInfo` and `SnapshotInfo` do not have them:
+  production returns none on a read, and Resource Manager lists the
+  binding. Reading them, binding another and removing one are Resource
+  Manager's calls, which this library does not make.
+- **The key and the value must be there**, and the caller needs the Tag
+  User role on the value. Production answers a key or a value that is
+  not there, or not the caller's to use, `error.PermissionDenied`, "(or
+  it may not exist)", for a topic, a subscription and a snapshot alike.
+- **Checked before sending**, `error.InvalidArgument`: more than 50, a
+  key twice, a key that is neither form, a value that is neither, and a
+  key by name with a value by id or the other way round, which
+  production refuses ("Both TagKey and TagValue must be provided in the
+  same format."). The emulator takes any key and any value, and echoes
+  them on a read of a topic or a subscription, which the client reads
+  past.
+
+Measured on 2026-10-12 with a tag key and value made for the purpose: a
+topic, a subscription and a snapshot were each made with the tag, by
+names and by ids.
+
+- **A binding holds its tag value.** Resource Manager refuses to delete
+  a value while anything is bound to it, and deleting the topic did not
+  let go at once: more than half an hour after the tagged resources
+  were gone their bindings were still listed, and could not be removed
+  by hand, since the resource they named no longer existed. So a tag
+  value used for short-lived resources cannot be retired right after
+  them.
 
 ## What the emulator and production do
 

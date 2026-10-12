@@ -47,6 +47,8 @@ Against production, pass a `.token_provider` as well:
 | [Delivery](delivery.md) | Push, BigQuery and Cloud Storage subscriptions: Pub/Sub delivers itself; the body options, the export states, and changing kind |
 | [Replaying and purging](replay.md) | Snapshots, seeking back to replay or ahead to purge, what a running subscriber sees, and detaching a subscription |
 | [Schemas](schemas.md) | Avro and Protocol Buffer schemas and their revisions; a topic that takes only what fits; asking before publishing; what a subscriber reads off a message |
+| [Message transforms](transforms.md) | JavaScript functions Pub/Sub runs on a topic's or a subscription's messages: rewriting, dropping and refusing; changing the list; why the emulator cannot test one |
+| [Import topics](import-topics.md) | A topic that fills itself from a bucket, Kinesis, Event Hubs, MSK or Confluent Cloud; the source's state; changing and stopping |
 
 **On this page:** [Handles and calls](#handles-and-calls) ·
 [Pulling](#pulling) · [Retries](#retries) · [Limits](#limits) ·
@@ -129,12 +131,19 @@ emulator does not fail later in production.
 | Exactly-once: a second ack of an acknowledged message | refused | taken |
 | Publishing to a deleted topic | refused at once | taken for 0.7 to 14 s in nine runs, and once for over 90 s |
 | IAM calls (0.8.36) | 501 `UNIMPLEMENTED`, `error.Unimplemented` | the policy |
+| [Message transforms](transforms.md) (0.8.36) | **kept and never run**: every message arrives untouched | run on every message |
+| An [import topic](import-topics.md)'s source (0.8.36) | kept as given, never read | connected to when the topic is made or changed, refused if it cannot be, and imported from |
+| [Tags](topics-and-subscriptions.md#tags) (0.8.36) | any key and value taken, and echoed on a read | bound if the key and value are there; never returned (*checked*: their form) |
 
 [Topics and subscriptions](topics-and-subscriptions.md#what-the-emulator-and-production-do)
 lists how the two treat settings and updates,
 [Delivery](delivery.md#what-the-emulator-and-production-do) how they
 treat push and the export kinds,
 [Replaying and purging](replay.md#what-the-emulator-and-production-do)
-how they treat snapshots, seeks and detach, and
+how they treat snapshots, seeks and detach,
 [Schemas](schemas.md#what-the-emulator-and-production-do) how they treat
-schemas and the topics that name them.
+schemas and the topics that name them,
+[Message transforms](transforms.md#what-the-emulator-and-production-do)
+what each does with a function, which the emulator never runs, and
+[Import topics](import-topics.md#what-the-emulator-and-production-do)
+what each does with a source.

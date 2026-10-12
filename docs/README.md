@@ -26,6 +26,8 @@ Google, not only what Google documents, and where the emulators differ.
 | [Delivery](pubsub/delivery.md) | Push, BigQuery and Cloud Storage subscriptions: the body options, the export states, and changing kind |
 | [Replaying and purging](pubsub/replay.md) | Snapshots, seeking back to replay or ahead to purge, and detaching a subscription |
 | [Schemas](pubsub/schemas.md) | Schemas and their revisions, a topic that takes only what fits, and what a subscriber reads off a message |
+| [Message transforms](pubsub/transforms.md) | JavaScript functions Pub/Sub runs on a topic's or a subscription's messages, and why the emulator cannot test one |
+| [Import topics](pubsub/import-topics.md) | A topic that fills itself from a bucket or from another cloud, and the state of its source |
 
 ## 🪣 Cloud Storage
 
