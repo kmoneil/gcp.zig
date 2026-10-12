@@ -469,7 +469,12 @@ jobs:
         # fault-storage (86), fault-gzip (82), slow-subscriber (76) and
         # heavy-storage (74). slow-pubsub (51, 34 and 38 at 1900K) stays
         # too: it has taken three times as long from one night to the
-        # next at an unchanged count.
+        # next at an unchanged count. fake-pubsub (10-12) holds the two
+        # properties of the in-memory Pub/Sub the tests use: a model
+        # property that plays a whole session of calls and checks every
+        # subscription after each, 25 ms a run on a Mac under the fuzzer,
+        # and arbitrary requests on every route, about 2 ms. 100K is
+        # about 45 minutes on the Mac, to be sized from its first nights.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 630K }
           - { job: auth, module: auth, filter: fuzz, iterations: 850K }
@@ -478,6 +483,7 @@ jobs:
           - { job: slow-pubsub, module: pubsub, filter: slow property Publisher, iterations: 1900K }
           - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 65K }
           - { job: heavy-pubsub, module: pubsub, filter: heavy property, iterations: 9M }
+          - { job: fake-pubsub, module: pubsub, filter: fake property, iterations: 100K }
           - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 5500K }
           - { job: heavy-secret_manager, module: secret_manager, filter: heavy property, iterations: 110K }
           - { job: storage, module: storage, filter: fuzz, iterations: 1100K }

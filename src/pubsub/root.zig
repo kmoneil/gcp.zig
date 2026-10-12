@@ -148,6 +148,7 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("codec.zig");
     _ = @import("errors.zig");
+    _ = @import("fake_pubsub.zig");
     _ = @import("iam.zig");
     _ = @import("logging.zig");
     _ = @import("rpc.zig");
