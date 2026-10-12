@@ -28,6 +28,7 @@ Google, not only what Google documents, and where the emulators differ.
 | [Schemas](pubsub/schemas.md) | Schemas and their revisions, a topic that takes only what fits, and what a subscriber reads off a message |
 | [Message transforms](pubsub/transforms.md) | JavaScript functions Pub/Sub runs on a topic's or a subscription's messages, and why the emulator cannot test one |
 | [Import topics](pubsub/import-topics.md) | A topic that fills itself from a bucket or from another cloud, and the state of its source |
+| [Testing](pubsub/testing.md) | An in-memory Pub/Sub for your own tests, with production's answers, a clock the test moves and faults on request (experimental) |
 
 ## 🪣 Cloud Storage
 

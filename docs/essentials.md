@@ -225,5 +225,10 @@ test "a publish, answered by a fake" {
 }
 ```
 
+For Pub/Sub there is more than a script: `pubsub.testing.FakePubSub`
+keeps topics, subscriptions and messages in memory and answers as
+production does, so a test publishes, pulls and acknowledges with no
+server at all. See [Testing with an in-memory Pub/Sub](pubsub/testing.md).
+
 The emulators make a fuller check, as this library's own integration
 suites do: see [Integration tests](development.md#integration-tests).

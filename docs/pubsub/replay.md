@@ -39,6 +39,12 @@ when it was made, and every message published to the topic since.
   topic's subscription is refused, `error.FailedPrecondition`. It
   outlives the subscription it was made of, and the topic too, whose
   name `SnapshotInfo.topic` then gives as `_deleted-topic_`.
+- **Once the topic is deleted, no new one is taken.** A snapshot of a
+  subscription whose topic is gone is refused,
+  `error.FailedPrecondition` ("attached to a deleted topic"), and stays
+  refused when a topic is made again under the name, which is another
+  topic. The subscription still seeks to a snapshot that was taken of
+  it before (measured 2026-10-12).
 - **It lives at most 7 days**, less the age of the oldest message its
   subscription held: `SnapshotInfo.expire_time` says until when. One
   that would expire within the hour is refused,
@@ -161,8 +167,8 @@ and write IAM policies.
 
 ## What the emulator and production do
 
-Measured on 2026-10-10, with emulator 0.8.36. The client's own checks
-catch the one marked *checked*.
+Measured on 2026-10-10, with emulator 0.8.36, and the last three rows on
+2026-10-12. The client's own checks catch the one marked *checked*.
 
 | Behavior | Emulator | Production |
 | --- | --- | --- |
@@ -174,3 +180,6 @@ catch the one marked *checked*.
 | A seek to a time on an ordered subscription | unsupported, by its own page | works, in order |
 | A snapshot whose topic was deleted | still names the topic | names `_deleted-topic_` |
 | `Topic.listSnapshots` on a deleted topic | still lists them | `error.NotFound` |
+| A seek to a snapshot, by a subscription made after the snapshot's messages | gets none of them | gets them: a snapshot is its topic's |
+| A snapshot of a subscription whose topic was deleted | taken, naming the topic | `error.FailedPrecondition` |
+| A seek of that subscription to a snapshot taken of it before | `error.FailedPrecondition`: it holds the two topics to differ | works |

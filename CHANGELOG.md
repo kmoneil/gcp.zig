@@ -4,6 +4,53 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.37.0 (unreleased)
+
+- pubsub: an in-memory Pub/Sub for tests, **experimental**.
+  `pubsub.testing.FakePubSub` goes where a client's transport goes
+  (`Client.Options.transport = fake.transport()`) and keeps topics,
+  subscriptions, snapshots, schemas and messages in the test's own
+  process: no emulator, no network, no credentials. It answers and
+  refuses as production did when measured, in production's words, which
+  is where it parts from the emulator. Its clock is the `Io` it is
+  given: with `pubsub.testing.FakeClock` a lease lapses when the test
+  moves the clock and not before, and with a real `Io` a `Publisher` and
+  a `Subscriber` run over it as they run over the network. It models
+  topics and subscriptions with their settings, updates and lists;
+  publish, pull, acknowledge, lease changes and nacks; filters, ordering
+  keys, dead letters and delivery attempts, retry policies, retention
+  and exactly-once delivery; snapshots, seeks and detach; schemas, their
+  revisions and a topic's schema settings; and IAM policies with their
+  etags. What Pub/Sub does on its own it keeps, checks and does not do:
+  a push or export subscription delivers nothing, no transform runs, and
+  nothing is imported. Faults are asked for, never random: `refuseNext`,
+  `loseAnswers` and `dropNext`, each for the next requests of one kind.
+  What production would find out by trying, a test says:
+  `setExportState`, `setIngestionState`, `Options.fits` for whether a
+  message fits a schema, and `Options.service_agent` for the account a
+  dead letter waits on. A test reads `backlog`, `outstanding`,
+  `publishedCount`, `requestCount` and `tagValue`. What it does not
+  model it answers 501, `error.Unimplemented`, with a message that
+  begins `fake:`, and production's delays are not modelled at all:
+  everything holds at once. It is held to production by the answers
+  production gave, kept as its tests' fixtures; by a model property over
+  random scripts of calls; by a differential test against the emulator
+  in CI, over what the two were measured to agree on; and by this
+  library's own `Publisher` and `Subscriber` running through it with
+  faults on every kind of call. New guide: `docs/pubsub/testing.md`;
+  new example: `examples/in_memory.zig`.
+- pubsub: measured in production while building it, 2026-10-12, and now
+  in the guides. A snapshot of a subscription whose topic is deleted is
+  refused, `error.FailedPrecondition`, and still refused when a topic is
+  made again under the name; the subscription goes on seeking to a
+  snapshot taken of it before. Three places where the emulator (0.8.36)
+  parts from that and from production are in the replay guide's table:
+  it takes such a snapshot, it refuses that seek, and its seek to a
+  snapshot gives a subscription only messages it was itself sent, where
+  in production a subscription made after the snapshot's messages gets
+  them.
+- auth, core, firestore, secret_manager and storage: unchanged.
+
 ## 0.36.0 (2026-10-12)
 
 - pubsub: message transforms. A topic or a subscription can run each

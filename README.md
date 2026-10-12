@@ -49,7 +49,7 @@ Pub/Sub, Cloud Storage, Secret Manager and Firestore, with credentials that find
 
 | | Module | Covers | Status |
 | :-: | --- | --- | --- |
-| 📨 | [`pubsub`](docs/pubsub/README.md) | Pub/Sub v1: publish one call at a time or batched from many tasks; pull, a worker loop that manages leases, and exactly-once delivery; delivery by push, to BigQuery or to Cloud Storage; topics, subscriptions, snapshots and schemas, with their IAM policies; message transforms, import topics and tags; replaying and purging by seeking, and detaching | beta |
+| 📨 | [`pubsub`](docs/pubsub/README.md) | Pub/Sub v1: publish one call at a time or batched from many tasks; pull, a worker loop that manages leases, and exactly-once delivery; delivery by push, to BigQuery or to Cloud Storage; topics, subscriptions, snapshots and schemas, with their IAM policies; message transforms, import topics and tags; replaying and purging by seeking, and detaching; an in-memory Pub/Sub for your own tests (experimental) | beta |
 | 🪣 | [`storage`](docs/storage/README.md) | Cloud Storage: objects of any size, streamed, parallel, resumable and checksummed both ways; preconditions, compose and server-side copies; buckets, versions, soft delete, retention and holds, IAM; folders, tree renames and managed folders; access control lists; signed URLs and POST policies, signed by a service account or an HMAC key; HMAC keys; encryption keys; Pub/Sub notifications | experimental |
 | 🔥 | [`firestore`](docs/firestore/README.md) | Cloud Firestore: documents read and written under preconditions, commits with field transforms, batched reads, queries and aggregations over collections and collection groups, large answers read one document at a time as they arrive, transactions run again on contention; the default database or a named one | experimental |
 | 🔑 | [`secret_manager`](docs/secret-manager/README.md) | Secret Manager v1: a secret's bytes, verified and wiped after use; versions; secrets global or regional, their settings, notifications, rotation, encryption keys and IAM policies | experimental |
@@ -162,6 +162,7 @@ The [documentation index](docs/README.md) lists every page.
 | [`publish`](examples/publish.zig) | Publishes messages, creating the topic first if needed | `zig build example-publish -- orders 5` |
 | [`publisher`](examples/publisher.zig) | Publishes from several tasks through one `Publisher`, and says how few requests it took | `zig build example-publisher -- orders 1000 4` |
 | [`worker`](examples/worker.zig) | Consumes a subscription with `Subscriber`, extending leases while it works | `zig build example-worker -- orders orders-worker` |
+| [`in_memory`](examples/in_memory.zig) | A `Publisher` and a `Subscriber` over the in-memory Pub/Sub for tests, with no server at all | `zig build example-in_memory -- 200` |
 | [`whoami`](examples/whoami.zig) | Which credentials this machine offers, and the topics they see | `zig build example-whoami` |
 | [`secret`](examples/secret.zig) | Reads a secret and reports which version answered | `zig build example-secret -- db-password latest` |
 | [`gcs_cp`](examples/gcs_cp.zig) | Copies files to and from Cloud Storage in constant memory: parallel, resumable, compressed, under keys | `zig build example-gcs_cp -- backup.tar gs://my-bucket/backup.tar` |
