@@ -49,8 +49,10 @@
 //!     `deliveryAttempt` with a policy alone. A message released after
 //!     its last attempt moves to the dead-letter topic, marked as
 //!     production marks one. Production forwards only when its service
-//!     agent holds two grants, and otherwise goes on delivering; the fake
-//!     has no IAM yet and always forwards.
+//!     agent may publish to that topic and acknowledge on the
+//!     subscription, and otherwise goes on delivering. The fake always
+//!     forwards, unless `Options.service_agent` names the agent: then it
+//!     reads the two policies as production does.
 //!   - A retry policy. A message given back, or lapsed, waits the minimum
 //!     backoff, doubled with each delivery up to the maximum: the fake's
 //!     own rule, inside the delays production showed. With ordering it
@@ -115,6 +117,13 @@
 //!   where production looks and may refuse. What production would then
 //!   find out by trying, a test says: `setExportState` and
 //!   `setIngestionState`.
+//! - IAM on a topic, a subscription, a snapshot and a schema, as
+//!   production answered on 2026-10-01 and after: a policy that reads
+//!   `{"etag":"ACAB"}` until it is written, an etag that every write
+//!   moves, a write under an older one refused, and bindings stored as
+//!   production stores them. The fake has no accounts and no callers: a
+//!   member of good form is taken to be there, and whoever asks holds
+//!   every permission.
 //! - Faults, on command: `refuseNext`, `loseAnswers`, `dropNext`.
 //!
 //! Its clock is the `io` it is given: with `core.testing.FakeClock`, a
@@ -122,8 +131,8 @@
 //! to use from several tasks at once.
 //!
 //! Not modelled yet, and answered 501 with a message that says so, never
-//! guessed at: IAM, a Bigtable subscription, and the transforms that are
-//! no JavaScript function. A filter of a shape production was not shown,
+//! guessed at: a Bigtable subscription, and the transforms that are no
+//! JavaScript function. A filter of a shape production was not shown,
 //! or that production itself fails on, is answered the same way, and so
 //! is a setting here and there that production was not shown.
 //! Production's delays are not modelled at all: a deleted topic that
@@ -163,6 +172,9 @@ pub const FakePubSub = struct {
     next_revision: u32 = 1,
     next_message_id: u64 = 1,
     next_uid: u64 = 1,
+    /// The microsecond the last policy was written at: no two writes
+    /// share one.
+    last_stamp: u64 = 0,
     prng: std.Random.DefaultPrng = .init(0x5eed),
     faults: [3]Fault = @splat(.{}),
     /// Requests served, by the kind of call, faults included.
@@ -185,6 +197,15 @@ pub const FakePubSub = struct {
         /// allows from the newest back, and of a message given to
         /// validateMessage. With none, every message fits.
         fits: ?Fits = null,
+        /// Pub/Sub's service agent, as a policy names it:
+        /// `serviceAccount:service-123@gcp-sa-pubsub.iam.gserviceaccount.com`.
+        /// Production forwards a dead letter only when this account may
+        /// publish to the dead-letter topic and acknowledge on the
+        /// subscription, and otherwise goes on delivering the message.
+        /// With the agent named here the fake does the same, by the
+        /// policies of those two resources: it has no project to grant
+        /// on. With none, it always forwards.
+        service_agent: ?[]const u8 = null,
     };
 
     pub const Fits = struct {
@@ -235,6 +256,7 @@ pub const FakePubSub = struct {
         /// Deleted, and kept for what still points at it: a topic made
         /// again under its name is another topic.
         deleted: bool = false,
+        policy: Policy = .{},
         schema: ?SchemaSettings = null,
         /// Kept, and run on nothing.
         transforms: []const Transform = &.{},
@@ -253,6 +275,7 @@ pub const FakePubSub = struct {
         /// Deleted, and kept for the topics that still point at it: one
         /// made again under its name is another schema.
         deleted: bool = false,
+        policy: Policy = .{},
 
         fn latest(s: *const Schema) *const Revision {
             return &s.revisions.items[s.revisions.items.len - 1];
@@ -319,6 +342,7 @@ pub const FakePubSub = struct {
         detached: bool = false,
         /// Ack ids of entries numbered below this are from before a seek.
         stale_below: u64 = 1,
+        policy: Policy = .{},
         ack_deadline_s: u32 = 10,
         labels: []const Label = &.{},
         retention_s: i64 = 604_800,
@@ -431,6 +455,31 @@ pub const FakePubSub = struct {
         from: usize,
         /// Bound as the snapshot was made, and never read back.
         tags: []const Label = &.{},
+        policy: Policy = .{},
+    };
+
+    /// An allow policy.
+    const Policy = struct {
+        /// The microsecond of the write that made it, which is what one
+        /// of production's etags holds. Zero: never written.
+        stamp: u64 = 0,
+        bindings: []const Binding = &.{},
+
+        const Binding = struct { role: []const u8, members: []const []const u8 };
+
+        /// Whether `member` holds one of `roles`.
+        fn grants(p: Policy, member: []const u8, roles: []const []const u8) bool {
+            for (p.bindings) |binding| {
+                const named = for (roles) |role| {
+                    if (std.mem.eql(u8, binding.role, role)) break true;
+                } else false;
+                if (!named) continue;
+                for (binding.members) |m| {
+                    if (std.ascii.eqlIgnoreCase(m, member)) return true;
+                }
+            }
+            return false;
+        }
     };
 
     const DeadLetter = struct {
@@ -766,6 +815,13 @@ pub const FakePubSub = struct {
 
     fn dispatch(f: *FakePubSub, method: tp.Method, route: Route, body: []const u8, arena: Allocator) tp.Error!Reply {
         const none = route.rest.len == 0;
+        if (route.id.len != 0) {
+            // Of a schema's revision production was not asked.
+            if (route.collection == .schemas and std.mem.indexOfScalar(u8, route.id, '@') != null and std.mem.indexOf(u8, route.rest, "Iam") != null) return notModelled(arena, "IAM on a revision of a schema");
+            if (method == .GET and std.mem.eql(u8, route.rest, ":getIamPolicy")) return f.getIamPolicy(arena, route);
+            if (method == .POST and std.mem.eql(u8, route.rest, ":setIamPolicy")) return f.setIamPolicy(arena, route, body);
+            if (method == .POST and std.mem.eql(u8, route.rest, ":testIamPermissions")) return f.testIamPermissions(arena, route, body);
+        }
         switch (route.collection) {
             .topics => {
                 if (route.id.len == 0) return if (method == .GET and none) f.listTopics(arena, route) else notModelled(arena, "this call on topics");
@@ -1584,6 +1640,10 @@ pub const FakePubSub = struct {
             // there and acknowledge here, and otherwise goes on delivering.
             // With no topic to forward to, the fake goes on delivering too.
             const dead = f.topics.get(policy.topic) orelse break :forwarded;
+            if (f.options.service_agent) |agent| {
+                if (!dead.policy.grants(agent, &.{ "roles/pubsub.publisher", "roles/pubsub.editor", "roles/pubsub.admin", "roles/editor" })) break :forwarded;
+                if (!sub.policy.grants(agent, &.{ "roles/pubsub.subscriber", "roles/pubsub.editor", "roles/pubsub.admin", "roles/editor" })) break :forwarded;
+            }
             try f.forward(sub, entry, dead);
             sub.entries.orderedRemoveAt(index);
             gone = true;
@@ -1888,6 +1948,137 @@ pub const FakePubSub = struct {
         }
         if (judged.refused.len > 0) return exactlyOnceRefusal(arena, judged.refused);
         return ok("{}");
+    }
+
+    // IAM. A policy is read whole, written whole, and guarded by its etag.
+
+    /// The policy of the resource a route names; null when there is none
+    /// such.
+    fn policyAt(f: *FakePubSub, arena: Allocator, route: Route) Allocator.Error!?*Policy {
+        const name = try resourceName(arena, route);
+        return switch (route.collection) {
+            .topics => if (f.topics.get(name)) |t| &t.policy else null,
+            .subscriptions => if (f.subscriptions.get(name)) |s| &s.policy else null,
+            .snapshots => if (f.snapshots.get(name)) |s| &s.policy else null,
+            .schemas => if (f.schemas.get(name)) |s| &s.policy else null,
+        };
+    }
+
+    fn getIamPolicy(f: *FakePubSub, arena: Allocator, route: Route) Allocator.Error!Reply {
+        // Production takes any integer for the version asked for.
+        if (try queryValue(arena, route.query, "options.requestedPolicyVersion")) |text| {
+            _ = std.fmt.parseInt(i32, text, 10) catch return badValue(arena, "options.requestedPolicyVersion");
+        }
+        const policy = (try f.policyAt(arena, route)) orelse return notFound(arena, route.id);
+        return ok(try renderPolicy(arena, policy.*));
+    }
+
+    /// The policy whole: what the request does not hold is gone. With an
+    /// etag, only if the policy is still the one that was read. Every
+    /// write moves the etag, one that changes nothing included, and the
+    /// answer is what a read right after gives.
+    fn setIamPolicy(f: *FakePubSub, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
+        const object = switch (try parseObject(arena, body)) {
+            .ok => |o| o,
+            .refused => |r| return r,
+        };
+        const policy = (try f.policyAt(arena, route)) orelse return notFound(arena, route.id);
+        var given: ?std.json.ObjectMap = null;
+        var it = object.iterator();
+        while (it.next()) |field| {
+            const key = field.key_ptr.*;
+            if (isField(key, "policy")) {
+                given = switch (field.value_ptr.*) {
+                    .object => |o| o,
+                    else => return badValue(arena, key),
+                };
+            } else if (isField(key, "updateMask")) {
+                return notModelled(arena, "a setIamPolicy with an update mask");
+            } else return unknownName(arena, key);
+        }
+        const wanted = given orelse return notModelled(arena, "a setIamPolicy with no policy");
+        var etag: []const u8 = "";
+        var bindings: []const Value = &.{};
+        var parts = wanted.iterator();
+        while (parts.next()) |part| {
+            const key = part.key_ptr.*;
+            if (isField(key, "etag")) {
+                etag = stringOf(part.value_ptr.*) orelse return badValue(arena, key);
+            } else if (isField(key, "bindings")) {
+                bindings = switch (part.value_ptr.*) {
+                    .array => |a| a.items,
+                    else => return badValue(arena, key),
+                };
+            } else if (isField(key, "version")) {
+                _ = intOf(part.value_ptr.*) orelse return badValue(arena, key);
+            } else if (isField(key, "auditConfigs")) {
+                return notModelled(arena, "audit configs in a policy");
+            } else return unknownName(arena, key);
+        }
+        // No etag, or an empty one, writes over whatever is there.
+        if (etag.len > 0) {
+            // As production refuses the bytes of a message that are no
+            // base64: its words for an etag were not kept.
+            const raw = (try decodeBase64(arena, etag)) orelse return fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Invalid value at 'policy.etag' (TYPE_BYTES), Base64 decoding failed for \"{s}\"", .{etag}));
+            var buf: [8]u8 = undefined;
+            if (!std.mem.eql(u8, raw, etagBytes(&buf, policy.stamp))) {
+                // What is no etag at all is never the mismatch.
+                if (!isEtag(raw)) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid etag");
+                return fail(arena, 409, "ABORTED", "There were concurrent policy changes. Please retry the whole read-modify-write with exponential backoff.");
+            }
+        }
+        const stored = switch (try bindingsOf(arena, route.collection == .subscriptions, bindings)) {
+            .ok => |list| try f.keepWhole([]const Policy.Binding, list),
+            .refused => |r| return r,
+        };
+        const wall: u64 = @intCast(@max(0, @divFloor(std.Io.Clock.real.now(f.io).nanoseconds, std.time.ns_per_us)));
+        f.last_stamp = @max(f.last_stamp + 1, wall);
+        policy.* = .{ .stamp = f.last_stamp, .bindings = stored };
+        return ok(try renderPolicy(arena, policy.*));
+    }
+
+    /// Which of the permissions asked the caller holds. The fake has no
+    /// callers: whoever asks holds every permission of the resource, as
+    /// the owner production answered did, and gets them back by name, one
+    /// asked twice twice. Production's words for what it refuses here
+    /// were not kept: the fake says what production says of an argument
+    /// it gives no reason for.
+    fn testIamPermissions(f: *FakePubSub, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
+        const object = switch (try parseObject(arena, body)) {
+            .ok => |o| o,
+            .refused => |r| return r,
+        };
+        if ((try f.policyAt(arena, route)) == null) return notFound(arena, route.id);
+        var list: []const Value = &.{};
+        var it = object.iterator();
+        while (it.next()) |field| {
+            const key = field.key_ptr.*;
+            if (!isField(key, "permissions")) return unknownName(arena, key);
+            list = switch (field.value_ptr.*) {
+                .array => |a| a.items,
+                else => return badValue(arena, key),
+            };
+        }
+        const unreasoned = "Request contains an invalid argument.";
+        if (list.len == 0 or list.len > 100) return fail(arena, 400, "INVALID_ARGUMENT", unreasoned);
+        const names = try arena.alloc([]const u8, list.len);
+        for (list, names) |item, *slot| {
+            const name = stringOf(item) orelse return badValue(arena, "permissions");
+            switch (permissionKind(route.collection, name)) {
+                .held => slot.* = name,
+                // A wildcard, another service's, or no permission's name.
+                .refused => return fail(arena, 400, "INVALID_ARGUMENT", unreasoned),
+                // One of Pub/Sub's the fake has no list of, or of
+                // another kind of resource.
+                .unknown => return notModelled(arena, try std.fmt.allocPrint(arena, "the permission {s} on this resource", .{name})),
+            }
+        }
+        std.mem.sort([]const u8, names, {}, struct {
+            fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.order(u8, x, y) == .lt;
+            }
+        }.lessThan);
+        return ok(try Stringify.valueAlloc(arena, .{ .permissions = names }, .{}));
     }
 
     // Schemas. A definition is kept and not read: an Avro one must be
@@ -3459,6 +3650,195 @@ fn writeSchema(jw: *Stringify, schema: *const FakePubSub.Schema, revision: *cons
     try jw.endObject();
 }
 
+/// An etag's bytes: `00 20 01` for a policy never written, which reads
+/// `ACAB`, and after a write a 7 and the microsecond of the write in
+/// seven bytes, which is how production's `BwZdpJFCzTA=` reads.
+fn etagBytes(buf: *[8]u8, stamp: u64) []const u8 {
+    if (stamp == 0) {
+        buf[0..3].* = .{ 0x00, 0x20, 0x01 };
+        return buf[0..3];
+    }
+    std.mem.writeInt(u64, buf, stamp, .big);
+    buf[0] = 0x07;
+    return buf;
+}
+
+/// Whether bytes have the form of one of the two. (Production said only
+/// that an etag which is none is "Invalid etag", never the mismatch: what
+/// it takes for one is the fake's reading.)
+fn isEtag(raw: []const u8) bool {
+    return (raw.len == 3 and std.mem.eql(u8, raw, &.{ 0x00, 0x20, 0x01 })) or (raw.len == 8 and raw[0] == 0x07);
+}
+
+fn renderPolicy(arena: Allocator, policy: FakePubSub.Policy) Allocator.Error![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writePolicy(&jw, policy) catch return error.OutOfMemory;
+    return out.written();
+}
+
+/// In production's order: the version, the etag, the bindings. A policy
+/// never written is its etag alone. (That one written empty still says
+/// its version is the fake's own: production's was not recorded.)
+fn writePolicy(jw: *Stringify, policy: FakePubSub.Policy) Stringify.Error!void {
+    var raw: [8]u8 = undefined;
+    var text: [12]u8 = undefined;
+    try jw.beginObject();
+    if (policy.stamp != 0) {
+        try jw.objectField("version");
+        try jw.write(1);
+    }
+    try jw.objectField("etag");
+    try jw.write(std.base64.standard.Encoder.encode(&text, etagBytes(&raw, policy.stamp)));
+    if (policy.bindings.len > 0) {
+        try jw.objectField("bindings");
+        try jw.beginArray();
+        for (policy.bindings) |binding| {
+            try jw.beginObject();
+            try jw.objectField("role");
+            try jw.write(binding.role);
+            try jw.objectField("members");
+            try jw.write(binding.members);
+            try jw.endObject();
+        }
+        try jw.endArray();
+    }
+    try jw.endObject();
+}
+
+/// A policy's bindings as production stores them: a binding with no
+/// members is dropped, a member named twice is kept once, two bindings of
+/// one role are one, and an address is in lower case. (In what order it
+/// then reads them back was not recorded: here, the request's.)
+fn bindingsOf(arena: Allocator, of_subscription: bool, list: []const Value) Allocator.Error!Parsed([]const FakePubSub.Policy.Binding) {
+    const Building = struct { role: []const u8, members: std.ArrayList([]const u8) = .empty };
+    var building: std.ArrayList(Building) = .empty;
+    for (list) |item| {
+        const object = switch (item) {
+            .object => |o| o,
+            else => return .{ .refused = try badValue(arena, "bindings") },
+        };
+        var role: []const u8 = "";
+        var members: []const Value = &.{};
+        var it = object.iterator();
+        while (it.next()) |field| {
+            const key = field.key_ptr.*;
+            if (isField(key, "role")) {
+                role = stringOf(field.value_ptr.*) orelse return .{ .refused = try badValue(arena, key) };
+            } else if (isField(key, "members")) {
+                members = switch (field.value_ptr.*) {
+                    .array => |a| a.items,
+                    else => return .{ .refused = try badValue(arena, key) },
+                };
+            } else if (isField(key, "condition")) {
+                // Its status word was not recorded: 400's usual one.
+                if (field.value_ptr.* != .null) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "Can't set conditional policy on this resource") };
+            } else return .{ .refused = try unknownName(arena, key) };
+        }
+        switch (roleKind(of_subscription, role)) {
+            .taken => {},
+            .refused => return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Role {s} is not supported for this resource.", .{role})) },
+            .unknown => return .{ .refused = try notModelled(arena, try std.fmt.allocPrint(arena, "the role {s} on this resource", .{role})) },
+        }
+        const slot = for (building.items) |*b| {
+            if (std.mem.eql(u8, b.role, role)) break b;
+        } else new: {
+            try building.append(arena, .{ .role = role });
+            break :new &building.items[building.items.len - 1];
+        };
+        each: for (members) |m| {
+            const member = switch (try memberOf(arena, stringOf(m) orelse return .{ .refused = try badValue(arena, "members") })) {
+                .ok => |text| text,
+                .refused => |r| return .{ .refused = r },
+            };
+            for (slot.members.items) |have| {
+                if (std.mem.eql(u8, have, member)) continue :each;
+            }
+            try slot.members.append(arena, member);
+        }
+    }
+    var out: std.ArrayList(FakePubSub.Policy.Binding) = .empty;
+    for (building.items) |b| {
+        if (b.members.items.len > 0) try out.append(arena, .{ .role = b.role, .members = b.members.items });
+    }
+    return .{ .ok = out.items };
+}
+
+/// Whether a resource takes a role. Topics and subscriptions took
+/// Pub/Sub's own roles and the basic `roles/viewer` and `roles/editor`,
+/// and a subscription refused the topic's `roles/pubsub.publisher`, in
+/// the words the fake gives every role it refuses: another service's,
+/// and text that is no role. A custom role the fake cannot look up, and
+/// takes. Of `roles/owner`, and of a Pub/Sub role not among the five,
+/// production was not asked. Snapshots and schemas, whose policies it was
+/// never asked to write, are held to the topic's rule.
+fn roleKind(of_subscription: bool, role: []const u8) enum { taken, refused, unknown } {
+    for ([_][]const u8{ "projects/", "organizations/" }) |prefix| {
+        if (!std.mem.startsWith(u8, role, prefix)) continue;
+        const rest = role[prefix.len..];
+        const cut = std.mem.indexOf(u8, rest, "/roles/") orelse return .refused;
+        return if (cut > 0 and rest.len > cut + "/roles/".len) .taken else .refused;
+    }
+    if (std.mem.eql(u8, role, "roles/pubsub.publisher")) return if (of_subscription) .refused else .taken;
+    for ([_][]const u8{ "roles/pubsub.admin", "roles/pubsub.editor", "roles/pubsub.subscriber", "roles/pubsub.viewer", "roles/viewer", "roles/editor" }) |known| {
+        if (std.mem.eql(u8, role, known)) return .taken;
+    }
+    if (std.mem.eql(u8, role, "roles/owner") or std.mem.startsWith(u8, role, "roles/pubsub.")) return .unknown;
+    return .refused;
+}
+
+/// A member as production stores one: its prefix as written, and an
+/// address in lower case. A prefix in another case, and Cloud Storage's
+/// `projectOwner:` and its kin, production refuses; its words were not
+/// kept, and these are the fake's. Whether a principal is there the fake
+/// cannot know, and takes it to be.
+fn memberOf(arena: Allocator, text: []const u8) Allocator.Error!Parsed([]const u8) {
+    if (std.mem.eql(u8, text, "allUsers") or std.mem.eql(u8, text, "allAuthenticatedUsers")) return .{ .ok = text };
+    for ([_][]const u8{ "user:", "serviceAccount:", "group:", "domain:" }) |prefix| {
+        if (!std.mem.startsWith(u8, text, prefix) or text.len == prefix.len) continue;
+        const stored = try arena.dupe(u8, text);
+        _ = std.ascii.lowerString(stored[prefix.len..], text[prefix.len..]);
+        return .{ .ok = stored };
+    }
+    for ([_][]const u8{ "principal://", "principalSet://" }) |prefix| {
+        if (std.mem.startsWith(u8, text, prefix) and text.len > prefix.len) return .{ .ok = text };
+    }
+    // IAM's own record of a principal that was deleted: the fake deletes
+    // none, and production was not asked to write one.
+    if (std.mem.startsWith(u8, text, "deleted:")) return .{ .refused = try notModelled(arena, "a deleted: member") };
+    return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Invalid member (member={s}).", .{text})) };
+}
+
+/// The permissions of each kind of resource that the fake knows by name.
+const permissions = [_]struct { of: @FieldType(FakePubSub.Route, "collection"), names: []const []const u8 }{
+    .{ .of = .topics, .names = &.{ "attachSubscription", "delete", "detachSubscription", "get", "getIamPolicy", "publish", "setIamPolicy", "update" } },
+    .{ .of = .subscriptions, .names = &.{ "consume", "delete", "get", "getIamPolicy", "setIamPolicy", "update" } },
+    .{ .of = .snapshots, .names = &.{ "delete", "get", "getIamPolicy", "seek", "setIamPolicy", "update" } },
+    .{ .of = .schemas, .names = &.{ "attach", "commit", "delete", "get", "getIamPolicy", "listRevisions", "rollback", "setIamPolicy", "validate" } },
+};
+
+/// What a test of `name` on a resource of `collection` comes to: held,
+/// when it is one of that kind of resource's that the fake knows;
+/// refused, a wildcard, another service's, or no permission's name; and
+/// unknown, one of Pub/Sub's that is another kind's or not on the list.
+fn permissionKind(collection: @FieldType(FakePubSub.Route, "collection"), name: []const u8) enum { held, refused, unknown } {
+    const prefix = "pubsub.";
+    if (!std.mem.startsWith(u8, name, prefix)) return .refused;
+    const rest = name[prefix.len..];
+    const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return .refused;
+    if (dot == 0 or dot + 1 == rest.len) return .refused;
+    for (rest) |c| {
+        if (!std.ascii.isAlphabetic(c) and c != '.') return .refused;
+    }
+    for (permissions) |known| {
+        if (known.of != collection or !std.mem.eql(u8, @tagName(known.of), rest[0..dot])) continue;
+        for (known.names) |verb| {
+            if (std.mem.eql(u8, verb, rest[dot + 1 ..])) return .held;
+        }
+    }
+    return .unknown;
+}
+
 fn detachedRefusal(arena: Allocator) Allocator.Error!FakePubSub.Reply {
     return fail(arena, 400, "FAILED_PRECONDITION", "This method is not supported on detached subscriptions.");
 }
@@ -4708,7 +5088,7 @@ test "topics: made, read, changed and deleted, and refused in production's words
     try testing.expectError(error.NotFound, b.client.topic("orders").get());
     try testing.expectEqualStrings("Resource not found (resource=orders).", b.diag.message());
     // What is not modelled yet says so, and guesses nothing.
-    try expectRefused(try b.raw(a, .GET, "projects/p/topics/zigps-b:getIamPolicy", ""), 501, "UNIMPLEMENTED", "fake: :getIamPolicy is not modelled yet");
+    try expectRefused(try b.raw(a, .POST, "projects/p/topics/zigps-b", "{}"), 501, "UNIMPLEMENTED", "fake: this call on a topic is not modelled yet");
 }
 
 test "lists: in name order, in pages, with tokens only this fake gave" {
@@ -5132,8 +5512,12 @@ test "ack ids and pulls: what production refuses, in its words" {
     remade.deinit();
     try testing.expectError(error.InvalidArgument, b.client.subscription("sub-b").ack(&.{got.value.messages[0].ack_id}));
     // Routes this fake has not got.
-    try testing.expectEqual(501, (try b.raw(a, .POST, "projects/p/subscriptions/sub-a:setIamPolicy", "{}")).status);
-    try testing.expectEqual(501, (try b.raw(a, .GET, "projects/p/snapshots/snap:getIamPolicy", "")).status);
+    try expectRefused(try b.raw(a, .POST, "projects/p/subscriptions/sub-a:streamingPull", "{}"), 501, "UNIMPLEMENTED", "fake: :streamingPull is not modelled yet");
+    try testing.expectEqual(501, (try b.raw(a, .POST, "projects/p/snapshots/snap", "{}")).status);
+    // A call of IAM's by the wrong method is no call of IAM's.
+    try testing.expectEqual(501, (try b.raw(a, .POST, "projects/p/subscriptions/sub-a:getIamPolicy", "{}")).status);
+    try expectRefused(try b.raw(a, .GET, "projects/p/subscriptions/sub-a:setIamPolicy", ""), 501, "UNIMPLEMENTED", "fake: :setIamPolicy is not modelled yet");
+    try testing.expectEqual(501, (try b.raw(a, .GET, "projects/p/subscriptions/sub-a:testIamPermissions", "")).status);
     try testing.expectEqual(404, (try b.raw(a, .GET, "projects/p/buckets", "")).status);
 }
 
@@ -8421,6 +8805,8 @@ test "what a request gives is kept apart from the request's own memory" {
         .{ .PUT, "projects/p/subscriptions/pulls", "{\"topic\":\"projects/p/topics/made\"}" },
         .{ .POST, "projects/p/subscriptions/pulls:modifyPushConfig", "{\"pushConfig\":" ++ push ++ "}" },
         .{ .PUT, "projects/p/snapshots/made", "{\"subscription\":\"projects/p/subscriptions/changed\",\"tags\":{\"p/env\":\"dev\"}}" },
+        .{ .POST, "projects/p/topics/made:setIamPolicy", "{\"policy\":{\"bindings\":[{\"role\":\"roles/pubsub.viewer\",\"members\":[\"user:Reader@X.com\",\"group:g@x.com\"]}]}}" },
+        .{ .POST, "projects/p/snapshots/made:setIamPolicy", "{\"policy\":{\"bindings\":[{\"role\":\"projects/p/roles/custom\",\"members\":[\"allUsers\"]}]}}" },
     };
     {
         // Each request in memory of its own, body and all, that is gone
@@ -8446,6 +8832,8 @@ test "what a request gives is kept apart from the request's own memory" {
     try testing.expectEqualStrings("prod", b.fake.tagValue("projects/p/topics/made", "p/env").?);
     try testing.expectEqualStrings("test", b.fake.tagValue("projects/p/subscriptions/made", "p/env").?);
     try testing.expectEqualStrings("dev", b.fake.tagValue("projects/p/snapshots/made", "p/env").?);
+    try testing.expectEqualStrings("[{\"role\":\"roles/pubsub.viewer\",\"members\":[\"user:reader@x.com\",\"group:g@x.com\"]}]}", tailOf((try b.raw(a, .GET, "projects/p/topics/made:getIamPolicy", "")).body, "\"bindings\":"));
+    try testing.expectEqualStrings("[{\"role\":\"projects/p/roles/custom\",\"members\":[\"allUsers\"]}]}", tailOf((try b.raw(a, .GET, "projects/p/snapshots/made:getIamPolicy", "")).body, "\"bindings\":"));
 }
 
 /// The client's own check of a filename datetime format was written from
@@ -8473,6 +8861,340 @@ test "fake property: a filename datetime format is taken or refused as the clien
 }
 
 const client_checks = @import("validate.zig");
+
+/// A policy's etag, as its JSON has it.
+fn etagOf(a: Allocator, body: []const u8) ![]const u8 {
+    const Shape = struct { etag: []const u8 };
+    return (try std.json.parseFromSliceLeaky(Shape, a, body, .{ .ignore_unknown_fields = true })).etag;
+}
+
+test "IAM: a policy read, written whole and guarded by its etag, on each of the four resources" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var made_topic = try b.client.topic("zigps-t").create(.{});
+    made_topic.deinit();
+    var made_sub = try b.client.subscription("zigps-s").create(.{ .topic_id = "zigps-t" });
+    made_sub.deinit();
+    var made_snap = try b.client.snapshot("zigps-n").create(.{ .subscription = "zigps-s" });
+    made_snap.deinit();
+    var made_schema = try b.client.schema("zigps-a").create(.{ .type = .avro, .definition = "\"string\"" });
+    made_schema.deinit();
+    const t = "projects/p/topics/zigps-t";
+    const s = "projects/p/subscriptions/zigps-s";
+    const resources = [_][]const u8{ t, s, "projects/p/snapshots/zigps-n", "projects/p/schemas/zigps-a" };
+
+    // Never written, a policy is its etag alone, whatever version is
+    // asked for: production takes any integer there.
+    for (resources) |resource| {
+        try testing.expectEqualStrings("{\"etag\":\"ACAB\"}", (try b.raw(a, .GET, try std.fmt.allocPrint(a, "{s}:getIamPolicy", .{resource}), "")).body);
+        try testing.expectEqualStrings("{\"etag\":\"ACAB\"}", (try b.raw(a, .GET, try std.fmt.allocPrint(a, "{s}:getIamPolicy?options.requestedPolicyVersion=3", .{resource}), "")).body);
+    }
+    try testing.expectEqualStrings("{\"etag\":\"ACAB\"}", (try b.raw(a, .GET, t ++ ":getIamPolicy?options.requestedPolicyVersion=77", "")).body);
+    try testing.expectEqual(400, (try b.raw(a, .GET, t ++ ":getIamPolicy?options.requestedPolicyVersion=three", "")).status);
+
+    // A write with no etag, as production answered one on a new topic:
+    // the version, a new etag, the bindings. Production's etag then was
+    // `BwZdpJFCzTA=`, a 7 and the microsecond it was written at in seven
+    // bytes. Here the clock says a second, a million of them.
+    const agent = "serviceAccount:service-82150720798@gcp-sa-pubsub.iam.gserviceaccount.com";
+    const publisher = "\"bindings\":[{\"role\":\"roles/pubsub.publisher\",\"members\":[\"" ++ agent ++ "\"]}]";
+    b.advance(1);
+    const written = (try b.raw(a, .POST, t ++ ":setIamPolicy", "{\"policy\":{" ++ publisher ++ "}}")).body;
+    try testing.expectEqualStrings("{\"version\":1,\"etag\":\"BwAAAAAPQkA=\"," ++ publisher ++ "}", written);
+    // The answer to a write is what a read right after gives.
+    try testing.expectEqualStrings(written, (try b.raw(a, .GET, t ++ ":getIamPolicy", "")).body);
+    // Every write moves the etag, one that changes nothing included.
+    const again = (try b.raw(a, .POST, t ++ ":setIamPolicy", "{\"policy\":{\"etag\":\"BwAAAAAPQkA=\"," ++ publisher ++ "}}")).body;
+    try testing.expectEqualStrings("{\"version\":1,\"etag\":\"BwAAAAAPQkE=\"," ++ publisher ++ "}", again);
+    // So the same write sent twice is refused the second time, though the
+    // first landed: a write under an older etag, in production's words.
+    const concurrent = "There were concurrent policy changes. Please retry the whole read-modify-write with exponential backoff.";
+    try expectRefused(try b.raw(a, .POST, t ++ ":setIamPolicy", "{\"policy\":{\"etag\":\"BwAAAAAPQkA=\"," ++ publisher ++ "}}"), 409, "ABORTED", concurrent);
+    try expectRefused(try b.raw(a, .POST, t ++ ":setIamPolicy", "{\"policy\":{\"etag\":\"ACAB\"}}"), 409, "ABORTED", concurrent);
+    // What is no etag at all is never the mismatch.
+    for ([_][]const u8{ "AAAA", "BwAAAAAPQg==", "CAAAAAAPQkE=", "ACABAA==" }) |etag| {
+        try expectRefused(try b.raw(a, .POST, t ++ ":setIamPolicy", try std.fmt.allocPrint(a, "{{\"policy\":{{\"etag\":\"{s}\"}}}}", .{etag})), 400, "INVALID_ARGUMENT", "Invalid etag");
+    }
+    try expectRefused(try b.raw(a, .POST, t ++ ":setIamPolicy", "{\"policy\":{\"etag\":\"***\"}}"), 400, "INVALID_ARGUMENT", "Invalid value at 'policy.etag' (TYPE_BYTES), Base64 decoding failed for \"***\"");
+    // None of which wrote anything.
+    try testing.expectEqualStrings(again, (try b.raw(a, .GET, t ++ ":getIamPolicy", "")).body);
+    // An empty etag, as none, writes over whatever is there, and a policy
+    // with no bindings empties it.
+    try testing.expectEqualStrings("{\"version\":1,\"etag\":\"BwAAAAAPQkI=\"}", (try b.raw(a, .POST, t ++ ":setIamPolicy", "{\"policy\":{\"etag\":\"\"}}")).body);
+    try testing.expectEqualStrings("{\"version\":1,\"etag\":\"BwAAAAAPQkM=\"}", (try b.raw(a, .POST, t ++ ":setIamPolicy", "{\"policy\":{\"etag\":\"BwAAAAAPQkI=\",\"bindings\":[]}}")).body);
+    // When the clock has moved, the etag is the clock's.
+    b.advance(1);
+    try testing.expectEqualStrings("BwAAAAAehIA=", try etagOf(a, (try b.raw(a, .POST, t ++ ":setIamPolicy", "{\"policy\":{}}")).body));
+
+    // Stored as production stores a policy: a binding with no members
+    // dropped, a member named twice kept once, two bindings of one role
+    // made one, and an address in lower case, under the etag of a policy
+    // never written. A custom role the fake cannot look up, and takes.
+    const stored = (try b.raw(a, .POST, s ++ ":setIamPolicy", "{\"policy\":{\"etag\":\"ACAB\",\"version\":3,\"bindings\":[" ++
+        "{\"role\":\"roles/pubsub.subscriber\",\"members\":[\"user:KEVIN@ONEIL.CM\",\"user:kevin@oneil.cm\",\"group:Ops@Example.com\"]}," ++
+        "{\"role\":\"roles/pubsub.viewer\",\"members\":[]}," ++
+        "{\"members\":[\"serviceAccount:Reader@P.iam.gserviceaccount.com\",\"user:kevin@oneil.cm\"],\"condition\":null,\"role\":\"roles/pubsub.subscriber\"}," ++
+        "{\"role\":\"projects/p/roles/custom\",\"members\":[\"domain:Example.COM\",\"allUsers\",\"allAuthenticatedUsers\",\"principal://iam.googleapis.com/locations/global/workforcePools/Pool/subject/Kevin\",\"principalSet://iam.googleapis.com/Pool\"]}," ++
+        "{\"role\":\"organizations/1/roles/custom\",\"members\":[\"user:a@x.com\"]}," ++
+        "{\"role\":\"roles/editor\",\"members\":[\"user:a@x.com\"]},{\"role\":\"roles/viewer\",\"members\":[\"user:a@x.com\"]},{\"role\":\"roles/pubsub.admin\",\"members\":[\"user:a@x.com\"]},{\"role\":\"roles/pubsub.editor\",\"members\":[\"user:a@x.com\"]}" ++
+        "]}}")).body;
+    try testing.expectEqualStrings("[" ++
+        "{\"role\":\"roles/pubsub.subscriber\",\"members\":[\"user:kevin@oneil.cm\",\"group:ops@example.com\",\"serviceAccount:reader@p.iam.gserviceaccount.com\"]}," ++
+        "{\"role\":\"projects/p/roles/custom\",\"members\":[\"domain:example.com\",\"allUsers\",\"allAuthenticatedUsers\",\"principal://iam.googleapis.com/locations/global/workforcePools/Pool/subject/Kevin\",\"principalSet://iam.googleapis.com/Pool\"]}," ++
+        "{\"role\":\"organizations/1/roles/custom\",\"members\":[\"user:a@x.com\"]}," ++
+        "{\"role\":\"roles/editor\",\"members\":[\"user:a@x.com\"]},{\"role\":\"roles/viewer\",\"members\":[\"user:a@x.com\"]},{\"role\":\"roles/pubsub.admin\",\"members\":[\"user:a@x.com\"]},{\"role\":\"roles/pubsub.editor\",\"members\":[\"user:a@x.com\"]}" ++
+        "]}", tailOf(stored, "\"bindings\":"));
+    try testing.expectEqualStrings(stored, (try b.raw(a, .GET, s ++ ":getIamPolicy", "")).body);
+
+    // What a write refuses. A subscription takes no publisher, which is a
+    // topic's; another service's role, and text that is no role, the fake
+    // refuses in the same words. Production's words for a member of no
+    // form were not kept: these are the fake's.
+    const one = "\"members\":[\"user:a@x.com\"]";
+    for ([_]struct { []const u8, u16, []const u8, []const u8 }{
+        .{ "{\"bindings\":[{\"role\":\"roles/pubsub.publisher\"," ++ one ++ "}]}", 400, "INVALID_ARGUMENT", "Role roles/pubsub.publisher is not supported for this resource." },
+        .{ "{\"bindings\":[{\"role\":\"roles/storage.admin\"," ++ one ++ "}]}", 400, "INVALID_ARGUMENT", "Role roles/storage.admin is not supported for this resource." },
+        .{ "{\"bindings\":[{\"role\":\"viewer\"," ++ one ++ "}]}", 400, "INVALID_ARGUMENT", "Role viewer is not supported for this resource." },
+        .{ "{\"bindings\":[{" ++ one ++ "}]}", 400, "INVALID_ARGUMENT", "Role  is not supported for this resource." },
+        .{ "{\"bindings\":[{\"role\":\"projects/p/roles/\"," ++ one ++ "}]}", 400, "INVALID_ARGUMENT", "Role projects/p/roles/ is not supported for this resource." },
+        .{ "{\"bindings\":[{\"role\":\"projects//roles/custom\"," ++ one ++ "}]}", 400, "INVALID_ARGUMENT", "Role projects//roles/custom is not supported for this resource." },
+        .{ "{\"bindings\":[{\"role\":\"organizations/custom\"," ++ one ++ "}]}", 400, "INVALID_ARGUMENT", "Role organizations/custom is not supported for this resource." },
+        .{ "{\"bindings\":[{\"role\":\"roles/pubsub.viewer\"," ++ one ++ ",\"condition\":{\"title\":\"t\",\"expression\":\"true\"}}]}", 400, "INVALID_ARGUMENT", "Can't set conditional policy on this resource" },
+        .{ "{\"bindings\":[{\"role\":\"roles/pubsub.viewer\",\"members\":[\"ServiceAccount:a@p.iam.gserviceaccount.com\"]}]}", 400, "INVALID_ARGUMENT", "Invalid member (member=ServiceAccount:a@p.iam.gserviceaccount.com)." },
+        .{ "{\"bindings\":[{\"role\":\"roles/pubsub.viewer\",\"members\":[\"allusers\"]}]}", 400, "INVALID_ARGUMENT", "Invalid member (member=allusers)." },
+        .{ "{\"bindings\":[{\"role\":\"roles/pubsub.viewer\",\"members\":[\"projectOwner:p\"]}]}", 400, "INVALID_ARGUMENT", "Invalid member (member=projectOwner:p)." },
+        .{ "{\"bindings\":[{\"role\":\"roles/pubsub.viewer\",\"members\":[\"user:\"]}]}", 400, "INVALID_ARGUMENT", "Invalid member (member=user:)." },
+        .{ "{\"bindings\":[{\"role\":\"roles/pubsub.viewer\",\"members\":[\"principal://\"]}]}", 400, "INVALID_ARGUMENT", "Invalid member (member=principal://)." },
+        .{ "{\"bindings\":[{\"role\":\"roles/pubsub.viewer\",\"members\":[\"user:a@x.com\",\"kevin@oneil.cm\"]}]}", 400, "INVALID_ARGUMENT", "Invalid member (member=kevin@oneil.cm)." },
+        .{ "{\"bindings\":[{\"role\":\"roles/pubsub.viewer\",\"members\":[7]}]}", 400, "INVALID_ARGUMENT", "Invalid value at 'members'" },
+        .{ "{\"bindings\":[{\"role\":\"roles/pubsub.viewer\"," ++ one ++ ",\"nonsense\":1}]}", 400, "INVALID_ARGUMENT", "Invalid JSON payload received. Unknown name \"nonsense\": Cannot find field." },
+        .{ "{\"nonsense\":1}", 400, "INVALID_ARGUMENT", "Invalid JSON payload received. Unknown name \"nonsense\": Cannot find field." },
+        .{ "{\"version\":\"three\"}", 400, "INVALID_ARGUMENT", "Invalid value at 'version'" },
+        // What production was not asked.
+        .{ "{\"bindings\":[{\"role\":\"roles/owner\"," ++ one ++ "}]}", 501, "UNIMPLEMENTED", "fake: the role roles/owner on this resource is not modelled yet" },
+        .{ "{\"bindings\":[{\"role\":\"roles/pubsub.serviceAgent\"," ++ one ++ "}]}", 501, "UNIMPLEMENTED", "fake: the role roles/pubsub.serviceAgent on this resource is not modelled yet" },
+        .{ "{\"bindings\":[{\"role\":\"roles/pubsub.viewer\",\"members\":[\"deleted:user:a@x.com?uid=1\"]}]}", 501, "UNIMPLEMENTED", "fake: a deleted: member is not modelled yet" },
+        .{ "{\"auditConfigs\":[]}", 501, "UNIMPLEMENTED", "fake: audit configs in a policy is not modelled yet" },
+    }) |case| {
+        try expectRefused(try b.raw(a, .POST, s ++ ":setIamPolicy", try std.fmt.allocPrint(a, "{{\"policy\":{s}}}", .{case[0]})), case[1], case[2], case[3]);
+    }
+    try expectRefused(try b.raw(a, .POST, s ++ ":setIamPolicy", "{\"policy\":{},\"updateMask\":\"bindings\"}"), 501, "UNIMPLEMENTED", "fake: a setIamPolicy with an update mask is not modelled yet");
+    try expectRefused(try b.raw(a, .POST, s ++ ":setIamPolicy", "{}"), 501, "UNIMPLEMENTED", "fake: a setIamPolicy with no policy is not modelled yet");
+    try testing.expectEqual(400, (try b.raw(a, .POST, s ++ ":setIamPolicy", "{\"policy\":[]}")).status);
+    try testing.expectEqual(400, (try b.raw(a, .POST, s ++ ":setIamPolicy", "{\"nonsense\":{}}")).status);
+    // A refused write writes nothing, and moves no etag.
+    try testing.expectEqualStrings(stored, (try b.raw(a, .GET, s ++ ":getIamPolicy", "")).body);
+    // A topic takes the publisher a subscription refuses, and a snapshot
+    // and a schema are held to the topic's rule: the fake's own.
+    for ([_][]const u8{ t, "projects/p/snapshots/zigps-n", "projects/p/schemas/zigps-a" }) |resource| {
+        try testing.expectEqual(200, (try b.raw(a, .POST, try std.fmt.allocPrint(a, "{s}:setIamPolicy", .{resource}), "{\"policy\":{" ++ publisher ++ "}}")).status);
+    }
+
+    // What is not there is 404 to all three calls, a test of permissions
+    // too, where Google's page promises an empty answer.
+    for ([_][]const u8{ "topics", "subscriptions", "snapshots", "schemas" }) |collection| {
+        const nope = try std.fmt.allocPrint(a, "projects/p/{s}/zigps-nope", .{collection});
+        try expectRefused(try b.raw(a, .GET, try std.fmt.allocPrint(a, "{s}:getIamPolicy", .{nope}), ""), 404, "NOT_FOUND", "Resource not found (resource=zigps-nope).");
+        try expectRefused(try b.raw(a, .POST, try std.fmt.allocPrint(a, "{s}:setIamPolicy", .{nope}), "{\"policy\":{}}"), 404, "NOT_FOUND", "Resource not found (resource=zigps-nope).");
+        try expectRefused(try b.raw(a, .POST, try std.fmt.allocPrint(a, "{s}:testIamPermissions", .{nope}), "{\"permissions\":[\"pubsub.topics.get\"]}"), 404, "NOT_FOUND", "Resource not found (resource=zigps-nope).");
+    }
+    try expectRefused(try b.raw(a, .GET, "projects/p/schemas/zigps-a@9e3779b1:getIamPolicy", ""), 501, "UNIMPLEMENTED", "fake: IAM on a revision of a schema is not modelled yet");
+    // A detached subscription still reads its policy.
+    var loose = try b.client.subscription("zigps-loose").create(.{ .topic_id = "zigps-t" });
+    loose.deinit();
+    try b.client.subscription("zigps-loose").detach();
+    try testing.expectEqualStrings("{\"etag\":\"ACAB\"}", (try b.raw(a, .GET, "projects/p/subscriptions/zigps-loose:getIamPolicy", "")).body);
+
+    // A test of permissions answers what the caller holds, by name: not
+    // in the order asked, and one asked twice twice.
+    try testing.expectEqualStrings(
+        \\{"permissions":["pubsub.snapshots.delete","pubsub.snapshots.seek","pubsub.snapshots.update"]}
+    , (try b.raw(a, .POST, "projects/p/snapshots/zigps-n:testIamPermissions", "{\"permissions\":[\"pubsub.snapshots.seek\",\"pubsub.snapshots.delete\",\"pubsub.snapshots.update\"]}")).body);
+    try testing.expectEqualStrings(
+        \\{"permissions":["pubsub.schemas.commit","pubsub.schemas.get"]}
+    , (try b.raw(a, .POST, "projects/p/schemas/zigps-a:testIamPermissions", "{\"permissions\":[\"pubsub.schemas.get\",\"pubsub.schemas.commit\"]}")).body);
+    try testing.expectEqualStrings(
+        \\{"permissions":["pubsub.topics.get","pubsub.topics.publish","pubsub.topics.publish"]}
+    , (try b.raw(a, .POST, t ++ ":testIamPermissions", "{\"permissions\":[\"pubsub.topics.publish\",\"pubsub.topics.get\",\"pubsub.topics.publish\"]}")).body);
+    try testing.expectEqualStrings(
+        \\{"permissions":["pubsub.subscriptions.consume"]}
+    , (try b.raw(a, .POST, s ++ ":testIamPermissions", "{\"permissions\":[\"pubsub.subscriptions.consume\"]}")).body);
+    // A hundred at most, and one at least. Production's words for these
+    // refusals were not kept.
+    var many: std.ArrayList(u8) = .empty;
+    for (0..101) |i| try many.print(a, "{s}\"pubsub.topics.get\"", .{if (i == 0) "" else ","});
+    try testing.expectEqual(200, (try b.raw(a, .POST, t ++ ":testIamPermissions", try std.fmt.allocPrint(a, "{{\"permissions\":[{s}]}}", .{many.items[0 .. many.items.len - "\"pubsub.topics.get\",".len]}))).status);
+    const unreasoned = "Request contains an invalid argument.";
+    try expectRefused(try b.raw(a, .POST, t ++ ":testIamPermissions", try std.fmt.allocPrint(a, "{{\"permissions\":[{s}]}}", .{many.items})), 400, "INVALID_ARGUMENT", unreasoned);
+    for ([_][]const u8{ "{\"permissions\":[]}", "{}", "{\"permissions\":[\"pubsub.topics.*\"]}", "{\"permissions\":[\"pubsub.*\"]}", "{\"permissions\":[\"storage.buckets.get\"]}", "{\"permissions\":[\"pubsub\"]}", "{\"permissions\":[\"pubsub.topics\"]}", "{\"permissions\":[\"pubsub.topics.\"]}", "{\"permissions\":[\"pubsub..get\"]}", "{\"permissions\":[\"pubsub.topics.get it\"]}", "{\"permissions\":[\"pubsub.topics.get\",\"\"]}" }) |body| {
+        try expectRefused(try b.raw(a, .POST, t ++ ":testIamPermissions", body), 400, "INVALID_ARGUMENT", unreasoned);
+    }
+    try testing.expectEqual(400, (try b.raw(a, .POST, t ++ ":testIamPermissions", "{\"permissions\":\"pubsub.topics.get\"}")).status);
+    try testing.expectEqual(400, (try b.raw(a, .POST, t ++ ":testIamPermissions", "{\"permissions\":[7]}")).status);
+    try testing.expectEqual(400, (try b.raw(a, .POST, t ++ ":testIamPermissions", "{\"permission\":[]}")).status);
+    // One of Pub/Sub's that is another kind of resource's, or that the
+    // fake has no name for, it does not answer for.
+    try expectRefused(try b.raw(a, .POST, s ++ ":testIamPermissions", "{\"permissions\":[\"pubsub.topics.publish\"]}"), 501, "UNIMPLEMENTED", "fake: the permission pubsub.topics.publish on this resource is not modelled yet");
+    try expectRefused(try b.raw(a, .POST, t ++ ":testIamPermissions", "{\"permissions\":[\"pubsub.topics.fly\"]}"), 501, "UNIMPLEMENTED", "fake: the permission pubsub.topics.fly on this resource is not modelled yet");
+    try expectRefused(try b.raw(a, .POST, t ++ ":testIamPermissions", "{\"permissions\":[\"pubsub.subscriptions.get\"]}"), 501, "UNIMPLEMENTED", "fake: the permission pubsub.subscriptions.get on this resource is not modelled yet");
+
+    // Through the client, on each of the four: a policy never written, a
+    // grant, the same again in other letters, which writes nothing, a
+    // revoke, and the same again.
+    var made_worker = try b.client.subscription("zigps-w").create(.{ .topic_id = "zigps-t" });
+    made_worker.deinit();
+    inline for (.{ b.client.topic("zigps-t"), b.client.subscription("zigps-w"), b.client.snapshot("zigps-n"), b.client.schema("zigps-a") }, .{ "roles/pubsub.editor", "roles/pubsub.subscriber", "roles/pubsub.viewer", "roles/pubsub.admin" }, .{ "pubsub.topics.publish", "pubsub.subscriptions.consume", "pubsub.snapshots.seek", "pubsub.schemas.commit" }) |handle, role, permission| {
+        var granted = try handle.addIamBinding(role, "user:Kevin@Oneil.CM");
+        defer granted.deinit();
+        try testing.expect(granted.value.grants(role, "user:kevin@oneil.cm"));
+        var same = try handle.addIamBinding(role, "user:KEVIN@ONEIL.CM");
+        defer same.deinit();
+        try testing.expectEqualStrings(granted.value.etag.?, same.value.etag.?);
+        var read = try handle.iamPolicy();
+        defer read.deinit();
+        try testing.expectEqualStrings(granted.value.etag.?, read.value.etag.?);
+        var found = false;
+        for (read.value.bindings) |binding| {
+            if (!std.mem.eql(u8, binding.role, role)) continue;
+            try testing.expectEqual(1, binding.members.len);
+            try testing.expectEqualStrings("user:kevin@oneil.cm", binding.members[0]);
+            found = true;
+        }
+        try testing.expect(found);
+        var revoked = try handle.removeIamBinding(role, "user:kevin@oneil.cm");
+        defer revoked.deinit();
+        try testing.expect(!revoked.value.grants(role, "user:kevin@oneil.cm"));
+        try testing.expect(!std.mem.eql(u8, granted.value.etag.?, revoked.value.etag.?));
+        var gone = try handle.removeIamBinding(role, "user:kevin@oneil.cm");
+        defer gone.deinit();
+        try testing.expectEqualStrings(revoked.value.etag.?, gone.value.etag.?);
+        var held = try handle.testIamPermissions(&.{permission});
+        defer held.deinit();
+        try testing.expectEqual(1, held.value.len);
+        try testing.expectEqualStrings(permission, held.value[0]);
+    }
+    // Each of the four has a policy of its own, a snapshot and a
+    // subscription apart from their topic.
+    for (resources, 0..) |resource, i| {
+        try testing.expectEqual(200, (try b.raw(a, .POST, try std.fmt.allocPrint(a, "{s}:setIamPolicy", .{resource}), try std.fmt.allocPrint(a, "{{\"policy\":{{\"bindings\":[{{\"role\":\"roles/pubsub.viewer\",\"members\":[\"user:u{d}@x.com\"]}}]}}}}", .{i}))).status);
+    }
+    for (resources, 0..) |resource, i| {
+        try testing.expectEqualStrings(try std.fmt.allocPrint(a, "[{{\"role\":\"roles/pubsub.viewer\",\"members\":[\"user:u{d}@x.com\"]}}]}}", .{i}), tailOf((try b.raw(a, .GET, try std.fmt.allocPrint(a, "{s}:getIamPolicy", .{resource}), "")).body, "\"bindings\":"));
+    }
+    // A write under an etag another write has made stale is `Aborted`,
+    // and so is one whose answer was lost and which was sent again: it
+    // landed the first time.
+    const worker = b.client.subscription("zigps-s");
+    var before = try worker.iamPolicy();
+    defer before.deinit();
+    try testing.expectEqual(200, (try b.raw(a, .POST, s ++ ":setIamPolicy", "{\"policy\":{}}")).status);
+    try testing.expectError(error.Aborted, worker.setIamPolicy(.{ .etag = before.value.etag, .bindings = &.{.{ .role = "roles/pubsub.viewer", .members = &.{"user:a@x.com"} }} }));
+    var now = try worker.iamPolicy();
+    defer now.deinit();
+    try testing.expectEqual(0, now.value.bindings.len);
+    b.fake.loseAnswers(1, .admin);
+    try testing.expectError(error.Aborted, worker.setIamPolicy(.{ .etag = now.value.etag, .bindings = &.{.{ .role = "roles/pubsub.viewer", .members = &.{"user:a@x.com"} }} }));
+    var landed = try worker.iamPolicy();
+    defer landed.deinit();
+    try testing.expect(landed.value.grants("roles/pubsub.viewer", "user:a@x.com"));
+}
+
+test "dead letters with the service agent named: forwarded only once it may publish there and acknowledge here" {
+    const agent = "serviceAccount:service-1@gcp-sa-pubsub.iam.gserviceaccount.com";
+    var b: Bench = undefined;
+    // Named in letters of either case: a policy stores an address in
+    // lower case.
+    try b.init(.{ .service_agent = "serviceAccount:Service-1@GCP-SA-PubSub.iam.gserviceaccount.com" });
+    defer b.deinit();
+    for ([_][]const u8{ "orders", "dead", "other" }) |id| {
+        var topic = try b.client.topic(id).create(.{});
+        topic.deinit();
+    }
+    const worker = b.client.subscription("worker");
+    var made = try worker.create(.{ .topic_id = "orders", .dead_letter_policy = .{ .topic = "dead" } });
+    made.deinit();
+    const morgue = b.client.subscription("morgue");
+    var made_morgue = try morgue.create(.{ .topic_id = "dead" });
+    made_morgue.deinit();
+    var sent = try b.client.topic("orders").publish(&.{.{ .data = "poison" }}, .{});
+    sent.deinit();
+
+    // Without the grants a message is never forwarded: production's went
+    // on to a sixth attempt and a seventh.
+    var attempt: u32 = 0;
+    const Step = struct {
+        /// One more delivery, given back.
+        fn nack(sub: anytype, count: *u32) !void {
+            count.* += 1;
+            var got = try sub.pull(.{ .return_immediately = true });
+            defer got.deinit();
+            try testing.expectEqual(1, got.value.messages.len);
+            try testing.expectEqual(count.*, got.value.messages[0].delivery_attempt);
+            try sub.nack(&.{got.value.messages[0].ack_id});
+        }
+    };
+    for (0..7) |_| try Step.nack(worker, &attempt);
+    try testing.expectEqual(1, b.fake.backlog("p", "worker"));
+    try testing.expectEqual(0, b.fake.backlog("p", "morgue"));
+
+    // That the agent may publish to the dead-letter topic is half of it,
+    // and a grant on another topic, or to another account, none.
+    var publisher = try b.client.topic("dead").addIamBinding("roles/pubsub.publisher", agent);
+    publisher.deinit();
+    try Step.nack(worker, &attempt);
+    try testing.expectEqual(0, b.fake.backlog("p", "morgue"));
+    var elsewhere = try b.client.topic("other").addIamBinding("roles/pubsub.publisher", agent);
+    elsewhere.deinit();
+    var another = try worker.addIamBinding("roles/pubsub.subscriber", "serviceAccount:service-2@gcp-sa-pubsub.iam.gserviceaccount.com");
+    another.deinit();
+    var lesser = try worker.addIamBinding("roles/pubsub.viewer", agent);
+    lesser.deinit();
+    try Step.nack(worker, &attempt);
+    try testing.expectEqual(0, b.fake.backlog("p", "morgue"));
+    // With the right to acknowledge on the subscription too, the message
+    // goes when it is next given back.
+    var subscriber = try worker.addIamBinding("roles/pubsub.subscriber", "serviceAccount:SERVICE-1@gcp-sa-pubsub.iam.gserviceaccount.com");
+    subscriber.deinit();
+    try Step.nack(worker, &attempt);
+    try testing.expectEqual(0, b.fake.backlog("p", "worker"));
+    try testing.expectEqual(1, b.fake.backlog("p", "morgue"));
+    try expectPulled(morgue, &.{"poison"}, true);
+
+    // The subscriber's grant alone is the other half, and no more, with
+    // a viewer's on the topic or without.
+    var no_publisher = try b.client.topic("dead").removeIamBinding("roles/pubsub.publisher", agent);
+    no_publisher.deinit();
+    var viewer = try b.client.topic("dead").addIamBinding("roles/pubsub.viewer", agent);
+    viewer.deinit();
+    var second = try b.client.topic("orders").publish(&.{.{ .data = "second" }}, .{});
+    second.deinit();
+    attempt = 0;
+    for (0..6) |_| try Step.nack(worker, &attempt);
+    try testing.expectEqual(0, b.fake.backlog("p", "morgue"));
+    // A wider role holds the narrower one's rights: Pub/Sub's editor and
+    // admin, and the basic editor. A viewer's holds neither.
+    inline for (.{ "roles/pubsub.editor", "roles/pubsub.admin", "roles/editor" }, .{ "roles/editor", "roles/pubsub.editor", "roles/pubsub.admin" }, 0..) |on_topic, on_subscription, round| {
+        var set_topic = try b.client.topic("dead").setIamPolicy(.{ .bindings = &.{.{ .role = on_topic, .members = &.{agent} }} });
+        set_topic.deinit();
+        var set_sub = try worker.setIamPolicy(.{ .bindings = &.{.{ .role = "roles/pubsub.viewer", .members = &.{agent} }} });
+        set_sub.deinit();
+        try Step.nack(worker, &attempt);
+        try testing.expectEqual(round, b.fake.backlog("p", "morgue"));
+        var widened = try worker.setIamPolicy(.{ .bindings = &.{.{ .role = on_subscription, .members = &.{agent} }} });
+        widened.deinit();
+        try Step.nack(worker, &attempt);
+        try testing.expectEqual(round + 1, b.fake.backlog("p", "morgue"));
+        // The next, one delivery short of its last.
+        var next = try b.client.topic("orders").publish(&.{.{ .data = "next" }}, .{});
+        next.deinit();
+        attempt = 0;
+        for (0..4) |_| try Step.nack(worker, &attempt);
+    }
+}
 
 /// What each subscription should hold, said again in as few lines as it
 /// takes: the fake is held to this after every step of a script. Three
@@ -9071,27 +9793,32 @@ fn arbitraryRequest(_: void, input: []const u8) !void {
     try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/subscriptions/pushed", "{\"topic\":\"projects/p/topics/orders\",\"pushConfig\":{\"pushEndpoint\":\"https://example.com/hook\"}}")).status);
     try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/topics/imported", "{\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"bucket\":\"b\",\"textFormat\":{}}}}")).status);
     const paths = [_][]const u8{
-        "projects/p/topics",                                 "projects/p/topics/orders",
-        "projects/p/topics/orders:publish",                  "projects/p/topics/orders/subscriptions",
-        "projects/p/subscriptions",                          "projects/p/subscriptions/worker",
-        "projects/p/subscriptions/worker:pull",              "projects/p/subscriptions/worker:acknowledge",
-        "projects/p/subscriptions/worker:modifyAckDeadline", "projects/p/topics/new",
-        "projects/p/subscriptions/new",                      "projects/p/topics?pageSize=1&pageToken=",
-        "projects/p/subscriptions/rules",                    "projects/p/subscriptions/rules:pull",
-        "projects/p/subscriptions/rules:acknowledge",        "projects/p/subscriptions/rules:modifyAckDeadline",
-        "projects/p/snapshots",                              "projects/p/snapshots/snap",
-        "projects/p/snapshots/new",                          "projects/p/topics/orders/snapshots",
-        "projects/p/subscriptions/worker:seek",              "projects/p/subscriptions/rules:seek",
-        "projects/p/subscriptions/worker:detach",            "projects/p/snapshots?pageSize=1&pageToken=",
-        "projects/p/schemas",                                "projects/p/schemas?schemaId=newer",
-        "projects/p/schemas/order",                          "projects/p/schemas/order:commit",
-        "projects/p/schemas/order:rollback",                 "projects/p/schemas/order:listRevisions",
-        "projects/p/schemas:validate",                       "projects/p/schemas:validateMessage",
-        "projects/p/schemas/order@9e3779b1",                 "projects/p/schemas/order@9e3779b1:deleteRevision",
-        "projects/p/topics/typed",                           "projects/p/topics/typed:publish",
-        "projects/p/subscriptions/pushed",                   "projects/p/subscriptions/pushed:modifyPushConfig",
-        "projects/p/subscriptions/pushed:pull",              "projects/p/subscriptions/worker:modifyPushConfig",
-        "projects/p/topics/imported",                        "projects/p/subscriptions/pushed:modifyAckDeadline",
+        "projects/p/topics",                                  "projects/p/topics/orders",
+        "projects/p/topics/orders:publish",                   "projects/p/topics/orders/subscriptions",
+        "projects/p/subscriptions",                           "projects/p/subscriptions/worker",
+        "projects/p/subscriptions/worker:pull",               "projects/p/subscriptions/worker:acknowledge",
+        "projects/p/subscriptions/worker:modifyAckDeadline",  "projects/p/topics/new",
+        "projects/p/subscriptions/new",                       "projects/p/topics?pageSize=1&pageToken=",
+        "projects/p/subscriptions/rules",                     "projects/p/subscriptions/rules:pull",
+        "projects/p/subscriptions/rules:acknowledge",         "projects/p/subscriptions/rules:modifyAckDeadline",
+        "projects/p/snapshots",                               "projects/p/snapshots/snap",
+        "projects/p/snapshots/new",                           "projects/p/topics/orders/snapshots",
+        "projects/p/subscriptions/worker:seek",               "projects/p/subscriptions/rules:seek",
+        "projects/p/subscriptions/worker:detach",             "projects/p/snapshots?pageSize=1&pageToken=",
+        "projects/p/schemas",                                 "projects/p/schemas?schemaId=newer",
+        "projects/p/schemas/order",                           "projects/p/schemas/order:commit",
+        "projects/p/schemas/order:rollback",                  "projects/p/schemas/order:listRevisions",
+        "projects/p/schemas:validate",                        "projects/p/schemas:validateMessage",
+        "projects/p/schemas/order@9e3779b1",                  "projects/p/schemas/order@9e3779b1:deleteRevision",
+        "projects/p/topics/typed",                            "projects/p/topics/typed:publish",
+        "projects/p/subscriptions/pushed",                    "projects/p/subscriptions/pushed:modifyPushConfig",
+        "projects/p/subscriptions/pushed:pull",               "projects/p/subscriptions/worker:modifyPushConfig",
+        "projects/p/topics/imported",                         "projects/p/subscriptions/pushed:modifyAckDeadline",
+        "projects/p/topics/orders:getIamPolicy",              "projects/p/topics/orders:setIamPolicy",
+        "projects/p/topics/orders:testIamPermissions",        "projects/p/subscriptions/worker:setIamPolicy",
+        "projects/p/subscriptions/worker:testIamPermissions", "projects/p/snapshots/snap:setIamPolicy",
+        "projects/p/schemas/order:setIamPolicy",              "projects/p/schemas/order:testIamPermissions",
+        "projects/p/snapshots/snap:getIamPolicy",             "projects/p/topics/orders:getIamPolicy?options.requestedPolicyVersion=",
     };
     const bodies = [_][]const u8{
         "{\"messages\":[{\"data\":\"",                                                                                                       "{\"topic\":\"projects/p/topics/orders\",",
@@ -9111,6 +9838,8 @@ fn arbitraryRequest(_: void, input: []const u8) !void {
         "{\"topic\":\"projects/p/topics/orders\",\"cloudStorageConfig\":{\"bucket\":\"b\",\"filenameDatetimeFormat\":\"YYYY-MM-DDThh:mm:ss", "{\"messageTransforms\":[{\"javascriptUdf\":{\"functionName\":\"f\",\"code\":\"",
         "{\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"bucket\":\"b\",\"textFormat\":{\"delimiter\":\"",                             "{\"ingestionDataSourceSettings\":{\"awsKinesis\":{\"streamArn\":\"",
         "{\"tags\":{\"p/k\":\"",                                                                                                             "{\"subscription\":{\"pushConfig\":{\"pushEndpoint\":\"https://e.x\"}},\"updateMask\":\"pushConfig,bigqueryConfig,cloudStorageConfig\",",
+        "{\"policy\":{\"bindings\":[{\"role\":\"roles/pubsub.viewer\",\"members\":[\"user:a@x.com\",\"",                                     "{\"policy\":{\"etag\":\"",
+        "{\"policy\":{\"bindings\":[{\"role\":\"",                                                                                           "{\"permissions\":[\"pubsub.topics.get\",\"pubsub.",
         "{\"subscription\":{\"cloudStorageConfig\":{\"bucket\":\"b\"}},\"updateMask\":\"cloudStorageConfig\"}",                              "{\"topic\":{\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"bucket\":\"b\",\"avroFormat\":{}}}},\"updateMask\":\"ingestionDataSourceSettings,messageTransforms\"}",
     };
     for (0..8) |_| {
@@ -9310,6 +10039,31 @@ fn sessionAllocations(gpa: Allocator) !void {
     try testing.expectEqualStrings("prod", fake.tagValue("projects/p/snapshots/tagged", "p/env").?);
     try testing.expectEqualStrings("prod", fake.tagValue("projects/p/subscriptions/pushed", "p/env").?);
     try testing.expectEqualStrings("tagValues/2", fake.tagValue("projects/p/topics/imported", "tagKeys/1").?);
+
+    // IAM: a policy written, read, written over under its etag and under
+    // an older one, permissions tested, and a dead letter that waits for
+    // the service agent's two grants.
+    const agent = "serviceAccount:service-1@gcp-sa-pubsub.iam.gserviceaccount.com";
+    const grant = "{\"policy\":{\"bindings\":[{\"role\":\"roles/pubsub.editor\",\"members\":[\"" ++ agent ++ "\",\"user:A@X.com\",\"user:a@x.com\"]},{\"role\":\"roles/pubsub.viewer\",\"members\":[]},{\"role\":\"roles/pubsub.editor\",\"members\":[\"group:g@x.com\"]}]}}";
+    const iam = [_]struct { tp.Method, []const u8, []const u8, u16 }{
+        .{ .GET, "topics/dead:getIamPolicy?options.requestedPolicyVersion=3", "", 200 },
+        .{ .POST, "topics/dead:setIamPolicy", grant, 200 },
+        .{ .POST, "topics/dead:setIamPolicy", "{\"policy\":{\"etag\":\"ACAB\"}}", 409 },
+        .{ .POST, "topics/dead:setIamPolicy", "{\"policy\":{\"etag\":\"AAAA\"}}", 400 },
+        .{ .POST, "topics/dead:setIamPolicy", "{\"policy\":{\"bindings\":[{\"role\":\"roles/storage.admin\",\"members\":[\"user:a@x.com\"]}]}}", 400 },
+        .{ .POST, "topics/dead:setIamPolicy", "{\"policy\":{\"bindings\":[{\"role\":\"roles/pubsub.viewer\",\"members\":[\"user:a@x.com\",\"nobody\"]}]}}", 400 },
+        .{ .GET, "topics/dead:getIamPolicy", "", 200 },
+        .{ .POST, "subscriptions/rules:setIamPolicy", grant, 200 },
+        .{ .POST, "subscriptions/rules:testIamPermissions", "{\"permissions\":[\"pubsub.subscriptions.update\",\"pubsub.subscriptions.consume\",\"pubsub.subscriptions.update\"]}", 200 },
+        .{ .POST, "subscriptions/rules:testIamPermissions", "{\"permissions\":[\"pubsub.subscriptions.*\"]}", 400 },
+        .{ .POST, "snapshots/tagged:setIamPolicy", grant, 200 },
+        .{ .POST, "schemas/gone:setIamPolicy", grant, 404 },
+    };
+    for (iam) |step| {
+        const method, const path, const body, const status = step;
+        try testing.expectEqual(status, (try fake.serve(method, try std.fmt.allocPrint(a, "{s}{s}", .{ base, path }), body, a)).status);
+    }
+    try testing.expect(std.mem.indexOf(u8, (try fake.serve(.GET, base ++ "subscriptions/rules:getIamPolicy", "", a)).body, "\"members\":[\"" ++ agent ++ "\",\"user:a@x.com\",\"group:g@x.com\"]") != null);
 }
 
 test "allocation failures: a session of every call leaks nothing and breaks nothing" {
