@@ -6,6 +6,7 @@
 [Batches](#batches) · [Caps](#caps) ·
 [Retries, flushing and stopping](#retries-flushing-and-stopping) ·
 [Ordering keys](#ordering-keys) ·
+[A topic with a schema](#a-topic-with-a-schema) ·
 [Compressed publishing](#compressed-publishing)
 
 ## Publishing at volume
@@ -88,6 +89,19 @@ ahead of one that failed. Google requires every message of a key to be
 published in one region. A publisher outside Google Cloud, or spread
 across regions, should use a locational endpoint, such as
 `.endpoint = .{ .url = "https://us-east1-pubsub.googleapis.com" }`.
+
+### A topic with a schema
+
+A topic that names a [schema](schemas.md) refuses a message that does
+not fit it, `error.InvalidArgument`, and refuses the whole request that
+held it. For `Topic.publish` that is every message of the call. For a
+`Publisher` it is every message that shared the batch: up to
+`max_batch_messages` receipts, from callers that have nothing to do with
+each other, fail for one caller's mistake. None is retried, and with an
+ordering key the key pauses, as after any failure. So check what a
+producer writes with `Schema.validateMessage` in its tests, and give a
+producer that cannot be trusted a publisher of its own, or one with
+`max_batch_messages = 1`.
 
 ## Compressed publishing
 

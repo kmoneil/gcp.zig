@@ -340,6 +340,145 @@ fn cutOff(consumers: *pubsub.Client) !void {
 }
 // end snippet
 
+// snippet: pubsub-schema-create
+/// Stores the contract, and makes a topic that holds every message to it.
+fn makeOrders(client: *pubsub.Client, avro_json: []const u8) !void {
+    var stored = try client.schema("order").create(.{ .type = .avro, .definition = avro_json });
+    defer stored.deinit();
+    var topic = try client.topic("orders").create(.{
+        .schema = .{ .schema = "order", .encoding = .json },
+    });
+    defer topic.deinit();
+}
+// end snippet
+
+// snippet: pubsub-schema-validate
+/// In a test, or before a deploy: would Pub/Sub store this definition,
+/// and would the topic take this message?
+fn check(client: *pubsub.Client, avro_json: []const u8, message: []const u8) !void {
+    try client.validateSchema(.{ .type = .avro, .definition = avro_json });
+    try client.schema("order").validateMessage(message, .json, null);
+}
+// end snippet
+
+// snippet: pubsub-schema-revise
+/// A new shape for orders: one more revision. Messages of the old shape
+/// are still taken.
+fn addField(client: *pubsub.Client, avro_json_v2: []const u8) !void {
+    var next = try client.schema("order").commit(.{ .type = .avro, .definition = avro_json_v2 });
+    defer next.deinit();
+}
+
+/// The new shape was a mistake. The schema's latest is the good one
+/// again, and the bad one is gone, so the topic stops taking it.
+fn undo(client: *pubsub.Client, good: []const u8, bad: []const u8) !void {
+    var back = try client.schema("order").rollback(good);
+    defer back.deinit();
+    try client.schema("order").deleteRevision(bad);
+}
+// end snippet
+
+// snippet: pubsub-schema-receive
+/// A handler's first question: how is this message written, and by which
+/// revision? A subscriber that decodes keeps one decoder per revision,
+/// each read once with `get(.{ .revision_id = ... })`.
+fn describe(message: pubsub.ReceivedMessage, out: *std.Io.Writer) !void {
+    const written = message.schema() orelse return out.writeAll("no schema\n");
+    try out.print("{s} revision {s}, as {t}\n", .{ written.name, written.revision_id, written.encoding });
+}
+// end snippet
+
+// snippet: pubsub-schema-topic
+/// Stops taking newer shapes: only revisions up to `last` fit.
+fn pin(client: *pubsub.Client, last: []const u8) !void {
+    var pinned = try client.topic("orders").update(.{ .schema = .{ .set = .{
+        .schema = "order",
+        .encoding = .json,
+        .last_revision_id = last,
+    } } });
+    defer pinned.deinit();
+}
+
+/// Any bytes again.
+fn release(client: *pubsub.Client) !void {
+    var plain = try client.topic("orders").update(.{ .schema = .clear });
+    defer plain.deinit();
+}
+// end snippet
+
+test "the schemas guide's code, against a scripted transport" {
+    const order = "{\"name\":\"projects/my-project/schemas/order\",\"type\":\"AVRO\",\"definition\":\"\\\"string\\\"\",\"revisionId\":\"1b46a16a\",\"revisionCreateTime\":\"2026-10-11T23:15:46.447Z\"}";
+    const topic = "{\"name\":\"projects/my-project/topics/orders\",\"schemaSettings\":{\"schema\":\"projects/my-project/schemas/order\",\"encoding\":\"JSON\"}}";
+    var fake: core.testing.FakeTransport = .init(std.testing.allocator, &.{
+        .{ .respond = .{ .body = order } },
+        .{ .respond = .{ .body = topic } },
+        .{ .respond = .{} },
+        .{ .respond = .{} },
+        .{ .respond = .{ .body = order } },
+        .{ .respond = .{ .body = order } },
+        .{ .respond = .{ .body = order } },
+        .{ .respond = .{ .body = topic } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/my-project/topics/orders\"}" } },
+    });
+    defer fake.deinit();
+    var tokens: core.testing.FakeTokenProvider = .{};
+    var client = try pubsub.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = tokens.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    const base = "https://pubsub.googleapis.com/v1/projects/my-project/";
+
+    try makeOrders(&client, "\"string\"");
+    try std.testing.expectEqualStrings(base ++ "schemas?schemaId=order", (try fake.request(0)).url);
+    try std.testing.expectEqualStrings("{\"type\":\"AVRO\",\"definition\":\"\\\"string\\\"\"}", (try fake.request(0)).body.?);
+    try std.testing.expectEqualStrings(base ++ "topics/orders", (try fake.request(1)).url);
+    try std.testing.expectEqualStrings(
+        "{\"schemaSettings\":{\"schema\":\"projects/my-project/schemas/order\",\"encoding\":\"JSON\"}}",
+        (try fake.request(1)).body.?,
+    );
+
+    try check(&client, "\"string\"", "\"a\"");
+    try std.testing.expectEqualStrings(base ++ "schemas:validate", (try fake.request(2)).url);
+    try std.testing.expectEqualStrings(base ++ "schemas:validateMessage", (try fake.request(3)).url);
+    try std.testing.expectEqualStrings(
+        "{\"name\":\"projects/my-project/schemas/order\",\"message\":\"ImEi\",\"encoding\":\"JSON\"}",
+        (try fake.request(3)).body.?,
+    );
+
+    try addField(&client, "\"bytes\"");
+    try std.testing.expectEqualStrings(base ++ "schemas/order:commit", (try fake.request(4)).url);
+
+    try undo(&client, "1b46a16a", "6f0519a4");
+    try std.testing.expectEqualStrings(base ++ "schemas/order:rollback", (try fake.request(5)).url);
+    try std.testing.expectEqualStrings("{\"revisionId\":\"1b46a16a\"}", (try fake.request(5)).body.?);
+    try std.testing.expectEqualStrings(base ++ "schemas/order@6f0519a4:deleteRevision", (try fake.request(6)).url);
+
+    try pin(&client, "1b46a16a");
+    try std.testing.expectEqualStrings(
+        "{\"topic\":{\"schemaSettings\":{\"schema\":\"projects/my-project/schemas/order\",\"encoding\":\"JSON\",\"lastRevisionId\":\"1b46a16a\"}},\"updateMask\":\"schemaSettings\"}",
+        (try fake.request(7)).body.?,
+    );
+    try release(&client);
+    try std.testing.expectEqualStrings("{\"topic\":{},\"updateMask\":\"schemaSettings\"}", (try fake.request(8)).body.?);
+    try std.testing.expectEqual(9, fake.requests.items.len);
+
+    // What a handler reads off a message, with and without a schema.
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const plain: pubsub.ReceivedMessage = .{ .ack_id = "a", .message_id = "1", .data = "x", .attributes = &.{}, .publish_time = "", .ordering_key = "", .delivery_attempt = 0 };
+    var written = plain;
+    written.attributes = &.{
+        .{ .key = "googclient_schemaencoding", .value = "JSON" },
+        .{ .key = "googclient_schemaname", .value = "projects/my-project/schemas/order" },
+        .{ .key = "googclient_schemarevisionid", .value = "1b46a16a" },
+    };
+    try describe(plain, &out.writer);
+    try describe(written, &out.writer);
+    try std.testing.expectEqualStrings("no schema\nprojects/my-project/schemas/order revision 1b46a16a, as json\n", out.written());
+}
+
 test "the replay guide's code, against a scripted transport" {
     var fake: core.testing.FakeTransport = .init(std.testing.allocator, &.{
         .{ .respond = .{ .body = "{\"name\":\"projects/my-project/snapshots/before-deploy\",\"topic\":\"projects/my-project/topics/orders\",\"expireTime\":\"2026-10-17T13:46:36.836Z\"}" } },

@@ -25,6 +25,7 @@ Google, not only what Google documents, and where the emulators differ.
 | [Topics and subscriptions](pubsub/topics-and-subscriptions.md) | Dead letters, retry policies, filters, retention, expiration, labels, updates, and IAM |
 | [Delivery](pubsub/delivery.md) | Push, BigQuery and Cloud Storage subscriptions: the body options, the export states, and changing kind |
 | [Replaying and purging](pubsub/replay.md) | Snapshots, seeking back to replay or ahead to purge, and detaching a subscription |
+| [Schemas](pubsub/schemas.md) | Schemas and their revisions, a topic that takes only what fits, and what a subscriber reads off a message |
 
 ## 🪣 Cloud Storage
 

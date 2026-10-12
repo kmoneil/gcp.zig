@@ -49,7 +49,7 @@ Pub/Sub, Cloud Storage, Secret Manager and Firestore, with credentials that find
 
 | | Module | Covers | Status |
 | :-: | --- | --- | --- |
-| 📨 | [`pubsub`](docs/pubsub/README.md) | Pub/Sub v1: publish one call at a time or batched from many tasks; pull, a worker loop that manages leases, and exactly-once delivery; delivery by push, to BigQuery or to Cloud Storage; topics, subscriptions and snapshots, with their IAM policies; replaying and purging by seeking, and detaching | beta |
+| 📨 | [`pubsub`](docs/pubsub/README.md) | Pub/Sub v1: publish one call at a time or batched from many tasks; pull, a worker loop that manages leases, and exactly-once delivery; delivery by push, to BigQuery or to Cloud Storage; topics, subscriptions, snapshots and schemas, with their IAM policies; replaying and purging by seeking, and detaching | beta |
 | 🪣 | [`storage`](docs/storage/README.md) | Cloud Storage: objects of any size, streamed, parallel, resumable and checksummed both ways; preconditions, compose and server-side copies; buckets, versions, soft delete, retention and holds, IAM; folders, tree renames and managed folders; access control lists; signed URLs and POST policies, signed by a service account or an HMAC key; HMAC keys; encryption keys; Pub/Sub notifications | experimental |
 | 🔥 | [`firestore`](docs/firestore/README.md) | Cloud Firestore: documents read and written under preconditions, commits with field transforms, batched reads, queries and aggregations over collections and collection groups, large answers read one document at a time as they arrive, transactions run again on contention; the default database or a named one | experimental |
 | 🔑 | [`secret_manager`](docs/secret-manager/README.md) | Secret Manager v1: a secret's bytes, verified and wiped after use; versions; secrets global or regional, their settings, notifications, rotation, encryption keys and IAM policies | experimental |
@@ -146,7 +146,7 @@ says how.
 | 🧭 [Essentials](docs/essentials.md) | Clients and handles, results and memory, errors and `Diagnostics`, retries and time limits, logging, testing with fakes |
 | 🪪 [Credentials](docs/auth.md) | Where `findDefault` looks, every kind of credential, quota projects and signing |
 | 🔏 [IAM](docs/iam.md) | Granting, revoking and testing permissions on buckets, topics, subscriptions and secrets |
-| 📨 [Pub/Sub](docs/pubsub/README.md) | Publishing at volume, a worker loop, exactly-once delivery, push and export delivery, subscription settings, IAM, limits |
+| 📨 [Pub/Sub](docs/pubsub/README.md) | Publishing at volume, a worker loop, exactly-once delivery, push and export delivery, schemas, subscription settings, IAM, limits |
 | 🪣 [Cloud Storage](docs/storage/README.md) | Transfers of any size, checksums and gzip, safe writes, signed URLs, buckets, retention, encryption keys, notifications, folders, ACLs, HMAC keys |
 | 🔑 [Secret Manager](docs/secret-manager/README.md) | Reading secrets safely, changing them under an etag, notifications and rotation, regional secrets |
 | 🔥 [Firestore](docs/firestore/README.md) | Documents and their values, masks and preconditions, transforms and commits, queries and aggregations, transactions, and where the emulator differs |
