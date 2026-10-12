@@ -182,6 +182,36 @@ fn writeSchemaListPath(
     try params.addOptional("pageToken", page_token);
 }
 
+/// `/v1/projects/{project}/schemas/{id}:listRevisions?view=V&pageSize=N&pageToken=T`.
+/// `view` is the wire's word and is always sent, as in `schemaListPath`.
+pub fn schemaRevisionsPath(
+    arena: Allocator,
+    project: []const u8,
+    id: []const u8,
+    view: []const u8,
+    page_size: u32,
+    page_token: ?[]const u8,
+) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    writeSchemaRevisionsPath(&out.writer, project, id, view, page_size, page_token) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeSchemaRevisionsPath(
+    w: *Writer,
+    project: []const u8,
+    id: []const u8,
+    view: []const u8,
+    page_size: u32,
+    page_token: ?[]const u8,
+) Writer.Error!void {
+    try writeResourcePath(w, project, .schemas, id, ":listRevisions");
+    var params: query.Params = .init(w);
+    try params.add("view", view);
+    try params.addNonZero("pageSize", page_size);
+    try params.addOptional("pageToken", page_token);
+}
+
 /// `/v1/projects/{project}/schemas{method}`: a call on the project's
 /// schemas as a whole, `:validate` or `:validateMessage`.
 pub fn schemasMethodPath(arena: Allocator, project: []const u8, method: []const u8) Allocator.Error![]u8 {
@@ -307,6 +337,8 @@ test "schema paths: the id in the query on create, a revision after an @, the vi
     try testing.expectEqualStrings("/v1/projects/test/schemas?view=FULL", try schemaListPath(a, "test", "FULL", 0, ""));
     try testing.expectEqualStrings("/v1/projects/test/schemas?view=FULL&pageSize=2&pageToken=n%2F1", try schemaListPath(a, "test", "FULL", 2, "n/1"));
 
+    try testing.expectEqualStrings("/v1/projects/test/schemas/order-v1:listRevisions?view=BASIC&pageSize=100", try schemaRevisionsPath(a, "test", "order-v1", "BASIC", 100, null));
+    try testing.expectEqualStrings("/v1/projects/test/schemas/a%2541b:listRevisions?view=FULL&pageToken=n%2F1", try schemaRevisionsPath(a, "test", "a%41b", "FULL", 0, "n/1"));
     try testing.expectEqualStrings("/v1/projects/test/schemas:validate", try schemasMethodPath(a, "test", ":validate"));
     try testing.expectEqualStrings("/v1/projects/example.com:proj/schemas:validateMessage", try schemasMethodPath(a, "example.com:proj", ":validateMessage"));
     try testing.expectEqualStrings("projects/test/schemas/order-v1", try resourceName(a, "test", .schemas, "order-v1"));
