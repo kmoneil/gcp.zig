@@ -11,6 +11,7 @@ pub const Client = @import("Client.zig");
 pub const Topic = @import("Topic.zig");
 pub const Subscription = @import("Subscription.zig");
 pub const Snapshot = @import("Snapshot.zig");
+pub const Schema = @import("Schema.zig");
 pub const Subscriber = @import("Subscriber.zig");
 pub const Publisher = @import("Publisher.zig");
 pub const Endpoint = @import("Endpoint.zig");
@@ -66,6 +67,14 @@ pub const SnapshotInfo = @import("types.zig").SnapshotInfo;
 pub const SnapshotUpdate = @import("types.zig").SnapshotUpdate;
 pub const SnapshotPage = @import("types.zig").SnapshotPage;
 pub const NamePage = @import("types.zig").NamePage;
+pub const SchemaType = @import("types.zig").SchemaType;
+pub const SchemaDefinition = @import("types.zig").SchemaDefinition;
+pub const SchemaInfo = @import("types.zig").SchemaInfo;
+pub const SchemaView = @import("types.zig").SchemaView;
+pub const SchemaGetOptions = @import("types.zig").SchemaGetOptions;
+pub const SchemaListOptions = @import("types.zig").SchemaListOptions;
+pub const SchemaPage = @import("types.zig").SchemaPage;
+pub const SchemaEncoding = @import("types.zig").SchemaEncoding;
 
 /// Parses a `publish_time` (RFC 3339) to nanoseconds since the Unix epoch.
 pub const parseTimestamp = core.timestamp.parse;

@@ -472,6 +472,62 @@ pub const NamePage = struct {
     next_page_token: ?[]const u8,
 };
 
+/// The language a schema is written in. An unrecognized value from the
+/// server is `.unknown`, which is only ever read.
+pub const SchemaType = enum { avro, protocol_buffer, unknown };
+
+/// A schema as it is written: what `Schema.create` stores and
+/// `Client.validateSchema` checks.
+pub const SchemaDefinition = struct {
+    type: SchemaType,
+    /// The Avro schema as JSON, or the `.proto` source, with one top-level
+    /// type and no imports. Valid UTF-8, at most 300 KB.
+    definition: []const u8,
+};
+
+/// One revision of a schema, as the server describes it.
+pub const SchemaInfo = struct {
+    /// `projects/{project}/schemas/{id}`.
+    name: []const u8,
+    type: SchemaType,
+    /// "" in the basic view.
+    definition: []const u8,
+    /// Eight characters the server chose, such as `c7cfa2a8`. "" when it
+    /// sends none.
+    revision_id: []const u8,
+    /// Null when the server sends none. The emulator's is in January 1970.
+    revision_create_time: ?std.Io.Timestamp,
+};
+
+/// How much of a schema an answer carries.
+pub const SchemaView = enum {
+    /// Without the definition.
+    basic,
+    full,
+};
+
+pub const SchemaGetOptions = struct {
+    /// Null: the latest revision.
+    revision_id: ?[]const u8 = null,
+    view: SchemaView = .full,
+};
+
+pub const SchemaListOptions = struct {
+    page: PageOptions = .{},
+    view: SchemaView = .basic,
+};
+
+pub const SchemaPage = struct {
+    schemas: []const SchemaInfo,
+    /// Pass as `page_token` to get the next page. Null on the last page.
+    next_page_token: ?[]const u8,
+};
+
+/// How a message's bytes spell what its schema describes: as JSON text, or
+/// in the schema type's own binary form. An unrecognized value from the
+/// server is `.unknown`, which is only ever read.
+pub const SchemaEncoding = enum { json, binary, unknown };
+
 test "ReceivedMessage.attribute finds the first match" {
     const m: ReceivedMessage = .{
         .ack_id = "a",

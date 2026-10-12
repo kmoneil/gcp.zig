@@ -28,6 +28,7 @@ const Fixture = struct {
     topics: std.ArrayList([]const u8),
     subscriptions: std.ArrayList([]const u8),
     snapshots: std.ArrayList([]const u8),
+    schemas: std.ArrayList([]const u8),
 
     /// Returns false when no server is configured; the test should skip.
     fn init(f: *Fixture) !bool {
@@ -40,6 +41,7 @@ const Fixture = struct {
         f.topics = .empty;
         f.subscriptions = .empty;
         f.snapshots = .empty;
+        f.schemas = .empty;
 
         var random: [4]u8 = undefined;
         testing.io.random(&random);
@@ -76,11 +78,13 @@ const Fixture = struct {
     }
 
     /// Deletes everything the test created: snapshots, then subscriptions,
-    /// then topics.
+    /// then topics, then the schemas those topics may have named.
     fn deinit(f: *Fixture) void {
         for (f.snapshots.items) |snapshot_id| f.client.snapshot(snapshot_id).delete() catch {};
         for (f.subscriptions.items) |sub_id| f.client.subscription(sub_id).delete() catch {};
         for (f.topics.items) |topic_id| f.client.topic(topic_id).delete() catch {};
+        for (f.schemas.items) |schema_id| f.client.schema(schema_id).delete() catch {};
+        f.schemas.deinit(testing.allocator);
         f.snapshots.deinit(testing.allocator);
         f.subscriptions.deinit(testing.allocator);
         f.topics.deinit(testing.allocator);
@@ -2302,4 +2306,113 @@ test "publisher: after its topic is deleted, receipts fail with NotFound and the
     // Still running: stop drains and returns.
     try live.finish();
     try testing.expect(live.publisher.stats().failed >= 2);
+}
+
+const avro_order =
+    \\{"type":"record","name":"Order","fields":[{"name":"id","type":"string"},{"name":"quantity","type":"int"}]}
+;
+const proto_order = "syntax = \"proto3\";\nmessage Order {\n  string id = 1;\n  int32 quantity = 2;\n}\n";
+
+test "schemas: one is made, read in both views and by its revision, found in its project's list, asked about messages both ways, and deleted" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const project = f.client.project_id;
+    const definition: pubsub.SchemaDefinition = .{ .type = .avro, .definition = avro_order };
+
+    // Pub/Sub says whether it would store a definition before it is asked to.
+    f.client.validateSchema(definition) catch |err| return f.fail(err);
+    try testing.expectError(error.InvalidArgument, f.client.validateSchema(.{ .type = .avro, .definition = "{\"type\":\"record\"" }));
+
+    const schema = f.client.schema(f.id("order"));
+    try f.schemas.append(testing.allocator, schema.id);
+    const name = try a.print("projects/{s}/schemas/{s}", .{ project, schema.id });
+    var created = schema.create(definition) catch |err| return f.fail(err);
+    defer created.deinit();
+    try testing.expect(std.mem.startsWith(u8, created.value.name, name));
+    try testing.expectEqual(pubsub.SchemaType.avro, created.value.type);
+    try testing.expect(created.value.revision_id.len > 0);
+    try testing.expect(created.value.definition.len > 0);
+    if (!f.production) {
+        // The emulator names the schema without its revision, keeps the
+        // definition byte for byte, and dates the revision in January 1970.
+        try testing.expectEqualStrings(name, created.value.name);
+        try testing.expectEqualStrings(avro_order, created.value.definition);
+        try testing.expect(created.value.revision_create_time.?.toSeconds() < 366 * 86400);
+    }
+    const revision = created.value.revision_id;
+
+    // Its id is taken, and what is not there is not found.
+    try testing.expectError(error.AlreadyExists, schema.create(definition));
+    const absent = f.client.schema(f.id("no-such-schema"));
+    try testing.expectError(error.NotFound, absent.get(.{}));
+    try testing.expectError(error.NotFound, absent.delete());
+    try testing.expectError(error.NotFound, schema.get(.{ .revision_id = "deadbeef" }));
+
+    var full = schema.get(.{}) catch |err| return f.fail(err);
+    defer full.deinit();
+    try testing.expectEqualStrings(created.value.definition, full.value.definition);
+    try testing.expectEqualStrings(revision, full.value.revision_id);
+    var basic = schema.get(.{ .view = .basic }) catch |err| return f.fail(err);
+    defer basic.deinit();
+    try testing.expectEqualStrings("", basic.value.definition);
+    try testing.expectEqual(pubsub.SchemaType.avro, basic.value.type);
+    var one = schema.get(.{ .revision_id = revision }) catch |err| return f.fail(err);
+    defer one.deinit();
+    try testing.expectEqualStrings(created.value.definition, one.value.definition);
+    try testing.expectEqualStrings(revision, one.value.revision_id);
+
+    // Among its project's schemas, with its definition when that is asked.
+    var token: ?[]const u8 = null;
+    const listed = search: while (true) {
+        var page = f.client.listSchemas(.{ .view = .full, .page = .{ .page_token = token } }) catch |err| return f.fail(err);
+        defer page.deinit();
+        for (page.value.schemas) |s| {
+            if (std.mem.startsWith(u8, s.name, name)) break :search try a.dupe(u8, s.definition);
+        }
+        token = try a.dupe(u8, page.value.next_page_token orelse break :search null);
+    };
+    try testing.expectEqualStrings(created.value.definition, listed.?);
+    {
+        // And without it in the basic view, a list's default, which the
+        // client always says: asked for no view, the emulator sends it.
+        var page = f.client.listSchemas(.{ .page = .{ .page_size = 1000 } }) catch |err| return f.fail(err);
+        defer page.deinit();
+        for (page.value.schemas) |s| {
+            if (std.mem.startsWith(u8, s.name, name)) try testing.expectEqualStrings("", s.definition);
+        }
+    }
+
+    // Would a message be taken? Asked of the stored schema, of one revision
+    // of it and of the definition alone, in both encodings.
+    const fits = "{\"id\":\"a\",\"quantity\":1}";
+    const fits_binary = "\x02a\x02";
+    schema.validateMessage(fits, .json, null) catch |err| return f.fail(err);
+    schema.validateMessage(fits_binary, .binary, null) catch |err| return f.fail(err);
+    schema.validateMessage(fits, .json, revision) catch |err| return f.fail(err);
+    f.client.validateMessage(definition, fits_binary, .binary) catch |err| return f.fail(err);
+    try testing.expectError(error.InvalidArgument, schema.validateMessage("{\"id\":\"a\",\"quantity\":\"one\"}", .json, null));
+    try testing.expectError(error.InvalidArgument, schema.validateMessage("\xff\xff\xff", .binary, null));
+    try testing.expectError(error.InvalidArgument, f.client.validateMessage(definition, "{}", .json));
+    try testing.expectError(error.NotFound, absent.validateMessage(fits, .json, null));
+
+    const proto = f.client.schema(f.id("order-proto"));
+    if (f.production) {
+        // What only production has: Protocol Buffer schemas and schema IAM.
+        try f.schemas.append(testing.allocator, proto.id);
+        var made = proto.create(.{ .type = .protocol_buffer, .definition = proto_order }) catch |err| return f.fail(err);
+        made.deinit();
+        proto.validateMessage("\x0a\x01a\x10\x01", .binary, null) catch |err| return f.fail(err);
+        var policy = schema.iamPolicy() catch |err| return f.fail(err);
+        policy.deinit();
+    } else {
+        try testing.expectError(error.Unimplemented, proto.create(.{ .type = .protocol_buffer, .definition = proto_order }));
+        try testing.expectEqualStrings("Protocol buffer support not implemented in emulator", f.diag.message());
+        try testing.expectError(error.Unimplemented, f.client.validateSchema(.{ .type = .protocol_buffer, .definition = proto_order }));
+        try testing.expectError(error.InvalidArgument, schema.iamPolicy());
+    }
+
+    schema.delete() catch |err| return f.fail(err);
+    try testing.expectError(error.NotFound, schema.get(.{}));
 }
