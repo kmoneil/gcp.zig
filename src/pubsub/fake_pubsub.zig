@@ -82,6 +82,18 @@
 //!     a delete.
 //!   - A topic's retention, which its subscriptions read as
 //!     `topicMessageRetentionDuration`.
+//! - Schemas, as production answered on 2026-10-12: create, get, delete,
+//!   a project's list, a schema's revisions, commit, rollback,
+//!   deleteRevision, validate and validateMessage, with production's
+//!   rules for revisions: eight hex digits of id, twenty to a schema, a
+//!   rollback that makes a new one, the last that goes only with the
+//!   schema. **A definition is kept and not read.** An Avro one must be
+//!   JSON, a Protocol Buffer one is taken as text, and a commit is held
+//!   against the revision before it in its type alone. A topic's schema
+//!   settings are checked and read back as production's, and a message
+//!   published to such a topic is marked with the encoding and the
+//!   revision it fit. **Whether a message fits is the test's to say**,
+//!   through `Options.fits`: with none, every message fits.
 //! - Faults, on command: `refuseNext`, `loseAnswers`, `dropNext`.
 //!
 //! Its clock is the `io` it is given: with `core.testing.FakeClock`, a
@@ -89,14 +101,14 @@
 //! to use from several tasks at once.
 //!
 //! Not modelled yet, and answered 501 with a message that says so, never
-//! guessed at: push and export deliveries, schemas, transforms, import
-//! settings, tags and IAM. A filter of a shape production was not shown,
+//! guessed at: push and export deliveries, transforms, import settings,
+//! tags and IAM. A filter of a shape production was not shown,
 //! or that production itself fails on, is answered the same way.
 //! Production's delays are not modelled at all: a deleted topic that
 //! still takes a publish, the two seconds before a nacked message comes
 //! again, the 2 to 50 seconds a seek back took to show, the seven
-//! seconds before a detached subscription refused. Everything holds at
-//! once.
+//! seconds before a detached subscription refused, the minute a deleted
+//! schema's topics went on taking publishes. Everything holds at once.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -120,6 +132,12 @@ pub const FakePubSub = struct {
     subscriptions: std.StringArrayHashMapUnmanaged(*Subscription) = .empty,
     /// By full name, in name order.
     snapshots: std.StringArrayHashMapUnmanaged(*Snapshot) = .empty,
+    /// By full name, in name order.
+    schemas: std.StringArrayHashMapUnmanaged(*Schema) = .empty,
+    /// Deleted schemas, whose revisions are freed at `deinit`.
+    old_schemas: std.ArrayList(*Schema) = .empty,
+    /// Counts revisions as they are made, of every schema.
+    next_revision: u32 = 1,
     next_message_id: u64 = 1,
     next_uid: u64 = 1,
     prng: std.Random.DefaultPrng = .init(0x5eed),
@@ -138,7 +156,36 @@ pub const FakePubSub = struct {
         /// as production gives no order without an ordering key. Off: in
         /// the order published, which no test should lean on.
         shuffle: bool = true,
+        /// Whether a message fits a schema. The fake reads no schema: it
+        /// keeps a definition and asks this, of every message published
+        /// to a topic that has a schema, for each revision the topic
+        /// allows from the newest back, and of a message given to
+        /// validateMessage. With none, every message fits.
+        fits: ?Fits = null,
     };
+
+    pub const Fits = struct {
+        context: ?*anyopaque = null,
+        /// Null: the message fits. Otherwise why it does not, in the
+        /// words production would put after "Invalid data in message: ",
+        /// such as "Could not parse binary message.".
+        call: *const fn (context: ?*anyopaque, check: SchemaCheck) ?[]const u8,
+    };
+
+    /// A message, and the revision of a schema it is tried against.
+    pub const SchemaCheck = struct {
+        /// The schema's full name. "" for one given whole to
+        /// validateMessage, which has no revision either.
+        schema: []const u8,
+        revision_id: []const u8,
+        type: SchemaType,
+        definition: []const u8,
+        encoding: Encoding,
+        data: []const u8,
+    };
+
+    pub const SchemaType = enum { avro, protocol_buffer };
+    pub const Encoding = enum { json, binary };
 
     /// The kinds of call a fault or a count can be about.
     pub const Calls = enum { all, publish, pull, acknowledge, modify_ack_deadline, admin };
@@ -165,6 +212,59 @@ pub const FakePubSub = struct {
         /// Deleted, and kept for what still points at it: a topic made
         /// again under its name is another topic.
         deleted: bool = false,
+        schema: ?SchemaSettings = null,
+    };
+
+    const Schema = struct {
+        name: []const u8,
+        uid: u64,
+        type: SchemaType,
+        /// Oldest first. Never empty.
+        revisions: std.ArrayList(Revision) = .empty,
+        /// Deleted, and kept for the topics that still point at it: one
+        /// made again under its name is another schema.
+        deleted: bool = false,
+
+        fn latest(s: *const Schema) *const Revision {
+            return &s.revisions.items[s.revisions.items.len - 1];
+        }
+
+        fn revision(s: *const Schema, id: []const u8) ?*const Revision {
+            for (s.revisions.items) |*r| {
+                if (std.mem.eql(u8, &r.id, id)) return r;
+            }
+            return null;
+        }
+    };
+
+    const Revision = struct {
+        /// Eight lower-case hex digits, as production's are.
+        id: [8]u8,
+        /// In the order made, across all schemas.
+        number: u32,
+        definition: []const u8,
+        created: std.Io.Timestamp,
+    };
+
+    /// A topic's schema: its messages must fit one of the schema's
+    /// revisions, of those from `first` to `last` when a range is set.
+    const SchemaSettings = struct {
+        schema: *Schema,
+        encoding: Encoding,
+        first: ?*const Bound = null,
+        last: ?*const Bound = null,
+
+        const Bound = struct { id: [8]u8, number: u32 };
+
+        fn allows(s: SchemaSettings, r: Revision) bool {
+            if (s.first) |first| {
+                if (r.number < first.number) return false;
+            }
+            if (s.last) |last| {
+                if (r.number > last.number) return false;
+            }
+            return true;
+        }
     };
 
     const StoragePolicy = struct { regions: []const []const u8, enforce_in_transit: bool };
@@ -337,9 +437,14 @@ pub const FakePubSub = struct {
             }
         }
         f.dropped.deinit(f.gpa);
+        for ([_][]const *Schema{ f.schemas.values(), f.old_schemas.items }) |list| {
+            for (list) |s| s.revisions.deinit(f.gpa);
+        }
+        f.old_schemas.deinit(f.gpa);
         f.topics.deinit(f.gpa);
         f.subscriptions.deinit(f.gpa);
         f.snapshots.deinit(f.gpa);
+        f.schemas.deinit(f.gpa);
         f.store.deinit();
         f.* = undefined;
     }
@@ -455,9 +560,11 @@ pub const FakePubSub = struct {
 
     const Route = struct {
         project: []const u8,
-        collection: enum { topics, subscriptions, snapshots },
+        collection: enum { topics, subscriptions, snapshots, schemas },
         /// Decoded. "" for the collection itself.
         id: []const u8,
+        /// As it was sent.
+        raw_id: []const u8,
         /// After the id: `:publish`, `/subscriptions`, or "".
         rest: []const u8,
         query: []const u8,
@@ -539,6 +646,28 @@ pub const FakePubSub = struct {
                 };
                 return notModelled(arena, route.rest);
             },
+            .schemas => {
+                if (route.id.len == 0) {
+                    if (none) return switch (method) {
+                        .GET => f.listSchemas(arena, route),
+                        .POST => f.createSchema(arena, route, body),
+                        .PUT, .PATCH, .DELETE => notModelled(arena, "this call on schemas"),
+                    };
+                    if (method == .POST and std.mem.eql(u8, route.rest, ":validate")) return f.validateSchema(arena, body);
+                    if (method == .POST and std.mem.eql(u8, route.rest, ":validateMessage")) return f.validateMessage(arena, body);
+                    return notModelled(arena, route.rest);
+                }
+                if (none) return switch (method) {
+                    .GET => f.getSchema(arena, route),
+                    .DELETE => f.deleteSchema(arena, route),
+                    .PUT, .PATCH, .POST => notModelled(arena, "this call on a schema"),
+                };
+                if (method == .POST and std.mem.eql(u8, route.rest, ":commit")) return f.commitSchema(arena, body);
+                if (method == .POST and std.mem.eql(u8, route.rest, ":rollback")) return f.rollbackSchema(arena, route, body);
+                if (method == .DELETE and std.mem.eql(u8, route.rest, ":deleteRevision")) return f.deleteRevision(arena, route);
+                if (method == .GET and std.mem.eql(u8, route.rest, ":listRevisions")) return f.listRevisions(arena, route);
+                return notModelled(arena, route.rest);
+            },
         }
     }
 
@@ -571,7 +700,12 @@ pub const FakePubSub = struct {
                 topic.kms_key_name = stringOf(value) orelse return badValue(arena, key);
             } else if (isField(key, "messageStoragePolicy")) {
                 topic.storage_policy = (try storagePolicyOf(arena, value)) orelse return badValue(arena, key);
-            } else if (isAnyField(key, &.{ "schemaSettings", "messageTransforms", "ingestionDataSourceSettings", "tags" })) {
+            } else if (isField(key, "schemaSettings")) {
+                topic.schema = switch (try f.schemaSettingsOf(arena, name, value, null)) {
+                    .ok => |settings| settings,
+                    .refused => |r| return r,
+                };
+            } else if (isAnyField(key, &.{ "messageTransforms", "ingestionDataSourceSettings", "tags" })) {
                 return notModelled(arena, key);
             } else return unknownName(arena, key);
         }
@@ -622,7 +756,21 @@ pub const FakePubSub = struct {
                 next.kms_key_name = if (given) |v| try f.keep(stringOf(v) orelse return badValue(arena, path)) else null;
             } else if (isPath(path, "messageStoragePolicy")) {
                 next.storage_policy = if (given) |v| try f.keepPolicy((try storagePolicyOf(arena, v)) orelse return badValue(arena, path)) else null;
-            } else if (isAnyPath(path, &.{ "schemaSettings", "messageTransforms", "ingestionDataSourceSettings" })) {
+            } else if (isPath(path, "schemaSettings")) {
+                // The settings whole: with none in the body, the topic has
+                // no schema.
+                next.schema = if (given) |v| switch (try f.schemaSettingsOf(arena, topic.name, v, null)) {
+                    .ok => |settings| settings,
+                    .refused => |r| return r,
+                } else null;
+            } else if (partOf(path, "schemaSettings")) |part| {
+                // One of the settings: the others stay as they are.
+                const whole = fieldOf(update.resource, "schemaSettings") orelse Value{ .object = .empty };
+                next.schema = switch (try f.schemaSettingsOf(arena, topic.name, whole, .{ .part = part, .of = next.schema })) {
+                    .ok => |settings| settings,
+                    .refused => |r| return r,
+                };
+            } else if (isAnyPath(path, &.{ "messageTransforms", "ingestionDataSourceSettings" })) {
                 return notModelled(arena, path);
             } else return unknownPath(arena, "UpdateTopicRequest", path, "Topic");
         }
@@ -753,6 +901,30 @@ pub const FakePubSub = struct {
             }
             if (message.ordering_key.len > 1024) return fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "An ordering key in the request is too long. The length is {d} characters, but the maximum allowed is 1024. Refer to https://cloud.google.com/pubsub/quotas for more information.", .{message.ordering_key.len}));
             if (!std.mem.eql(u8, message.ordering_key, parsed[0].ordering_key)) return fail(arena, 400, "FAILED_PRECONDITION", "In a single publish request, all messages must have no ordering key or they must all have the same ordering key. [code=539b]");
+        }
+
+        // A topic with a schema takes a request only if every message of
+        // it fits, and marks each with the encoding and the revision it
+        // fit, over whatever the publisher wrote there. The schema's name
+        // production leaves alone if the publisher wrote one.
+        if (topic.schema) |settings| {
+            for (parsed) |*message| {
+                const revision_id = switch (try f.fit(arena, settings, message.data)) {
+                    .ok => |id| id,
+                    .refused => |r| return r,
+                };
+                var marked: std.ArrayList(Label) = .empty;
+                var named = false;
+                for (message.attributes) |a| {
+                    if (std.mem.eql(u8, a.key, "googclient_schemaencoding") or std.mem.eql(u8, a.key, "googclient_schemarevisionid")) continue;
+                    named = named or std.mem.eql(u8, a.key, "googclient_schemaname");
+                    try marked.append(arena, a);
+                }
+                if (!named) try marked.append(arena, .{ .key = "googclient_schemaname", .value = settings.schema.name });
+                try marked.append(arena, .{ .key = "googclient_schemaencoding", .value = encodingName(settings.encoding) });
+                try marked.append(arena, .{ .key = "googclient_schemarevisionid", .value = revision_id });
+                message.attributes = marked.items;
+            }
         }
 
         const now = std.Io.Clock.real.now(f.io);
@@ -1413,6 +1585,412 @@ pub const FakePubSub = struct {
         return ok("{}");
     }
 
+    // Schemas. A definition is kept and not read: an Avro one must be
+    // JSON, and a Protocol Buffer one is taken as text.
+
+    fn createSchema(f: *FakePubSub, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
+        const id = (try queryValue(arena, route.query, "schemaId")) orelse "";
+        const name = try std.fmt.allocPrint(arena, "projects/{s}/schemas/{s}", .{ route.project, id });
+        if (!isResourceId(id)) return invalidName(arena, name);
+        const object = switch (try parseObject(arena, body)) {
+            .ok => |o| o,
+            .refused => |r| return r,
+        };
+        const given = switch (try schemaOf(arena, .{ .object = object })) {
+            .ok => |s| s,
+            .refused => |r| return r,
+        };
+        if (f.schemas.contains(name)) return fail(arena, 409, "ALREADY_EXISTS", try std.fmt.allocPrint(arena, "Resource already exists in the project (resource={s}).", .{name}));
+        const schema = try f.store.allocator().create(Schema);
+        schema.* = .{ .name = try f.keep(name), .uid = f.next_uid, .type = given.type };
+        errdefer schema.revisions.deinit(f.gpa);
+        const first = try f.addRevision(schema, given.definition);
+        try f.insertSorted(Schema, &f.schemas, schema);
+        f.next_uid += 1;
+        return ok(try renderSchema(arena, schema, first, .{}));
+    }
+
+    /// A new revision, the schema's latest.
+    fn addRevision(f: *FakePubSub, schema: *Schema, definition: []const u8) Allocator.Error!*const Revision {
+        try schema.revisions.ensureUnusedCapacity(f.gpa, 1);
+        const kept = try f.keep(definition);
+        var id: [8]u8 = undefined;
+        // Each its own, and none like the one before, as production's.
+        _ = std.fmt.bufPrint(&id, "{x:0>8}", .{f.next_revision *% 0x9e3779b1}) catch unreachable;
+        schema.revisions.appendAssumeCapacity(.{ .id = id, .number = f.next_revision, .definition = kept, .created = std.Io.Clock.real.now(f.io) });
+        f.next_revision += 1;
+        return schema.latest();
+    }
+
+    /// The schema a path names, and the revision if it names one after
+    /// an `@`. A refusal names the resource as it was asked for.
+    fn findSchema(f: *FakePubSub, arena: Allocator, project: []const u8, id: []const u8) Allocator.Error!Parsed(struct { schema: *Schema, revision: ?*const Revision }) {
+        const asked = try std.fmt.allocPrint(arena, "projects/{s}/schemas/{s}", .{ project, id });
+        const at = std.mem.indexOfScalar(u8, asked, '@');
+        const schema = f.schemas.get(asked[0 .. at orelse asked.len]) orelse return .{ .refused = try schemaNotFound(arena, asked) };
+        const revision = if (at) |i| schema.revision(asked[i + 1 ..]) orelse return .{ .refused = try schemaNotFound(arena, asked) } else null;
+        return .{ .ok = .{ .schema = schema, .revision = revision } };
+    }
+
+    fn getSchema(f: *FakePubSub, arena: Allocator, route: Route) Allocator.Error!Reply {
+        // An `@` sent as `%40` production does not read as one.
+        if (std.mem.indexOf(u8, route.raw_id, "%40") != null) return schemaNotFound(arena, try std.fmt.allocPrint(arena, "projects/{s}/schemas/{s}", .{ route.project, route.raw_id }));
+        const found = switch (try f.findSchema(arena, route.project, route.id)) {
+            .ok => |s| s,
+            .refused => |r| return r,
+        };
+        // With no view a get answers the whole of it.
+        const basic = switch (try viewOf(arena, route.query)) {
+            .ok => |view| view == .basic,
+            .refused => |r| return r,
+        };
+        return ok(try renderSchema(arena, found.schema, found.revision orelse found.schema.latest(), .{ .definition = !basic, .revision_in_name = found.revision != null }));
+    }
+
+    fn deleteSchema(f: *FakePubSub, arena: Allocator, route: Route) Allocator.Error!Reply {
+        const name = try resourceName(arena, route);
+        const schema = f.schemas.get(name) orelse return schemaNotFound(arena, name);
+        try f.old_schemas.append(f.gpa, schema);
+        _ = f.schemas.orderedRemove(name);
+        // The topics that name it read `_deleted-schema_`, and take no
+        // publish. (In production both showed up to a minute late.)
+        schema.deleted = true;
+        return ok("{}");
+    }
+
+    /// A project's schemas, each as its latest revision, by name: the
+    /// fake's own order, since production's was neither by name nor by
+    /// time. With no view a list leaves the definitions out.
+    fn listSchemas(f: *FakePubSub, arena: Allocator, route: Route) Allocator.Error!Reply {
+        const page = switch (try pageOf(arena, route.query)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const full = switch (try viewOf(arena, route.query)) {
+            .ok => |view| view == .full,
+            .refused => |r| return r,
+        };
+        const prefix = try std.fmt.allocPrint(arena, "projects/{s}/schemas/", .{route.project});
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        jw.beginObject() catch return error.OutOfMemory;
+        var written: usize = 0;
+        var next: ?[]const u8 = null;
+        for (f.schemas.keys(), f.schemas.values()) |name, schema| {
+            if (!std.mem.startsWith(u8, name, prefix)) continue;
+            if (page.after) |after| {
+                if (std.mem.order(u8, name, after) == .lt) continue;
+            }
+            if (written == page.size) {
+                next = name;
+                break;
+            }
+            if (written == 0) {
+                jw.objectField("schemas") catch return error.OutOfMemory;
+                jw.beginArray() catch return error.OutOfMemory;
+            }
+            writeSchema(&jw, schema, schema.latest(), .{ .definition = full }) catch return error.OutOfMemory;
+            written += 1;
+        }
+        if (written > 0) jw.endArray() catch return error.OutOfMemory;
+        if (next) |name| {
+            jw.objectField("nextPageToken") catch return error.OutOfMemory;
+            jw.write(try pageToken(arena, name)) catch return error.OutOfMemory;
+        }
+        jw.endObject() catch return error.OutOfMemory;
+        return ok(out.written());
+    }
+
+    /// A schema's revisions, the newest first, each under its own name.
+    fn listRevisions(f: *FakePubSub, arena: Allocator, route: Route) Allocator.Error!Reply {
+        const name = try resourceName(arena, route);
+        const schema = f.schemas.get(name) orelse return schemaNotFound(arena, name);
+        const page = switch (try pageOf(arena, route.query)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const full = switch (try viewOf(arena, route.query)) {
+            .ok => |view| view == .full,
+            .refused => |r| return r,
+        };
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        jw.beginObject() catch return error.OutOfMemory;
+        var written: usize = 0;
+        var next: ?[]const u8 = null;
+        // A page begins at the revision its token names.
+        var reached = page.after == null;
+        var i = schema.revisions.items.len;
+        while (i > 0) {
+            i -= 1;
+            const revision = &schema.revisions.items[i];
+            reached = reached or std.mem.eql(u8, &revision.id, page.after.?);
+            if (!reached) continue;
+            if (written == page.size) {
+                next = &revision.id;
+                break;
+            }
+            if (written == 0) {
+                jw.objectField("schemas") catch return error.OutOfMemory;
+                jw.beginArray() catch return error.OutOfMemory;
+            }
+            writeSchema(&jw, schema, revision, .{ .definition = full, .revision_in_name = true }) catch return error.OutOfMemory;
+            written += 1;
+        }
+        if (written > 0) jw.endArray() catch return error.OutOfMemory;
+        if (next) |id| {
+            jw.objectField("nextPageToken") catch return error.OutOfMemory;
+            jw.write(try pageToken(arena, id)) catch return error.OutOfMemory;
+        }
+        jw.endObject() catch return error.OutOfMemory;
+        return ok(out.written());
+    }
+
+    /// Production commits to the schema the body names, whatever the
+    /// path says, and refuses a body that names none.
+    fn commitSchema(f: *FakePubSub, arena: Allocator, body: []const u8) Allocator.Error!Reply {
+        const object = switch (try parseObject(arena, body)) {
+            .ok => |o| o,
+            .refused => |r| return r,
+        };
+        var inner: Value = .{ .object = .empty };
+        var it = object.iterator();
+        while (it.next()) |field| {
+            const key = field.key_ptr.*;
+            if (isField(key, "schema")) inner = field.value_ptr.* else if (!isField(key, "name")) return unknownName(arena, key);
+        }
+        const name = switch (inner) {
+            .object => |o| if (o.get("name")) |n| stringOf(n) orelse return badValue(arena, "name") else "",
+            else => return badValue(arena, "schema"),
+        };
+        if (!isResourceName(name, "schemas")) return invalidName(arena, name);
+        const schema = f.schemas.get(name) orelse return schemaNotFound(arena, name);
+        const given = switch (try schemaOf(arena, inner)) {
+            .ok => |s| s,
+            .refused => |r| return r,
+        };
+        // The one way a revision is checked against the one before it
+        // here. Production reads both, and refuses a field that changed
+        // its type; the fake reads neither.
+        if (given.type != schema.type) return fail(arena, 400, "FAILED_PRECONDITION", try std.fmt.allocPrint(arena, "Compatibility checking failed to commit a schema revision for (schema=\"{s}\"). (reason=\"Revision is incompatible with previous revision: {s}. Failed with error: Types do not match). Refer to https://cloud.google.com/pubsub/docs/schemas for more information.", .{ schema.name, &schema.latest().id }));
+        if (try revisionsFull(arena, schema)) |refusal| return refusal;
+        return ok(try renderSchema(arena, schema, try f.addRevision(schema, given.definition), .{ .revision_in_name = true }));
+    }
+
+    /// A rollback makes a new revision that holds an old one's
+    /// definition.
+    fn rollbackSchema(f: *FakePubSub, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
+        const object = switch (try parseObject(arena, body)) {
+            .ok => |o| o,
+            .refused => |r| return r,
+        };
+        var to: []const u8 = "";
+        var it = object.iterator();
+        while (it.next()) |field| {
+            const key = field.key_ptr.*;
+            if (isField(key, "revisionId")) to = stringOf(field.value_ptr.*) orelse return badValue(arena, key) else if (!isField(key, "name")) return unknownName(arena, key);
+        }
+        const name = try resourceName(arena, route);
+        const schema = f.schemas.get(name) orelse return schemaNotFound(arena, name);
+        // For a revision that is not there production names the schema.
+        const old = schema.revision(to) orelse return schemaNotFound(arena, name);
+        // The recording of these words was cut after "for mor": they end
+        // as production's other two of the kind end.
+        if (old == schema.latest()) return fail(arena, 400, "FAILED_PRECONDITION", try std.fmt.allocPrint(arena, "Cannot rollback to the latest revision: (schema=\"{s}\"). Refer to https://cloud.google.com/pubsub/docs/schemas for more information.", .{name}));
+        if (try revisionsFull(arena, schema)) |refusal| return refusal;
+        return ok(try renderSchema(arena, schema, try f.addRevision(schema, old.definition), .{ .revision_in_name = true }));
+    }
+
+    fn deleteRevision(f: *FakePubSub, arena: Allocator, route: Route) Allocator.Error!Reply {
+        // The revision goes in the path, after an `@`: the old query
+        // parameter production refuses.
+        if (std.mem.indexOfScalar(u8, route.id, '@') == null) return fail(arena, 400, "INVALID_ARGUMENT", "Request contains an invalid argument.");
+        const found = switch (try f.findSchema(arena, route.project, route.id)) {
+            .ok => |s| s,
+            .refused => |r| return r,
+        };
+        const schema = found.schema;
+        const revision = found.revision.?;
+        if (schema.revisions.items.len == 1) return fail(arena, 400, "FAILED_PRECONDITION", try std.fmt.allocPrint(arena, "This schema contains only one revision, which can only be deleted by deleting the parent schema: (schema=\"{s}@{s}\"). Refer to https://cloud.google.com/pubsub/docs/schemas for more information.", .{ schema.name, &revision.id }));
+        // It answers the revision deleted, without its definition.
+        // (Production writes the project's number in that name, and no
+        // other; the fake writes its id.)
+        const answer = try renderSchema(arena, schema, revision, .{ .definition = false, .revision_in_name = true });
+        _ = schema.revisions.orderedRemove(revision - schema.revisions.items.ptr);
+        return ok(answer);
+    }
+
+    fn validateSchema(f: *FakePubSub, arena: Allocator, body: []const u8) Allocator.Error!Reply {
+        _ = f;
+        const object = switch (try parseObject(arena, body)) {
+            .ok => |o| o,
+            .refused => |r| return r,
+        };
+        var inner: Value = .{ .object = .empty };
+        var it = object.iterator();
+        while (it.next()) |field| {
+            if (isField(field.key_ptr.*, "schema")) inner = field.value_ptr.* else return unknownName(arena, field.key_ptr.*);
+        }
+        return switch (try schemaOf(arena, inner)) {
+            .ok => ok("{}"),
+            .refused => |r| r,
+        };
+    }
+
+    /// Whether a message fits a schema, named or given whole: the test's
+    /// to say, through `Options.fits`.
+    fn validateMessage(f: *FakePubSub, arena: Allocator, body: []const u8) Allocator.Error!Reply {
+        const object = switch (try parseObject(arena, body)) {
+            .ok => |o| o,
+            .refused => |r| return r,
+        };
+        var named: ?[]const u8 = null;
+        var inline_schema: ?Value = null;
+        var data: []const u8 = "";
+        var encoding: ?Encoding = null;
+        var it = object.iterator();
+        while (it.next()) |field| {
+            const key = field.key_ptr.*;
+            const value = field.value_ptr.*;
+            if (isField(key, "name")) {
+                named = stringOf(value) orelse return badValue(arena, key);
+            } else if (isField(key, "schema")) {
+                inline_schema = value;
+            } else if (isField(key, "message")) {
+                data = (try decodeBase64(arena, stringOf(value) orelse return badValue(arena, key))) orelse return badValue(arena, key);
+            } else if (isField(key, "encoding")) {
+                encoding = switch (encodingOf(value)) {
+                    .ok => |e| e,
+                    .bad => return badValue(arena, key),
+                };
+            } else if (!isField(key, "parent")) return unknownName(arena, key);
+        }
+        const as = encoding orelse return fail(arena, 400, "INVALID_ARGUMENT", "You have passed an invalid argument to the service (argument=Invalid message encoding type: ENCODING_UNSPECIFIED).");
+        var why: ?[]const u8 = null;
+        var of: SchemaType = undefined;
+        if (inline_schema) |value| {
+            const given = switch (try schemaOf(arena, value)) {
+                .ok => |s| s,
+                .refused => |r| return r,
+            };
+            of = given.type;
+            why = f.ask(.{ .schema = "", .revision_id = "", .type = given.type, .definition = given.definition, .encoding = as, .data = data });
+        } else {
+            const name = named orelse return notModelled(arena, "validateMessage with neither a name nor a schema");
+            const at = std.mem.indexOfScalar(u8, name, '@');
+            if (!isResourceName(name[0 .. at orelse name.len], "schemas")) return invalidName(arena, name);
+            const schema = f.schemas.get(name[0 .. at orelse name.len]) orelse return schemaNotFound(arena, name);
+            of = schema.type;
+            if (at) |i| {
+                const revision = schema.revision(name[i + 1 ..]) orelse return schemaNotFound(arena, name);
+                why = f.ask(.{ .schema = schema.name, .revision_id = &revision.id, .type = schema.type, .definition = revision.definition, .encoding = as, .data = data });
+            } else {
+                // Any revision will do, the newest first.
+                var i = schema.revisions.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const revision = &schema.revisions.items[i];
+                    why = f.ask(.{ .schema = schema.name, .revision_id = &revision.id, .type = schema.type, .definition = revision.definition, .encoding = as, .data = data });
+                    if (why == null) break;
+                }
+            }
+        }
+        const words = why orelse return ok("{}");
+        return refusalWith(arena, try std.fmt.allocPrint(arena, "Invalid data in message: {s}", .{words}), misfit(of, as), &.{});
+    }
+
+    fn ask(f: *const FakePubSub, check: SchemaCheck) ?[]const u8 {
+        const fits = f.options.fits orelse return null;
+        return fits.call(fits.context, check);
+    }
+
+    /// Tries a message published to a topic on the revisions the topic
+    /// allows, from the newest back, and answers the id of the first it
+    /// fits. With none, production's refusal names the last it tried.
+    fn fit(f: *FakePubSub, arena: Allocator, settings: SchemaSettings, data: []const u8) Allocator.Error!Parsed([]const u8) {
+        const schema = settings.schema;
+        if (schema.deleted) return .{ .refused = try fail(arena, 404, "NOT_FOUND", "The schema associated with the topic has been deleted.") };
+        var last: ?struct { id: []const u8, why: []const u8 } = null;
+        var i = schema.revisions.items.len;
+        while (i > 0) {
+            i -= 1;
+            const revision = &schema.revisions.items[i];
+            if (!settings.allows(revision.*)) continue;
+            const why = f.ask(.{ .schema = schema.name, .revision_id = &revision.id, .type = schema.type, .definition = revision.definition, .encoding = settings.encoding, .data = data }) orelse return .{ .ok = &revision.id };
+            last = .{ .id = &revision.id, .why = why };
+        }
+        const words = "Invalid data in message: Message failed schema validation.";
+        // Every revision of the topic's range deleted: production said
+        // no more than this. The probe did not keep the details.
+        const tried = last orelse return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", words) };
+        // Production names the schema by the project's number here; the
+        // fake has the id. The full stop after the reason is its own,
+        // after whatever the reason ends with.
+        const info = try std.fmt.allocPrint(arena, "Could not validate message with any schema revision for schema: {s}, last checked revision: revision_id={s} failed with status: Invalid data in message: {s}.", .{ schema.name, tried.id, tried.why });
+        return .{ .refused = try refusalWith(arena, words, misfit(schema.type, settings.encoding), &.{ .{ .key = "revisionInfo", .value = info }, .{ .key = "message", .value = "Message failed schema validation" } }) };
+    }
+
+    /// A topic's schema settings, from its JSON. With `change`, one of
+    /// the settings alone is taken from it, and the others from what the
+    /// topic has.
+    fn schemaSettingsOf(f: *FakePubSub, arena: Allocator, topic_name: []const u8, value: Value, change: ?struct { part: []const u8, of: ?SchemaSettings }) Allocator.Error!Parsed(SchemaSettings) {
+        const object = switch (value) {
+            .object => |o| o,
+            else => return .{ .refused = try badValue(arena, "schemaSettings") },
+        };
+        var text: struct { schema: []const u8 = "", encoding: ?Encoding = null, first: []const u8 = "", last: []const u8 = "" } = .{};
+        if (change) |c| {
+            if (c.of) |now| text = .{
+                .schema = now.schema.name,
+                .encoding = now.encoding,
+                .first = if (now.first) |b| &b.id else "",
+                .last = if (now.last) |b| &b.id else "",
+            };
+        }
+        const part: ?[]const u8 = if (change) |c| c.part else null;
+        if (part) |p| {
+            // What the mask names is taken from the body, or cleared.
+            if (sameField(p, "schema")) text.schema = "" else if (sameField(p, "encoding")) text.encoding = null else if (sameField(p, "firstRevisionId")) text.first = "" else if (sameField(p, "lastRevisionId")) text.last = "" else return .{ .refused = try unknownPath(arena, "UpdateTopicRequest", try std.fmt.allocPrint(arena, "schema_settings.{s}", .{p}), "Topic") };
+        }
+        var it = object.iterator();
+        while (it.next()) |field| {
+            const key = field.key_ptr.*;
+            const known = isAnyField(key, &.{ "schema", "encoding", "firstRevisionId", "lastRevisionId" });
+            if (!known) return .{ .refused = try unknownName(arena, key) };
+            if (part) |p| {
+                if (!sameField(p, key)) continue;
+            }
+            if (isField(key, "encoding")) {
+                text.encoding = switch (encodingOf(field.value_ptr.*)) {
+                    .ok => |e| e,
+                    .bad => return .{ .refused = try badValue(arena, key) },
+                };
+                continue;
+            }
+            const given = stringOf(field.value_ptr.*) orelse return .{ .refused = try badValue(arena, key) };
+            if (isField(key, "schema")) text.schema = given else if (isField(key, "firstRevisionId")) text.first = given else text.last = given;
+        }
+        const encoding = text.encoding orelse return .{ .refused = try bothNeeded(arena, topic_name) };
+        if (text.schema.len == 0) return .{ .refused = try bothNeeded(arena, topic_name) };
+        // A name with a revision after it is no name here.
+        if (std.mem.indexOfScalar(u8, text.schema, '@') != null) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "Request contains an invalid argument.") };
+        if (!isResourceName(text.schema, "schemas")) return .{ .refused = try invalidName(arena, text.schema) };
+        const schema = f.schemas.get(text.schema) orelse return .{ .refused = try schemaNotFound(arena, text.schema) };
+        var settings: SchemaSettings = .{ .schema = schema, .encoding = encoding };
+        inline for (.{ "first", "last" }) |end| {
+            const id = @field(text, end);
+            if (id.len > 0) {
+                // Production's words carry a number of its own for the
+                // schema, and no space after it; here it is the fake's.
+                const revision = schema.revision(id) orelse return .{ .refused = try fail(arena, 404, "NOT_FOUND", try std.fmt.allocPrint(arena, "Resource not found (resource=schema_id: {d}revision_id: {s}).", .{ schema.uid, id })) };
+                const bound = try f.store.allocator().create(SchemaSettings.Bound);
+                bound.* = .{ .id = revision.id, .number = revision.number };
+                @field(settings, end) = bound;
+            }
+        }
+        return .{ .ok = settings };
+    }
+
     // Replay: snapshots, seek and detach.
 
     fn createSnapshot(f: *FakePubSub, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
@@ -1748,24 +2326,41 @@ fn parseUrl(arena: Allocator, url: []const u8) Allocator.Error!?FakePubSub.Route
     }
     var parts = std.mem.splitScalar(u8, path, '/');
     const project = try percentDecode(arena, parts.next() orelse return null);
-    const collection_text = parts.next() orelse return null;
+    // A method on a collection itself follows its name after a colon:
+    // `schemas:validate`.
+    const collection_part = parts.next() orelse return null;
+    const colon_at = std.mem.indexOfScalar(u8, collection_part, ':') orelse collection_part.len;
+    const collection_text = collection_part[0..colon_at];
+    const method_on_all = collection_part[colon_at..];
     const collection: @FieldType(FakePubSub.Route, "collection") = if (std.mem.eql(u8, collection_text, "topics"))
         .topics
     else if (std.mem.eql(u8, collection_text, "subscriptions"))
         .subscriptions
     else if (std.mem.eql(u8, collection_text, "snapshots"))
         .snapshots
+    else if (std.mem.eql(u8, collection_text, "schemas"))
+        .schemas
     else
         return null;
-    const id_part = parts.next() orelse return .{ .project = project, .collection = collection, .id = "", .rest = "", .query = query };
+    const id_part = parts.next() orelse return .{ .project = project, .collection = collection, .id = "", .raw_id = "", .rest = method_on_all, .query = query };
+    if (method_on_all.len != 0) return null;
     const after = parts.rest();
     // A method follows the id after a colon: an id holds none.
     if (std.mem.indexOfScalar(u8, id_part, ':')) |colon| {
         if (after.len != 0) return null;
-        return .{ .project = project, .collection = collection, .id = try percentDecode(arena, id_part[0..colon]), .rest = id_part[colon..], .query = query };
+        return .{ .project = project, .collection = collection, .id = try percentDecode(arena, id_part[0..colon]), .raw_id = id_part[0..colon], .rest = id_part[colon..], .query = query };
     }
     const rest = if (after.len == 0) "" else try std.fmt.allocPrint(arena, "/{s}", .{after});
-    return .{ .project = project, .collection = collection, .id = try percentDecode(arena, id_part), .rest = rest, .query = query };
+    return .{ .project = project, .collection = collection, .id = try percentDecode(arena, id_part), .raw_id = id_part, .rest = rest, .query = query };
+}
+
+/// The value of one query parameter, decoded; null when it is not there.
+fn queryValue(arena: Allocator, query: []const u8, comptime key: []const u8) Allocator.Error!?[]const u8 {
+    var parts = std.mem.splitScalar(u8, query, '&');
+    while (parts.next()) |part| {
+        if (std.mem.startsWith(u8, part, key ++ "=")) return try percentDecode(arena, part[key.len + 1 ..]);
+    }
+    return null;
 }
 
 fn percentDecode(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
@@ -2321,6 +2916,168 @@ fn writeExactlyOnceRefusal(jw: *Stringify, ids: []const []const u8) Stringify.Er
     try jw.endObject();
 }
 
+/// A schema that is not there, or a revision of one: production names
+/// the whole of what was asked for, where for a topic it names the id.
+fn schemaNotFound(arena: Allocator, asked: []const u8) Allocator.Error!FakePubSub.Reply {
+    return fail(arena, 404, "NOT_FOUND", try std.fmt.allocPrint(arena, "Resource not found (resource={s}).", .{asked}));
+}
+
+fn bothNeeded(arena: Allocator, topic_name: []const u8) Allocator.Error!FakePubSub.Reply {
+    return fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Schema settings for the topic {s} must include both the name and the encoding.", .{topic_name}));
+}
+
+/// A schema holds twenty revisions: production refused the next.
+fn revisionsFull(arena: Allocator, schema: *const FakePubSub.Schema) Allocator.Error!?FakePubSub.Reply {
+    if (schema.revisions.items.len < 20) return null;
+    return try fail(arena, 429, "RESOURCE_EXHAUSTED", try std.fmt.allocPrint(arena, "You have exceeded your revisions per schema quota (schema=\"{s}\"). Refer to https://cloud.google.com/pubsub/quotas for more information.", .{schema.name}));
+}
+
+/// The reason production gives for a message that fits no revision.
+fn misfit(of: FakePubSub.SchemaType, as: FakePubSub.Encoding) []const u8 {
+    return switch (of) {
+        .avro => if (as == .json) "INVALID_JSON_AVRO_MESSAGE" else "INVALID_BINARY_AVRO_MESSAGE",
+        .protocol_buffer => if (as == .json) "INVALID_JSON_PROTO_MESSAGE" else "INVALID_BINARY_PROTO_MESSAGE",
+    };
+}
+
+fn encodingName(encoding: FakePubSub.Encoding) []const u8 {
+    return if (encoding == .json) "JSON" else "BINARY";
+}
+
+/// An encoding as JSON names it. None, and the one that says none, are
+/// null.
+fn encodingOf(value: Value) union(enum) { ok: ?FakePubSub.Encoding, bad } {
+    const text = stringOf(value) orelse return .bad;
+    if (std.mem.eql(u8, text, "JSON")) return .{ .ok = .json };
+    if (std.mem.eql(u8, text, "BINARY")) return .{ .ok = .binary };
+    if (std.mem.eql(u8, text, "ENCODING_UNSPECIFIED")) return .{ .ok = null };
+    return .bad;
+}
+
+/// The part of a mask path under `parent`: `encoding` of
+/// `schemaSettings.encoding`, in either spelling.
+fn partOf(path: []const u8, comptime parent: []const u8) ?[]const u8 {
+    const dot = std.mem.indexOfScalar(u8, path, '.') orelse return null;
+    return if (sameField(path[0..dot], parent)) path[dot + 1 ..] else null;
+}
+
+/// How much of a schema a read asks for.
+fn viewOf(arena: Allocator, query: []const u8) Allocator.Error!Parsed(enum { unsaid, basic, full }) {
+    const text = (try queryValue(arena, query, "view")) orelse return .{ .ok = .unsaid };
+    if (std.mem.eql(u8, text, "BASIC")) return .{ .ok = .basic };
+    if (std.mem.eql(u8, text, "FULL")) return .{ .ok = .full };
+    if (std.mem.eql(u8, text, "SCHEMA_VIEW_UNSPECIFIED")) return .{ .ok = .unsaid };
+    return .{ .refused = try badValue(arena, "view") };
+}
+
+const GivenSchema = struct { type: FakePubSub.SchemaType, definition: []const u8 };
+
+/// A schema as a create, a commit, a validate or a validateMessage gives
+/// one, checked as far as the fake reads one: its type, its size, and
+/// that an Avro definition is JSON.
+fn schemaOf(arena: Allocator, value: Value) Allocator.Error!Parsed(GivenSchema) {
+    const object = switch (value) {
+        .object => |o| o,
+        else => return .{ .refused = try badValue(arena, "schema") },
+    };
+    var kind: ?FakePubSub.SchemaType = null;
+    var definition: []const u8 = "";
+    var it = object.iterator();
+    while (it.next()) |field| {
+        const key = field.key_ptr.*;
+        if (isField(key, "type")) {
+            const text = stringOf(field.value_ptr.*) orelse return .{ .refused = try badValue(arena, key) };
+            kind = if (std.mem.eql(u8, text, "AVRO")) .avro else if (std.mem.eql(u8, text, "PROTOCOL_BUFFER")) .protocol_buffer else if (std.mem.eql(u8, text, "TYPE_UNSPECIFIED")) null else return .{ .refused = try badValue(arena, key) };
+        } else if (isField(key, "definition")) {
+            definition = stringOf(field.value_ptr.*) orelse return .{ .refused = try badValue(arena, key) };
+        } else if (!isAnyField(key, &.{ "name", "revisionId", "revisionCreateTime" })) return .{ .refused = try unknownName(arena, key) };
+    }
+    const of = kind orelse return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "The schema's type must be specified.") };
+    // 307,200 bytes were taken, and one more refused in these words.
+    if (definition.len > 307_200) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "Request contains an invalid argument.") };
+    if (of == .avro) {
+        if (definition.len == 0) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "Invalid schema definition: Avro schema did not specify a text definition: .") };
+        if (!(std.json.validate(arena, definition) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        })) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "AVRO schema definition is not valid: Tried to parse invalid JSON.") };
+    }
+    return .{ .ok = .{ .type = of, .definition = definition } };
+}
+
+/// A refusal with production's `ErrorInfo` beside it: a reason, and what
+/// it has to say of it.
+fn refusalWith(arena: Allocator, message: []const u8, reason: []const u8, metadata: []const FakePubSub.Label) Allocator.Error!FakePubSub.Reply {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeRefusalWith(&jw, message, reason, metadata) catch return error.OutOfMemory;
+    return .{ .status = 400, .body = out.written() };
+}
+
+fn writeRefusalWith(jw: *Stringify, message: []const u8, reason: []const u8, metadata: []const FakePubSub.Label) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("error");
+    try jw.beginObject();
+    try jw.objectField("code");
+    try jw.write(400);
+    try jw.objectField("message");
+    try jw.write(message);
+    try jw.objectField("status");
+    try jw.write("INVALID_ARGUMENT");
+    try jw.objectField("details");
+    try jw.beginArray();
+    try jw.beginObject();
+    try jw.objectField("@type");
+    try jw.write("type.googleapis.com/google.rpc.ErrorInfo");
+    try jw.objectField("reason");
+    try jw.write(reason);
+    try jw.objectField("domain");
+    try jw.write("pubsub.googleapis.com");
+    if (metadata.len > 0) {
+        try jw.objectField("metadata");
+        try writeLabels(jw, metadata);
+    }
+    try jw.endObject();
+    try jw.endArray();
+    try jw.endObject();
+    try jw.endObject();
+}
+
+const SchemaShown = struct { definition: bool = true, revision_in_name: bool = false };
+
+fn renderSchema(arena: Allocator, schema: *const FakePubSub.Schema, revision: *const FakePubSub.Revision, shown: SchemaShown) Allocator.Error![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeSchema(&jw, schema, revision, shown) catch return error.OutOfMemory;
+    return out.written();
+}
+
+/// One revision of a schema, in the order production writes the fields.
+fn writeSchema(jw: *Stringify, schema: *const FakePubSub.Schema, revision: *const FakePubSub.Revision, shown: SchemaShown) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("name");
+    if (shown.revision_in_name) {
+        try jw.beginWriteRaw();
+        try jw.writer.writeByte('"');
+        try jw.writer.writeAll(schema.name);
+        try jw.writer.writeByte('@');
+        try jw.writer.writeAll(&revision.id);
+        try jw.writer.writeByte('"');
+        jw.endWriteRaw();
+    } else try jw.write(schema.name);
+    try jw.objectField("type");
+    try jw.write(if (schema.type == .avro) "AVRO" else "PROTOCOL_BUFFER");
+    if (shown.definition) {
+        try jw.objectField("definition");
+        try jw.write(revision.definition);
+    }
+    try jw.objectField("revisionId");
+    try jw.write(&revision.id);
+    var time_buf: [timestamp.max_len]u8 = undefined;
+    try jw.objectField("revisionCreateTime");
+    try jw.write(timestamp.format(&time_buf, revision.created));
+    try jw.endObject();
+}
+
 fn detachedRefusal(arena: Allocator) Allocator.Error!FakePubSub.Reply {
     return fail(arena, 400, "FAILED_PRECONDITION", "This method is not supported on detached subscriptions.");
 }
@@ -2359,6 +3116,23 @@ fn writeTopic(jw: *Stringify, topic: *const FakePubSub.Topic) Stringify.Error!vo
     if (topic.kms_key_name) |key| {
         try jw.objectField("kmsKeyName");
         try jw.write(key);
+    }
+    if (topic.schema) |settings| {
+        try jw.objectField("schemaSettings");
+        try jw.beginObject();
+        try jw.objectField("schema");
+        try jw.write(if (settings.schema.deleted) "_deleted-schema_" else settings.schema.name);
+        try jw.objectField("encoding");
+        try jw.write(encodingName(settings.encoding));
+        if (settings.first) |bound| {
+            try jw.objectField("firstRevisionId");
+            try jw.write(&bound.id);
+        }
+        if (settings.last) |bound| {
+            try jw.objectField("lastRevisionId");
+            try jw.write(&bound.id);
+        }
+        try jw.endObject();
     }
     if (topic.retention_s) |seconds| {
         try jw.objectField("messageRetentionDuration");
@@ -2685,8 +3459,8 @@ test "topics: made, read, changed and deleted, and refused in production's words
     try testing.expectError(error.NotFound, b.client.topic("orders").get());
     try testing.expectEqualStrings("Resource not found (resource=orders).", b.diag.message());
     // What is not modelled yet says so, and guesses nothing.
-    try testing.expectError(error.Unimplemented, b.client.topic("typed").create(.{ .schema = .{ .schema = "order", .encoding = .json } }));
-    try testing.expectEqualStrings("fake: schemaSettings is not modelled yet", b.diag.message());
+    try testing.expectError(error.Unimplemented, b.client.topic("changed").create(.{ .message_transforms = &.{.{ .kind = .{ .javascript_udf = .{ .function_name = "same", .code = "function same(message, metadata) { return message; }" } } }} }));
+    try testing.expectEqualStrings("fake: messageTransforms is not modelled yet", b.diag.message());
 }
 
 test "lists: in name order, in pages, with tokens only this fake gave" {
@@ -3113,7 +3887,7 @@ test "ack ids and pulls: what production refuses, in its words" {
     // Routes this fake has not got.
     try testing.expectEqual(501, (try b.raw(a, .POST, "projects/p/subscriptions/sub-a:modifyPushConfig", "{}")).status);
     try testing.expectEqual(501, (try b.raw(a, .GET, "projects/p/snapshots/snap:getIamPolicy", "")).status);
-    try testing.expectEqual(404, (try b.raw(a, .GET, "projects/p/schemas", "")).status);
+    try testing.expectEqual(404, (try b.raw(a, .GET, "projects/p/buckets", "")).status);
 }
 
 test "order: none without an ordering key, so a pull's is the fake's own unless asked for the published one" {
@@ -4858,6 +5632,547 @@ test "ids of one request: each is judged as the request finds it, before any of 
     try testing.expectEqual(2, b.fake.backlog("p", "morgue"));
 }
 
+/// A stand-in for reading schemas, for `Options.fits`: a message fits a
+/// revision when its data is written somewhere in the revision's
+/// definition. It says why not in words production used, and keeps count
+/// of what it was asked.
+const Judge = struct {
+    asked: usize = 0,
+    last_revision: [8]u8 = @splat(' '),
+    last_schema_len: usize = 0,
+
+    fn fits(j: *Judge) FakePubSub.Fits {
+        return .{ .context = j, .call = call };
+    }
+
+    fn call(context: ?*anyopaque, check: FakePubSub.SchemaCheck) ?[]const u8 {
+        const j: *Judge = @ptrCast(@alignCast(context.?));
+        j.asked += 1;
+        j.last_schema_len = check.schema.len;
+        if (check.revision_id.len == 8) j.last_revision = check.revision_id[0..8].*;
+        if (check.data.len == 0) return "Tried to parse invalid JSON.";
+        if (std.mem.indexOf(u8, check.definition, check.data) != null) return null;
+        return switch (check.encoding) {
+            .json => "JSON object with type string does not match schema which expected number_integer.",
+            .binary => if (check.type == .avro) "Invalid length: -62." else "Could not parse binary message.",
+        };
+    }
+};
+
+const two_fields = "{\"type\": \"record\", \"name\": \"M\", \"fields\": [{\"name\": \"name\", \"type\": \"string\"}, {\"name\": \"age\", \"type\": \"int\"}]}";
+const three_fields = "{\"type\": \"record\", \"name\": \"M\", \"fields\": [{\"name\": \"name\", \"type\": \"string\"}, {\"name\": \"age\", \"type\": \"int\"}, {\"name\": \"note\", \"type\": \"string\", \"default\": \"\"}]}";
+
+/// A schema as a request gives one: its type, and its definition as the
+/// JSON string it is.
+fn schemaBody(a: Allocator, kind: []const u8, definition: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "{{\"type\":\"{s}\",\"definition\":{s}}}", .{ kind, try Stringify.valueAlloc(a, definition, .{}) });
+}
+
+/// The `revisionId` of a schema in an answer.
+fn revisionOf(a: Allocator, body: []const u8) ![]const u8 {
+    const Shape = struct { revisionId: []const u8 };
+    return (try std.json.parseFromSliceLeaky(Shape, a, body, .{ .ignore_unknown_fields = true })).revisionId;
+}
+
+test "schemas: made, read, listed and deleted, as production answers" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    b.advance(39);
+    const quoted = try Stringify.valueAlloc(a, two_fields, .{});
+
+    // Production's answer, 2026-10-12, in the order it writes the fields.
+    // A revision's id is eight hex digits.
+    const made = (try b.raw(a, .POST, "projects/p/schemas?schemaId=zigps-avro", try schemaBody(a, "AVRO", two_fields))).body;
+    const first = try revisionOf(a, made);
+    try testing.expectEqual(8, first.len);
+    for (first) |c| try testing.expect(std.ascii.isDigit(c) or (c >= 'a' and c <= 'f'));
+    const whole = try std.fmt.allocPrint(a, "{{\"name\":\"projects/p/schemas/zigps-avro\",\"type\":\"AVRO\",\"definition\":{s},\"revisionId\":\"{s}\",\"revisionCreateTime\":\"1970-01-01T00:00:39Z\"}}", .{ quoted, first });
+    const basic = try std.fmt.allocPrint(a, "{{\"name\":\"projects/p/schemas/zigps-avro\",\"type\":\"AVRO\",\"revisionId\":\"{s}\",\"revisionCreateTime\":\"1970-01-01T00:00:39Z\"}}", .{first});
+    try testing.expectEqualStrings(whole, made);
+    // A get with no view answers the whole of it; a list does not.
+    try testing.expectEqualStrings(whole, (try b.raw(a, .GET, "projects/p/schemas/zigps-avro", "")).body);
+    try testing.expectEqualStrings(whole, (try b.raw(a, .GET, "projects/p/schemas/zigps-avro?view=FULL", "")).body);
+    try testing.expectEqualStrings(basic, (try b.raw(a, .GET, "projects/p/schemas/zigps-avro?view=BASIC", "")).body);
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{{\"schemas\":[{s}]}}", .{basic}), (try b.raw(a, .GET, "projects/p/schemas", "")).body);
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{{\"schemas\":[{s}]}}", .{whole}), (try b.raw(a, .GET, "projects/p/schemas?view=FULL&pageSize=5", "")).body);
+    try testing.expectEqual(400, (try b.raw(a, .GET, "projects/p/schemas?view=EVERYTHING", "")).status);
+    // Named with its revision, it reads under that name.
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "{{\"name\":\"projects/p/schemas/zigps-avro@{s}\",\"type\":\"AVRO\",\"definition\":{s},\"revisionId\":\"{s}\",\"revisionCreateTime\":\"1970-01-01T00:00:39Z\"}}", .{ first, quoted, first }),
+        (try b.raw(a, .GET, try std.fmt.allocPrint(a, "projects/p/schemas/zigps-avro@{s}?view=FULL", .{first}), "")).body,
+    );
+
+    // What a create refuses, in production's words. A schema that is
+    // there, or not, is named whole, where a topic is named by its id.
+    try expectRefused(try b.raw(a, .POST, "projects/p/schemas?schemaId=zigps-avro", try schemaBody(a, "AVRO", two_fields)), 409, "ALREADY_EXISTS", "Resource already exists in the project (resource=projects/p/schemas/zigps-avro).");
+    try expectRefused(try b.raw(a, .POST, "projects/p/schemas", "{\"name\":\"projects/p/schemas/zigps-x\",\"type\":\"AVRO\",\"definition\":\"\\\"string\\\"\"}"), 400, "INVALID_ARGUMENT", "Invalid resource name given (name=projects/p/schemas/). Refer to https://cloud.google.com/pubsub/docs/pubsub-basics#resource_names for more information.");
+    for ([_]struct { []const u8, []const u8 }{ .{ "ab", "ab" }, .{ "1abc", "1abc" }, .{ "goog-x", "goog-x" }, .{ "a%20b", "a b" }, .{ "a%2Fb", "a/b" }, .{ "a%40b", "a@b" } }) |id| {
+        try expectRefused(
+            try b.raw(a, .POST, try std.fmt.allocPrint(a, "projects/p/schemas?schemaId={s}", .{id[0]}), try schemaBody(a, "AVRO", two_fields)),
+            400,
+            "INVALID_ARGUMENT",
+            try std.fmt.allocPrint(a, "Invalid resource name given (name=projects/p/schemas/{s}). Refer to https://cloud.google.com/pubsub/docs/pubsub-basics#resource_names for more information.", .{id[1]}),
+        );
+    }
+    for ([_][]const u8{ "{\"definition\":\"\\\"string\\\"\"}", "{\"type\":\"TYPE_UNSPECIFIED\",\"definition\":\"\\\"string\\\"\"}" }) |body| {
+        try expectRefused(try b.raw(a, .POST, "projects/p/schemas?schemaId=zigps-bad", body), 400, "INVALID_ARGUMENT", "The schema's type must be specified.");
+    }
+    try expectRefused(try b.raw(a, .POST, "projects/p/schemas?schemaId=zigps-bad", "{\"type\":\"AVRO\"}"), 400, "INVALID_ARGUMENT", "Invalid schema definition: Avro schema did not specify a text definition: .");
+    try expectRefused(try b.raw(a, .POST, "projects/p/schemas?schemaId=zigps-bad", "{\"type\":\"AVRO\",\"definition\":\"{nope\"}"), 400, "INVALID_ARGUMENT", "AVRO schema definition is not valid: Tried to parse invalid JSON.");
+    try testing.expectEqual(400, (try b.raw(a, .POST, "projects/p/schemas?schemaId=zigps-bad", "{\"type\":\"THRIFT\",\"definition\":\"x\"}")).status);
+    try testing.expectEqual(404, (try b.raw(a, .GET, "projects/p/schemas/zigps-bad", "")).status);
+    // Production took 307,200 bytes of definition, and no more.
+    const most = try a.alloc(u8, 307_200);
+    @memset(most, 'x');
+    most[0] = '"';
+    most[most.len - 1] = '"';
+    try testing.expectEqual(200, (try b.raw(a, .POST, "projects/p/schemas?schemaId=zigps-most", try schemaBody(a, "AVRO", most))).status);
+    const over = try a.alloc(u8, 307_201);
+    @memset(over, 'x');
+    over[0] = '"';
+    over[over.len - 1] = '"';
+    try expectRefused(try b.raw(a, .POST, "projects/p/schemas?schemaId=zigps-over", try schemaBody(a, "AVRO", over)), 400, "INVALID_ARGUMENT", "Request contains an invalid argument.");
+    // An Avro definition is JSON, and one word of it will do. A Protocol
+    // Buffer one is kept as text, and not read: production refused this
+    // one, which does not parse.
+    try testing.expectEqual(200, (try b.raw(a, .POST, "projects/p/schemas?schemaId=zigps-word", "{\"type\":\"AVRO\",\"definition\":\"\\\"string\\\"\"}")).status);
+    try testing.expect(std.mem.startsWith(u8, (try b.raw(a, .POST, "projects/p/schemas?schemaId=zigps-proto", "{\"type\":\"PROTOCOL_BUFFER\",\"definition\":\"message {\"}")).body,
+        \\{"name":"projects/p/schemas/zigps-proto","type":"PROTOCOL_BUFFER","definition":"message {","revisionId":"
+    ));
+
+    // One that is not there, by its name or by a revision of it.
+    try expectRefused(try b.raw(a, .GET, "projects/p/schemas/zigps-absent", ""), 404, "NOT_FOUND", "Resource not found (resource=projects/p/schemas/zigps-absent).");
+    try expectRefused(try b.raw(a, .GET, "projects/p/schemas/zigps-avro@deadbeef", ""), 404, "NOT_FOUND", "Resource not found (resource=projects/p/schemas/zigps-avro@deadbeef).");
+    // The `@` sent as `%40` production does not read as one.
+    try expectRefused(try b.raw(a, .GET, try std.fmt.allocPrint(a, "projects/p/schemas/zigps-avro%40{s}?view=BASIC", .{first}), ""), 404, "NOT_FOUND", try std.fmt.allocPrint(a, "Resource not found (resource=projects/p/schemas/zigps-avro%40{s}).", .{first}));
+
+    // Through the client, and in pages, by name.
+    var created = try b.client.schema("orders-v1").create(.{ .type = .protocol_buffer, .definition = "syntax = \"proto3\";\nmessage M {\n  string name = 1;\n}\n" });
+    defer created.deinit();
+    try testing.expectEqualStrings("projects/p/schemas/orders-v1", created.value.name);
+    try testing.expectEqual(types.SchemaType.protocol_buffer, created.value.type);
+    try testing.expectEqualStrings("syntax = \"proto3\";\nmessage M {\n  string name = 1;\n}\n", created.value.definition);
+    try testing.expectEqual(std.Io.Timestamp{ .nanoseconds = 39 * std.time.ns_per_s }, created.value.revision_create_time.?);
+    var read = try b.client.schema("orders-v1").get(.{ .view = .basic });
+    defer read.deinit();
+    try testing.expectEqualStrings("", read.value.definition);
+    try testing.expectEqualStrings(created.value.revision_id, read.value.revision_id);
+    var page = try b.client.listSchemas(.{ .page = .{ .page_size = 2 } });
+    defer page.deinit();
+    try testing.expectEqual(2, page.value.schemas.len);
+    try testing.expectEqualStrings("projects/p/schemas/orders-v1", page.value.schemas[0].name);
+    try testing.expectEqualStrings("projects/p/schemas/zigps-avro", page.value.schemas[1].name);
+    var rest = try b.client.listSchemas(.{ .page = .{ .page_size = 2, .page_token = page.value.next_page_token.? }, .view = .full });
+    defer rest.deinit();
+    try testing.expectEqualStrings("projects/p/schemas/zigps-most", rest.value.schemas[0].name);
+    try testing.expectEqual(307_200, rest.value.schemas[0].definition.len);
+
+    // Deleted, it is gone, and its id is free: one made under it is new.
+    try testing.expectEqualStrings("{}", (try b.raw(a, .DELETE, "projects/p/schemas/zigps-avro", "")).body);
+    try expectRefused(try b.raw(a, .DELETE, "projects/p/schemas/zigps-avro", ""), 404, "NOT_FOUND", "Resource not found (resource=projects/p/schemas/zigps-avro).");
+    try testing.expectError(error.NotFound, b.client.schema("zigps-avro").get(.{}));
+    const again = (try b.raw(a, .POST, "projects/p/schemas?schemaId=zigps-avro", try schemaBody(a, "AVRO", two_fields))).body;
+    try testing.expect(!std.mem.eql(u8, first, try revisionOf(a, again)));
+    try b.client.schema("orders-v1").delete();
+    try testing.expectError(error.NotFound, b.client.schema("orders-v1").delete());
+}
+
+test "schema revisions: committed, rolled back, deleted and listed, with production's rules for each" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const name = "projects/p/schemas/zigps-rev";
+    const r1 = try revisionOf(a, (try b.raw(a, .POST, "projects/p/schemas?schemaId=zigps-rev", try schemaBody(a, "AVRO", two_fields))).body);
+    b.advance(4);
+    const commit = try std.fmt.allocPrint(a, "{{\"schema\":{{\"name\":\"{s}\",\"type\":\"AVRO\",\"definition\":{s}}}}}", .{ name, try Stringify.valueAlloc(a, three_fields, .{}) });
+
+    // A commit answers the new revision, under its own name.
+    const second = (try b.raw(a, .POST, "projects/p/schemas/zigps-rev:commit", commit)).body;
+    const r2 = try revisionOf(a, second);
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "{{\"name\":\"{s}@{s}\",\"type\":\"AVRO\",\"definition\":{s},\"revisionId\":\"{s}\",\"revisionCreateTime\":\"1970-01-01T00:00:04Z\"}}", .{ name, r2, try Stringify.valueAlloc(a, three_fields, .{}), r2 }),
+        second,
+    );
+    // The definition the schema already has makes one more revision.
+    const r3 = try revisionOf(a, (try b.raw(a, .POST, "projects/p/schemas/zigps-rev:commit", commit)).body);
+    try testing.expect(!std.mem.eql(u8, r2, r3) and !std.mem.eql(u8, r1, r3) and !std.mem.eql(u8, r1, r2));
+
+    // Production commits to the schema the body names, whatever the path
+    // says, and refuses a body that names none.
+    try testing.expectEqual(200, (try b.raw(a, .POST, "projects/p/schemas?schemaId=zigps-other", try schemaBody(a, "AVRO", two_fields))).status);
+    const elsewhere = (try b.raw(a, .POST, "projects/p/schemas/zigps-other:commit", commit)).body;
+    try testing.expect(std.mem.startsWith(u8, elsewhere, "{\"name\":\"projects/p/schemas/zigps-rev@"));
+    const r4 = try revisionOf(a, elsewhere);
+    try expectRefused(try b.raw(a, .POST, "projects/p/schemas/zigps-rev:commit", try std.fmt.allocPrint(a, "{{\"schema\":{s}}}", .{try schemaBody(a, "AVRO", three_fields)})), 400, "INVALID_ARGUMENT", "Invalid resource name given (name=). Refer to https://cloud.google.com/pubsub/docs/pubsub-basics#resource_names for more information.");
+    try expectRefused(try b.raw(a, .POST, "projects/p/schemas/zigps-absent:commit", "{\"schema\":{\"name\":\"projects/p/schemas/zigps-absent\",\"type\":\"AVRO\",\"definition\":\"\\\"string\\\"\"}}"), 404, "NOT_FOUND", "Resource not found (resource=projects/p/schemas/zigps-absent).");
+    // A revision of another type is refused against the one before it,
+    // in production's words, its unclosed quote and all. A definition
+    // that does not read is refused as on a create.
+    try expectRefused(
+        try b.raw(a, .POST, "projects/p/schemas/zigps-rev:commit", "{\"schema\":{\"name\":\"" ++ name ++ "\",\"type\":\"PROTOCOL_BUFFER\",\"definition\":\"syntax = \\\"proto3\\\";\"}}"),
+        400,
+        "FAILED_PRECONDITION",
+        try std.fmt.allocPrint(a, "Compatibility checking failed to commit a schema revision for (schema=\"{s}\"). (reason=\"Revision is incompatible with previous revision: {s}. Failed with error: Types do not match). Refer to https://cloud.google.com/pubsub/docs/schemas for more information.", .{ name, r4 }),
+    );
+    try expectRefused(try b.raw(a, .POST, "projects/p/schemas/zigps-rev:commit", "{\"schema\":{\"name\":\"" ++ name ++ "\",\"type\":\"AVRO\",\"definition\":\"{nope\"}}"), 400, "INVALID_ARGUMENT", "AVRO schema definition is not valid: Tried to parse invalid JSON.");
+
+    // Its revisions, the newest first, each under its own name, with no
+    // definition unless asked; in pages.
+    const Listed = struct { schemas: []const struct { name: []const u8, revisionId: []const u8, definition: []const u8 = "" }, nextPageToken: []const u8 = "" };
+    const listed = try std.json.parseFromSliceLeaky(Listed, a, (try b.raw(a, .GET, "projects/p/schemas/zigps-rev:listRevisions", "")).body, .{ .ignore_unknown_fields = true });
+    try testing.expectEqual(4, listed.schemas.len);
+    for (listed.schemas, [_][]const u8{ r4, r3, r2, r1 }) |entry, id| {
+        try testing.expectEqualStrings(id, entry.revisionId);
+        try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}@{s}", .{ name, id }), entry.name);
+        try testing.expectEqualStrings("", entry.definition);
+    }
+    var token: []const u8 = "";
+    for ([_][]const u8{ r4, r3, r2, r1 }, 0..) |id, i| {
+        const one = try std.json.parseFromSliceLeaky(Listed, a, (try b.raw(a, .GET, try std.fmt.allocPrint(a, "projects/p/schemas/zigps-rev:listRevisions?view=FULL&pageSize=1&pageToken={s}", .{token}), "")).body, .{ .ignore_unknown_fields = true });
+        try testing.expectEqual(1, one.schemas.len);
+        try testing.expectEqualStrings(id, one.schemas[0].revisionId);
+        try testing.expectEqualStrings(if (i == 3) two_fields else three_fields, one.schemas[0].definition);
+        // The last page has no token.
+        try testing.expectEqual(i == 3, one.nextPageToken.len == 0);
+        token = one.nextPageToken;
+    }
+    try expectRefused(try b.raw(a, .GET, "projects/p/schemas/zigps-absent:listRevisions", ""), 404, "NOT_FOUND", "Resource not found (resource=projects/p/schemas/zigps-absent).");
+    // By its bare name a schema reads as its latest revision, and a
+    // project's list holds it as that one.
+    try testing.expectEqualStrings(r4, try revisionOf(a, (try b.raw(a, .GET, "projects/p/schemas/zigps-rev", "")).body));
+    const of_project = try std.json.parseFromSliceLeaky(Listed, a, (try b.raw(a, .GET, "projects/p/schemas?view=FULL", "")).body, .{ .ignore_unknown_fields = true });
+    try testing.expectEqual(2, of_project.schemas.len);
+    try testing.expectEqualStrings(name, of_project.schemas[1].name);
+    try testing.expectEqualStrings(r4, of_project.schemas[1].revisionId);
+    try testing.expectEqualStrings(three_fields, of_project.schemas[1].definition);
+
+    // A rollback makes a new revision that holds the old definition.
+    b.advance(1);
+    const back = (try b.raw(a, .POST, "projects/p/schemas/zigps-rev:rollback", try std.fmt.allocPrint(a, "{{\"revisionId\":\"{s}\"}}", .{r1}))).body;
+    const r5 = try revisionOf(a, back);
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "{{\"name\":\"{s}@{s}\",\"type\":\"AVRO\",\"definition\":{s},\"revisionId\":\"{s}\",\"revisionCreateTime\":\"1970-01-01T00:00:05Z\"}}", .{ name, r5, try Stringify.valueAlloc(a, two_fields, .{}), r5 }),
+        back,
+    );
+    // To one that is not there, production names the schema; to the
+    // latest, it refuses.
+    try expectRefused(try b.raw(a, .POST, "projects/p/schemas/zigps-rev:rollback", "{\"revisionId\":\"deadbeef\"}"), 404, "NOT_FOUND", "Resource not found (resource=projects/p/schemas/zigps-rev).");
+    try expectRefused(try b.raw(a, .POST, "projects/p/schemas/zigps-absent:rollback", "{\"revisionId\":\"deadbeef\"}"), 404, "NOT_FOUND", "Resource not found (resource=projects/p/schemas/zigps-absent).");
+    try expectRefused(try b.raw(a, .POST, "projects/p/schemas/zigps-rev:rollback", try std.fmt.allocPrint(a, "{{\"revisionId\":\"{s}\"}}", .{r5})), 400, "FAILED_PRECONDITION", "Cannot rollback to the latest revision: (schema=\"projects/p/schemas/zigps-rev\"). Refer to https://cloud.google.com/pubsub/docs/schemas for more information.");
+
+    // A revision deleted is answered without its definition. Then it is
+    // gone, to a second delete and to a read.
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "{{\"name\":\"{s}@{s}\",\"type\":\"AVRO\",\"revisionId\":\"{s}\",\"revisionCreateTime\":\"1970-01-01T00:00:04Z\"}}", .{ name, r2, r2 }),
+        (try b.raw(a, .DELETE, try std.fmt.allocPrint(a, "projects/p/schemas/zigps-rev@{s}:deleteRevision", .{r2}), "")).body,
+    );
+    for ([_]tp.Method{ .DELETE, .GET }) |method| {
+        try expectRefused(try b.raw(a, method, try std.fmt.allocPrint(a, "projects/p/schemas/zigps-rev@{s}{s}", .{ r2, if (method == .DELETE) ":deleteRevision" else "" }), ""), 404, "NOT_FOUND", try std.fmt.allocPrint(a, "Resource not found (resource={s}@{s}).", .{ name, r2 }));
+    }
+    try testing.expectEqual(4, std.mem.count(u8, (try b.raw(a, .GET, "projects/p/schemas/zigps-rev:listRevisions", "")).body, "\"revisionId\""));
+    // The revision goes in the path: with none there, production refuses.
+    for ([_][]const u8{ "projects/p/schemas/zigps-rev:deleteRevision", "projects/p/schemas/zigps-rev:deleteRevision?revisionId=deadbeef" }) |path| {
+        try expectRefused(try b.raw(a, .DELETE, path, ""), 400, "INVALID_ARGUMENT", "Request contains an invalid argument.");
+    }
+    // A schema's only revision goes with the schema, and no other way.
+    const only = try revisionOf(a, (try b.raw(a, .POST, "projects/p/schemas?schemaId=zigps-one", try schemaBody(a, "AVRO", two_fields))).body);
+    try expectRefused(
+        try b.raw(a, .DELETE, try std.fmt.allocPrint(a, "projects/p/schemas/zigps-one@{s}:deleteRevision", .{only}), ""),
+        400,
+        "FAILED_PRECONDITION",
+        try std.fmt.allocPrint(a, "This schema contains only one revision, which can only be deleted by deleting the parent schema: (schema=\"projects/p/schemas/zigps-one@{s}\"). Refer to https://cloud.google.com/pubsub/docs/schemas for more information.", .{only}),
+    );
+
+    // A schema holds twenty revisions: the twenty-first is refused, by a
+    // commit and by a rollback, until one is deleted.
+    const twenty = b.client.schema("zigps-twenty");
+    var first_of_twenty = try twenty.create(.{ .type = .avro, .definition = "\"string\"" });
+    defer first_of_twenty.deinit();
+    for (0..19) |_| {
+        var more = try twenty.commit(.{ .type = .avro, .definition = "\"string\"" });
+        more.deinit();
+    }
+    try expectRefused(try b.raw(a, .POST, "projects/p/schemas/zigps-twenty:commit", "{\"schema\":{\"name\":\"projects/p/schemas/zigps-twenty\",\"type\":\"AVRO\",\"definition\":\"\\\"string\\\"\"}}"), 429, "RESOURCE_EXHAUSTED", "You have exceeded your revisions per schema quota (schema=\"projects/p/schemas/zigps-twenty\"). Refer to https://cloud.google.com/pubsub/quotas for more information.");
+    try testing.expectError(error.ResourceExhausted, twenty.rollback(first_of_twenty.value.revision_id));
+    try twenty.deleteRevision(first_of_twenty.value.revision_id);
+    var one_more = try twenty.commit(.{ .type = .avro, .definition = "\"string\"" });
+    defer one_more.deinit();
+    var revisions = try twenty.listRevisions(.{});
+    defer revisions.deinit();
+    try testing.expectEqual(20, revisions.value.schemas.len);
+    try testing.expectEqualStrings(one_more.value.revision_id, revisions.value.schemas[0].revision_id);
+}
+
+test "validate and validateMessage: a definition is checked as far as the fake reads one, and whether a message fits is the test's to say" {
+    var judge: Judge = .{};
+    var b: Bench = undefined;
+    try b.init(.{ .fits = judge.fits() });
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const validate = "projects/p/schemas:validate";
+    const message = "projects/p/schemas:validateMessage";
+
+    try testing.expectEqualStrings("{}", (try b.raw(a, .POST, validate, try std.fmt.allocPrint(a, "{{\"schema\":{s}}}", .{try schemaBody(a, "AVRO", two_fields)}))).body);
+    try testing.expectEqualStrings("{}", (try b.raw(a, .POST, validate, "{\"schema\":{\"type\":\"PROTOCOL_BUFFER\",\"definition\":\"syntax = \\\"proto3\\\";\\nmessage M { string name = 1; }\\n\"}}")).body);
+    try expectRefused(try b.raw(a, .POST, validate, "{\"schema\":{\"type\":\"AVRO\",\"definition\":\"{nope\"}}"), 400, "INVALID_ARGUMENT", "AVRO schema definition is not valid: Tried to parse invalid JSON.");
+    try expectRefused(try b.raw(a, .POST, validate, "{\"schema\":{\"definition\":\"\\\"string\\\"\"}}"), 400, "INVALID_ARGUMENT", "The schema's type must be specified.");
+    try expectRefused(try b.raw(a, .POST, validate, "{}"), 400, "INVALID_ARGUMENT", "The schema's type must be specified.");
+    try testing.expectEqual(0, judge.asked);
+    // Nothing is kept of a schema that was only looked at.
+    try testing.expectEqualStrings("{}", (try b.raw(a, .GET, "projects/p/schemas", "")).body);
+
+    const r1 = try revisionOf(a, (try b.raw(a, .POST, "projects/p/schemas?schemaId=zigps-avro", try schemaBody(a, "AVRO", two_fields))).body);
+    const r2 = try revisionOf(a, (try b.raw(a, .POST, "projects/p/schemas/zigps-avro:commit", try std.fmt.allocPrint(a, "{{\"schema\":{{\"name\":\"projects/p/schemas/zigps-avro\",\"type\":\"AVRO\",\"definition\":{s}}}}}", .{try Stringify.valueAlloc(a, three_fields, .{})}))).body);
+    // A method on all schemas takes no id after it.
+    try expectRefused(try b.raw(a, .GET, "projects/p/schemas:validate/zigps-avro", ""), 404, "NOT_FOUND", "fake: no such route");
+    const named = "\"name\":\"projects/p/schemas/zigps-avro\"";
+    // "age" is in both revisions: the newest is asked, and that is all.
+    try testing.expectEqualStrings("{}", (try b.raw(a, .POST, message, "{" ++ named ++ ",\"message\":\"YWdl\",\"encoding\":\"JSON\"}")).body);
+    try testing.expectEqual(1, judge.asked);
+    try testing.expectEqualStrings(r2, &judge.last_revision);
+    // "int\"}]" ends the first alone: the newest is asked, then the older.
+    try testing.expectEqualStrings("{}", (try b.raw(a, .POST, message, "{" ++ named ++ ",\"message\":\"aW50In1d\",\"encoding\":\"BINARY\"}")).body);
+    try testing.expectEqual(3, judge.asked);
+    try testing.expectEqualStrings(r1, &judge.last_revision);
+    // One that fits none is refused in production's body, with the
+    // reason its type and its encoding give.
+    try testing.expectEqualStrings(
+        \\{"error":{"code":400,"message":"Invalid data in message: JSON object with type string does not match schema which expected number_integer.","status":"INVALID_ARGUMENT","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"INVALID_JSON_AVRO_MESSAGE","domain":"pubsub.googleapis.com"}]}}
+    , (try b.raw(a, .POST, message, "{" ++ named ++ ",\"message\":\"b25l\",\"encoding\":\"JSON\"}")).body);
+    try testing.expectEqualStrings(
+        \\{"error":{"code":400,"message":"Invalid data in message: Invalid length: -62.","status":"INVALID_ARGUMENT","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"INVALID_BINARY_AVRO_MESSAGE","domain":"pubsub.googleapis.com"}]}}
+    , (try b.raw(a, .POST, message, "{" ++ named ++ ",\"message\":\"b25l\",\"encoding\":\"BINARY\"}")).body);
+
+    // Against one revision, named after an `@`.
+    judge.asked = 0;
+    try testing.expectEqual(400, (try b.raw(a, .POST, message, try std.fmt.allocPrint(a, "{{\"name\":\"projects/p/schemas/zigps-avro@{s}\",\"message\":\"bm90ZQ==\",\"encoding\":\"JSON\"}}", .{r1}))).status);
+    try testing.expectEqual(200, (try b.raw(a, .POST, message, try std.fmt.allocPrint(a, "{{\"name\":\"projects/p/schemas/zigps-avro@{s}\",\"message\":\"bm90ZQ==\",\"encoding\":\"JSON\"}}", .{r2}))).status);
+    try testing.expectEqual(2, judge.asked);
+    try expectRefused(try b.raw(a, .POST, message, "{\"name\":\"projects/p/schemas/zigps-avro@deadbeef\",\"message\":\"YWdl\",\"encoding\":\"JSON\"}"), 404, "NOT_FOUND", "Resource not found (resource=projects/p/schemas/zigps-avro@deadbeef).");
+    try expectRefused(try b.raw(a, .POST, message, "{\"name\":\"projects/p/schemas/zigps-absent\",\"message\":\"YWdl\",\"encoding\":\"JSON\"}"), 404, "NOT_FOUND", "Resource not found (resource=projects/p/schemas/zigps-absent).");
+    try testing.expectEqual(400, (try b.raw(a, .POST, message, "{\"name\":\"zigps-avro\",\"message\":\"YWdl\",\"encoding\":\"JSON\"}")).status);
+    // Against a schema given whole, which has no name and no revision.
+    try testing.expectEqualStrings("{}", (try b.raw(a, .POST, message, "{\"schema\":{\"type\":\"PROTOCOL_BUFFER\",\"definition\":\"message M { string name = 1; }\"},\"message\":\"bmFtZQ==\",\"encoding\":\"BINARY\"}")).body);
+    try testing.expectEqual(0, judge.last_schema_len);
+    try testing.expectEqualStrings(
+        \\{"error":{"code":400,"message":"Invalid data in message: Could not parse binary message.","status":"INVALID_ARGUMENT","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"INVALID_BINARY_PROTO_MESSAGE","domain":"pubsub.googleapis.com"}]}}
+    , (try b.raw(a, .POST, message, "{\"schema\":{\"type\":\"PROTOCOL_BUFFER\",\"definition\":\"message M { string name = 1; }\"},\"message\":\"////\",\"encoding\":\"BINARY\"}")).body);
+    try expectRefused(try b.raw(a, .POST, message, "{\"schema\":{\"type\":\"AVRO\",\"definition\":\"{nope\"},\"message\":\"YWdl\",\"encoding\":\"JSON\"}"), 400, "INVALID_ARGUMENT", "AVRO schema definition is not valid: Tried to parse invalid JSON.");
+    // No encoding, or the one that says none.
+    for ([_][]const u8{ "", ",\"encoding\":\"ENCODING_UNSPECIFIED\"" }) |encoding| {
+        try expectRefused(try b.raw(a, .POST, message, try std.fmt.allocPrint(a, "{{" ++ named ++ ",\"message\":\"YWdl\"{s}}}", .{encoding})), 400, "INVALID_ARGUMENT", "You have passed an invalid argument to the service (argument=Invalid message encoding type: ENCODING_UNSPECIFIED).");
+    }
+    try testing.expectEqual(501, (try b.raw(a, .POST, message, "{\"message\":\"YWdl\",\"encoding\":\"JSON\"}")).status);
+
+    // Through the client. And with nothing to ask, every message fits.
+    try b.client.validateSchema(.{ .type = .avro, .definition = two_fields });
+    try testing.expectError(error.InvalidArgument, b.client.validateSchema(.{ .type = .avro, .definition = "{nope" }));
+    try b.client.schema("zigps-avro").validateMessage("note", .json, null);
+    try testing.expectError(error.InvalidArgument, b.client.schema("zigps-avro").validateMessage("note", .json, r1));
+    try testing.expectError(error.InvalidArgument, b.client.schema("zigps-avro").validateMessage("one", .json, null));
+    try b.client.validateMessage(.{ .type = .avro, .definition = two_fields }, "age", .binary);
+    var plain: Bench = undefined;
+    try plain.init(.{});
+    defer plain.deinit();
+    var made = try plain.client.schema("anything").create(.{ .type = .avro, .definition = "\"string\"" });
+    made.deinit();
+    try plain.client.schema("anything").validateMessage("whatever", .binary, null);
+}
+
+test "a topic's schema: its settings as production reads and refuses them, and its messages marked with the revision they fit" {
+    var judge: Judge = .{};
+    var b: Bench = undefined;
+    try b.init(.{ .shuffle = false, .fits = judge.fits() });
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const r1 = try revisionOf(a, (try b.raw(a, .POST, "projects/p/schemas?schemaId=zigps-avro", try schemaBody(a, "AVRO", two_fields))).body);
+    try testing.expectEqual(200, (try b.raw(a, .POST, "projects/p/schemas?schemaId=zigps-proto", "{\"type\":\"PROTOCOL_BUFFER\",\"definition\":\"message M { string name = 1; }\"}")).status);
+    const avro = "\"schema\":\"projects/p/schemas/zigps-avro\"";
+
+    // Production's answers, 2026-10-12.
+    const as_json =
+        \\{"name":"projects/p/topics/zigps-json","schemaSettings":{"schema":"projects/p/schemas/zigps-avro","encoding":"JSON"}}
+    ;
+    try testing.expectEqualStrings(as_json, (try b.raw(a, .PUT, "projects/p/topics/zigps-json", "{\"schemaSettings\":{" ++ avro ++ ",\"encoding\":\"JSON\"}}")).body);
+    try testing.expectEqualStrings(as_json, (try b.raw(a, .GET, "projects/p/topics/zigps-json", "")).body);
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/topics/zigps-pbin","schemaSettings":{"schema":"projects/p/schemas/zigps-proto","encoding":"BINARY"}}
+    , (try b.raw(a, .PUT, "projects/p/topics/zigps-pbin", "{\"schemaSettings\":{\"schema\":\"projects/p/schemas/zigps-proto\",\"encoding\":\"BINARY\"}}")).body);
+    // A range of revisions, in the order production writes the four. The
+    // settings come after the key, and before the retention.
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "{{\"name\":\"projects/p/topics/zigps-range\",\"kmsKeyName\":\"k\",\"schemaSettings\":{{\"schema\":\"projects/p/schemas/zigps-avro\",\"encoding\":\"JSON\",\"firstRevisionId\":\"{s}\",\"lastRevisionId\":\"{s}\"}},\"messageRetentionDuration\":\"600s\"}}", .{ r1, r1 }),
+        (try b.raw(a, .PUT, "projects/p/topics/zigps-range", try std.fmt.allocPrint(a, "{{\"messageRetentionDuration\":\"600s\",\"kmsKeyName\":\"k\",\"schemaSettings\":{{" ++ avro ++ ",\"encoding\":\"JSON\",\"firstRevisionId\":\"{s}\",\"lastRevisionId\":\"{s}\"}}}}", .{ r1, r1 }))).body,
+    );
+    // What a create refuses.
+    const both = "Schema settings for the topic projects/p/topics/zigps-bad must include both the name and the encoding.";
+    for ([_]struct { []const u8, u16, []const u8, []const u8 }{
+        .{ "{" ++ avro ++ "}", 400, "INVALID_ARGUMENT", both },
+        .{ "{\"encoding\":\"JSON\"}", 400, "INVALID_ARGUMENT", both },
+        .{ "{" ++ avro ++ ",\"encoding\":\"ENCODING_UNSPECIFIED\"}", 400, "INVALID_ARGUMENT", both },
+        .{ "{\"schema\":\"projects/p/schemas/zigps-absent\",\"encoding\":\"JSON\"}", 404, "NOT_FOUND", "Resource not found (resource=projects/p/schemas/zigps-absent)." },
+        .{ "{\"schema\":\"zigps-avro\",\"encoding\":\"JSON\"}", 400, "INVALID_ARGUMENT", "Invalid resource name given (name=zigps-avro). Refer to https://cloud.google.com/pubsub/docs/pubsub-basics#resource_names for more information." },
+        .{ try std.fmt.allocPrint(a, "{{\"schema\":\"projects/p/schemas/zigps-avro@{s}\",\"encoding\":\"JSON\"}}", .{r1}), 400, "INVALID_ARGUMENT", "Request contains an invalid argument." },
+        // Production names the schema here by a number of its own, with
+        // no space after it. The fake's number is its own too.
+        .{ "{" ++ avro ++ ",\"encoding\":\"JSON\",\"firstRevisionId\":\"deadbeef\"}", 404, "NOT_FOUND", "Resource not found (resource=schema_id: 1revision_id: deadbeef)." },
+        .{ "{" ++ avro ++ ",\"encoding\":\"JSON\",\"lastRevisionId\":\"deadbeef\"}", 404, "NOT_FOUND", "Resource not found (resource=schema_id: 1revision_id: deadbeef)." },
+    }) |case| {
+        try expectRefused(try b.raw(a, .PUT, "projects/p/topics/zigps-bad", try std.fmt.allocPrint(a, "{{\"schemaSettings\":{s}}}", .{case[0]})), case[1], case[2], case[3]);
+    }
+    try testing.expectEqual(400, (try b.raw(a, .PUT, "projects/p/topics/zigps-bad", "{\"schemaSettings\":{" ++ avro ++ ",\"encoding\":\"XML\"}}")).status);
+    try testing.expectEqual(404, (try b.raw(a, .GET, "projects/p/topics/zigps-bad", "")).status);
+
+    // Updates. The settings whole, in either spelling of the mask.
+    const patch = "projects/p/topics/zigps-json";
+    const as_binary =
+        \\{"name":"projects/p/topics/zigps-json","schemaSettings":{"schema":"projects/p/schemas/zigps-avro","encoding":"BINARY"}}
+    ;
+    try testing.expectEqualStrings(as_binary, (try b.raw(a, .PATCH, patch, "{\"topic\":{\"schemaSettings\":{" ++ avro ++ ",\"encoding\":\"BINARY\"}},\"updateMask\":\"schemaSettings\"}")).body);
+    // One of them: the rest stays, whatever the body holds beside it.
+    try testing.expectEqualStrings(as_json, (try b.raw(a, .PATCH, patch, "{\"topic\":{\"schemaSettings\":{\"schema\":\"projects/p/schemas/zigps-proto\",\"encoding\":\"JSON\"}},\"updateMask\":\"schemaSettings.encoding\"}")).body);
+    try testing.expectEqualStrings(as_binary, (try b.raw(a, .PATCH, patch, "{\"topic\":{\"schemaSettings\":{" ++ avro ++ ",\"encoding\":\"BINARY\"}},\"updateMask\":\"schema_settings\"}")).body);
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/topics/zigps-json","schemaSettings":{"schema":"projects/p/schemas/zigps-proto","encoding":"BINARY"}}
+    , (try b.raw(a, .PATCH, patch, "{\"topic\":{\"schemaSettings\":{\"schema\":\"projects/p/schemas/zigps-proto\"}},\"updateMask\":\"schema_settings.schema\"}")).body);
+    // A refused update changes nothing.
+    try expectRefused(try b.raw(a, .PATCH, patch, "{\"topic\":{\"schemaSettings\":{" ++ avro ++ "}},\"updateMask\":\"schemaSettings\"}"), 400, "INVALID_ARGUMENT", "Schema settings for the topic projects/p/topics/zigps-json must include both the name and the encoding.");
+    try expectRefused(try b.raw(a, .PATCH, patch, "{\"topic\":{\"schemaSettings\":{}},\"updateMask\":\"schemaSettings.encoding\"}"), 400, "INVALID_ARGUMENT", "Schema settings for the topic projects/p/topics/zigps-json must include both the name and the encoding.");
+    try testing.expectEqual(400, (try b.raw(a, .PATCH, patch, "{\"topic\":{\"schemaSettings\":{}},\"updateMask\":\"schemaSettings.nonsense\"}")).status);
+    try testing.expect(std.mem.indexOf(u8, (try b.raw(a, .GET, patch, "")).body, "zigps-proto\",\"encoding\":\"BINARY\"") != null);
+    // With none in the body the topic has no schema, and takes one again.
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/zigps-json\"}", (try b.raw(a, .PATCH, patch, "{\"topic\":{},\"updateMask\":\"schemaSettings\"}")).body);
+    try testing.expectEqualStrings(as_json, (try b.raw(a, .PATCH, patch, "{\"topic\":{\"schemaSettings\":{" ++ avro ++ ",\"encoding\":\"JSON\"}},\"updateMask\":\"schemaSettings\"}")).body);
+
+    // Publishing. Two more revisions: the third holds a field the first
+    // has not.
+    const commit = "{{\"schema\":{{\"name\":\"projects/p/schemas/zigps-avro\",\"type\":\"AVRO\",\"definition\":{s}}}}}";
+    const r2 = try revisionOf(a, (try b.raw(a, .POST, "projects/p/schemas/zigps-avro:commit", try std.fmt.allocPrint(a, commit, .{try Stringify.valueAlloc(a, two_fields, .{})}))).body);
+    const r3 = try revisionOf(a, (try b.raw(a, .POST, "projects/p/schemas/zigps-avro:commit", try std.fmt.allocPrint(a, commit, .{try Stringify.valueAlloc(a, three_fields, .{})}))).body);
+    const reader = b.client.subscription("reader");
+    var subscribed = try reader.create(.{ .topic_id = "zigps-json" });
+    subscribed.deinit();
+    var as_sent = try b.client.subscription("as-sent").create(.{ .topic_id = "zigps-json" });
+    as_sent.deinit();
+    const topic = b.client.topic("zigps-json");
+    judge.asked = 0;
+    // The first fits every revision, and is marked with the newest. The
+    // second fits the third alone. The third fits the two older, and is
+    // marked with the newer of those. What the publisher wrote of the
+    // encoding and the revision is written over; a name it wrote is kept.
+    // (This client lets no attribute through that begins `goog`, so the
+    // request is written out.)
+    try testing.expectEqual(200, (try b.raw(a, .POST, "projects/p/topics/zigps-json:publish", "{\"messages\":[" ++
+        "{\"data\":\"YWdl\",\"attributes\":{\"k\":\"v\",\"googclient_schemaencoding\":\"BINARY\",\"googclient_schemarevisionid\":\"forged\"}}," ++
+        "{\"data\":\"bm90ZQ==\"}," ++
+        "{\"data\":\"aW50In1d\",\"attributes\":{\"googclient_schemaname\":\"forged\"}}]}")).status);
+    try testing.expectEqual(1 + 1 + 2, judge.asked);
+    {
+        // As sent: each of the three once a message, with nothing left of
+        // an encoding or a revision the publisher wrote.
+        const sent = (try b.raw(a, .POST, "projects/p/subscriptions/as-sent:pull", "{\"maxMessages\":10}")).body;
+        try testing.expectEqual(3, std.mem.count(u8, sent, "\"googclient_schemaencoding\":\"JSON\""));
+        try testing.expectEqual(3, std.mem.count(u8, sent, "\"googclient_schemaencoding\""));
+        try testing.expectEqual(3, std.mem.count(u8, sent, "\"googclient_schemarevisionid\""));
+        try testing.expectEqual(3, std.mem.count(u8, sent, "\"googclient_schemaname\""));
+    }
+    {
+        var got = try reader.pull(.{});
+        defer got.deinit();
+        try testing.expectEqual(3, got.value.messages.len);
+        const first, const second, const third = got.value.messages[0..3].*;
+        try testing.expectEqual(4, first.attributes.len);
+        try testing.expectEqualStrings("v", first.attribute("k").?);
+        try testing.expectEqualStrings("JSON", first.attribute("googclient_schemaencoding").?);
+        try testing.expectEqualStrings("projects/p/schemas/zigps-avro", first.attribute("googclient_schemaname").?);
+        try testing.expectEqualStrings(r3, first.attribute("googclient_schemarevisionid").?);
+        try testing.expectEqual(3, second.attributes.len);
+        try testing.expectEqualStrings(r3, second.attribute("googclient_schemarevisionid").?);
+        try testing.expectEqual(3, third.attributes.len);
+        try testing.expectEqualStrings("forged", third.attribute("googclient_schemaname").?);
+        try testing.expectEqualStrings("JSON", third.attribute("googclient_schemaencoding").?);
+        try testing.expectEqualStrings(r2, third.attribute("googclient_schemarevisionid").?);
+        for (got.value.messages) |m| try reader.ack(&.{m.ack_id});
+    }
+    // One that fits none is refused in production's body, which names
+    // the last revision tried, the oldest. (Production names the schema
+    // there by the project's number.) Nothing of the request is taken,
+    // the message that fits included.
+    const before = b.fake.publishedCount("p", "zigps-json");
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "{{\"error\":{{\"code\":400,\"message\":\"Invalid data in message: Message failed schema validation.\",\"status\":\"INVALID_ARGUMENT\",\"details\":[{{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfo\",\"reason\":\"INVALID_JSON_AVRO_MESSAGE\",\"domain\":\"pubsub.googleapis.com\",\"metadata\":{{\"revisionInfo\":\"Could not validate message with any schema revision for schema: projects/p/schemas/zigps-avro, last checked revision: revision_id={s} failed with status: Invalid data in message: JSON object with type string does not match schema which expected number_integer..\",\"message\":\"Message failed schema validation\"}}}}]}}}}", .{r1}),
+        (try b.raw(a, .POST, "projects/p/topics/zigps-json:publish", "{\"messages\":[{\"data\":\"YWdl\"},{\"data\":\"b25l\"}]}")).body,
+    );
+    // Attributes and no data: to production that is no JSON.
+    const empty = (try b.raw(a, .POST, "projects/p/topics/zigps-json:publish", "{\"messages\":[{\"attributes\":{\"k\":\"v\"}}]}")).body;
+    try testing.expect(std.mem.indexOf(u8, empty, "failed with status: Invalid data in message: Tried to parse invalid JSON..\"") != null);
+    try testing.expectEqual(before, b.fake.publishedCount("p", "zigps-json"));
+    try testing.expectError(error.InvalidArgument, topic.publish(&.{.{ .data = "one" }}, .{}));
+    // The reason follows the schema's type and the topic's encoding.
+    try testing.expect(std.mem.indexOf(u8, (try b.raw(a, .POST, "projects/p/topics/zigps-pbin:publish", "{\"messages\":[{\"data\":\"////\"}]}")).body, "\"reason\":\"INVALID_BINARY_PROTO_MESSAGE\"") != null);
+
+    // A topic held to a range is tried on the range alone.
+    judge.asked = 0;
+    try testing.expectEqual(400, (try b.raw(a, .POST, "projects/p/topics/zigps-range:publish", "{\"messages\":[{\"data\":\"bm90ZQ==\"}]}")).status);
+    try testing.expectEqual(1, judge.asked);
+    try testing.expectEqualStrings(r1, &judge.last_revision);
+    try testing.expectEqual(200, (try b.raw(a, .POST, "projects/p/topics/zigps-range:publish", "{\"messages\":[{\"data\":\"YWdl\"}]}")).status);
+    // With the range's one revision deleted nothing fits. (Production
+    // took a minute to say so, and said no more than this.)
+    try testing.expectEqual(200, (try b.raw(a, .DELETE, try std.fmt.allocPrint(a, "projects/p/schemas/zigps-avro@{s}:deleteRevision", .{r1}), "")).status);
+    try expectRefused(try b.raw(a, .POST, "projects/p/topics/zigps-range:publish", "{\"messages\":[{\"data\":\"YWdl\"}]}"), 400, "INVALID_ARGUMENT", "Invalid data in message: Message failed schema validation.");
+    try testing.expect(std.mem.indexOf(u8, (try b.raw(a, .GET, "projects/p/topics/zigps-range", "")).body, try std.fmt.allocPrint(a, "\"firstRevisionId\":\"{s}\",\"lastRevisionId\":\"{s}\"", .{ r1, r1 })) != null);
+
+    // A topic with no schema keeps the three attributes as written.
+    var plain_made = try b.client.topic("plain").create(.{});
+    plain_made.deinit();
+    var plain_sub = try b.client.subscription("plain-reader").create(.{ .topic_id = "plain" });
+    plain_sub.deinit();
+    try testing.expectEqual(200, (try b.raw(a, .POST, "projects/p/topics/plain:publish", "{\"messages\":[{\"data\":\"eA==\",\"attributes\":{\"googclient_schemaencoding\":\"JSON\",\"googclient_schemaname\":\"forged\",\"googclient_schemarevisionid\":\"forged\"}}]}")).status);
+    {
+        var got = try b.client.subscription("plain-reader").pull(.{});
+        defer got.deinit();
+        try testing.expectEqual(3, got.value.messages[0].attributes.len);
+        try testing.expectEqualStrings("forged", got.value.messages[0].attribute("googclient_schemarevisionid").?);
+    }
+
+    // Its schema deleted, a topic reads `_deleted-schema_` and keeps its
+    // encoding, and a publish is refused. (Production showed both up to
+    // a minute late.) A schema made again under the id is another.
+    try b.client.schema("zigps-avro").delete();
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/topics/zigps-json","schemaSettings":{"schema":"_deleted-schema_","encoding":"JSON"}}
+    , (try b.raw(a, .GET, "projects/p/topics/zigps-json", "")).body);
+    try expectRefused(try b.raw(a, .POST, "projects/p/topics/zigps-json:publish", "{\"messages\":[{\"data\":\"YWdl\"}]}"), 404, "NOT_FOUND", "The schema associated with the topic has been deleted.");
+    try testing.expectEqual(200, (try b.raw(a, .POST, "projects/p/schemas?schemaId=zigps-avro", try schemaBody(a, "AVRO", two_fields))).status);
+    try testing.expectError(error.NotFound, topic.publish(&.{.{ .data = "age" }}, .{}));
+    var read = try topic.get();
+    defer read.deinit();
+    try testing.expectEqualStrings(types.SchemaSettings.deleted, read.value.schema.?.schema);
+    try testing.expectEqual(types.SchemaEncoding.json, read.value.schema.?.encoding);
+    // Cleared, the topic takes anything again.
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/zigps-json\"}", (try b.raw(a, .PATCH, patch, "{\"topic\":{},\"updateMask\":\"schemaSettings\"}")).body);
+    var free = try topic.publish(&.{.{ .data = "one" }}, .{});
+    free.deinit();
+
+    // Through the client: a topic made with a schema, and given another.
+    var typed = try b.client.topic("typed").create(.{ .schema = .{ .schema = "zigps-proto", .encoding = .binary } });
+    defer typed.deinit();
+    try testing.expectEqualStrings("projects/p/schemas/zigps-proto", typed.value.schema.?.schema);
+    try testing.expectEqual(types.SchemaEncoding.binary, typed.value.schema.?.encoding);
+}
+
 /// What each subscription should hold, said again in as few lines as it
 /// takes: the fake is held to this after every step of a script. Three
 /// subscriptions, each with rules of its own. The first retains what is
@@ -5450,6 +6765,8 @@ fn arbitraryRequest(_: void, input: []const u8) !void {
     try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/subscriptions/rules", "{\"topic\":\"projects/p/topics/orders\",\"enableMessageOrdering\":true,\"enableExactlyOnceDelivery\":true,\"filter\":\"attributes:k OR NOT attributes:k\",\"deadLetterPolicy\":{\"deadLetterTopic\":\"projects/p/topics/orders\"},\"retryPolicy\":{}}")).status);
     try testing.expectEqual(200, (try b.raw(a, .POST, "projects/p/topics/orders:publish", "{\"messages\":[{\"data\":\"eA==\",\"orderingKey\":\"o\"}]}")).status);
     try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/snapshots/snap", "{\"subscription\":\"projects/p/subscriptions/worker\"}")).status);
+    try testing.expectEqual(200, (try b.raw(a, .POST, "projects/p/schemas?schemaId=order", "{\"type\":\"AVRO\",\"definition\":\"\\\"string\\\"\"}")).status);
+    try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/topics/typed", "{\"schemaSettings\":{\"schema\":\"projects/p/schemas/order\",\"encoding\":\"JSON\"}}")).status);
     const paths = [_][]const u8{
         "projects/p/topics",                                 "projects/p/topics/orders",
         "projects/p/topics/orders:publish",                  "projects/p/topics/orders/subscriptions",
@@ -5463,17 +6780,26 @@ fn arbitraryRequest(_: void, input: []const u8) !void {
         "projects/p/snapshots/new",                          "projects/p/topics/orders/snapshots",
         "projects/p/subscriptions/worker:seek",              "projects/p/subscriptions/rules:seek",
         "projects/p/subscriptions/worker:detach",            "projects/p/snapshots?pageSize=1&pageToken=",
+        "projects/p/schemas",                                "projects/p/schemas?schemaId=newer",
+        "projects/p/schemas/order",                          "projects/p/schemas/order:commit",
+        "projects/p/schemas/order:rollback",                 "projects/p/schemas/order:listRevisions",
+        "projects/p/schemas:validate",                       "projects/p/schemas:validateMessage",
+        "projects/p/schemas/order@9e3779b1",                 "projects/p/schemas/order@9e3779b1:deleteRevision",
+        "projects/p/topics/typed",                           "projects/p/topics/typed:publish",
     };
     const bodies = [_][]const u8{
-        "{\"messages\":[{\"data\":\"",                                    "{\"topic\":\"projects/p/topics/orders\",",
-        "{\"subscription\":{",                                            "{\"topic\":{",
-        "{\"ackIds\":[\"",                                                "{\"maxMessages\":",
-        "{\"updateMask\":\"",                                             "",
-        "{\"topic\":\"projects/p/topics/orders\",\"filter\":\"",          "{\"topic\":\"projects/p/topics/orders\",\"deadLetterPolicy\":{",
-        "{\"topic\":\"projects/p/topics/orders\",\"retryPolicy\":{",      "{\"maxMessages\":3}",
-        "{\"messages\":[{\"orderingKey\":\"o\",\"attributes\":{\"k\":\"", "{\"ackIds\":[\"FAKE",
-        "{\"subscription\":\"projects/p/subscriptions/worker\",",         "{\"snapshot\":\"projects/p/snapshots/snap\"}",
-        "{\"time\":\"1970-01-01T00:00:0",                                 "{\"snapshot\":{\"labels\":{",
+        "{\"messages\":[{\"data\":\"",                                      "{\"topic\":\"projects/p/topics/orders\",",
+        "{\"subscription\":{",                                              "{\"topic\":{",
+        "{\"ackIds\":[\"",                                                  "{\"maxMessages\":",
+        "{\"updateMask\":\"",                                               "",
+        "{\"topic\":\"projects/p/topics/orders\",\"filter\":\"",            "{\"topic\":\"projects/p/topics/orders\",\"deadLetterPolicy\":{",
+        "{\"topic\":\"projects/p/topics/orders\",\"retryPolicy\":{",        "{\"maxMessages\":3}",
+        "{\"messages\":[{\"orderingKey\":\"o\",\"attributes\":{\"k\":\"",   "{\"ackIds\":[\"FAKE",
+        "{\"subscription\":\"projects/p/subscriptions/worker\",",           "{\"snapshot\":\"projects/p/snapshots/snap\"}",
+        "{\"time\":\"1970-01-01T00:00:0",                                   "{\"snapshot\":{\"labels\":{",
+        "{\"type\":\"AVRO\",\"definition\":\"",                             "{\"schema\":{\"name\":\"projects/p/schemas/order\",\"type\":\"AVRO\",\"definition\":\"1\"},",
+        "{\"revisionId\":\"",                                               "{\"name\":\"projects/p/schemas/order\",\"encoding\":\"JSON\",\"message\":\"",
+        "{\"topic\":{\"schemaSettings\":{\"schema\":\"projects/p/schemas/", "{\"schemaSettings\":{\"encoding\":\"BINARY\",",
     };
     for (0..8) |_| {
         const method = g.pick(tp.Method, &.{ .GET, .PUT, .POST, .PATCH, .DELETE });
@@ -5601,6 +6927,37 @@ fn sessionAllocations(gpa: Allocator) !void {
         if (std.mem.endsWith(u8, path, ":seek")) try testing.expectEqual(1, fake.backlog("p", "morgue"));
     }
     try testing.expectEqual(0, fake.backlog("p", "morgue"));
+
+    // Schemas: one made, given two more revisions, read every way, looked
+    // at, set on a topic that is published to, and deleted.
+    const made = try fake.serve(.POST, base ++ "schemas?schemaId=order", "{\"type\":\"AVRO\",\"definition\":\"{\\\"type\\\":\\\"string\\\"}\"}", a);
+    const Made = struct { revisionId: []const u8 };
+    const first = (try std.json.parseFromSliceLeaky(Made, a, made.body, .{ .ignore_unknown_fields = true })).revisionId;
+    const schemas = [_]struct { tp.Method, []const u8, []const u8, u16 }{
+        .{ .POST, "schemas/order:commit", "{\"schema\":{\"name\":\"projects/p/schemas/order\",\"type\":\"AVRO\",\"definition\":\"\\\"string\\\"\"}}", 200 },
+        .{ .POST, "schemas/order:commit", "{\"schema\":{\"name\":\"projects/p/schemas/order\",\"type\":\"PROTOCOL_BUFFER\",\"definition\":\"x\"}}", 400 },
+        .{ .POST, "schemas/order:rollback", try std.fmt.allocPrint(a, "{{\"revisionId\":\"{s}\"}}", .{first}), 200 },
+        .{ .GET, try std.fmt.allocPrint(a, "schemas/order@{s}?view=BASIC", .{first}), "", 200 },
+        .{ .GET, "schemas?view=FULL&pageSize=1", "", 200 },
+        .{ .GET, "schemas/order:listRevisions?pageSize=2", "", 200 },
+        .{ .POST, "schemas:validate", "{\"schema\":{\"type\":\"AVRO\",\"definition\":\"{nope\"}}", 400 },
+        .{ .POST, "schemas:validateMessage", "{\"name\":\"projects/p/schemas/order\",\"message\":\"eA==\",\"encoding\":\"JSON\"}", 200 },
+        .{ .PUT, "topics/typed", try std.fmt.allocPrint(a, "{{\"schemaSettings\":{{\"schema\":\"projects/p/schemas/order\",\"encoding\":\"JSON\",\"firstRevisionId\":\"{s}\"}}}}", .{first}), 200 },
+        .{ .PUT, "subscriptions/reader", "{\"topic\":\"projects/p/topics/typed\"}", 200 },
+        .{ .POST, "topics/typed:publish", "{\"messages\":[{\"data\":\"eA==\",\"attributes\":{\"googclient_schemaencoding\":\"BINARY\",\"k\":\"v\"}}]}", 200 },
+        .{ .PATCH, "topics/typed", "{\"topic\":{\"schemaSettings\":{\"encoding\":\"BINARY\"}},\"updateMask\":\"schemaSettings.encoding\"}", 200 },
+        .{ .DELETE, try std.fmt.allocPrint(a, "schemas/order@{s}:deleteRevision", .{first}), "", 200 },
+        // The range has no end: the later revisions are still its own.
+        .{ .POST, "topics/typed:publish", "{\"messages\":[{\"data\":\"eA==\"}]}", 200 },
+        .{ .DELETE, "schemas/order", "", 200 },
+        .{ .POST, "topics/typed:publish", "{\"messages\":[{\"data\":\"eA==\"}]}", 404 },
+        .{ .GET, "topics/typed", "", 200 },
+    };
+    for (schemas) |step| {
+        const method, const path, const body, const status = step;
+        try testing.expectEqual(status, (try fake.serve(method, try std.fmt.allocPrint(a, "{s}{s}", .{ base, path }), body, a)).status);
+    }
+    try testing.expectEqual(2, fake.backlog("p", "reader"));
 }
 
 test "allocation failures: a session of every call leaks nothing and breaks nothing" {
