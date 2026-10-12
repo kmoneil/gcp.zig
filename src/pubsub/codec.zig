@@ -456,6 +456,116 @@ const SnapshotUpdateBody = struct {
     }
 };
 
+/// The `schemas.create` body: the type and the definition. The id goes in
+/// the query, and a name in the body would be ignored.
+pub fn encodeSchema(arena: Allocator, definition: types.SchemaDefinition) Allocator.Error![]u8 {
+    return render(arena, SchemaBody{ .definition = definition });
+}
+
+const SchemaBody = struct {
+    definition: types.SchemaDefinition,
+
+    fn write(self: SchemaBody, jw: *Stringify) Stringify.Error!void {
+        try writeSchema(jw, self.definition);
+    }
+};
+
+/// The `schemas.validate` body: the schema as `encodeSchema` writes it,
+/// under `schema`.
+pub fn encodeValidateSchema(arena: Allocator, definition: types.SchemaDefinition) Allocator.Error![]u8 {
+    return render(arena, ValidateSchemaBody{ .definition = definition });
+}
+
+const ValidateSchemaBody = struct {
+    definition: types.SchemaDefinition,
+
+    fn write(self: ValidateSchemaBody, jw: *Stringify) Stringify.Error!void {
+        try jw.beginObject();
+        try jw.objectField("schema");
+        try writeSchema(jw, self.definition);
+        try jw.endObject();
+    }
+};
+
+/// What a message is checked against: a stored schema by its full name,
+/// with `@revision` after it for one revision, or a definition not stored.
+pub const SchemaRef = union(enum) {
+    name: []const u8,
+    definition: types.SchemaDefinition,
+};
+
+/// The `schemas.validateMessage` body. The message goes as base64, and an
+/// empty one as "".
+pub fn encodeValidateMessage(
+    arena: Allocator,
+    against: SchemaRef,
+    data: []const u8,
+    encoding: types.SchemaEncoding,
+) Allocator.Error![]u8 {
+    return render(arena, ValidateMessageBody{ .against = against, .data = data, .encoding = encoding });
+}
+
+const ValidateMessageBody = struct {
+    against: SchemaRef,
+    data: []const u8,
+    encoding: types.SchemaEncoding,
+
+    fn write(self: ValidateMessageBody, jw: *Stringify) Stringify.Error!void {
+        try jw.beginObject();
+        switch (self.against) {
+            .name => |name| {
+                try jw.objectField("name");
+                try jw.write(name);
+            },
+            .definition => |definition| {
+                try jw.objectField("schema");
+                try writeSchema(jw, definition);
+            },
+        }
+        try jw.objectField("message");
+        try base64.writeJsonString(jw, self.data);
+        try jw.objectField("encoding");
+        try jw.write(schemaEncodingName(self.encoding));
+        try jw.endObject();
+    }
+};
+
+fn writeSchema(jw: *Stringify, definition: types.SchemaDefinition) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("type");
+    try jw.write(schemaTypeName(definition.type));
+    try jw.objectField("definition");
+    try jw.write(definition.definition);
+    try jw.endObject();
+}
+
+/// The wire's word for a schema type. `.unknown`, which `validate` refuses
+/// first, goes as the value the server refuses.
+pub fn schemaTypeName(t: types.SchemaType) []const u8 {
+    return switch (t) {
+        .avro => "AVRO",
+        .protocol_buffer => "PROTOCOL_BUFFER",
+        .unknown => "TYPE_UNSPECIFIED",
+    };
+}
+
+/// The wire's word for an encoding, as `schemaTypeName` is for a type.
+pub fn schemaEncodingName(e: types.SchemaEncoding) []const u8 {
+    return switch (e) {
+        .json => "JSON",
+        .binary => "BINARY",
+        .unknown => "ENCODING_UNSPECIFIED",
+    };
+}
+
+/// The wire's word for a view, as the `view` query parameter takes it.
+pub fn schemaViewName(v: types.SchemaView) []const u8 {
+    return switch (v) {
+        .basic => "BASIC",
+        .full => "FULL",
+    };
+}
+
 /// An update mask: the camelCase paths an update names, comma-separated in
 /// one JSON string, as the REST API takes a `FieldMask`.
 const Mask = struct {
@@ -872,6 +982,19 @@ const WireSnapshotList = struct {
     nextPageToken: ?[]const u8 = null,
 };
 
+const WireSchema = struct {
+    name: ?[]const u8 = null,
+    type: ?[]const u8 = null,
+    definition: ?[]const u8 = null,
+    revisionId: ?[]const u8 = null,
+    revisionCreateTime: ?[]const u8 = null,
+};
+
+const WireSchemaList = struct {
+    schemas: ?[]const WireSchema = null,
+    nextPageToken: ?[]const u8 = null,
+};
+
 /// What is attached to a topic: names alone, under the key of their kind.
 const WireNameList = struct {
     subscriptions: ?[]const []const u8 = null,
@@ -1070,6 +1193,41 @@ pub fn decodeSnapshotPage(arena: Allocator, body: []const u8) DecodeError!types.
     const snapshots = try arena.alloc(types.SnapshotInfo, list.len);
     for (list, snapshots) |s, *out| out.* = try snapshotFromWire(arena, s);
     return .{ .snapshots = snapshots, .next_page_token = nonEmpty(wire.nextPageToken) };
+}
+
+fn schemaFromWire(w: WireSchema) DecodeError!types.SchemaInfo {
+    return .{
+        // Every answer names its schema. Without a name it is none.
+        .name = nonEmpty(w.name) orelse return error.InvalidResponse,
+        .type = schemaType(w.type),
+        // The basic view leaves it out, and so does a schema made from a
+        // compiled descriptor set, which this client does not model.
+        .definition = w.definition orelse "",
+        .revision_id = w.revisionId orelse "",
+        .revision_create_time = if (nonEmpty(w.revisionCreateTime)) |text|
+            timestamp.parse(text) catch return error.InvalidResponse
+        else
+            null,
+    };
+}
+
+fn schemaType(text: ?[]const u8) types.SchemaType {
+    const s = text orelse return .unknown;
+    if (std.mem.eql(u8, s, "AVRO")) return .avro;
+    if (std.mem.eql(u8, s, "PROTOCOL_BUFFER")) return .protocol_buffer;
+    return .unknown;
+}
+
+pub fn decodeSchema(arena: Allocator, body: []const u8) DecodeError!types.SchemaInfo {
+    return schemaFromWire(try parseWire(WireSchema, arena, body));
+}
+
+pub fn decodeSchemaPage(arena: Allocator, body: []const u8) DecodeError!types.SchemaPage {
+    const wire = try parseWire(WireSchemaList, arena, body);
+    const list = wire.schemas orelse &.{};
+    const schemas = try arena.alloc(types.SchemaInfo, list.len);
+    for (list, schemas) |s, *out| out.* = try schemaFromWire(s);
+    return .{ .schemas = schemas, .next_page_token = nonEmpty(wire.nextPageToken) };
 }
 
 /// Which of a topic's two lists of names an answer holds.
@@ -2644,4 +2802,163 @@ fn seekBodyProperty(_: void, input: []const u8) !void {
 
 test "fuzz seek bodies: one target, and a time that reads back as itself" {
     try test_util.fuzzBytes({}, seekBodyProperty, .{ .corpus = &.{ "", "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01", "\x01\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\x02", "\x00\x01" } });
+}
+
+test "golden: a schema's create body, the two validation bodies, and the wire's words" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const avro: types.SchemaDefinition = .{ .type = .avro, .definition = "{\"type\":\"record\",\"name\":\"M\",\"fields\":[]}" };
+    try testing.expectEqualStrings(
+        \\{"type":"AVRO","definition":"{\"type\":\"record\",\"name\":\"M\",\"fields\":[]}"}
+    , try encodeSchema(a, avro));
+    // A `.proto` source keeps its line breaks and quotes, escaped.
+    try testing.expectEqualStrings(
+        \\{"type":"PROTOCOL_BUFFER","definition":"syntax = \"proto3\";\nmessage M { string name = 1; }\n"}
+    , try encodeSchema(a, .{ .type = .protocol_buffer, .definition = "syntax = \"proto3\";\nmessage M { string name = 1; }\n" }));
+    try testing.expectEqualStrings(
+        \\{"schema":{"type":"AVRO","definition":"{\"type\":\"record\",\"name\":\"M\",\"fields\":[]}"}}
+    , try encodeValidateSchema(a, avro));
+
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/schemas/order-v1","message":"eyJuYW1lIjoiYSJ9","encoding":"JSON"}
+    , try encodeValidateMessage(a, .{ .name = "projects/p/schemas/order-v1" }, "{\"name\":\"a\"}", .json));
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/schemas/order-v1@c7cfa2a8","message":"AmEC","encoding":"BINARY"}
+    , try encodeValidateMessage(a, .{ .name = "projects/p/schemas/order-v1@c7cfa2a8" }, "\x02a\x02", .binary));
+    // No message is an empty string, which the server then judges.
+    try testing.expectEqualStrings(
+        \\{"schema":{"type":"AVRO","definition":"{\"type\":\"record\",\"name\":\"M\",\"fields\":[]}"},"message":"","encoding":"JSON"}
+    , try encodeValidateMessage(a, .{ .definition = avro }, "", .json));
+
+    // What `validate` refuses first still has a word, one the server refuses.
+    try testing.expectEqualStrings("TYPE_UNSPECIFIED", schemaTypeName(.unknown));
+    try testing.expectEqualStrings("ENCODING_UNSPECIFIED", schemaEncodingName(.unknown));
+    try testing.expectEqualStrings("BASIC", schemaViewName(.basic));
+    try testing.expectEqualStrings("FULL", schemaViewName(.full));
+}
+
+test "decode: a schema in both views, from the emulator and without what an answer may leave out" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The emulator's answer to a create, 2026-10-11: its revision time is
+    // in January 1970, and it still parses.
+    const made = try decodeSchema(a,
+        \\{
+        \\  "name": "projects/test/schemas/zigps-s-cc18a1-avro",
+        \\  "type": "AVRO",
+        \\  "definition": "{\"type\": \"record\", \"name\": \"M\", \"fields\": [{\"name\": \"name\", \"type\": \"string\"}, {\"name\": \"age\", \"type\": \"int\"}]}",
+        \\  "revisionId": "1b46a16a",
+        \\  "revisionCreateTime": "1970-01-17T11:51:58.663505750Z"
+        \\}
+    );
+    try testing.expectEqualStrings("projects/test/schemas/zigps-s-cc18a1-avro", made.name);
+    try testing.expectEqual(types.SchemaType.avro, made.type);
+    try testing.expectEqualStrings("{\"type\": \"record\", \"name\": \"M\", \"fields\": [{\"name\": \"name\", \"type\": \"string\"}, {\"name\": \"age\", \"type\": \"int\"}]}", made.definition);
+    try testing.expectEqualStrings("1b46a16a", made.revision_id);
+    try testing.expectEqual(try timestamp.parse("1970-01-17T11:51:58.663505750Z"), made.revision_create_time.?);
+
+    // Its basic view: no definition.
+    const basic = try decodeSchema(a, "{\"name\":\"projects/test/schemas/s\",\"type\":\"AVRO\",\"revisionId\":\"1b46a16a\",\"revisionCreateTime\":\"1970-01-17T11:51:58.663505750Z\"}");
+    try testing.expectEqualStrings("", basic.definition);
+    try testing.expectEqualStrings("1b46a16a", basic.revision_id);
+
+    // A name and a type alone, as Google's text describes the basic view; a
+    // type not yet known; a schema from a compiled descriptor set, whose
+    // extra field is read past; and nulls, which count as absent.
+    const bare = try decodeSchema(a, "{\"name\":\"projects/p/schemas/s\",\"type\":\"PROTOCOL_BUFFER\"}");
+    try testing.expectEqual(types.SchemaType.protocol_buffer, bare.type);
+    try testing.expectEqualStrings("", bare.revision_id);
+    try testing.expectEqual(null, bare.revision_create_time);
+    try testing.expectEqual(types.SchemaType.unknown, (try decodeSchema(a, "{\"name\":\"projects/p/schemas/s\",\"type\":\"THRIFT\"}")).type);
+    try testing.expectEqual(types.SchemaType.unknown, (try decodeSchema(a, "{\"name\":\"projects/p/schemas/s\"}")).type);
+    const compiled = try decodeSchema(a, "{\"name\":\"projects/p/schemas/s\",\"type\":\"PROTOCOL_BUFFER\",\"compiledProtoSchema\":{\"rootMessage\":\"M\",\"compiledBytes\":\"CgA=\"},\"revisionId\":\"c7cfa2a8\"}");
+    try testing.expectEqualStrings("", compiled.definition);
+    const nulls = try decodeSchema(a, "{\"name\":\"projects/p/schemas/s\",\"type\":null,\"definition\":null,\"revisionId\":null,\"revisionCreateTime\":null}");
+    try testing.expectEqual(null, nulls.revision_create_time);
+
+    // No name is no schema, and a time that is none is not guessed at.
+    try testing.expectError(error.InvalidResponse, decodeSchema(a, "{}"));
+    try testing.expectError(error.InvalidResponse, decodeSchema(a, "{\"name\":\"\",\"type\":\"AVRO\"}"));
+    try testing.expectError(error.InvalidResponse, decodeSchema(a, "{\"name\":\"projects/p/schemas/s\",\"revisionCreateTime\":\"last week\"}"));
+    try testing.expectError(error.InvalidResponse, decodeSchema(a, "{\"name\":\"projects/p/schemas/s\",\"definition\":17}"));
+    try testing.expectError(error.InvalidResponse, decodeSchema(a, "[]"));
+
+    const page = try decodeSchemaPage(a,
+        \\{"schemas":[{"name":"projects/p/schemas/a","type":"AVRO"},
+        \\{"name":"projects/p/schemas/b","type":"PROTOCOL_BUFFER","definition":"message M {}","revisionId":"c7cfa2a8"}],
+        \\"nextPageToken":"next"}
+    );
+    try testing.expectEqual(2, page.schemas.len);
+    try testing.expectEqualStrings("projects/p/schemas/a", page.schemas[0].name);
+    try testing.expectEqualStrings("message M {}", page.schemas[1].definition);
+    try testing.expectEqualStrings("next", page.next_page_token.?);
+    try testing.expectEqual(0, (try decodeSchemaPage(a, "{}")).schemas.len);
+    try testing.expectEqual(null, (try decodeSchemaPage(a, "{\"nextPageToken\":\"\"}")).next_page_token);
+    // One entry that is no schema spoils the page.
+    try testing.expectError(error.InvalidResponse, decodeSchemaPage(a, "{\"schemas\":[{\"type\":\"AVRO\"}]}"));
+}
+
+fn schemaRoundTrip(_: void, input: []const u8) !void {
+    var g: ByteGen = .init(input);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [512]u8 = undefined;
+    var text = g.utf8(&buf, buf.len);
+    if (text.len == 0) text = "{}";
+    const definition: types.SchemaDefinition = .{
+        .type = g.pick(types.SchemaType, &.{ .avro, .protocol_buffer }),
+        .definition = text,
+    };
+    try @import("validate.zig").schemaDefinition(definition, null);
+
+    // The create body is the type and the definition, whatever the
+    // definition holds, and a validation carries the same under `schema`.
+    const Sent = struct { type: []const u8, definition: []const u8 };
+    const body = try encodeSchema(a, definition);
+    const sent = try std.json.parseFromSliceLeaky(Sent, a, body, .{});
+    try testing.expectEqualStrings(schemaTypeName(definition.type), sent.type);
+    try testing.expectEqualStrings(text, sent.definition);
+    const wrapped = try std.json.parseFromSliceLeaky(struct { schema: Sent }, a, try encodeValidateSchema(a, definition), .{});
+    try testing.expectEqualStrings(schemaTypeName(definition.type), wrapped.schema.type);
+    try testing.expectEqualStrings(text, wrapped.schema.definition);
+
+    // With the name and the revision the server adds, it reads back as the
+    // schema that was written.
+    const info = try decodeSchema(a, try a.print(
+        "{{\"name\":\"projects/p/schemas/x\",\"revisionId\":\"c7cfa2a8\",\"revisionCreateTime\":\"2026-10-11T23:15:46.447Z\",{s}",
+        .{body[1..]},
+    ));
+    try testing.expectEqual(definition.type, info.type);
+    try testing.expectEqualStrings(text, info.definition);
+    try testing.expectEqualStrings("c7cfa2a8", info.revision_id);
+
+    // A message to check survives its base64, against a name or a
+    // definition, and the body names exactly one of the two.
+    const data = g.slice(64);
+    const encoding = g.pick(types.SchemaEncoding, &.{ .json, .binary });
+    const against: SchemaRef = if (g.boolean()) .{ .name = "projects/p/schemas/x@c7cfa2a8" } else .{ .definition = definition };
+    const check = try std.json.parseFromSliceLeaky(struct {
+        name: ?[]const u8 = null,
+        schema: ?Sent = null,
+        message: []const u8,
+        encoding: []const u8,
+    }, a, try encodeValidateMessage(a, against, data, encoding), .{});
+    try testing.expectEqualSlices(u8, data, try decodeBase64(a, check.message));
+    try testing.expectEqualStrings(schemaEncodingName(encoding), check.encoding);
+    try testing.expectEqual(against == .name, check.name != null);
+    try testing.expectEqual(against == .definition, check.schema != null);
+    if (check.schema) |s| try testing.expectEqualStrings(text, s.definition);
+}
+
+test "fuzz schema bodies: a definition reads back as it was written, and a message to check survives its base64" {
+    try test_util.fuzzBytes({}, schemaRoundTrip, .{ .corpus = &.{
+        "",
+        "\x20\x02{\x02}\x01\x00\x03abc\x01\x01",
+        "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+        "\x08\x01\x00\x01\x01\x00\x00\x00\x01\x02\x03\x04\x05",
+    } });
 }

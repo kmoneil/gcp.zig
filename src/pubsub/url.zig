@@ -11,6 +11,7 @@ pub const Collection = enum {
     topics,
     subscriptions,
     snapshots,
+    schemas,
 };
 
 /// `/v1/projects/{project}/{collection}/{id}{suffix}`, with `project` and `id`
@@ -104,6 +105,98 @@ fn writeAttachedPath(
     try params.addOptional("pageToken", page_token);
 }
 
+/// `/v1/projects/{project}/schemas?schemaId={id}`: where a schema is made.
+/// Its id goes in the query, not the path.
+pub fn schemaCreatePath(arena: Allocator, project: []const u8, id: []const u8) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    writeSchemaCreatePath(&out.writer, project, id) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeSchemaCreatePath(w: *Writer, project: []const u8, id: []const u8) Writer.Error!void {
+    try w.writeAll("/v1/projects/");
+    try query.writeSegment(w, project);
+    try w.writeAll("/schemas");
+    var params: query.Params = .init(w);
+    try params.add("schemaId", id);
+}
+
+/// `/v1/projects/{project}/schemas/{id}{suffix}`, or with `@{revision}`
+/// after the id for one revision of the schema. `suffix` is a literal
+/// method or query, such as `:rollback` or `?view=FULL`, or "".
+pub fn schemaPath(
+    arena: Allocator,
+    project: []const u8,
+    id: []const u8,
+    revision_id: ?[]const u8,
+    suffix: []const u8,
+) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    writeSchemaPath(&out.writer, project, id, revision_id, suffix) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeSchemaPath(
+    w: *Writer,
+    project: []const u8,
+    id: []const u8,
+    revision_id: ?[]const u8,
+    suffix: []const u8,
+) Writer.Error!void {
+    try writeResourcePath(w, project, .schemas, id, "");
+    if (revision_id) |revision| {
+        // The `@` is the API's own separator, and goes as it is.
+        try w.writeByte('@');
+        try query.writeSegment(w, revision);
+    }
+    try w.writeAll(suffix);
+}
+
+/// `/v1/projects/{project}/schemas?view=V&pageSize=N&pageToken=T`. `view`
+/// is the wire's word, `BASIC` or `FULL`, and is always sent.
+pub fn schemaListPath(
+    arena: Allocator,
+    project: []const u8,
+    view: []const u8,
+    page_size: u32,
+    page_token: ?[]const u8,
+) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    writeSchemaListPath(&out.writer, project, view, page_size, page_token) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeSchemaListPath(
+    w: *Writer,
+    project: []const u8,
+    view: []const u8,
+    page_size: u32,
+    page_token: ?[]const u8,
+) Writer.Error!void {
+    try w.writeAll("/v1/projects/");
+    try query.writeSegment(w, project);
+    try w.writeAll("/schemas");
+    var params: query.Params = .init(w);
+    try params.add("view", view);
+    try params.addNonZero("pageSize", page_size);
+    try params.addOptional("pageToken", page_token);
+}
+
+/// `/v1/projects/{project}/schemas{method}`: a call on the project's
+/// schemas as a whole, `:validate` or `:validateMessage`.
+pub fn schemasMethodPath(arena: Allocator, project: []const u8, method: []const u8) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    writeSchemasMethodPath(&out.writer, project, method) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeSchemasMethodPath(w: *Writer, project: []const u8, method: []const u8) Writer.Error!void {
+    try w.writeAll("/v1/projects/");
+    try query.writeSegment(w, project);
+    try w.writeAll("/schemas");
+    try w.writeAll(method);
+}
+
 /// The unencoded resource name, `projects/{project}/{collection}/{id}`, as it
 /// appears inside JSON bodies.
 pub fn resourceName(
@@ -193,4 +286,28 @@ test "snapshots are a collection as topics and subscriptions are" {
     try testing.expectEqualStrings("/v1/projects/test/snapshots/before", try resourcePath(a, "test", .snapshots, "before", ""));
     try testing.expectEqualStrings("/v1/projects/test/snapshots?pageSize=5", try listPath(a, "test", .snapshots, 5, null));
     try testing.expectEqualStrings("projects/test/snapshots/before", try resourceName(a, "test", .snapshots, "before"));
+}
+
+test "schema paths: the id in the query on create, a revision after an @, the view on a list, and the two calls on the collection" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("/v1/projects/test/schemas?schemaId=order-v1", try schemaCreatePath(a, "test", "order-v1"));
+    // A `%` in an id is encoded in the query as it is in a path.
+    try testing.expectEqualStrings("/v1/projects/test/schemas?schemaId=a%2541b%2Bc", try schemaCreatePath(a, "test", "a%41b+c"));
+
+    try testing.expectEqualStrings("/v1/projects/test/schemas/order-v1", try schemaPath(a, "test", "order-v1", null, ""));
+    try testing.expectEqualStrings("/v1/projects/test/schemas/order-v1?view=FULL", try schemaPath(a, "test", "order-v1", null, "?view=FULL"));
+    try testing.expectEqualStrings("/v1/projects/test/schemas/order-v1@c7cfa2a8?view=BASIC", try schemaPath(a, "test", "order-v1", "c7cfa2a8", "?view=BASIC"));
+    try testing.expectEqualStrings("/v1/projects/test/schemas/a%2541b@c7cfa2a8:deleteRevision", try schemaPath(a, "test", "a%41b", "c7cfa2a8", ":deleteRevision"));
+    // What could never be in a revision id is still encoded, never passed raw.
+    try testing.expectEqualStrings("/v1/projects/test/schemas/s-1@a%2Fb%3Fc", try schemaPath(a, "test", "s-1", "a/b?c", ""));
+
+    try testing.expectEqualStrings("/v1/projects/test/schemas?view=BASIC&pageSize=100", try schemaListPath(a, "test", "BASIC", 100, null));
+    try testing.expectEqualStrings("/v1/projects/test/schemas?view=FULL", try schemaListPath(a, "test", "FULL", 0, ""));
+    try testing.expectEqualStrings("/v1/projects/test/schemas?view=FULL&pageSize=2&pageToken=n%2F1", try schemaListPath(a, "test", "FULL", 2, "n/1"));
+
+    try testing.expectEqualStrings("/v1/projects/test/schemas:validate", try schemasMethodPath(a, "test", ":validate"));
+    try testing.expectEqualStrings("/v1/projects/example.com:proj/schemas:validateMessage", try schemasMethodPath(a, "example.com:proj", ":validateMessage"));
+    try testing.expectEqualStrings("projects/test/schemas/order-v1", try resourceName(a, "test", .schemas, "order-v1"));
 }

@@ -64,6 +64,9 @@ pub const min_storage_messages = 1000;
 /// A Cloud Storage filename prefix and suffix together ("the maximum
 /// allowed is 992", production, 2026-10-10).
 pub const max_filename_chars = 992;
+/// Documented as "300 KB" and not yet measured: read as kibibytes, so that
+/// no definition production takes is refused here.
+pub const max_schema_definition_bytes = 300 * 1024;
 
 /// The exact size of the body `Topic.publish` would send, without encoding
 /// anything. Callers splitting large batches can compare it with
@@ -571,6 +574,41 @@ pub fn seekTarget(target: types.SeekTarget, diag: ?*Diagnostics) error{InvalidAr
             return refuse(diag, "the snapshot is neither a snapshot id nor projects/{{project}}/snapshots/{{id}}", .{});
         },
     }
+}
+
+/// A schema as written: a type this client can name, and a definition that
+/// is there, is UTF-8 and is within the bound. Whether it parses is the
+/// server's to say.
+pub fn schemaDefinition(d: types.SchemaDefinition, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    if (d.type == .unknown) return refuse(diag, "the schema type is .unknown, which is only ever read", .{});
+    if (d.definition.len == 0) return refuse(diag, "the schema definition is empty", .{});
+    if (d.definition.len > max_schema_definition_bytes) {
+        return refuse(diag, "the schema definition is {d} bytes; the limit is {d}", .{ d.definition.len, max_schema_definition_bytes });
+    }
+    if (!std.unicode.utf8ValidateSlice(d.definition)) return refuse(diag, "the schema definition is not valid UTF-8", .{});
+}
+
+/// A revision id, which the client writes after an `@` in a path or a name:
+/// not empty, and printable ASCII with none of `/`, `@`, `?`, `#` and `:`,
+/// which would make the path another call's. Its length and alphabet are
+/// Google's to change, so nothing more is asked.
+pub fn revisionId(id: []const u8, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    if (isRevisionId(id)) return;
+    return refuse(diag, "the revision id is empty, or holds a space, a control or non-ASCII character, or one of / @ ? # :", .{});
+}
+
+pub fn isRevisionId(id: []const u8) bool {
+    if (id.len == 0) return false;
+    for (id) |c| switch (c) {
+        '/', '@', '?', '#', ':', ' ' => return false,
+        else => if (!std.ascii.isPrint(c)) return false,
+    };
+    return true;
+}
+
+/// An encoding this client can name.
+pub fn schemaEncoding(encoding: types.SchemaEncoding, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    if (encoding == .unknown) return refuse(diag, "the encoding is .unknown, which is only ever read", .{});
 }
 
 fn refuse(diag: ?*Diagnostics, comptime format: []const u8, args: anytype) error{InvalidArgument} {
@@ -1137,4 +1175,44 @@ test "a seek's target: a time a timestamp can hold, or a snapshot's id or full n
         try testing.expectError(error.InvalidArgument, seekTarget(.{ .snapshot = bad }, &d));
     }
     try testing.expectEqualStrings("the snapshot is neither a snapshot id nor projects/{project}/snapshots/{id}", d.message());
+}
+
+test "schemas: a definition that is there, UTF-8 and within the bound, of a type and in an encoding this client can name" {
+    var d: Diagnostics = .{};
+    try schemaDefinition(.{ .type = .avro, .definition = "{\"type\":\"record\",\"name\":\"M\",\"fields\":[]}" }, &d);
+    try schemaDefinition(.{ .type = .protocol_buffer, .definition = "syntax = \"proto3\";\nmessage M { string caf\xc3\xa9 = 1; }\n" }, &d);
+
+    try testing.expectError(error.InvalidArgument, schemaDefinition(.{ .type = .unknown, .definition = "{}" }, &d));
+    try testing.expectEqualStrings("the schema type is .unknown, which is only ever read", d.message());
+    try testing.expectError(error.InvalidArgument, schemaDefinition(.{ .type = .avro, .definition = "" }, &d));
+    try testing.expectEqualStrings("the schema definition is empty", d.message());
+    try testing.expectError(error.InvalidArgument, schemaDefinition(.{ .type = .avro, .definition = "\"caf\xe9\"" }, &d));
+    try testing.expectEqualStrings("the schema definition is not valid UTF-8", d.message());
+
+    // The bound, at its edge.
+    const big = try testing.allocator.alloc(u8, max_schema_definition_bytes + 1);
+    defer testing.allocator.free(big);
+    @memset(big, ' ');
+    try schemaDefinition(.{ .type = .avro, .definition = big[0..max_schema_definition_bytes] }, &d);
+    try testing.expectError(error.InvalidArgument, schemaDefinition(.{ .type = .avro, .definition = big }, &d));
+    try testing.expectEqualStrings("the schema definition is 307201 bytes; the limit is 307200", d.message());
+
+    try schemaEncoding(.json, &d);
+    try schemaEncoding(.binary, &d);
+    try testing.expectError(error.InvalidArgument, schemaEncoding(.unknown, &d));
+    try testing.expectEqualStrings("the encoding is .unknown, which is only ever read", d.message());
+    // Without diagnostics the checks still refuse.
+    try testing.expectError(error.InvalidArgument, schemaDefinition(.{ .type = .avro, .definition = "" }, null));
+}
+
+test "revision ids: what the server makes passes, and nothing that could turn a path into another call's" {
+    var d: Diagnostics = .{};
+    for ([_][]const u8{ "c7cfa2a8", "1b46a16a", "A", "a-b_c.d~e", "0123456789abcdef0123456789abcdef" }) |good| {
+        try revisionId(good, &d);
+    }
+    for ([_][]const u8{ "", "c7cf a2a8", "c7cfa2a8:rollback", "a@b", "a/b", "a?view=FULL", "a#b", "c7cfa2a8\n", "caf\xc3\xa9", "\x7f", "\x00" }) |bad| {
+        try testing.expect(!isRevisionId(bad));
+        try testing.expectError(error.InvalidArgument, revisionId(bad, &d));
+        try testing.expectEqualStrings("the revision id is empty, or holds a space, a control or non-ASCII character, or one of / @ ? # :", d.message());
+    }
 }

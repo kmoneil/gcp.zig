@@ -4,6 +4,31 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.36.0 (unreleased)
+
+- pubsub: schemas. `client.schema(id)` is a `Schema` handle, as
+  `client.topic` and `client.snapshot` are. `create(.{ .type = .avro,
+  .definition = ... })` stores an Avro or Protocol Buffer definition
+  under the id, `get` reads its latest revision or the one
+  `revision_id` names, with or without the definition (`SchemaView`),
+  `delete` removes it, and the five IAM calls complete it.
+  `Client.listSchemas` pages through a project's. Two calls ask Pub/Sub
+  a question and change nothing: `Client.validateSchema` whether a
+  definition parses, and `validateMessage`, on the handle for a stored
+  schema and on the client for a definition, whether a message's bytes
+  fit in a given `SchemaEncoding`. This client encodes no Avro and no
+  Protocol Buffers: the bytes are the caller's. Ids, a definition's
+  size and UTF-8, and a revision id are checked before sending.
+  Measured on emulator 0.8.36, 2026-10-11: it serves Avro schemas and
+  checks messages against them for real, answers every call that names
+  a Protocol Buffer schema `error.Unimplemented`, serves no schema IAM,
+  and dates every revision in January 1970. A list asked for no view
+  sends every definition there, where the API's default is none, so the
+  view is always sent. New types: `SchemaDefinition`, `SchemaInfo`,
+  `SchemaType`, `SchemaView`, `SchemaEncoding`, `SchemaGetOptions`,
+  `SchemaListOptions`, `SchemaPage`.
+- auth, core, firestore, secret_manager and storage: unchanged.
+
 ## 0.35.0 (unreleased)
 
 - pubsub: snapshots. `client.snapshot(id)` is a `Snapshot` handle, as

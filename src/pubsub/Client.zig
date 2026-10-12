@@ -13,6 +13,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const Endpoint = @import("Endpoint.zig");
+const Schema = @import("Schema.zig");
 const Snapshot = @import("Snapshot.zig");
 const Subscription = @import("Subscription.zig");
 const Topic = @import("Topic.zig");
@@ -174,6 +175,12 @@ pub fn snapshot(self: *Client, id: []const u8) Snapshot {
     return .{ .client = self, .id = id };
 }
 
+/// A handle for the schema `id`, such as "order-v1". Sends nothing. The
+/// handle borrows the client and `id`, and must not outlive either.
+pub fn schema(self: *Client, id: []const u8) Schema {
+    return .{ .client = self, .id = id };
+}
+
 /// One page of the project's topics.
 pub fn listTopics(self: *Client, page: types.PageOptions) Error!types.Owned(types.TopicPage) {
     rpc.begin(self);
@@ -215,6 +222,67 @@ pub fn listSnapshots(self: *Client, page: types.PageOptions) Error!types.Owned(t
     result.value = codec.decodeSnapshotPage(result.arena.allocator(), body) catch |err|
         return rpc.decodeFailed(self, err, "snapshot list");
     return result;
+}
+
+/// One page of the project's schemas, the latest revision of each, without
+/// their definitions unless `options.view` is `.full`. Needs
+/// `pubsub.schemas.list`.
+pub fn listSchemas(self: *Client, options: types.SchemaListOptions) Error!types.Owned(types.SchemaPage) {
+    rpc.begin(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const path = try url.schemaListPath(
+        scratch.allocator(),
+        self.project_id,
+        codec.schemaViewName(options.view),
+        options.page.page_size,
+        options.page.page_token,
+    );
+    var result: types.Owned(types.SchemaPage) = try .init(self.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(self, result.arena, .{ .method = .GET, .path = path });
+    result.value = codec.decodeSchemaPage(result.arena.allocator(), body) catch |err|
+        return rpc.decodeFailed(self, err, "schema list");
+    return result;
+}
+
+/// Asks Pub/Sub whether `definition` is a schema it would store: whether
+/// it parses as its type. Nothing is stored. One that does not parse is
+/// `error.InvalidArgument` in the server's words. This does not say
+/// whether it could become a revision of a schema that is there: only a
+/// commit checks one revision against the others. Needs
+/// `pubsub.schemas.validate`.
+pub fn validateSchema(self: *Client, definition: types.SchemaDefinition) Error!void {
+    rpc.begin(self);
+    try validate.schemaDefinition(definition, self.diagnostics);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const path = try url.schemasMethodPath(a, self.project_id, ":validate");
+    const body = try codec.encodeValidateSchema(a, definition);
+    return rpc.executeDiscard(self, .{ .method = .POST, .path = path, .body = body });
+}
+
+/// Asks Pub/Sub whether `data`, read in `encoding`, fits `definition`, a
+/// schema that need not be stored; `Schema.validateMessage` asks it of one
+/// that is. Nothing is stored or published. A message that does not fit,
+/// and a definition that does not parse, are `error.InvalidArgument` in
+/// the server's words. Needs `pubsub.schemas.validate`.
+pub fn validateMessage(
+    self: *Client,
+    definition: types.SchemaDefinition,
+    data: []const u8,
+    encoding: types.SchemaEncoding,
+) Error!void {
+    rpc.begin(self);
+    try validate.schemaDefinition(definition, self.diagnostics);
+    try validate.schemaEncoding(encoding, self.diagnostics);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const path = try url.schemasMethodPath(a, self.project_id, ":validateMessage");
+    const body = try codec.encodeValidateMessage(a, .{ .definition = definition }, data, encoding);
+    return rpc.executeDiscard(self, .{ .method = .POST, .path = path, .body = body });
 }
 
 fn isValidUserAgent(user_agent: []const u8) bool {
@@ -474,4 +542,60 @@ test "golden: listSnapshots passes page options, and reads whole snapshots" {
 
     try testing.expectError(error.InvalidResponse, h.client.listSnapshots(.{}));
     try testing.expectEqualStrings("the snapshot list response could not be decoded", h.diag.message());
+}
+
+test "golden: listSchemas says its view and passes page options, and the two validations name no stored schema" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body =
+        \\{"schemas":[{"name":"projects/p/schemas/a","type":"AVRO","revisionId":"1b46a16a","revisionCreateTime":"2026-10-11T23:15:46.447Z"}],
+        \\"nextPageToken":"next"}
+        } },
+        .{ .respond = .{ .body = "{}" } },
+        .{ .respond = .{ .body = "{\"schemas\":[{\"type\":\"AVRO\"}]}" } },
+        .{ .respond = .{ .body = "{}" } },
+        .{ .respond = .{ .body = "{}" } },
+        // The emulator's words for a message that does not fit, 2026-10-11.
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Could not parse binary Avro message\",\"status\":\"INVALID_ARGUMENT\"}}" } },
+    }, .{});
+    defer h.deinit();
+    const base = "http://localhost:8085/v1/projects/p/schemas";
+
+    var first = try h.client.listSchemas(.{ .page = .{ .page_size = 1 } });
+    defer first.deinit();
+    try h.expectRequest(0, .GET, base ++ "?view=BASIC&pageSize=1", null);
+    try testing.expectEqual(1, first.value.schemas.len);
+    try testing.expectEqualStrings("projects/p/schemas/a", first.value.schemas[0].name);
+    try testing.expectEqualStrings("", first.value.schemas[0].definition);
+    try testing.expectEqualStrings("1b46a16a", first.value.schemas[0].revision_id);
+    try testing.expectEqualStrings("next", first.value.next_page_token.?);
+
+    // A project with none lists as `{}`.
+    var none = try h.client.listSchemas(.{ .view = .full, .page = .{ .page_token = first.value.next_page_token } });
+    defer none.deinit();
+    try h.expectRequest(1, .GET, base ++ "?view=FULL&pageSize=100&pageToken=next", null);
+    try testing.expectEqual(0, none.value.schemas.len);
+    try testing.expectEqual(null, none.value.next_page_token);
+
+    try testing.expectError(error.InvalidResponse, h.client.listSchemas(.{}));
+    try testing.expectEqualStrings("the schema list response could not be decoded", h.diag.message());
+
+    const avro: types.SchemaDefinition = .{ .type = .avro, .definition = "\"string\"" };
+    try h.client.validateSchema(avro);
+    try h.expectRequest(3, .POST, base ++ ":validate",
+        \\{"schema":{"type":"AVRO","definition":"\"string\""}}
+    );
+    try h.client.validateMessage(avro, "\"a\"", .json);
+    try h.expectRequest(4, .POST, base ++ ":validateMessage",
+        \\{"schema":{"type":"AVRO","definition":"\"string\""},"message":"ImEi","encoding":"JSON"}
+    );
+    try testing.expectError(error.InvalidArgument, h.client.validateMessage(avro, "\xff", .binary));
+    try testing.expectEqualStrings("Could not parse binary Avro message", h.diag.message());
+    try h.expectRequestCount(6);
+
+    // What the checks refuse is never sent.
+    try testing.expectError(error.InvalidArgument, h.client.validateSchema(.{ .type = .avro, .definition = "" }));
+    try testing.expectError(error.InvalidArgument, h.client.validateMessage(.{ .type = .unknown, .definition = "{}" }, "x", .json));
+    try testing.expectError(error.InvalidArgument, h.client.validateMessage(avro, "x", .unknown));
+    try h.expectRequestCount(6);
 }
