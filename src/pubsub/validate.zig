@@ -64,8 +64,9 @@ pub const min_storage_messages = 1000;
 /// A Cloud Storage filename prefix and suffix together ("the maximum
 /// allowed is 992", production, 2026-10-10).
 pub const max_filename_chars = 992;
-/// Documented as "300 KB" and not yet measured: read as kibibytes, so that
-/// no definition production takes is refused here.
+/// Documented as "300 KB". Measured on 2026-10-12: production takes a
+/// definition of 307,200 bytes and refuses one of 307,201, in six words
+/// that do not say why.
 pub const max_schema_definition_bytes = 300 * 1024;
 
 /// The exact size of the body `Topic.publish` would send, without encoding

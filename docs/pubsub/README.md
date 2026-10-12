@@ -118,7 +118,7 @@ emulator does not fail later in production.
 | Behavior | Emulator | Production |
 | --- | --- | --- |
 | Publish size limit | none | 10,485,760-byte request body, counted decompressed (*checked*) |
-| Empty or `goog...` attribute keys | accepted | rejected (*checked*) |
+| Empty or `goog...` attribute keys | accepted | rejected, all but the three [`googclient_schema...` keys](schemas.md#what-a-subscriber-sees) (*checked*: the client refuses those too) |
 | Ids starting with `GOOG` | accepted | rejected (*checked*) |
 | Ordering key over 1,024 bytes | accepted | rejected (*checked*) |
 | Mixed ordering keys in one publish | accepted | FAILED_PRECONDITION (the API takes one key per call) |

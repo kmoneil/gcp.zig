@@ -92,8 +92,10 @@ pub fn delete(self: Schema) Error!void {
 
 /// Commits `definition` as the schema's next revision, the one a read then
 /// gives. Pub/Sub checks it against the revisions before it and refuses
-/// one that is not compatible with them; the emulator checks only that it
-/// parses. The type is the schema's own: another is refused.
+/// one that is not compatible with them, or of another type, as
+/// `error.FailedPrecondition`; the emulator checks only that it parses.
+/// A schema holds 20 revisions, and a 21st is `error.ResourceExhausted`,
+/// which the client, as for any quota, tries a few times before giving.
 ///
 /// A repeat of a commit that landed would spend a second of the schema's
 /// 20 revisions, so a failed attempt is not simply sent again. The latest
@@ -119,7 +121,8 @@ pub fn commit(self: Schema, definition: types.SchemaDefinition) Error!Owned(type
 /// Makes a new revision that holds what the revision `revision_id` held,
 /// and returns it: the schema's latest is then that definition again, under
 /// a new id, and the revisions in between stay. A revision that is not
-/// there is `error.NotFound`.
+/// there is `error.NotFound`, and production refuses a rollback to the
+/// latest revision itself, where the emulator makes one more of it.
 ///
 /// As with `commit`, a failed attempt is not simply sent again: the
 /// revision rolled back to and the latest one are read, and if the latest
@@ -140,7 +143,8 @@ pub fn rollback(self: Schema, revision_id: []const u8) Error!Owned(types.SchemaI
 
 /// Deletes one revision. The others stay, and a topic whose range began
 /// or ended at this one then uses the next one inward. A schema's only
-/// revision cannot be deleted, which the emulator says as
+/// revision cannot be deleted, which production says as
+/// `error.FailedPrecondition` and the emulator as
 /// `error.InvalidArgument`: delete the schema. If a lost first attempt
 /// already deleted it, the retry reports `error.NotFound`. Needs
 /// `pubsub.schemas.delete`.
@@ -156,8 +160,8 @@ pub fn deleteRevision(self: Schema, revision_id: []const u8) Error!void {
 }
 
 /// One page of the schema's revisions, without their definitions unless
-/// `options.view` is `.full`. The emulator lists the oldest first. Needs
-/// `pubsub.schemas.listRevisions`.
+/// `options.view` is `.full`. Production lists the newest first, and the
+/// emulator the oldest. Needs `pubsub.schemas.listRevisions`.
 pub fn listRevisions(self: Schema, options: types.SchemaListOptions) Error!Owned(types.SchemaPage) {
     const c = self.client;
     rpc.begin(c);
@@ -270,7 +274,12 @@ fn revise(self: Schema, call: rpc.Call, what: Revision) Error!Owned(types.Schema
         attempt += 1;
         return fetch(c, call) catch |err| {
             if (!core.isRetryable(err) or attempt >= c.retry.max_attempts) return err;
-            if (try self.landed(what, err)) |latest| return latest;
+            // A refusal for quota is an answer: the attempt did not land,
+            // and a latest revision that happens to hold the same
+            // definition would not make it one that did.
+            if (err != error.ResourceExhausted) {
+                if (try self.landed(what, err)) |latest| return latest;
+            }
             const delay_ms = c.retry.backoffMs(attempt, core.rpc.entropy(c.io));
             logging.warn("revising schema {s} failed with {t}; trying again in {d} ms", .{ self.id, err, delay_ms });
             try c.io.sleep(.fromMilliseconds(delay_ms), .awake);
@@ -871,6 +880,58 @@ test "commit: attempts run out with the last failure, its diagnostics restored a
     try testing.expectEqualStrings("still down", h.diag.message());
     try testing.expectEqual(503, h.diag.http_status);
     try h.expectRequestCount(3);
+}
+
+test "commit: a refusal for quota is tried again without a read, and a latest revision that holds the same definition is not taken for the commit" {
+    // Production's words for a 21st revision, 2026-10-12.
+    const exhausted: test_util.FakeTransport.Reply = .{ .respond = .{ .status = 429, .body = "{\"error\":{\"code\":429,\"message\":\"You have exceeded your revisions per schema quota (schema=\\\"projects/p/schemas/order-v1\\\"). Refer to https://cloud.google.com/pubsub/quotas for more information.\",\"status\":\"RESOURCE_EXHAUSTED\"}}" } };
+    var h: Harness = undefined;
+    try h.init(&.{ exhausted, exhausted, .{ .respond = .{ .body = stored_v2 } }, exhausted, exhausted }, .{ .retry = .{ .max_attempts = 2 } });
+    defer h.deinit();
+    const order = h.client.schema("order-v1");
+
+    // A rate limit passes: the third attempt of three is answered.
+    h.client.retry.max_attempts = 3;
+    var second = try order.commit(avro_v2);
+    defer second.deinit();
+    try testing.expectEqualStrings("6f0519a4", second.value.revision_id);
+    try h.expectRequestCount(3);
+    for (0..3) |i| try testing.expectEqual(.POST, (try h.fake.request(i)).method);
+    try testing.expectEqual(2, h.clock.sleep_count);
+
+    // A schema that is full stays full: the refusal stands, in its words,
+    // though the latest revision holds this very definition.
+    h.client.retry.max_attempts = 2;
+    try testing.expectError(error.ResourceExhausted, order.commit(avro_v2));
+    try testing.expect(std.mem.startsWith(u8, h.diag.message(), "You have exceeded your revisions per schema quota"));
+    try testing.expectEqual(429, h.diag.http_status);
+    try h.expectRequestCount(5);
+    for (3..5) |i| try testing.expectEqual(.POST, (try h.fake.request(i)).method);
+}
+
+test "refusals in production's words: a revision that is not compatible, a schema's only revision, and a rollback to the latest" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        // Measured 2026-10-12.
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Compatibility checking failed to commit a schema revision for (schema=\\\"projects/p/schemas/order-v1\\\"). (reason=\\\"Revision is incompatible with previous revision: 6e3214ab. Failed with error: Field age has type mismatch: Types do not match.). Refer to https://cloud.google.com/pubsub/docs/schemas for more information.\",\"status\":\"FAILED_PRECONDITION\"}}" } },
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"This schema contains only one revision, which can only be deleted by deleting the parent schema: (schema=\\\"projects/p/schemas/order-v1@12b2a799\\\"). Refer to https://cloud.google.com/pubsub/docs/schemas for more information.\",\"status\":\"FAILED_PRECONDITION\"}}" } },
+        .{ .respond = .{ .status = 409, .body = "{\"error\":{\"code\":409,\"message\":\"Resource already exists in the project (resource=projects/p/schemas/order-v1).\",\"status\":\"ALREADY_EXISTS\"}}" } },
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"Resource not found (resource=projects/p/schemas/order-v1@deadbeef).\",\"status\":\"NOT_FOUND\"}}" } },
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Invalid data in message: JSON object with type string does not match schema which expected number_integer.\",\"status\":\"INVALID_ARGUMENT\",\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfo\",\"reason\":\"INVALID_JSON_AVRO_MESSAGE\",\"domain\":\"pubsub.googleapis.com\"}]}}" } },
+    }, .{});
+    defer h.deinit();
+    const order = h.client.schema("order-v1");
+
+    try testing.expectError(error.FailedPrecondition, order.commit(avro_v2));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "Revision is incompatible with previous revision: 6e3214ab") != null);
+    try testing.expectError(error.FailedPrecondition, order.deleteRevision("12b2a799"));
+    try testing.expect(std.mem.startsWith(u8, h.diag.message(), "This schema contains only one revision"));
+    try testing.expectError(error.AlreadyExists, order.create(avro));
+    try testing.expectError(error.NotFound, order.get(.{ .revision_id = "deadbeef" }));
+    try testing.expectError(error.InvalidArgument, order.validateMessage("{\"age\":\"one\"}", .json, null));
+    try testing.expectEqualStrings("Invalid data in message: JSON object with type string does not match schema which expected number_integer.", h.diag.message());
+    // Each is an answer: none is asked a second time, and none read for.
+    try h.expectRequestCount(5);
 }
 
 test "commit: with retries off, a failure is returned as it is, with no read" {

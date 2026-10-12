@@ -91,9 +91,17 @@ pub const ReceivedMessage = struct {
 
     /// What a topic with a schema wrote on the message when it took it:
     /// the schema, the revision the message fit, and the encoding, which
-    /// says how to decode `data`. Null for a message from a topic with no
-    /// schema. Pub/Sub sets these three attributes itself, and a publisher
-    /// cannot: a key that starts with `goog` is refused.
+    /// says how to decode `data`. Null when the message has no such
+    /// attributes, as one from a topic with no schema has none.
+    ///
+    /// They are attributes, and only as trustworthy as the topic. This
+    /// client refuses to publish a key that starts with `goog`, but
+    /// Pub/Sub takes the three `googclient_schema...` keys from any
+    /// publisher (measured 2026-10-12): on a topic with no schema they
+    /// arrive as the publisher wrote them, and on a topic with one the
+    /// encoding and the revision are overwritten and the name is not. So
+    /// rely on this for a topic known to have a schema, and take the
+    /// schema's name from the topic, not from the message.
     pub fn schema(self: ReceivedMessage) ?MessageSchema {
         const encoding = self.attribute("googclient_schemaencoding") orelse return null;
         return .{
@@ -519,14 +527,16 @@ pub const SchemaType = enum { avro, protocol_buffer, unknown };
 /// `Client.validateSchema` checks.
 pub const SchemaDefinition = struct {
     type: SchemaType,
-    /// The Avro schema as JSON, or the `.proto` source, with one top-level
-    /// type and no imports. Valid UTF-8, at most 300 KB.
+    /// The Avro schema as JSON, or the `.proto` source, which must begin
+    /// with a `syntax` or `edition` statement and hold one top-level
+    /// message and no imports. Valid UTF-8, at most 300 KB.
     definition: []const u8,
 };
 
 /// One revision of a schema, as the server describes it.
 pub const SchemaInfo = struct {
-    /// `projects/{project}/schemas/{id}`.
+    /// `projects/{project}/schemas/{id}`: the schema's own name, without
+    /// the `@revision` production writes after it in some answers.
     name: []const u8,
     type: SchemaType,
     /// "" in the basic view.
