@@ -79,6 +79,14 @@ pub const SchemaSettings = @import("types.zig").SchemaSettings;
 pub const MessageSchema = @import("types.zig").MessageSchema;
 pub const MessageTransform = @import("types.zig").MessageTransform;
 pub const JavaScriptUdf = @import("types.zig").JavaScriptUdf;
+pub const Ingestion = @import("types.zig").Ingestion;
+pub const AwsKinesis = @import("types.zig").AwsKinesis;
+pub const CloudStorageSource = @import("types.zig").CloudStorageSource;
+pub const AzureEventHubs = @import("types.zig").AzureEventHubs;
+pub const AwsMsk = @import("types.zig").AwsMsk;
+pub const ConfluentCloud = @import("types.zig").ConfluentCloud;
+pub const IngestionInfo = @import("types.zig").IngestionInfo;
+pub const IngestionState = @import("types.zig").IngestionState;
 
 /// Parses a `publish_time` (RFC 3339) to nanoseconds since the Unix epoch.
 pub const parseTimestamp = core.timestamp.parse;

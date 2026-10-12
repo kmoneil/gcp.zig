@@ -336,9 +336,117 @@ const TopicBody = struct {
             try jw.objectField("messageTransforms");
             try writeTransforms(jw, c.message_transforms);
         }
+        if (c.ingestion) |settings| {
+            try jw.objectField("ingestionDataSourceSettings");
+            try writeIngestion(jw, settings);
+        }
         try jw.endObject();
     }
 };
+
+/// An import topic's settings: one source, and the log severity unless it
+/// is the default. A Cloud Storage source always carries a format, which
+/// an emulator requires, and a time and a glob only when given. A state
+/// is the server's to say, and is never sent. The severity must be one
+/// the wire names: the checks refuse `.unknown` first.
+fn writeIngestion(jw: *Stringify, settings: types.Ingestion) Stringify.Error!void {
+    try jw.beginObject();
+    switch (settings.source) {
+        .aws_kinesis => |k| {
+            try jw.objectField("awsKinesis");
+            try jw.beginObject();
+            try writeField(jw, "streamArn", k.stream_arn);
+            try writeField(jw, "consumerArn", k.consumer_arn);
+            try writeField(jw, "awsRoleArn", k.aws_role_arn);
+            try writeField(jw, "gcpServiceAccount", k.gcp_service_account);
+            try jw.endObject();
+        },
+        .cloud_storage => |s| {
+            try jw.objectField("cloudStorage");
+            try jw.beginObject();
+            try writeField(jw, "bucket", s.bucket);
+            switch (s.format) {
+                .text => |t| {
+                    try jw.objectField("textFormat");
+                    try jw.beginObject();
+                    try writeField(jw, "delimiter", t.delimiter);
+                    try jw.endObject();
+                },
+                .avro => {
+                    try jw.objectField("avroFormat");
+                    try jw.beginObject();
+                    try jw.endObject();
+                },
+                .pubsub_avro => {
+                    try jw.objectField("pubsubAvroFormat");
+                    try jw.beginObject();
+                    try jw.endObject();
+                },
+            }
+            if (s.minimum_object_create_time) |t| {
+                var buf: [timestamp.max_len]u8 = undefined;
+                try writeField(jw, "minimumObjectCreateTime", timestamp.format(&buf, t));
+            }
+            if (s.match_glob.len > 0) try writeField(jw, "matchGlob", s.match_glob);
+            try jw.endObject();
+        },
+        .azure_event_hubs => |e| {
+            try jw.objectField("azureEventHubs");
+            try jw.beginObject();
+            try writeField(jw, "resourceGroup", e.resource_group);
+            try writeField(jw, "namespace", e.namespace);
+            try writeField(jw, "eventHub", e.event_hub);
+            try writeField(jw, "clientId", e.client_id);
+            try writeField(jw, "tenantId", e.tenant_id);
+            try writeField(jw, "subscriptionId", e.subscription_id);
+            try writeField(jw, "gcpServiceAccount", e.gcp_service_account);
+            try jw.endObject();
+        },
+        .aws_msk => |m| {
+            try jw.objectField("awsMsk");
+            try jw.beginObject();
+            try writeField(jw, "clusterArn", m.cluster_arn);
+            try writeField(jw, "topic", m.topic);
+            try writeField(jw, "awsRoleArn", m.aws_role_arn);
+            try writeField(jw, "gcpServiceAccount", m.gcp_service_account);
+            try jw.endObject();
+        },
+        .confluent_cloud => |c| {
+            try jw.objectField("confluentCloud");
+            try jw.beginObject();
+            try writeField(jw, "bootstrapServer", c.bootstrap_server);
+            try writeField(jw, "clusterId", c.cluster_id);
+            try writeField(jw, "topic", c.topic);
+            try writeField(jw, "identityPoolId", c.identity_pool_id);
+            try writeField(jw, "gcpServiceAccount", c.gcp_service_account);
+            try jw.endObject();
+        },
+    }
+    if (logSeverityName(settings.log_severity)) |severity| {
+        try jw.objectField("platformLogsSettings");
+        try jw.beginObject();
+        try writeField(jw, "severity", severity);
+        try jw.endObject();
+    }
+    try jw.endObject();
+}
+
+fn writeField(jw: *Stringify, name: []const u8, value: []const u8) Stringify.Error!void {
+    try jw.objectField(name);
+    try jw.write(value);
+}
+
+/// The wire's word for a severity, or null for what is left out: the
+/// default, which is no logs, and `.unknown`, which has no word.
+fn logSeverityName(severity: types.Ingestion.LogSeverity) ?[]const u8 {
+    return switch (severity) {
+        .disabled, .unknown => null,
+        .debug => "DEBUG",
+        .info => "INFO",
+        .warning => "WARNING",
+        .@"error" => "ERROR",
+    };
+}
 
 /// A list of transforms, in the order they run. `disabled` is written only
 /// when set, and the deprecated `enabled` never. A kind this client does
@@ -458,6 +566,17 @@ const TopicUpdateBody = struct {
             },
         }
         if (u.message_transforms) |list| try writeTransformsUpdate(jw, &mask, list);
+        // Masked whole, as the schema's settings are: what is given is
+        // all that holds afterwards, and nothing given is a standard topic.
+        switch (u.ingestion) {
+            .keep => {},
+            .clear => mask.add("ingestionDataSourceSettings"),
+            .set => |settings| {
+                mask.add("ingestionDataSourceSettings");
+                try jw.objectField("ingestionDataSourceSettings");
+                try writeIngestion(jw, settings);
+            },
+        }
         try jw.endObject();
         try jw.objectField("updateMask");
         try mask.write(jw);
@@ -1017,7 +1136,53 @@ const WireTopic = struct {
     messageStoragePolicy: ?WireStoragePolicy = null,
     schemaSettings: ?WireSchemaSettings = null,
     messageTransforms: ?[]const WireTransform = null,
+    ingestionDataSourceSettings: ?WireIngestion = null,
     state: ?[]const u8 = null,
+};
+
+const WireIngestion = struct {
+    awsKinesis: ?struct {
+        streamArn: ?[]const u8 = null,
+        consumerArn: ?[]const u8 = null,
+        awsRoleArn: ?[]const u8 = null,
+        gcpServiceAccount: ?[]const u8 = null,
+        state: ?[]const u8 = null,
+    } = null,
+    cloudStorage: ?struct {
+        bucket: ?[]const u8 = null,
+        textFormat: ?struct { delimiter: ?[]const u8 = null } = null,
+        avroFormat: ?struct {} = null,
+        pubsubAvroFormat: ?struct {} = null,
+        minimumObjectCreateTime: ?[]const u8 = null,
+        matchGlob: ?[]const u8 = null,
+        state: ?[]const u8 = null,
+    } = null,
+    azureEventHubs: ?struct {
+        resourceGroup: ?[]const u8 = null,
+        namespace: ?[]const u8 = null,
+        eventHub: ?[]const u8 = null,
+        clientId: ?[]const u8 = null,
+        tenantId: ?[]const u8 = null,
+        subscriptionId: ?[]const u8 = null,
+        gcpServiceAccount: ?[]const u8 = null,
+        state: ?[]const u8 = null,
+    } = null,
+    awsMsk: ?struct {
+        clusterArn: ?[]const u8 = null,
+        topic: ?[]const u8 = null,
+        awsRoleArn: ?[]const u8 = null,
+        gcpServiceAccount: ?[]const u8 = null,
+        state: ?[]const u8 = null,
+    } = null,
+    confluentCloud: ?struct {
+        bootstrapServer: ?[]const u8 = null,
+        clusterId: ?[]const u8 = null,
+        topic: ?[]const u8 = null,
+        identityPoolId: ?[]const u8 = null,
+        gcpServiceAccount: ?[]const u8 = null,
+        state: ?[]const u8 = null,
+    } = null,
+    platformLogsSettings: ?struct { severity: ?[]const u8 = null } = null,
 };
 
 /// `enabled`, which is deprecated, is not read: production keeps whatever
@@ -1198,8 +1363,125 @@ fn topicFromWire(arena: Allocator, w: WireTopic) DecodeError!types.TopicInfo {
         } else null,
         .schema = schemaSettingsFromWire(w.schemaSettings),
         .message_transforms = try transformsFromWire(arena, w.messageTransforms),
+        .ingestion = try ingestionFromWire(w.ingestionDataSourceSettings),
         .state = topicState(w.state),
     };
+}
+
+/// An import topic's settings as read. Settings that hold none of the five
+/// sources are of a source this client does not model, and are kept as
+/// such: the topic is still an import topic. Should an answer hold two,
+/// the first in this fixed order wins. A Cloud Storage source with no
+/// format reads as text split at newlines, which is what production
+/// makes of one sent without.
+fn ingestionFromWire(wire: ?WireIngestion) DecodeError!?types.IngestionInfo {
+    const w = wire orelse return null;
+    const severity = logSeverity(if (w.platformLogsSettings) |logs| logs.severity else null);
+    if (w.awsKinesis) |k| return .{
+        .source = .{ .aws_kinesis = .{
+            .stream_arn = k.streamArn orelse "",
+            .consumer_arn = k.consumerArn orelse "",
+            .aws_role_arn = k.awsRoleArn orelse "",
+            .gcp_service_account = k.gcpServiceAccount orelse "",
+        } },
+        .log_severity = severity,
+        .state = ingestionState(k.state),
+    };
+    if (w.cloudStorage) |s| return .{
+        .source = .{ .cloud_storage = .{
+            .bucket = s.bucket orelse "",
+            .format = if (s.avroFormat != null)
+                .avro
+            else if (s.pubsubAvroFormat != null)
+                .pubsub_avro
+            else
+                .{ .text = .{ .delimiter = if (s.textFormat) |t| nonEmpty(t.delimiter) orelse "\n" else "\n" } },
+            .minimum_object_create_time = if (nonEmpty(s.minimumObjectCreateTime)) |text|
+                timestamp.parse(text) catch return error.InvalidResponse
+            else
+                null,
+            .match_glob = s.matchGlob orelse "",
+        } },
+        .log_severity = severity,
+        .state = ingestionState(s.state),
+    };
+    if (w.azureEventHubs) |e| return .{
+        .source = .{ .azure_event_hubs = .{
+            .resource_group = e.resourceGroup orelse "",
+            .namespace = e.namespace orelse "",
+            .event_hub = e.eventHub orelse "",
+            .client_id = e.clientId orelse "",
+            .tenant_id = e.tenantId orelse "",
+            .subscription_id = e.subscriptionId orelse "",
+            .gcp_service_account = e.gcpServiceAccount orelse "",
+        } },
+        .log_severity = severity,
+        .state = ingestionState(e.state),
+    };
+    if (w.awsMsk) |m| return .{
+        .source = .{ .aws_msk = .{
+            .cluster_arn = m.clusterArn orelse "",
+            .topic = m.topic orelse "",
+            .aws_role_arn = m.awsRoleArn orelse "",
+            .gcp_service_account = m.gcpServiceAccount orelse "",
+        } },
+        .log_severity = severity,
+        .state = ingestionState(m.state),
+    };
+    if (w.confluentCloud) |c| return .{
+        .source = .{ .confluent_cloud = .{
+            .bootstrap_server = c.bootstrapServer orelse "",
+            .cluster_id = c.clusterId orelse "",
+            .topic = c.topic orelse "",
+            .identity_pool_id = c.identityPoolId orelse "",
+            .gcp_service_account = c.gcpServiceAccount orelse "",
+        } },
+        .log_severity = severity,
+        .state = ingestionState(c.state),
+    };
+    return .{ .source = null, .log_severity = severity, .state = .unknown };
+}
+
+/// No settings, and the wire's unspecified, are no logs.
+fn logSeverity(text: ?[]const u8) types.Ingestion.LogSeverity {
+    const s = text orelse return .disabled;
+    if (std.mem.eql(u8, s, "DISABLED") or std.mem.eql(u8, s, "SEVERITY_UNSPECIFIED")) return .disabled;
+    if (std.mem.eql(u8, s, "DEBUG")) return .debug;
+    if (std.mem.eql(u8, s, "INFO")) return .info;
+    if (std.mem.eql(u8, s, "WARNING")) return .warning;
+    if (std.mem.eql(u8, s, "ERROR")) return .@"error";
+    return .unknown;
+}
+
+/// The five sources' states as one: each source's own permission error is
+/// `.permission_denied`, and a word not yet known, or none, is `.unknown`.
+fn ingestionState(text: ?[]const u8) types.IngestionState {
+    const s = text orelse return .unknown;
+    const words = [_]struct { []const u8, types.IngestionState }{
+        .{ "ACTIVE", .active },
+        .{ "PUBLISH_PERMISSION_DENIED", .publish_permission_denied },
+        .{ "CONFLICTING_REGION_CONSTRAINTS", .conflicting_region_constraints },
+        .{ "KINESIS_PERMISSION_DENIED", .permission_denied },
+        .{ "CLOUD_STORAGE_PERMISSION_DENIED", .permission_denied },
+        .{ "EVENT_HUBS_PERMISSION_DENIED", .permission_denied },
+        .{ "MSK_PERMISSION_DENIED", .permission_denied },
+        .{ "CONFLUENT_CLOUD_PERMISSION_DENIED", .permission_denied },
+        .{ "STREAM_NOT_FOUND", .stream_not_found },
+        .{ "CONSUMER_NOT_FOUND", .consumer_not_found },
+        .{ "BUCKET_NOT_FOUND", .bucket_not_found },
+        .{ "TOO_MANY_OBJECTS", .too_many_objects },
+        .{ "NAMESPACE_NOT_FOUND", .namespace_not_found },
+        .{ "EVENT_HUB_NOT_FOUND", .event_hub_not_found },
+        .{ "SUBSCRIPTION_NOT_FOUND", .subscription_not_found },
+        .{ "RESOURCE_GROUP_NOT_FOUND", .resource_group_not_found },
+        .{ "CLUSTER_NOT_FOUND", .cluster_not_found },
+        .{ "TOPIC_NOT_FOUND", .topic_not_found },
+        .{ "UNREACHABLE_BOOTSTRAP_SERVER", .unreachable_bootstrap_server },
+    };
+    for (words) |word| {
+        if (std.mem.eql(u8, s, word[0])) return word[1];
+    }
+    return .unknown;
 }
 
 /// Each transform, in the server's order. One with no JavaScript function
@@ -3588,6 +3870,407 @@ test "fuzz message transforms: what a create sends a read gives back, and an upd
             // Seven, so the sixth and seventh are disabled; an empty list given.
             "\x07" ++ &@as([7 * 17]u8, @splat(0)) ++ "\x01\x00\x01",
             "\x03\x00\x00\x00\x00\x00\x00\x00\x08\x01\x22\x02\x41\x04\x00\x00\x00\xe9\x01\x00\x00\x00\x00\x00\x00\x00\x01\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+        },
+    });
+}
+
+const kinesis: types.Ingestion.Source = .{ .aws_kinesis = .{
+    .stream_arn = "arn:aws:kinesis:us-east-1:111111111111:stream/orders",
+    .consumer_arn = "arn:aws:kinesis:us-east-1:111111111111:stream/orders/consumer/c:1",
+    .aws_role_arn = "arn:aws:iam::111111111111:role/pubsub",
+    .gcp_service_account = "importer@my-project.iam.gserviceaccount.com",
+} };
+const event_hubs: types.Ingestion.Source = .{ .azure_event_hubs = .{
+    .resource_group = "rg",
+    .namespace = "ns",
+    .event_hub = "eh",
+    .client_id = "11111111-1111-1111-1111-111111111111",
+    .tenant_id = "22222222-2222-2222-2222-222222222222",
+    .subscription_id = "33333333-3333-3333-3333-333333333333",
+    .gcp_service_account = "importer@my-project.iam.gserviceaccount.com",
+} };
+const msk: types.Ingestion.Source = .{ .aws_msk = .{
+    .cluster_arn = "arn:aws:kafka:us-east-1:111111111111:cluster/orders/abc",
+    .topic = "orders",
+    .aws_role_arn = "arn:aws:iam::111111111111:role/pubsub",
+    .gcp_service_account = "importer@my-project.iam.gserviceaccount.com",
+} };
+const confluent: types.Ingestion.Source = .{ .confluent_cloud = .{
+    .bootstrap_server = "pkc-xxxx.us-east-1.aws.confluent.cloud:9092",
+    .cluster_id = "lkc-xxxx",
+    .topic = "orders",
+    .identity_pool_id = "pool-xxxx",
+    .gcp_service_account = "importer@my-project.iam.gserviceaccount.com",
+} };
+
+test "golden: an import topic's settings on create, for each source, and in an update, set whole and cleared" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const kinesis_json =
+        \\{"awsKinesis":{"streamArn":"arn:aws:kinesis:us-east-1:111111111111:stream/orders","consumerArn":"arn:aws:kinesis:us-east-1:111111111111:stream/orders/consumer/c:1","awsRoleArn":"arn:aws:iam::111111111111:role/pubsub","gcpServiceAccount":"importer@my-project.iam.gserviceaccount.com"}}
+    ;
+    try testing.expectEqualStrings(
+        "{\"ingestionDataSourceSettings\":" ++ kinesis_json ++ "}",
+        try encodeTopic(a, .{ .ingestion = .{ .source = kinesis } }),
+    );
+
+    // A bucket with nothing else said: text, a message a line. The format
+    // is always sent, which an emulator requires, and no time and no glob.
+    try testing.expectEqualStrings(
+        \\{"ingestionDataSourceSettings":{"cloudStorage":{"bucket":"my-uploads","textFormat":{"delimiter":"\n"}}}}
+    , try encodeTopic(a, .{ .ingestion = .{ .source = .{ .cloud_storage = .{ .bucket = "my-uploads" } } } }));
+    // Every option, beside other settings, with logs.
+    try testing.expectEqualStrings(
+        \\{"labels":{"env":"test"},"ingestionDataSourceSettings":{"cloudStorage":{"bucket":"my-uploads","textFormat":{"delimiter":"\t"},"minimumObjectCreateTime":"2026-10-12T02:33:53.500Z","matchGlob":"logs/**.txt"},"platformLogsSettings":{"severity":"WARNING"}}}
+    , try encodeTopic(a, .{
+        .labels = &.{.{ .key = "env", .value = "test" }},
+        .ingestion = .{
+            .source = .{ .cloud_storage = .{
+                .bucket = "my-uploads",
+                .format = .{ .text = .{ .delimiter = "\t" } },
+                .minimum_object_create_time = try timestamp.parse("2026-10-12T02:33:53.5Z"),
+                .match_glob = "logs/**.txt",
+            } },
+            .log_severity = .warning,
+        },
+    }));
+    try testing.expectEqualStrings(
+        \\{"ingestionDataSourceSettings":{"cloudStorage":{"bucket":"b","avroFormat":{}},"platformLogsSettings":{"severity":"DEBUG"}}}
+    , try encodeTopic(a, .{ .ingestion = .{ .source = .{ .cloud_storage = .{ .bucket = "b", .format = .avro } }, .log_severity = .debug } }));
+    try testing.expectEqualStrings(
+        \\{"ingestionDataSourceSettings":{"cloudStorage":{"bucket":"b","pubsubAvroFormat":{}},"platformLogsSettings":{"severity":"INFO"}}}
+    , try encodeTopic(a, .{ .ingestion = .{ .source = .{ .cloud_storage = .{ .bucket = "b", .format = .pubsub_avro } }, .log_severity = .info } }));
+
+    try testing.expectEqualStrings(
+        \\{"ingestionDataSourceSettings":{"azureEventHubs":{"resourceGroup":"rg","namespace":"ns","eventHub":"eh","clientId":"11111111-1111-1111-1111-111111111111","tenantId":"22222222-2222-2222-2222-222222222222","subscriptionId":"33333333-3333-3333-3333-333333333333","gcpServiceAccount":"importer@my-project.iam.gserviceaccount.com"},"platformLogsSettings":{"severity":"ERROR"}}}
+    , try encodeTopic(a, .{ .ingestion = .{ .source = event_hubs, .log_severity = .@"error" } }));
+    try testing.expectEqualStrings(
+        \\{"ingestionDataSourceSettings":{"awsMsk":{"clusterArn":"arn:aws:kafka:us-east-1:111111111111:cluster/orders/abc","topic":"orders","awsRoleArn":"arn:aws:iam::111111111111:role/pubsub","gcpServiceAccount":"importer@my-project.iam.gserviceaccount.com"}}}
+    , try encodeTopic(a, .{ .ingestion = .{ .source = msk } }));
+    try testing.expectEqualStrings(
+        \\{"ingestionDataSourceSettings":{"confluentCloud":{"bootstrapServer":"pkc-xxxx.us-east-1.aws.confluent.cloud:9092","clusterId":"lkc-xxxx","topic":"orders","identityPoolId":"pool-xxxx","gcpServiceAccount":"importer@my-project.iam.gserviceaccount.com"}}}
+    , try encodeTopic(a, .{ .ingestion = .{ .source = confluent } }));
+    // No logs is the default, and is left out; `.unknown` has no word, and
+    // the checks refuse it before it is ever encoded.
+    try testing.expectEqualStrings(
+        "{\"ingestionDataSourceSettings\":" ++ kinesis_json ++ "}",
+        try encodeTopic(a, .{ .ingestion = .{ .source = kinesis, .log_severity = .unknown } }),
+    );
+
+    // An update masks the settings whole and carries them; a clear is the
+    // mask alone.
+    try testing.expectEqualStrings(
+        "{\"topic\":{\"ingestionDataSourceSettings\":" ++ kinesis_json ++ "},\"updateMask\":\"ingestionDataSourceSettings\"}",
+        try encodeTopicUpdate(a, .{ .ingestion = .{ .set = .{ .source = kinesis } } }),
+    );
+    try testing.expectEqualStrings(
+        "{\"topic\":{},\"updateMask\":\"ingestionDataSourceSettings\"}",
+        try encodeTopicUpdate(a, .{ .ingestion = .clear }),
+    );
+    // Everything a topic update can name, at once.
+    try testing.expectEqualStrings(
+        "{\"topic\":{\"labels\":{},\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"bucket\":\"b\",\"avroFormat\":{}}}}," ++
+            "\"updateMask\":\"labels,messageRetentionDuration,kmsKeyName,messageStoragePolicy,schemaSettings,messageTransforms,ingestionDataSourceSettings\"}",
+        try encodeTopicUpdate(a, .{
+            .labels = &.{},
+            .message_retention = .clear,
+            .kms_key_name = .clear,
+            .message_storage_policy = .clear,
+            .schema = .clear,
+            .message_transforms = &.{},
+            .ingestion = .{ .set = .{ .source = .{ .cloud_storage = .{ .bucket = "b", .format = .avro } } } },
+        }),
+    );
+}
+
+test "decode: an import topic's settings, each source as the emulator echoes it, each state, and what an answer may leave out" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The emulator's answers, 2026-10-12. It sends no state.
+    const k = (try decodeTopic(a,
+        \\{ "name": "projects/test/topics/zigps-x-cc470e-t25", "ingestionDataSourceSettings": { "awsKinesis": { "streamArn": "arn:aws:kinesis:us-east-1:111111111111:stream/zigps", "consumerArn": "arn:aws:kinesis:us-east-1:111111111111:stream/zigps/consumer/c:1", "awsRoleArn": "arn:aws:iam::111111111111:role/zigps", "gcpServiceAccount": "zig-gcp@test.iam.gserviceaccount.com" } } }
+    )).ingestion.?;
+    try testing.expectEqualStrings("arn:aws:kinesis:us-east-1:111111111111:stream/zigps", k.source.?.aws_kinesis.stream_arn);
+    try testing.expectEqualStrings("arn:aws:kinesis:us-east-1:111111111111:stream/zigps/consumer/c:1", k.source.?.aws_kinesis.consumer_arn);
+    try testing.expectEqualStrings("arn:aws:iam::111111111111:role/zigps", k.source.?.aws_kinesis.aws_role_arn);
+    try testing.expectEqualStrings("zig-gcp@test.iam.gserviceaccount.com", k.source.?.aws_kinesis.gcp_service_account);
+    try testing.expectEqual(types.Ingestion.LogSeverity.disabled, k.log_severity);
+    try testing.expectEqual(types.IngestionState.unknown, k.state);
+
+    const s = (try decodeTopic(a,
+        \\{ "name": "projects/test/topics/zigps-x-cc470e-t27", "ingestionDataSourceSettings": { "cloudStorage": { "bucket": "zigps-x-cc470e-no-such-bucket", "textFormat": { "delimiter": "\n" } } } }
+    )).ingestion.?.source.?.cloud_storage;
+    try testing.expectEqualStrings("zigps-x-cc470e-no-such-bucket", s.bucket);
+    try testing.expectEqualStrings("\n", s.format.text.delimiter);
+    try testing.expectEqual(null, s.minimum_object_create_time);
+    try testing.expectEqualStrings("", s.match_glob);
+
+    const e = (try decodeTopic(a,
+        \\{ "name": "projects/test/topics/zigps-x-cc470e-t33", "ingestionDataSourceSettings": { "azureEventHubs": { "resourceGroup": "rg", "namespace": "ns", "eventHub": "eh", "clientId": "11111111-1111-1111-1111-111111111111", "tenantId": "22222222-2222-2222-2222-222222222222", "subscriptionId": "33333333-3333-3333-3333-333333333333", "gcpServiceAccount": "zig-gcp@test.iam.gserviceaccount.com" } } }
+    )).ingestion.?.source.?.azure_event_hubs;
+    try testing.expectEqualStrings("rg", e.resource_group);
+    try testing.expectEqualStrings("ns", e.namespace);
+    try testing.expectEqualStrings("eh", e.event_hub);
+    try testing.expectEqualStrings("11111111-1111-1111-1111-111111111111", e.client_id);
+    try testing.expectEqualStrings("22222222-2222-2222-2222-222222222222", e.tenant_id);
+    try testing.expectEqualStrings("33333333-3333-3333-3333-333333333333", e.subscription_id);
+    try testing.expectEqualStrings("zig-gcp@test.iam.gserviceaccount.com", e.gcp_service_account);
+
+    const m = (try decodeTopic(a,
+        \\{ "name": "projects/test/topics/zigps-x-cc470e-t34", "ingestionDataSourceSettings": { "awsMsk": { "clusterArn": "arn:aws:kafka:us-east-1:111111111111:cluster/zigps/abc", "topic": "t", "awsRoleArn": "arn:aws:iam::111111111111:role/zigps", "gcpServiceAccount": "zig-gcp@test.iam.gserviceaccount.com" } } }
+    )).ingestion.?.source.?.aws_msk;
+    try testing.expectEqualStrings("arn:aws:kafka:us-east-1:111111111111:cluster/zigps/abc", m.cluster_arn);
+    try testing.expectEqualStrings("t", m.topic);
+    try testing.expectEqualStrings("arn:aws:iam::111111111111:role/zigps", m.aws_role_arn);
+    try testing.expectEqualStrings("zig-gcp@test.iam.gserviceaccount.com", m.gcp_service_account);
+
+    const c = (try decodeTopic(a,
+        \\{ "name": "projects/test/topics/zigps-x-cc470e-t35", "ingestionDataSourceSettings": { "confluentCloud": { "bootstrapServer": "pkc-xxxx.us-east-1.aws.confluent.cloud:9092", "clusterId": "lkc-xxxx", "topic": "t", "identityPoolId": "pool-xxxx", "gcpServiceAccount": "zig-gcp@test.iam.gserviceaccount.com" } } }
+    )).ingestion.?.source.?.confluent_cloud;
+    try testing.expectEqualStrings("pkc-xxxx.us-east-1.aws.confluent.cloud:9092", c.bootstrap_server);
+    try testing.expectEqualStrings("lkc-xxxx", c.cluster_id);
+    try testing.expectEqualStrings("t", c.topic);
+    try testing.expectEqualStrings("pool-xxxx", c.identity_pool_id);
+    try testing.expectEqualStrings("zig-gcp@test.iam.gserviceaccount.com", c.gcp_service_account);
+
+    // A Cloud Storage source with every option, its state and its logs,
+    // in the discovery document's shape.
+    const full = (try decodeTopic(a,
+        \\{"name":"projects/p/topics/t","state":"INGESTION_RESOURCE_ERROR","ingestionDataSourceSettings":{"cloudStorage":{"state":"CLOUD_STORAGE_PERMISSION_DENIED","bucket":"b","avroFormat":{},"minimumObjectCreateTime":"2026-10-12T02:33:53.500Z","matchGlob":"logs/**.avro"},"platformLogsSettings":{"severity":"WARNING"}}}
+    ));
+    try testing.expectEqual(types.TopicInfo.State.ingestion_resource_error, full.state);
+    try testing.expectEqual(types.IngestionState.permission_denied, full.ingestion.?.state);
+    try testing.expectEqual(types.Ingestion.LogSeverity.warning, full.ingestion.?.log_severity);
+    try testing.expect(full.ingestion.?.source.?.cloud_storage.format == .avro);
+    try testing.expectEqual(try timestamp.parse("2026-10-12T02:33:53.5Z"), full.ingestion.?.source.?.cloud_storage.minimum_object_create_time.?);
+    try testing.expectEqualStrings("logs/**.avro", full.ingestion.?.source.?.cloud_storage.match_glob);
+    try testing.expect((try decodeTopic(a, "{\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"bucket\":\"b\",\"pubsubAvroFormat\":{}}}}")).ingestion.?.source.?.cloud_storage.format == .pubsub_avro);
+    // No format, and a text format with no delimiter or an empty one, are
+    // text split at newlines; another delimiter is kept.
+    for ([_][]const u8{
+        "{\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"bucket\":\"b\"}}}",
+        "{\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"bucket\":\"b\",\"textFormat\":{}}}}",
+        "{\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"bucket\":\"b\",\"textFormat\":{\"delimiter\":\"\"}}}}",
+    }) |body| {
+        try testing.expectEqualStrings("\n", (try decodeTopic(a, body)).ingestion.?.source.?.cloud_storage.format.text.delimiter);
+    }
+    try testing.expectEqualStrings("|", (try decodeTopic(a, "{\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"bucket\":\"b\",\"textFormat\":{\"delimiter\":\"|\"}}}}")).ingestion.?.source.?.cloud_storage.format.text.delimiter);
+    try testing.expectEqual(null, (try decodeTopic(a, "{\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"bucket\":\"b\",\"minimumObjectCreateTime\":\"\"}}}")).ingestion.?.source.?.cloud_storage.minimum_object_create_time);
+    try testing.expectError(error.InvalidResponse, decodeTopic(a, "{\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"bucket\":\"b\",\"minimumObjectCreateTime\":\"yesterday\"}}}"));
+
+    // Every state the discovery document names, under the source that can
+    // say it; a word not yet known, the wire's unspecified and none at all
+    // are `.unknown`.
+    for ([_]struct { []const u8, []const u8, types.IngestionState }{
+        .{ "awsKinesis", "ACTIVE", .active },
+        .{ "awsKinesis", "KINESIS_PERMISSION_DENIED", .permission_denied },
+        .{ "awsKinesis", "PUBLISH_PERMISSION_DENIED", .publish_permission_denied },
+        .{ "awsKinesis", "STREAM_NOT_FOUND", .stream_not_found },
+        .{ "awsKinesis", "CONSUMER_NOT_FOUND", .consumer_not_found },
+        .{ "awsKinesis", "CONFLICTING_REGION_CONSTRAINTS", .conflicting_region_constraints },
+        .{ "cloudStorage", "ACTIVE", .active },
+        .{ "cloudStorage", "CLOUD_STORAGE_PERMISSION_DENIED", .permission_denied },
+        .{ "cloudStorage", "PUBLISH_PERMISSION_DENIED", .publish_permission_denied },
+        .{ "cloudStorage", "BUCKET_NOT_FOUND", .bucket_not_found },
+        .{ "cloudStorage", "TOO_MANY_OBJECTS", .too_many_objects },
+        .{ "azureEventHubs", "ACTIVE", .active },
+        .{ "azureEventHubs", "EVENT_HUBS_PERMISSION_DENIED", .permission_denied },
+        .{ "azureEventHubs", "NAMESPACE_NOT_FOUND", .namespace_not_found },
+        .{ "azureEventHubs", "EVENT_HUB_NOT_FOUND", .event_hub_not_found },
+        .{ "azureEventHubs", "SUBSCRIPTION_NOT_FOUND", .subscription_not_found },
+        .{ "azureEventHubs", "RESOURCE_GROUP_NOT_FOUND", .resource_group_not_found },
+        .{ "awsMsk", "ACTIVE", .active },
+        .{ "awsMsk", "MSK_PERMISSION_DENIED", .permission_denied },
+        .{ "awsMsk", "CLUSTER_NOT_FOUND", .cluster_not_found },
+        .{ "awsMsk", "TOPIC_NOT_FOUND", .topic_not_found },
+        .{ "confluentCloud", "ACTIVE", .active },
+        .{ "confluentCloud", "CONFLUENT_CLOUD_PERMISSION_DENIED", .permission_denied },
+        .{ "confluentCloud", "UNREACHABLE_BOOTSTRAP_SERVER", .unreachable_bootstrap_server },
+        .{ "confluentCloud", "CLUSTER_NOT_FOUND", .cluster_not_found },
+        .{ "confluentCloud", "TOPIC_NOT_FOUND", .topic_not_found },
+        .{ "confluentCloud", "CONFLICTING_REGION_CONSTRAINTS", .conflicting_region_constraints },
+        .{ "awsMsk", "STATE_UNSPECIFIED", .unknown },
+        .{ "cloudStorage", "QUOTA_EXCEEDED", .unknown },
+        .{ "awsKinesis", "active", .unknown },
+    }) |case| {
+        const source, const word, const want = case;
+        const body = try std.fmt.allocPrint(a, "{{\"ingestionDataSourceSettings\":{{\"{s}\":{{\"state\":\"{s}\"}}}}}}", .{ source, word });
+        const info = (try decodeTopic(a, body)).ingestion.?;
+        try testing.expectEqual(want, info.state);
+        try testing.expect(info.source != null);
+    }
+
+    // Each severity; none, and the wire's unspecified, are no logs.
+    for ([_]struct { []const u8, types.Ingestion.LogSeverity }{
+        .{ "DISABLED", .disabled }, .{ "SEVERITY_UNSPECIFIED", .disabled }, .{ "DEBUG", .debug },      .{ "INFO", .info },
+        .{ "WARNING", .warning },   .{ "ERROR", .@"error" },                .{ "CRITICAL", .unknown }, .{ "", .unknown },
+    }) |case| {
+        const word, const want = case;
+        const body = try std.fmt.allocPrint(a, "{{\"ingestionDataSourceSettings\":{{\"awsMsk\":{{}},\"platformLogsSettings\":{{\"severity\":\"{s}\"}}}}}}", .{word});
+        try testing.expectEqual(want, (try decodeTopic(a, body)).ingestion.?.log_severity);
+    }
+    try testing.expectEqual(types.Ingestion.LogSeverity.disabled, (try decodeTopic(a, "{\"ingestionDataSourceSettings\":{\"awsMsk\":{},\"platformLogsSettings\":{}}}")).ingestion.?.log_severity);
+
+    // No settings and a null are a standard topic. Settings with a source
+    // this client does not model are an import topic still, with its logs.
+    try testing.expectEqual(null, (try decodeTopic(a, "{\"name\":\"projects/p/topics/t\"}")).ingestion);
+    try testing.expectEqual(null, (try decodeTopic(a, "{\"ingestionDataSourceSettings\":null}")).ingestion);
+    const newer = (try decodeTopic(a, "{\"ingestionDataSourceSettings\":{\"someQueue\":{\"queue\":\"q\",\"state\":\"ACTIVE\"},\"platformLogsSettings\":{\"severity\":\"INFO\"}}}")).ingestion.?;
+    try testing.expectEqual(null, newer.source);
+    try testing.expectEqual(types.Ingestion.LogSeverity.info, newer.log_severity);
+    try testing.expectEqual(types.IngestionState.unknown, newer.state);
+    // A source with a part left out reads as "" there.
+    try testing.expectEqualStrings("", (try decodeTopic(a, "{\"ingestionDataSourceSettings\":{\"awsKinesis\":{}}}")).ingestion.?.source.?.aws_kinesis.stream_arn);
+    try testing.expectError(error.InvalidResponse, decodeTopic(a, "{\"ingestionDataSourceSettings\":\"awsKinesis\"}"));
+    try testing.expectError(error.InvalidResponse, decodeTopic(a, "{\"ingestionDataSourceSettings\":{\"cloudStorage\":[]}}"));
+
+    // Should an answer hold two sources, the first in the fixed order wins.
+    const two = (try decodeTopic(a, "{\"ingestionDataSourceSettings\":{\"confluentCloud\":{\"topic\":\"c\"},\"awsMsk\":{\"topic\":\"m\"}}}")).ingestion.?;
+    try testing.expectEqualStrings("m", two.source.?.aws_msk.topic);
+
+    // In a list, each topic with its own.
+    const page = try decodeTopicPage(a,
+        \\{"topics":[{"name":"projects/p/topics/a"},{"name":"projects/p/topics/b","ingestionDataSourceSettings":{"cloudStorage":{"bucket":"b","state":"ACTIVE"}}}]}
+    );
+    try testing.expectEqual(null, page.topics[0].ingestion);
+    try testing.expectEqual(types.IngestionState.active, page.topics[1].ingestion.?.state);
+}
+
+fn genText(g: *ByteGen, arena: Allocator, fallback: []const u8) ![]const u8 {
+    const buf = try arena.alloc(u8, 24);
+    const text = g.utf8(buf, 24);
+    return if (text.len == 0) fallback else text;
+}
+
+fn genIngestion(g: *ByteGen, arena: Allocator) !types.Ingestion {
+    const account = "importer@my-project.iam.gserviceaccount.com";
+    const source: types.Ingestion.Source = switch (g.intRange(u8, 0, 4)) {
+        0 => .{ .aws_kinesis = .{
+            .stream_arn = try std.fmt.allocPrint(arena, "arn:{s}", .{try genText(g, arena, "s")}),
+            .consumer_arn = try std.fmt.allocPrint(arena, "arn:{s}", .{try genText(g, arena, "c")}),
+            .aws_role_arn = try std.fmt.allocPrint(arena, "arn:{s}", .{try genText(g, arena, "r")}),
+            .gcp_service_account = account,
+        } },
+        1 => .{
+            .cloud_storage = .{
+                .bucket = g.pick([]const u8, &.{ "my-uploads", "gs://my-uploads", "b", "example.com", "b\u{e9}" }),
+                .format = switch (g.intRange(u8, 0, 2)) {
+                    0 => .{ .text = .{ .delimiter = try arena.dupe(u8, &.{g.intRange(u8, 0, 0x7f)}) } },
+                    1 => .avro,
+                    else => .pubsub_avro,
+                },
+                // Any time a timestamp can hold, to the nanosecond.
+                .minimum_object_create_time = if (g.boolean())
+                    .{ .nanoseconds = @as(i96, g.intRange(u64, 0, 253_402_300_799)) * std.time.ns_per_s + g.intRange(u32, 0, 999_999_999) }
+                else
+                    null,
+                .match_glob = if (g.boolean()) try genText(g, arena, "**") else "",
+            },
+        },
+        2 => .{ .azure_event_hubs = .{
+            .resource_group = try genText(g, arena, "rg"),
+            .namespace = try genText(g, arena, "ns"),
+            .event_hub = try genText(g, arena, "eh"),
+            .client_id = try genText(g, arena, "c"),
+            .tenant_id = try genText(g, arena, "t"),
+            .subscription_id = try genText(g, arena, "s"),
+            .gcp_service_account = account,
+        } },
+        3 => .{ .aws_msk = .{
+            .cluster_arn = try std.fmt.allocPrint(arena, "arn:{s}", .{try genText(g, arena, "k")}),
+            .topic = try genText(g, arena, "t"),
+            .aws_role_arn = try std.fmt.allocPrint(arena, "arn:{s}", .{try genText(g, arena, "r")}),
+            .gcp_service_account = account,
+        } },
+        else => .{ .confluent_cloud = .{
+            .bootstrap_server = try genText(g, arena, "host:9092"),
+            .cluster_id = try genText(g, arena, "lkc"),
+            .topic = try genText(g, arena, "t"),
+            .identity_pool_id = try genText(g, arena, "pool"),
+            .gcp_service_account = account,
+        } },
+    };
+    return .{ .source = source, .log_severity = g.pick(types.Ingestion.LogSeverity, &.{ .disabled, .debug, .info, .warning, .@"error" }) };
+}
+
+/// Every field of two sources of one kind is the same, strings by their
+/// bytes.
+fn expectSourcesEqual(want: types.Ingestion.Source, have: types.Ingestion.Source) !void {
+    try testing.expectEqual(std.meta.activeTag(want), std.meta.activeTag(have));
+    switch (want) {
+        .cloud_storage => |w| {
+            const h = have.cloud_storage;
+            try testing.expectEqualStrings(w.bucket, h.bucket);
+            try testing.expectEqual(std.meta.activeTag(w.format), std.meta.activeTag(h.format));
+            if (w.format == .text) try testing.expectEqualStrings(w.format.text.delimiter, h.format.text.delimiter);
+            try testing.expectEqual(w.minimum_object_create_time, h.minimum_object_create_time);
+            try testing.expectEqualStrings(w.match_glob, h.match_glob);
+        },
+        inline else => |w, tag| {
+            const h = @field(have, @tagName(tag));
+            inline for (@typeInfo(@TypeOf(w)).@"struct".field_names) |name| {
+                try testing.expectEqualStrings(@field(w, name), @field(h, name));
+            }
+        },
+    }
+}
+
+fn ingestionRoundTrip(_: void, input: []const u8) !void {
+    var g: ByteGen = .init(input);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const settings = try genIngestion(&g, a);
+    try @import("validate.zig").ingestion(settings, null);
+
+    // What a create sends, a read gives back, with no state: that is the
+    // server's to add.
+    const created = (try decodeTopic(a, try encodeTopic(a, .{ .ingestion = settings }))).ingestion.?;
+    try expectSourcesEqual(settings.source, created.source.?);
+    try testing.expectEqual(settings.log_severity, created.log_severity);
+    try testing.expectEqual(types.IngestionState.unknown, created.state);
+
+    // An update names the settings in its mask exactly when it sets or
+    // clears them, and carries them exactly when it sets them.
+    const change: types.Change(types.Ingestion) = switch (g.intRange(u8, 0, 2)) {
+        0 => .keep,
+        1 => .clear,
+        else => .{ .set = settings },
+    };
+    const with_labels = g.boolean();
+    if (change == .keep and !with_labels) return;
+    const update = try std.json.parseFromSliceLeaky(struct {
+        topic: struct { ingestionDataSourceSettings: ?WireIngestion = null, labels: ?std.json.Value = null },
+        updateMask: []const u8,
+    }, a, try encodeTopicUpdate(a, .{ .labels = if (with_labels) &.{} else null, .ingestion = change }), .{});
+    var named: usize = 0;
+    var paths = std.mem.splitScalar(u8, update.updateMask, ',');
+    while (paths.next()) |path| {
+        if (std.mem.eql(u8, path, "ingestionDataSourceSettings")) named += 1;
+    }
+    try testing.expectEqual(@intFromBool(change != .keep), named);
+    try testing.expectEqual(change == .set, update.topic.ingestionDataSourceSettings != null);
+    if (change == .set) {
+        const sent = (try ingestionFromWire(update.topic.ingestionDataSourceSettings)).?;
+        try expectSourcesEqual(settings.source, sent.source.?);
+        try testing.expectEqual(settings.log_severity, sent.log_severity);
+    }
+}
+
+test "fuzz import topic settings: what a create sends a read gives back, and an update's mask names them exactly when it changes them" {
+    try test_util.fuzzBytes({}, ingestionRoundTrip, .{
+        .corpus = &.{
+            "",
+            "\x01",
+            "\x02",
+            "\x03",
+            "\x04",
+            // A bucket, text with a delimiter, a time and a glob, set in an update.
+            "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x02\x41\x01\x00\x00\x00\x00\x6a\x0f\x2b\x11\x1d\xcd\x65\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x02\x01",
+            "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
         },
     });
 }

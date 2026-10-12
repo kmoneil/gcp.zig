@@ -1002,3 +1002,145 @@ fn topicTransformsAllocations(gpa: std.mem.Allocator) !void {
 test "allocation failures: a topic's transforms on create, as read, and in an update" {
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, topicTransformsAllocations, .{});
 }
+
+const import_account = "importer@my-project.iam.gserviceaccount.com";
+const kinesis_source: types.Ingestion.Source = .{ .aws_kinesis = .{
+    .stream_arn = "arn:aws:kinesis:us-east-1:111111111111:stream/orders",
+    .consumer_arn = "arn:aws:kinesis:us-east-1:111111111111:stream/orders/consumer/c:1",
+    .aws_role_arn = "arn:aws:iam::111111111111:role/pubsub",
+    .gcp_service_account = import_account,
+} };
+const kinesis_json =
+    \\{"awsKinesis":{"streamArn":"arn:aws:kinesis:us-east-1:111111111111:stream/orders","consumerArn":"arn:aws:kinesis:us-east-1:111111111111:stream/orders/consumer/c:1","awsRoleArn":"arn:aws:iam::111111111111:role/pubsub","gcpServiceAccount":"importer@my-project.iam.gserviceaccount.com"},"platformLogsSettings":{"severity":"INFO"}}
+;
+
+test "golden: an import topic is made, read with its state, given another source whole, and made a standard topic again" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/uploads\",\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"state\":\"ACTIVE\",\"bucket\":\"my-uploads\",\"textFormat\":{\"delimiter\":\"\\n\"}}}}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/uploads\",\"state\":\"INGESTION_RESOURCE_ERROR\",\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"state\":\"BUCKET_NOT_FOUND\",\"bucket\":\"my-uploads\",\"textFormat\":{\"delimiter\":\"\\n\"}}}}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/uploads\",\"ingestionDataSourceSettings\":{\"awsKinesis\":{\"state\":\"ACTIVE\",\"streamArn\":\"arn:aws:kinesis:us-east-1:111111111111:stream/orders\",\"consumerArn\":\"arn:aws:kinesis:us-east-1:111111111111:stream/orders/consumer/c:1\",\"awsRoleArn\":\"arn:aws:iam::111111111111:role/pubsub\",\"gcpServiceAccount\":\"importer@my-project.iam.gserviceaccount.com\"},\"platformLogsSettings\":{\"severity\":\"INFO\"}}}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/uploads\"}" } },
+    }, .{});
+    defer h.deinit();
+    const uploads = h.client.topic("uploads");
+    const path = "http://localhost:8085/v1/projects/p/topics/uploads";
+
+    var created = try uploads.create(.{ .ingestion = .{ .source = .{ .cloud_storage = .{ .bucket = "my-uploads" } } } });
+    defer created.deinit();
+    try h.expectRequest(0, .PUT, path,
+        \\{"ingestionDataSourceSettings":{"cloudStorage":{"bucket":"my-uploads","textFormat":{"delimiter":"\n"}}}}
+    );
+    try testing.expectEqualStrings("my-uploads", created.value.ingestion.?.source.?.cloud_storage.bucket);
+    try testing.expectEqualStrings("\n", created.value.ingestion.?.source.?.cloud_storage.format.text.delimiter);
+    try testing.expectEqual(types.IngestionState.active, created.value.ingestion.?.state);
+    try testing.expectEqual(types.TopicInfo.State.active, created.value.state);
+
+    // A source that has gone shows in its state, and in the topic's.
+    var read = try uploads.get();
+    defer read.deinit();
+    try testing.expectEqual(types.IngestionState.bucket_not_found, read.value.ingestion.?.state);
+    try testing.expectEqual(types.TopicInfo.State.ingestion_resource_error, read.value.state);
+
+    // An update replaces the settings whole: another source, with logs.
+    var changed = try uploads.update(.{ .ingestion = .{ .set = .{ .source = kinesis_source, .log_severity = .info } } });
+    defer changed.deinit();
+    try h.expectRequest(2, .PATCH, path, "{\"topic\":{\"ingestionDataSourceSettings\":" ++ kinesis_json ++ "},\"updateMask\":\"ingestionDataSourceSettings\"}");
+    try testing.expectEqualStrings("arn:aws:iam::111111111111:role/pubsub", changed.value.ingestion.?.source.?.aws_kinesis.aws_role_arn);
+    try testing.expectEqual(types.Ingestion.LogSeverity.info, changed.value.ingestion.?.log_severity);
+
+    var standard = try uploads.update(.{ .ingestion = .clear });
+    defer standard.deinit();
+    try h.expectRequest(3, .PATCH, path, "{\"topic\":{},\"updateMask\":\"ingestionDataSourceSettings\"}");
+    try testing.expectEqual(null, standard.value.ingestion);
+    try h.expectRequestCount(4);
+}
+
+test "an import topic: what the checks refuse is never sent, and a source production cannot reach is refused in its words when the topic is made" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        // Production's words, 2026-10-12.
+        .{ .respond = .{ .status = 403, .body = "{\"error\":{\"code\":403,\"message\":\"Cloud Pub/Sub does not have the necessary permissions settings on the ingestion data source: AccessDenied: Not authorized to perform sts:AssumeRoleWithWebIdentity.\",\"status\":\"PERMISSION_DENIED\"}}" } },
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"Cloud Pub/Sub encountered a not-found error while trying to connect to the ingestion data source: Bucket \\\"my-uploads\\\" not found for operation OP_TEST_IAM_PERMISSIONS.\",\"status\":\"NOT_FOUND\"}}" } },
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"Cloud Pub/Sub encountered a not-found error while trying to connect to the ingestion data source: Failed to resolve bootstrap server ns.servicebus.windows.net to an IP.\",\"status\":\"NOT_FOUND\"}}" } },
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Cloud Pub/Sub received invalid argument/s for the ingestion data source: Unreachable bootstrap server.\",\"status\":\"INVALID_ARGUMENT\"}}" } },
+    }, .{ .token = "t" });
+    defer h.deinit();
+    const uploads = h.client.topic("uploads");
+
+    try testing.expectError(error.InvalidArgument, uploads.create(.{ .ingestion = .{ .source = .{ .cloud_storage = .{ .bucket = "" } } } }));
+    try testing.expectEqualStrings("the import topic's bucket is empty", h.diag.message());
+    var no_arn = kinesis_source;
+    no_arn.aws_kinesis.stream_arn = "orders";
+    try testing.expectError(error.InvalidArgument, uploads.create(.{ .ingestion = .{ .source = no_arn } }));
+    try testing.expectEqualStrings("the Kinesis stream ARN does not begin arn:", h.diag.message());
+    try testing.expectError(error.InvalidArgument, uploads.update(.{ .ingestion = .{ .set = .{ .source = kinesis_source, .log_severity = .unknown } } }));
+    try testing.expectEqualStrings("the log severity is .unknown, which is only ever read", h.diag.message());
+    try h.expectRequestCount(0);
+
+    // A role Pub/Sub may not assume, a bucket and a namespace that are
+    // not there, and a server it cannot reach: each refuses the create,
+    // once.
+    try testing.expectError(error.PermissionDenied, uploads.create(.{ .ingestion = .{ .source = kinesis_source } }));
+    try testing.expect(std.mem.endsWith(u8, h.diag.message(), "Not authorized to perform sts:AssumeRoleWithWebIdentity."));
+    try testing.expectError(error.NotFound, uploads.create(.{ .ingestion = .{ .source = .{ .cloud_storage = .{ .bucket = "my-uploads" } } } }));
+    try testing.expectEqualStrings("Cloud Pub/Sub encountered a not-found error while trying to connect to the ingestion data source: Bucket \"my-uploads\" not found for operation OP_TEST_IAM_PERMISSIONS.", h.diag.message());
+    try testing.expectError(error.NotFound, uploads.update(.{ .ingestion = .{ .set = .{ .source = .{ .azure_event_hubs = .{
+        .resource_group = "rg",
+        .namespace = "ns",
+        .event_hub = "eh",
+        .client_id = "11111111-1111-1111-1111-111111111111",
+        .tenant_id = "22222222-2222-2222-2222-222222222222",
+        .subscription_id = "33333333-3333-3333-3333-333333333333",
+        .gcp_service_account = import_account,
+    } } } } }));
+    try testing.expect(std.mem.endsWith(u8, h.diag.message(), "Failed to resolve bootstrap server ns.servicebus.windows.net to an IP."));
+    try testing.expectError(error.InvalidArgument, uploads.create(.{ .ingestion = .{ .source = .{ .confluent_cloud = .{
+        .bootstrap_server = "pkc-xxxx.us-east-1.aws.confluent.cloud:9092",
+        .cluster_id = "lkc-xxxx",
+        .topic = "orders",
+        .identity_pool_id = "pool-xxxx",
+        .gcp_service_account = import_account,
+    } } } }));
+    try testing.expect(std.mem.endsWith(u8, h.diag.message(), "Unreachable bootstrap server."));
+    try h.expectRequestCount(4);
+}
+
+fn importTopicAllocations(gpa: std.mem.Allocator) !void {
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/uploads\",\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"state\":\"ACTIVE\",\"bucket\":\"my-uploads\",\"textFormat\":{\"delimiter\":\"\\t\"},\"minimumObjectCreateTime\":\"2026-10-12T02:33:53.500Z\",\"matchGlob\":\"logs/**.txt\"},\"platformLogsSettings\":{\"severity\":\"WARNING\"}}}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/uploads\",\"ingestionDataSourceSettings\":{\"awsKinesis\":{\"state\":\"KINESIS_PERMISSION_DENIED\",\"streamArn\":\"arn:aws:kinesis:us-east-1:111111111111:stream/or\\u0064ers\",\"consumerArn\":\"arn:c\",\"awsRoleArn\":\"arn:r\",\"gcpServiceAccount\":\"importer@my-project.iam.gserviceaccount.com\"}}}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/uploads\",\"ingestionDataSourceSettings\":{\"awsKinesis\":{\"streamArn\":\"arn:s\",\"consumerArn\":\"arn:c\",\"awsRoleArn\":\"arn:r\",\"gcpServiceAccount\":\"importer@my-project.iam.gserviceaccount.com\"}}}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/uploads\"}" } },
+    });
+    defer fake.deinit();
+    var clock: test_util.FakeClock = .{};
+    var client = try Client.init(gpa, clock.io(), .{
+        .project_id = "p",
+        .endpoint = .{ .url = "localhost:8085", .emulator = true },
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    const uploads = client.topic("uploads");
+    var created = try uploads.create(.{ .ingestion = .{
+        .source = .{ .cloud_storage = .{
+            .bucket = "my-uploads",
+            .format = .{ .text = .{ .delimiter = "\t" } },
+            .minimum_object_create_time = .{ .nanoseconds = 1_791_772_433_500_000_000 },
+            .match_glob = "logs/**.txt",
+        } },
+        .log_severity = .warning,
+    } });
+    created.deinit();
+    var read = try uploads.get();
+    read.deinit();
+    var changed = try uploads.update(.{ .ingestion = .{ .set = .{ .source = kinesis_source } } });
+    changed.deinit();
+    var standard = try uploads.update(.{ .ingestion = .clear });
+    standard.deinit();
+    try testing.expectEqual(4, fake.requests.items.len);
+}
+
+test "allocation failures: an import topic on create, as read, and in an update" {
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, importTopicAllocations, .{});
+}
