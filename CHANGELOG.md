@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.36.0 (unreleased)
+## 0.36.0 (2026-10-12)
 
 - pubsub: message transforms. A topic or a subscription can run each
   message through up to five JavaScript functions, which Pub/Sub runs:
