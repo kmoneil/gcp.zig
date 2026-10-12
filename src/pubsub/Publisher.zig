@@ -1745,6 +1745,26 @@ test "deadlines: a failure retrying cannot fix is final at once" {
     try testing.expectEqual(1, s.fake.requestCount());
 }
 
+test "a schema topic: one message that does not fit fails every message that shared its batch, in one request" {
+    var s: Solo = undefined;
+    try s.init(.{});
+    defer s.deinit();
+    // As a topic with a schema refuses a publish with one misfit in it:
+    // the whole request, and nothing of it is published.
+    s.fake.script = &.{.{ .status = .{ 400, "INVALID_ARGUMENT" } }};
+    const fits = try s.publishText("{\"quantity\":1}");
+    defer fits.release();
+    const misfit = try s.publishText("{\"quantity\":\"one\"}");
+    defer misfit.release();
+    s.advance(10);
+    try s.publisher.sendDue();
+    try testing.expectError(error.InvalidArgument, idOf(fits));
+    try testing.expectError(error.InvalidArgument, idOf(misfit));
+    try testing.expectEqual(400, fits.diagnostics().http_status);
+    // One request held both, and it is not tried again.
+    try testing.expectEqual(1, s.fake.requestCount());
+}
+
 test "deadlines: each attempt's limit is the client's, cut to the time left" {
     var s: Solo = undefined;
     try s.init(.{ .publish_timeout_ms = 20_000, .request_timeout_ms = 15_000 });

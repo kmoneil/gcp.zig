@@ -41,6 +41,23 @@ including the ones that did not change.
   already has is one more revision, a rollback makes a new revision id,
   revisions list oldest first, and a commit is checked for whether it
   parses, not against the revisions before it.
+- pubsub: a topic's schema. `TopicConfig.schema`, `TopicInfo.schema`
+  and `TopicUpdate.schema` carry a `SchemaSettings`: the schema, by an
+  id in the client's project or by a full name, the encoding, and the
+  oldest and newest revision a message may fit. The topic then takes
+  only messages that fit, and a publish of one that does not is
+  `error.InvalidArgument` for its whole request: in a `Publisher`, for
+  every message that shared its batch. An update replaces the settings
+  whole, and `.clear` leaves the topic taking any bytes again. Once its
+  schema is deleted a topic reads `_deleted-schema_`, which
+  `SchemaSettings.isDeleted` answers, and that name is refused before
+  sending. `ReceivedMessage.schema()` reads what a schema topic writes
+  on a message (`MessageSchema`): the schema's name, the revision the
+  message fit and the encoding. Measured on emulator 0.8.36,
+  2026-10-11: a publish is checked in both encodings; JSON with a field
+  the schema does not have is taken; a topic whose schema is deleted
+  answers a publish `error.NotFound`, and a schema made again under the
+  id is not the one it had.
 - auth, core, firestore, secret_manager and storage: unchanged.
 
 ## 0.35.0 (unreleased)

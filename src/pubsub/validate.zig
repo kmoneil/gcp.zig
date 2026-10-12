@@ -238,6 +238,12 @@ pub fn isSnapshotName(name: []const u8) bool {
     return isNameIn(name, "/snapshots/");
 }
 
+/// `projects/{project}/schemas/{id}`, with a valid project and schema id,
+/// and no revision after it.
+pub fn isSchemaName(name: []const u8) bool {
+    return isNameIn(name, "/schemas/");
+}
+
 fn isNameIn(name: []const u8, comptime collection: []const u8) bool {
     const prefix = "projects/";
     if (!std.mem.startsWith(u8, name, prefix)) return false;
@@ -488,6 +494,7 @@ pub fn topicConfig(config: types.TopicConfig, diag: ?*Diagnostics) error{Invalid
     if (config.message_retention) |r| try messageRetention(r, diag);
     if (config.kms_key_name) |k| try kmsKeyName(k, diag);
     if (config.message_storage_policy) |p| try storagePolicy(p, diag);
+    if (config.schema) |s| try schemaSettings(s, diag);
 }
 
 /// A subscription update: something to change, and every new value valid.
@@ -542,9 +549,29 @@ pub fn topicUpdate(u: types.TopicUpdate, diag: ?*Diagnostics) error{InvalidArgum
         .set => |p| try storagePolicy(p, diag),
         else => {},
     }
-    if (u.labels == null and u.message_retention == .keep and u.kms_key_name == .keep and u.message_storage_policy == .keep) {
+    switch (u.schema) {
+        .set => |s| try schemaSettings(s, diag),
+        else => {},
+    }
+    if (u.labels == null and u.message_retention == .keep and u.kms_key_name == .keep and u.message_storage_policy == .keep and u.schema == .keep) {
         return refuse(diag, "the update changes nothing", .{});
     }
+}
+
+/// A topic's schema settings: a schema named by its id or in full, with no
+/// revision after it, an encoding this client can name, and revision ids,
+/// where given, that are ones. What a topic reads once its schema is
+/// deleted is not a schema to name.
+pub fn schemaSettings(s: types.SchemaSettings, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    if (s.isDeleted()) {
+        return refuse(diag, "the schema is _deleted-schema_, which a topic reads once its schema is deleted: name a schema that is there, or clear the settings", .{});
+    }
+    if (!isResourceId(s.schema) and !isSchemaName(s.schema)) {
+        return refuse(diag, "the schema is neither a schema id nor projects/{{project}}/schemas/{{id}}", .{});
+    }
+    try schemaEncoding(s.encoding, diag);
+    if (s.first_revision_id) |r| try revisionId(r, diag);
+    if (s.last_revision_id) |r| try revisionId(r, diag);
 }
 
 /// A snapshot's settings: a subscription id or a full subscription name,
@@ -1215,4 +1242,39 @@ test "revision ids: what the server makes passes, and nothing that could turn a 
         try testing.expectError(error.InvalidArgument, revisionId(bad, &d));
         try testing.expectEqualStrings("the revision id is empty, or holds a space, a control or non-ASCII character, or one of / @ ? # :", d.message());
     }
+}
+
+test "a topic's schema settings: the schema's two forms, an encoding, and revisions that are ones" {
+    var d: Diagnostics = .{};
+    try schemaSettings(.{ .schema = "order-v1", .encoding = .json }, &d);
+    try schemaSettings(.{ .schema = "projects/other-project/schemas/a%41+b", .encoding = .binary, .first_revision_id = "1b46a16a", .last_revision_id = "6f0519a4" }, &d);
+    try topicConfig(.{ .schema = .{ .schema = "order-v1", .encoding = .json } }, &d);
+    try topicUpdate(.{ .schema = .{ .set = .{ .schema = "order-v1", .encoding = .json } } }, &d);
+    // Taking the schema away is a change.
+    try topicUpdate(.{ .schema = .clear }, &d);
+
+    for ([_][]const u8{
+        "",
+        "go",
+        "projects/p/topics/order-v1",
+        "schemas/order-v1",
+        "projects//schemas/order-v1",
+        "projects/p/schemas/order-v1/x",
+        // A revision is the range's to name, never the name's.
+        "order-v1@1b46a16a",
+        "projects/p/schemas/order-v1@1b46a16a",
+    }) |bad| {
+        try testing.expect(!isSchemaName(bad));
+        try testing.expectError(error.InvalidArgument, schemaSettings(.{ .schema = bad, .encoding = .json }, &d));
+        try testing.expectEqualStrings("the schema is neither a schema id nor projects/{project}/schemas/{id}", d.message());
+    }
+    try testing.expectError(error.InvalidArgument, schemaSettings(.{ .schema = "_deleted-schema_", .encoding = .json }, &d));
+    try testing.expect(std.mem.startsWith(u8, d.message(), "the schema is _deleted-schema_"));
+    try testing.expectError(error.InvalidArgument, schemaSettings(.{ .schema = "order-v1", .encoding = .unknown }, &d));
+    try testing.expectEqualStrings("the encoding is .unknown, which is only ever read", d.message());
+    try testing.expectError(error.InvalidArgument, schemaSettings(.{ .schema = "order-v1", .encoding = .json, .first_revision_id = "" }, &d));
+    try testing.expectError(error.InvalidArgument, schemaSettings(.{ .schema = "order-v1", .encoding = .json, .last_revision_id = "a/b" }, &d));
+    // Through a topic's settings and an update, the same refusals.
+    try testing.expectError(error.InvalidArgument, topicConfig(.{ .schema = .{ .schema = "go", .encoding = .json } }, &d));
+    try testing.expectError(error.InvalidArgument, topicUpdate(.{ .schema = .{ .set = .{ .schema = "order-v1", .encoding = .unknown } } }, &d));
 }
