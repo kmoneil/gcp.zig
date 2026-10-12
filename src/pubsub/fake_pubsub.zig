@@ -94,6 +94,27 @@
 //!   published to such a topic is marked with the encoding and the
 //!   revision it fit. **Whether a message fits is the test's to say**,
 //!   through `Options.fits`: with none, every message fits.
+//! - What Pub/Sub would do on its own, kept and not done, as production
+//!   answered on 2026-10-10 to 2026-10-12:
+//!   - A subscription that pushes, or writes to BigQuery or to Cloud
+//!     Storage: the config is checked as production checked it and read
+//!     back as production read it back, with what production fills in.
+//!     **Nothing is delivered**: such a subscription holds what it is
+//!     sent, and refuses a pull. `modifyPushConfig`, and an update by
+//!     `pushConfig`, `bigqueryConfig` and `cloudStorageConfig`, change
+//!     one kind for another.
+//!   - Message transforms on a topic and on a subscription. **No function
+//!     runs**: a message goes through as it was published.
+//!   - An import topic's source. **Nothing is imported.**
+//!   - Tags on a topic, a subscription and a snapshot as each is made.
+//!     Production returns none on a read, and neither does the fake:
+//!     `tagValue` says what was bound.
+//!
+//!   The fake has no world outside itself. A table, a bucket, a stream, a
+//!   service account and a tag are each taken to be there and allowed,
+//!   where production looks and may refuse. What production would then
+//!   find out by trying, a test says: `setExportState` and
+//!   `setIngestionState`.
 //! - Faults, on command: `refuseNext`, `loseAnswers`, `dropNext`.
 //!
 //! Its clock is the `io` it is given: with `core.testing.FakeClock`, a
@@ -101,9 +122,10 @@
 //! to use from several tasks at once.
 //!
 //! Not modelled yet, and answered 501 with a message that says so, never
-//! guessed at: push and export deliveries, transforms, import settings,
-//! tags and IAM. A filter of a shape production was not shown,
-//! or that production itself fails on, is answered the same way.
+//! guessed at: IAM, a Bigtable subscription, and the transforms that are
+//! no JavaScript function. A filter of a shape production was not shown,
+//! or that production itself fails on, is answered the same way, and so
+//! is a setting here and there that production was not shown.
 //! Production's delays are not modelled at all: a deleted topic that
 //! still takes a publish, the two seconds before a nacked message comes
 //! again, the 2 to 50 seconds a seek back took to show, the seven
@@ -118,6 +140,7 @@ const core = @import("core");
 const tp = core.transport;
 const timestamp = core.timestamp;
 const fake_filter = @import("fake_filter.zig");
+const types = @import("types.zig");
 
 pub const FakePubSub = struct {
     gpa: Allocator,
@@ -213,6 +236,12 @@ pub const FakePubSub = struct {
         /// again under its name is another topic.
         deleted: bool = false,
         schema: ?SchemaSettings = null,
+        /// Kept, and run on nothing.
+        transforms: []const Transform = &.{},
+        /// An import topic's source. Nothing is imported from it.
+        ingestion: ?Ingestion = null,
+        /// Bound as the topic was made, and never read back.
+        tags: []const Label = &.{},
     };
 
     const Schema = struct {
@@ -296,9 +325,13 @@ pub const FakePubSub = struct {
         retain_acked: bool = false,
         /// Seconds. Null: it never expires.
         expiration_ttl_s: ?i64 = 2_678_400,
-        /// Production answers a different `pushConfig` once a subscription
-        /// has been updated.
-        updated: bool = false,
+        /// How its messages would be handed over. Anything but a pull is
+        /// kept and not done: the subscription holds what it is sent.
+        delivery: Delivery = .pull,
+        /// Kept, and run on nothing.
+        transforms: []const Transform = &.{},
+        /// Bound as the subscription was made, and never read back.
+        tags: []const Label = &.{},
         dead_letter: ?DeadLetter = null,
         retry: ?Retry = null,
         /// Messages with an ordering key come in the key's order.
@@ -396,6 +429,8 @@ pub const FakePubSub = struct {
         /// How many messages the topic had been sent by then: every one
         /// after is the snapshot's too.
         from: usize,
+        /// Bound as the snapshot was made, and never read back.
+        tags: []const Label = &.{},
     };
 
     const DeadLetter = struct {
@@ -407,6 +442,87 @@ pub const FakePubSub = struct {
 
     /// Seconds, each 0 to 600.
     const Retry = struct { min_s: i64, max_s: i64 };
+
+    const Delivery = union(enum) {
+        pull,
+        push: Push,
+        bigquery: BigQuery,
+        cloud_storage: CloudStorage,
+    };
+
+    const Push = struct {
+        endpoint: []const u8,
+        /// `x-goog-version`, when the request said one.
+        version: ?[]const u8 = null,
+        oidc: ?Oidc = null,
+        wrapper: Wrapper = .unsaid,
+
+        const Oidc = struct { email: []const u8, audience: []const u8 = "" };
+        const Wrapper = union(enum) { unsaid, pubsub, none: struct { write_metadata: bool = false } };
+    };
+
+    const BigQuery = struct {
+        table: []const u8 = "",
+        use_topic_schema: bool = false,
+        write_metadata: bool = false,
+        drop_unknown_fields: bool = false,
+        use_table_schema: bool = false,
+        service_account: []const u8 = "",
+        /// What production would say of its writes: the test's to set.
+        state: types.ExportState = .active,
+    };
+
+    const CloudStorage = struct {
+        bucket: []const u8 = "",
+        prefix: []const u8 = "",
+        suffix: []const u8 = "",
+        datetime_format: []const u8 = "",
+        format: Format = .text,
+        /// Five minutes when none is said.
+        max_duration_ns: i64 = 300 * std.time.ns_per_s,
+        /// 0: no such limit.
+        max_bytes: i64 = 0,
+        max_messages: i64 = 0,
+        service_account: []const u8 = "",
+        /// What production would say of its writes: the test's to set.
+        state: types.ExportState = .active,
+
+        const Format = union(enum) { text, avro: struct { write_metadata: bool = false, use_topic_schema: bool = false } };
+    };
+
+    /// A JavaScript function, which is all a transform here can be.
+    const Transform = struct {
+        function_name: []const u8 = "",
+        code: []const u8 = "",
+        enabled: bool = false,
+        disabled: bool = false,
+    };
+
+    const Ingestion = struct {
+        source: Source,
+        /// The severity's word, as it was sent. "": none was.
+        log_severity: []const u8 = "",
+        /// What production would say of the source: the test's to set.
+        state: types.IngestionState = .active,
+
+        const Source = union(enum) {
+            cloud_storage: Bucket,
+            /// One of `outside_sources`, with a value for each of its
+            /// fields.
+            outside: struct { kind: usize, values: []const []const u8 },
+        };
+
+        const Bucket = struct {
+            bucket: []const u8 = "",
+            format: ?Format = null,
+            /// As it reads back. "": none.
+            minimum_object_create_time: []const u8 = "",
+            match_glob: []const u8 = "",
+
+            /// A text format's delimiter is null when none was said.
+            const Format = union(enum) { text: ?[]const u8, avro, pubsub_avro };
+        };
+    };
 
     const Entry = struct {
         message: *const Message,
@@ -535,6 +651,52 @@ pub const FakePubSub = struct {
         return f.counts[@backingInt(which)];
     }
 
+    // What a test tells it: what production would find out on its own.
+
+    /// What a BigQuery or a Cloud Storage subscription reads as the state
+    /// of its writes, which production learns by writing and the fake
+    /// cannot. While it is anything but `.active` the subscription's own
+    /// state reads `RESOURCE_ERROR`, as Google's reference says it does;
+    /// `.unknown` reads as no state at all. A new config is `.active`
+    /// again. Nothing happens for a subscription that is not there, or
+    /// that exports nothing.
+    pub fn setExportState(f: *FakePubSub, project: []const u8, subscription: []const u8, state: types.ExportState) void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        const s = f.findSubscription(project, subscription) orelse return;
+        switch (s.delivery) {
+            .bigquery => |*config| config.state = state,
+            .cloud_storage => |*config| config.state = state,
+            .pull, .push => {},
+        }
+    }
+
+    /// What an import topic reads as the state of its source. While it is
+    /// anything but `.active` the topic's own state reads
+    /// `INGESTION_RESOURCE_ERROR`, as production's did. Nothing happens
+    /// for a topic that is not there, or that imports nothing.
+    pub fn setIngestionState(f: *FakePubSub, project: []const u8, topic: []const u8, state: types.IngestionState) void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        var buf: [1024]u8 = undefined;
+        const name = fullName(&buf, project, "topics", topic) orelse return;
+        const t = f.topics.get(name) orelse return;
+        if (t.ingestion) |*ingestion| ingestion.state = state;
+    }
+
+    /// The value of a tag a topic, a subscription or a snapshot was made
+    /// with, by the resource's full name. Production returns no tag on a
+    /// read, and neither does the fake: this is how a test sees one.
+    pub fn tagValue(f: *FakePubSub, resource: []const u8, key: []const u8) ?[]const u8 {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        const tags = if (f.topics.get(resource)) |t| t.tags else if (f.subscriptions.get(resource)) |s| s.tags else if (f.snapshots.get(resource)) |s| s.tags else return null;
+        for (tags) |tag| {
+            if (std.mem.eql(u8, tag.key, key)) return tag.value;
+        }
+        return null;
+    }
+
     fn findSubscription(f: *FakePubSub, project: []const u8, subscription: []const u8) ?*Subscription {
         var buf: [1024]u8 = undefined;
         const name = fullName(&buf, project, "subscriptions", subscription) orelse return null;
@@ -633,6 +795,7 @@ pub const FakePubSub = struct {
                 if (method == .POST and std.mem.eql(u8, route.rest, ":modifyAckDeadline")) return f.modifyAckDeadline(arena, route, body);
                 if (method == .POST and std.mem.eql(u8, route.rest, ":seek")) return f.seek(arena, route, body);
                 if (method == .POST and std.mem.eql(u8, route.rest, ":detach")) return f.detach(arena, route);
+                if (method == .POST and std.mem.eql(u8, route.rest, ":modifyPushConfig")) return f.modifyPushConfig(arena, route, body);
                 return notModelled(arena, route.rest);
             },
             .snapshots => {
@@ -705,19 +868,32 @@ pub const FakePubSub = struct {
                     .ok => |settings| settings,
                     .refused => |r| return r,
                 };
-            } else if (isAnyField(key, &.{ "messageTransforms", "ingestionDataSourceSettings", "tags" })) {
-                return notModelled(arena, key);
+            } else if (isField(key, "messageTransforms")) {
+                topic.transforms = switch (try transformsOf(arena, value)) {
+                    .ok => |list| list,
+                    .refused => |r| return r,
+                };
+            } else if (isField(key, "ingestionDataSourceSettings")) {
+                topic.ingestion = switch (try ingestionOf(arena, value)) {
+                    .ok => |ingestion| ingestion,
+                    .refused => |r| return r,
+                };
+            } else if (isField(key, "tags")) {
+                topic.tags = switch (try tagsOf(arena, value)) {
+                    .ok => |tags| tags,
+                    .refused => |r| return r,
+                };
             } else return unknownName(arena, key);
         }
         if (f.topics.contains(name)) return alreadyExists(arena, route.id);
         const stored = try f.keepTopic(topic);
         try f.insertSorted(Topic, &f.topics, stored);
-        return ok(try renderTopic(arena, stored));
+        return ok(try renderTopic(arena, stored, .created));
     }
 
     fn getTopic(f: *FakePubSub, arena: Allocator, route: Route) Allocator.Error!Reply {
         const topic = f.topics.get(try resourceName(arena, route)) orelse return notFound(arena, route.id);
-        return ok(try renderTopic(arena, topic));
+        return ok(try renderTopic(arena, topic, .as_read));
     }
 
     fn deleteTopic(f: *FakePubSub, arena: Allocator, route: Route) Allocator.Error!Reply {
@@ -770,12 +946,28 @@ pub const FakePubSub = struct {
                     .ok => |settings| settings,
                     .refused => |r| return r,
                 };
-            } else if (isAnyPath(path, &.{ "messageTransforms", "ingestionDataSourceSettings" })) {
+            } else if (isPath(path, "messageTransforms")) {
+                // The list whole: with none in the body, the topic has none.
+                next.transforms = if (given) |v| switch (try transformsOf(arena, v)) {
+                    .ok => |list| try f.keepWhole([]const Transform, list),
+                    .refused => |r| return r,
+                } else &.{};
+            } else if (isPath(path, "ingestionDataSourceSettings")) {
+                // The settings whole, the logging with them: with none
+                // in the body, the topic imports nothing.
+                next.ingestion = if (given) |v| switch (try ingestionOf(arena, v)) {
+                    .ok => |ingestion| try f.keepWhole(Ingestion, ingestion),
+                    .refused => |r| return r,
+                } else null;
+            } else if (isPath(path, "tags")) {
+                // Production took an update that names them, and changed
+                // nothing.
+            } else if (partOf(path, "messageTransforms") != null or partOf(path, "ingestionDataSourceSettings") != null) {
                 return notModelled(arena, path);
             } else return unknownPath(arena, "UpdateTopicRequest", path, "Topic");
         }
         topic.* = next;
-        return ok(try renderTopic(arena, topic));
+        return ok(try renderTopic(arena, topic, .after_update));
     }
 
     fn listTopics(f: *FakePubSub, arena: Allocator, route: Route) Allocator.Error!Reply {
@@ -802,7 +994,7 @@ pub const FakePubSub = struct {
                 jw.objectField("topics") catch return error.OutOfMemory;
                 jw.beginArray() catch return error.OutOfMemory;
             }
-            writeTopic(&jw, topic) catch return error.OutOfMemory;
+            writeTopic(&jw, topic, .as_read) catch return error.OutOfMemory;
             written += 1;
         }
         if (written > 0) jw.endArray() catch return error.OutOfMemory;
@@ -981,6 +1173,9 @@ pub const FakePubSub = struct {
         var topic_name: []const u8 = "";
         var expiration_given = false;
         var deadline_given = false;
+        var push: ?Push = null;
+        var bigquery: ?BigQuery = null;
+        var storage: ?CloudStorage = null;
         var it = object.iterator();
         while (it.next()) |field| {
             const key = field.key_ptr.*;
@@ -1015,12 +1210,34 @@ pub const FakePubSub = struct {
                     .refused => |r| return r,
                 };
             } else if (isField(key, "pushConfig")) {
-                // An empty one is what a pull subscription has.
-                const push = switch (value) {
-                    .object => |o| o,
-                    else => return badValue(arena, key),
+                push = switch (try pushOf(arena, value)) {
+                    .ok => |config| config,
+                    .refused => |r| return r,
                 };
-                if (push.count() != 0) return notModelled(arena, "a push subscription");
+            } else if (isField(key, "bigqueryConfig")) {
+                bigquery = switch (try bigQueryOf(arena, value)) {
+                    .ok => |config| config,
+                    .refused => |r| return r,
+                };
+            } else if (isField(key, "cloudStorageConfig")) {
+                storage = switch (try cloudStorageOf(arena, value)) {
+                    .ok => |config| config,
+                    .refused => |r| return r,
+                };
+            } else if (isField(key, "bigtableConfig")) {
+                // Production's answer was about its own project: an API
+                // not enabled there.
+                return notModelled(arena, "a Bigtable subscription");
+            } else if (isField(key, "messageTransforms")) {
+                sub.transforms = switch (try transformsOf(arena, value)) {
+                    .ok => |list| list,
+                    .refused => |r| return r,
+                };
+            } else if (isField(key, "tags")) {
+                sub.tags = switch (try tagsOf(arena, value)) {
+                    .ok => |tags| tags,
+                    .refused => |r| return r,
+                };
             } else if (isField(key, "enableMessageOrdering")) {
                 sub.ordered = boolOf(value) orelse return badValue(arena, key);
             } else if (isField(key, "enableExactlyOnceDelivery")) {
@@ -1037,11 +1254,14 @@ pub const FakePubSub = struct {
                     .ok => |policy| policy,
                     .refused => |r| return r,
                 };
-            } else if (isAnyField(key, &.{ "bigqueryConfig", "cloudStorageConfig", "messageTransforms", "tags" })) {
-                return notModelled(arena, key);
             } else return unknownName(arena, key);
         }
         if (!isResourceName(topic_name, "topics")) return invalidName(arena, topic_name);
+        sub.delivery = switch (try oneDelivery(arena, push, bigquery, storage, sub.exactly_once)) {
+            .ok => |delivery| delivery,
+            .refused => |r| return r,
+        };
+        sub.ack_deadline_s = fileDeadline(sub.delivery, sub.ack_deadline_s);
         if (sub.filter_text.len > 0) switch (try fake_filter.parse(arena, sub.filter_text)) {
             // Read again into the store when the subscription is kept.
             .ok => |filter| sub.filter = filter,
@@ -1062,12 +1282,38 @@ pub const FakePubSub = struct {
         f.next_uid += 1;
         const stored = try f.keepSubscription(sub);
         try f.insertSorted(Subscription, &f.subscriptions, stored);
-        return ok(try renderSubscription(arena, stored));
+        return ok(try renderSubscription(arena, stored, .created));
+    }
+
+    /// A subscription's push config by itself: with an endpoint it is a
+    /// push subscription, and with none it pulls again.
+    fn modifyPushConfig(f: *FakePubSub, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
+        const object = switch (try parseObject(arena, body)) {
+            .ok => |o| o,
+            .refused => |r| return r,
+        };
+        const sub = f.subscriptions.get(try resourceName(arena, route)) orelse return notFound(arena, route.id);
+        var push: ?Push = null;
+        var it = object.iterator();
+        while (it.next()) |field| {
+            if (!isField(field.key_ptr.*, "pushConfig")) return unknownName(arena, field.key_ptr.*);
+            push = switch (try pushOf(arena, field.value_ptr.*)) {
+                .ok => |config| config,
+                .refused => |r| return r,
+            };
+        }
+        // Production was asked this of subscriptions that push or pull.
+        if (sub.delivery == .bigquery or sub.delivery == .cloud_storage) return notModelled(arena, "modifyPushConfig on a subscription that exports");
+        sub.delivery = switch (try oneDelivery(arena, push, null, null, sub.exactly_once)) {
+            .ok => |delivery| try f.keepWhole(Delivery, delivery),
+            .refused => |r| return r,
+        };
+        return ok("{}");
     }
 
     fn getSubscription(f: *FakePubSub, arena: Allocator, route: Route) Allocator.Error!Reply {
         const sub = f.subscriptions.get(try resourceName(arena, route)) orelse return notFound(arena, route.id);
-        return ok(try renderSubscription(arena, sub));
+        return ok(try renderSubscription(arena, sub, .as_read));
     }
 
     fn deleteSubscription(f: *FakePubSub, arena: Allocator, route: Route) Allocator.Error!Reply {
@@ -1086,6 +1332,11 @@ pub const FakePubSub = struct {
         const sub = f.subscriptions.get(try resourceName(arena, route)) orelse return notFound(arena, route.id);
         var next = sub.*;
         var expiration_given = false;
+        // What the subscription has of each kind of delivery, which a
+        // mask path replaces whole or clears.
+        var push: ?Push = if (sub.delivery == .push) sub.delivery.push else null;
+        var bigquery: ?BigQuery = if (sub.delivery == .bigquery) sub.delivery.bigquery else null;
+        var storage: ?CloudStorage = if (sub.delivery == .cloud_storage) sub.delivery.cloud_storage else null;
         for (update.paths) |path| {
             const given = fieldOf(update.resource, path);
             if (isPath(path, "name")) {
@@ -1133,12 +1384,60 @@ pub const FakePubSub = struct {
                 } else null;
             } else if (isPath(path, "enableExactlyOnceDelivery")) {
                 next.exactly_once = if (given) |v| boolOf(v) orelse return badValue(arena, path) else false;
-            } else if (isAnyPath(path, &.{ "pushConfig", "bigqueryConfig", "cloudStorageConfig", "messageTransforms" })) {
+            } else if (isPath(path, "pushConfig")) {
+                push = if (given) |v| switch (try pushOf(arena, v)) {
+                    .ok => |config| config,
+                    .refused => |r| return r,
+                } else null;
+            } else if (sameField(path, "pushConfig.pushEndpoint")) {
+                // The endpoint alone: what else the push config holds
+                // stays. With none in the body the subscription pulls.
+                const whole = fieldOf(update.resource, "pushConfig") orelse Value{ .object = .empty };
+                const endpoint = switch (whole) {
+                    .object => |o| if (fieldOf(o, "pushEndpoint")) |v| stringOf(v) orelse return badValue(arena, path) else "",
+                    else => return badValue(arena, "pushConfig"),
+                };
+                if (endpoint.len == 0) {
+                    push = null;
+                } else {
+                    if (!isPushEndpoint(endpoint)) return badEndpoint(arena, endpoint);
+                    var config: Push = push orelse .{ .endpoint = "" };
+                    config.endpoint = endpoint;
+                    push = config;
+                }
+            } else if (isPath(path, "bigqueryConfig")) {
+                bigquery = if (given) |v| switch (try bigQueryOf(arena, v)) {
+                    .ok => |config| config,
+                    .refused => |r| return r,
+                } else null;
+            } else if (isPath(path, "cloudStorageConfig")) {
+                storage = if (given) |v| switch (try cloudStorageOf(arena, v)) {
+                    .ok => |config| config,
+                    .refused => |r| return r,
+                } else null;
+            } else if (isPath(path, "bigtableConfig")) {
+                // Named and not given, production changed nothing.
+                if (given != null) return notModelled(arena, "a Bigtable subscription");
+            } else if (isPath(path, "messageTransforms")) {
+                next.transforms = if (given) |v| switch (try transformsOf(arena, v)) {
+                    .ok => |list| try f.keepWhole([]const Transform, list),
+                    .refused => |r| return r,
+                } else &.{};
+            } else if (isPath(path, "tags")) {
+                // Of a topic's, production took the update and changed
+                // nothing. Of a subscription's it was not asked.
+                return notModelled(arena, "an update of a subscription's tags");
+            } else if (partOf(path, "pushConfig") != null or partOf(path, "bigqueryConfig") != null or partOf(path, "cloudStorageConfig") != null or partOf(path, "messageTransforms") != null) {
+                // Production was shown one path inside a config.
                 return notModelled(arena, path);
             } else return unknownPath(arena, "UpdateSubscriptionRequest", path, "Subscription");
         }
         if (expirationRefusal(arena, next.retention_s, next.expiration_ttl_s, expiration_given)) |refusal| return try refusal;
-        next.updated = true;
+        next.delivery = switch (try oneDelivery(arena, push, bigquery, storage, next.exactly_once)) {
+            .ok => |delivery| try f.keepWhole(Delivery, delivery),
+            .refused => |r| return r,
+        };
+        next.ack_deadline_s = fileDeadline(next.delivery, next.ack_deadline_s);
         sub.* = next;
         // Production's answer to an update leaves `detached` out, though
         // a read right after says it.
@@ -1218,6 +1517,7 @@ pub const FakePubSub = struct {
             // or detached while a pull is held.
             const sub = f.subscriptions.get(name) orelse return notFound(arena, route.id);
             if (sub.detached) return detachedRefusal(arena);
+            if (sub.delivery != .pull) return notThisKind(arena);
             const ready = try f.readyEntries(arena, sub, now);
             if (ready.len > 0) return f.deliver(arena, sub, ready[0..@min(ready.len, max)], now);
             if (now >= hold_until) return ok("{}");
@@ -1560,6 +1860,11 @@ pub const FakePubSub = struct {
     }
 
     fn modifyAckDeadline(f: *FakePubSub, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
+        // Before its ids are read: production refused a lease change on a
+        // push subscription for its kind, and an ack there for its id.
+        if (f.subscriptions.get(try resourceName(arena, route))) |sub| {
+            if (sub.delivery != .pull and !sub.detached) return notThisKind(arena);
+        }
         const checked = switch (try f.ackRequest(arena, route, body)) {
             .ok => |c| c,
             .refused => |r| return r,
@@ -2002,6 +2307,7 @@ pub const FakePubSub = struct {
         };
         var of: []const u8 = "";
         var labels: []const Label = &.{};
+        var tags: []const Label = &.{};
         var it = object.iterator();
         while (it.next()) |field| {
             const key = field.key_ptr.*;
@@ -2014,7 +2320,10 @@ pub const FakePubSub = struct {
                     .refused => |r| return r,
                 };
             } else if (isField(key, "tags")) {
-                return notModelled(arena, key);
+                tags = switch (try tagsOf(arena, field.value_ptr.*)) {
+                    .ok => |t| t,
+                    .refused => |r| return r,
+                };
             } else return unknownName(arena, key);
         }
         if (!isResourceName(of, "subscriptions")) return invalidName(arena, of);
@@ -2047,6 +2356,7 @@ pub const FakePubSub = struct {
             .expire = .{ .nanoseconds = oldest + 7 * std.time.ns_per_day },
             .held = held.items,
             .from = sub.topic.messages.items.len,
+            .tags = try f.keepLabels(tags),
         };
         try f.insertSorted(Snapshot, &f.snapshots, snap);
         return ok(try renderSnapshot(arena, snap));
@@ -2084,6 +2394,8 @@ pub const FakePubSub = struct {
                 return immutable(arena, "UpdateSnapshotRequest", "topic", "Snapshot");
             } else if (isPath(path, "expireTime")) {
                 return immutable(arena, "UpdateSnapshotRequest", "expire_time", "Snapshot");
+            } else if (isPath(path, "tags")) {
+                return notModelled(arena, "an update of a snapshot's tags");
             } else return unknownPath(arena, "UpdateSnapshotRequest", path, "Snapshot");
         }
         snap.labels = labels;
@@ -2278,7 +2590,33 @@ pub const FakePubSub = struct {
         kept.labels = try f.keepLabels(topic.labels);
         if (topic.kms_key_name) |k| kept.kms_key_name = try f.keep(k);
         if (topic.storage_policy) |p| kept.storage_policy = try f.keepPolicy(p);
+        kept.transforms = try f.keepWhole([]const Transform, topic.transforms);
+        kept.ingestion = try f.keepWhole(?Ingestion, topic.ingestion);
+        kept.tags = try f.keepLabels(topic.tags);
         return kept;
+    }
+
+    /// A copy of `value` in the store, with every text and list it holds.
+    fn keepWhole(f: *FakePubSub, comptime T: type, value: T) Allocator.Error!T {
+        switch (@typeInfo(T)) {
+            .pointer => |p| if (p.child == u8) {
+                return f.keep(value);
+            } else {
+                const out = try f.store.allocator().alloc(p.child, value.len);
+                for (value, out) |item, *slot| slot.* = try f.keepWhole(p.child, item);
+                return out;
+            },
+            .optional => |o| return if (value) |v| try f.keepWhole(o.child, v) else null,
+            .@"struct" => |s| {
+                var out = value;
+                inline for (s.field_names) |name| @field(out, name) = try f.keepWhole(@FieldType(T, name), @field(value, name));
+                return out;
+            },
+            .@"union" => switch (value) {
+                inline else => |payload, which| return @unionInit(T, @tagName(which), try f.keepWhole(@TypeOf(payload), payload)),
+            },
+            else => return value,
+        }
     }
 
     fn keepSubscription(f: *FakePubSub, sub: Subscription) Allocator.Error!*Subscription {
@@ -2287,6 +2625,9 @@ pub const FakePubSub = struct {
         kept.name = try f.keep(sub.name);
         kept.labels = try f.keepLabels(sub.labels);
         if (sub.dead_letter) |policy| kept.dead_letter = .{ .topic = try f.keep(policy.topic), .max_attempts = policy.max_attempts };
+        kept.delivery = try f.keepWhole(Delivery, sub.delivery);
+        kept.transforms = try f.keepWhole([]const Transform, sub.transforms);
+        kept.tags = try f.keepLabels(sub.tags);
         kept.filter_text = try f.keep(sub.filter_text);
         if (sub.filter != null) kept.filter = switch (try fake_filter.parse(f.store.allocator(), kept.filter_text)) {
             .ok => |filter| filter,
@@ -2728,17 +3069,57 @@ fn expirationRefusal(arena: Allocator, retention_s: i64, ttl_s: ?i64, given: boo
     return fail(arena, 400, "INVALID_ARGUMENT", message);
 }
 
-/// A duration as production's refusals write one: `9m59s`, `744h1s`, `1h`.
 fn goDuration(arena: Allocator, seconds: i64) Allocator.Error![]const u8 {
-    if (seconds <= 0) return "0s";
-    const h = @divTrunc(seconds, 3600);
-    const m = @divTrunc(@mod(seconds, 3600), 60);
-    const s = @mod(seconds, 60);
+    return durationWords(arena, @as(i128, seconds) * std.time.ns_per_s);
+}
+
+/// A duration as production's refusals write one: `9m59s`, `744h1s`, `1h`,
+/// `59.999s`, and `0` for none at all. (That a part of a second alone is
+/// written the same way, `0.5s`, is the fake's own.)
+fn durationWords(arena: Allocator, ns: i128) Allocator.Error![]const u8 {
+    if (ns == 0) return "0";
     var out: std.ArrayList(u8) = .empty;
+    if (ns < 0) try out.append(arena, '-');
+    const whole = @abs(ns) / std.time.ns_per_s;
+    const part = @abs(ns) % std.time.ns_per_s;
+    const h = whole / 3600;
+    const m = whole % 3600 / 60;
+    const s = whole % 60;
     if (h > 0) try out.print(arena, "{d}h", .{h});
     if (m > 0) try out.print(arena, "{d}m", .{m});
-    if (s > 0) try out.print(arena, "{d}s", .{s});
+    if (s > 0 or part > 0) {
+        try out.print(arena, "{d}", .{s});
+        if (part > 0) {
+            var digits: [9]u8 = undefined;
+            _ = std.fmt.bufPrint(&digits, "{d:0>9}", .{part}) catch unreachable;
+            try out.print(arena, ".{s}", .{std.mem.trimEnd(u8, &digits, "0")});
+        }
+        try out.append(arena, 's');
+    }
     return out.items;
+}
+
+/// A duration as proto3 JSON writes one, `90s` or `59.999s`, in
+/// nanoseconds.
+fn durationOf(value: Value) ?i128 {
+    const text = stringOf(value) orelse return null;
+    if (text.len < 2 or text[text.len - 1] != 's') return null;
+    const negative = text[0] == '-';
+    const number = text[@intFromBool(negative) .. text.len - 1];
+    const dot = std.mem.indexOfScalar(u8, number, '.') orelse number.len;
+    const whole = std.fmt.parseInt(u64, number[0..dot], 10) catch return null;
+    var ns: i128 = @as(i128, whole) * std.time.ns_per_s;
+    if (dot < number.len) {
+        const fraction = number[dot + 1 ..];
+        if (fraction.len == 0 or fraction.len > 9) return null;
+        var scale: i128 = std.time.ns_per_s / 10;
+        for (fraction) |c| {
+            if (!std.ascii.isDigit(c)) return null;
+            ns += (c - '0') * scale;
+            scale = @divTrunc(scale, 10);
+        }
+    }
+    return if (negative) -ns else ns;
 }
 
 const Page = struct { size: usize, after: ?[]const u8 };
@@ -3082,19 +3463,602 @@ fn detachedRefusal(arena: Allocator) Allocator.Error!FakePubSub.Reply {
     return fail(arena, 400, "FAILED_PRECONDITION", "This method is not supported on detached subscriptions.");
 }
 
+// What Pub/Sub would do on its own, and the fake keeps: where a
+// subscription's messages go, what runs on them, and where a topic's come
+// from. Each is checked as production checked it, one fault at a time: of
+// several in one request, which is named is the fake's own. The fake has
+// no world outside itself, so a table, a bucket, a stream, a service
+// account and a tag are each taken to be there, and to be allowed.
+
+/// Production's answer to a pull, or to a lease change, on a subscription
+/// that pushes. That one that exports answers the same is the fake's own:
+/// production was not asked.
+fn notThisKind(arena: Allocator) Allocator.Error!FakePubSub.Reply {
+    return fail(arena, 400, "FAILED_PRECONDITION", "This method is not supported for this subscription type.");
+}
+
+/// A refusal with the detail production gives a field it could not read.
+fn badRequest(arena: Allocator, field: []const u8, message: []const u8) Allocator.Error!FakePubSub.Reply {
+    return .{ .status = 400, .body = try Stringify.valueAlloc(arena, .{ .@"error" = .{
+        .code = 400,
+        .message = message,
+        .status = "INVALID_ARGUMENT",
+        .details = .{.{
+            .@"@type" = "type.googleapis.com/google.rpc.BadRequest",
+            .fieldViolations = .{.{ .field = field, .description = message }},
+        }},
+    } }, .{}) };
+}
+
+/// A second member of a oneof, named as the request spelled it.
+/// Production's detail is recorded for an import topic's two sources; the
+/// probes of the other two kept the message alone.
+fn oneofRefusal(arena: Allocator, comptime field: []const u8, comptime oneof: []const u8, second: []const u8) Allocator.Error!FakePubSub.Reply {
+    return badRequest(arena, field, try std.fmt.allocPrint(arena, "Invalid value at '" ++ field ++ "' (oneof), oneof field '" ++ oneof ++ "' is already set. Cannot set '{s}'", .{second}));
+}
+
+/// One kind of delivery at most, and none beside exactly-once delivery.
+/// (All three at once production was not shown.)
+fn oneDelivery(arena: Allocator, push: ?FakePubSub.Push, bigquery: ?FakePubSub.BigQuery, storage: ?FakePubSub.CloudStorage, exactly_once: bool) Allocator.Error!Parsed(FakePubSub.Delivery) {
+    const kinds = @as(u8, @intFromBool(push != null)) + @intFromBool(bigquery != null) + @intFromBool(storage != null);
+    if (kinds == 3) return .{ .refused = try notModelled(arena, "a subscription with all three kinds of delivery") };
+    if (kinds == 2) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Cannot create a subscription with multiple configurations. Only at most one of {s}, {s} can be specified.", .{
+        if (push != null) "PushConfig" else "BigQueryConfig",
+        if (storage != null) "CloudStorageConfig" else "BigQueryConfig",
+    })) };
+    if (kinds == 1 and exactly_once) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "A subscription cannot have {s} config set with exactly once delivery configured.", .{
+        if (push != null) "push" else if (bigquery != null) "bigquery" else "cloud storage",
+    })) };
+    if (push) |config| return .{ .ok = .{ .push = config } };
+    if (bigquery) |config| return .{ .ok = .{ .bigquery = config } };
+    if (storage) |config| return .{ .ok = .{ .cloud_storage = config } };
+    return .{ .ok = .pull };
+}
+
+/// A subscription that writes files has an ack deadline no shorter than
+/// a file is kept open: production raised 10 seconds to 60, to 300 and to
+/// 600 with the file's duration, and left it there when the subscription
+/// went on to push. (It was given the deadline and the config together;
+/// that a later update of the deadline alone is held to this too is the
+/// fake's own.)
+fn fileDeadline(delivery: FakePubSub.Delivery, seconds: u32) u32 {
+    return switch (delivery) {
+        .cloud_storage => |config| @max(seconds, @as(u32, @intCast(@divFloor(config.max_duration_ns + std.time.ns_per_s - 1, std.time.ns_per_s)))),
+        .pull, .push, .bigquery => seconds,
+    };
+}
+
+/// A `pushConfig`. Null: it names no endpoint, which is what a
+/// subscription that pulls has, whatever else it holds. (Production was
+/// shown `{}`, and answers an update with a version and no endpoint.)
+fn pushOf(arena: Allocator, value: Value) Allocator.Error!Parsed(?FakePubSub.Push) {
+    const object = switch (value) {
+        .object => |o| o,
+        else => return .{ .refused = try badValue(arena, "pushConfig") },
+    };
+    var push: FakePubSub.Push = .{ .endpoint = "" };
+    var other_attribute = false;
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const given = entry.value_ptr.*;
+        if (isField(key, "pushEndpoint")) {
+            push.endpoint = stringOf(given) orelse return .{ .refused = try badValue(arena, key) };
+        } else if (isField(key, "attributes")) {
+            const attributes = (try stringMapOf(arena, given)) orelse return .{ .refused = try badValue(arena, key) };
+            for (attributes) |a| {
+                if (std.mem.eql(u8, a.key, "x-goog-version")) push.version = a.value else other_attribute = true;
+            }
+        } else if (isField(key, "oidcToken")) {
+            const token = switch (given) {
+                .object => |o| o,
+                else => return .{ .refused = try badValue(arena, key) },
+            };
+            var oidc: FakePubSub.Push.Oidc = .{ .email = "" };
+            var parts = token.iterator();
+            while (parts.next()) |part| {
+                const name = part.key_ptr.*;
+                const text = stringOf(part.value_ptr.*) orelse return .{ .refused = try badValue(arena, name) };
+                if (isField(name, "serviceAccountEmail")) oidc.email = text else if (isField(name, "audience")) oidc.audience = text else return .{ .refused = try unknownName(arena, name) };
+            }
+            push.oidc = oidc;
+        } else if (isAnyField(key, &.{ "pubsubWrapper", "noWrapper" })) {
+            if (push.wrapper != .unsaid) return .{ .refused = try oneofRefusal(arena, "push_config", "wrapper", key) };
+            const wrapper = switch (given) {
+                .object => |o| o,
+                else => return .{ .refused = try badValue(arena, key) },
+            };
+            push.wrapper = if (isField(key, "pubsubWrapper")) .pubsub else .{ .none = .{} };
+            var parts = wrapper.iterator();
+            while (parts.next()) |part| {
+                const name = part.key_ptr.*;
+                if (push.wrapper != .none or !isField(name, "writeMetadata")) return .{ .refused = try unknownName(arena, name) };
+                push.wrapper.none.write_metadata = boolOf(part.value_ptr.*) orelse return .{ .refused = try badValue(arena, name) };
+            }
+        } else return .{ .refused = try unknownName(arena, key) };
+    }
+    if (push.endpoint.len == 0) return .{ .ok = null };
+    if (!isPushEndpoint(push.endpoint)) return .{ .refused = try badEndpoint(arena, push.endpoint) };
+    if (push.version) |version| {
+        if (!std.mem.eql(u8, version, "v1") and !std.mem.eql(u8, version, "v1beta1")) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Invalid push endpoint version given in push config (version={s}).", .{version})) };
+    }
+    // Production was shown another attribute only beside a version it
+    // refused.
+    if (other_attribute) return .{ .refused = try notModelled(arena, "a push attribute other than x-goog-version") };
+    if (push.oidc) |token| {
+        // An account that is not there, production refuses so; the fake
+        // knows of none, and only that no address is no account.
+        if (token.email.len == 0) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "You have passed an invalid argument to the service (argument=PushConfig::oidc_token::service_account_email).") };
+    }
+    return .{ .ok = push };
+}
+
+/// Production takes an `https://` URL and refused `http://` and text that
+/// is no URL. The fake's reading of the rest: something after the scheme,
+/// and no space or control character.
+fn isPushEndpoint(endpoint: []const u8) bool {
+    const scheme = "https://";
+    if (!std.mem.startsWith(u8, endpoint, scheme) or endpoint.len == scheme.len) return false;
+    for (endpoint) |c| {
+        if (c <= ' ' or c == 0x7f) return false;
+    }
+    return true;
+}
+
+fn badEndpoint(arena: Allocator, endpoint: []const u8) Allocator.Error!FakePubSub.Reply {
+    return fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Invalid push endpoint given (endpoint={s}). Refer to https://cloud.google.com/pubsub/subscriber#create for more information.", .{endpoint}));
+}
+
+/// A `bigqueryConfig`. A `state` in it is production's to say, and is
+/// taken and ignored.
+fn bigQueryOf(arena: Allocator, value: Value) Allocator.Error!Parsed(FakePubSub.BigQuery) {
+    const object = switch (value) {
+        .object => |o| o,
+        else => return .{ .refused = try badValue(arena, "bigqueryConfig") },
+    };
+    var config: FakePubSub.BigQuery = .{};
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const given = entry.value_ptr.*;
+        if (isField(key, "state")) continue;
+        if (isAnyField(key, &.{ "table", "serviceAccountEmail" })) {
+            const text = stringOf(given) orelse return .{ .refused = try badValue(arena, key) };
+            if (isField(key, "table")) config.table = text else config.service_account = text;
+            continue;
+        }
+        const flag: *bool = if (isField(key, "useTopicSchema"))
+            &config.use_topic_schema
+        else if (isField(key, "writeMetadata"))
+            &config.write_metadata
+        else if (isField(key, "dropUnknownFields"))
+            &config.drop_unknown_fields
+        else if (isField(key, "useTableSchema"))
+            &config.use_table_schema
+        else
+            return .{ .refused = try unknownName(arena, key) };
+        flag.* = boolOf(given) orelse return .{ .refused = try badValue(arena, key) };
+    }
+    switch (tableForm(config.table)) {
+        .ok => {},
+        .malformed => return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "Request contains an invalid argument.") },
+        .too_many => return .{ .refused = try fail(arena, 404, "NOT_FOUND", "Requested entity was not found.") },
+    }
+    if (config.use_table_schema and config.use_topic_schema) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "The options use_table_schema and use_topic_schema cannot both be set to 'true' when creating a BigQuery subscription.") };
+    return .{ .ok = config };
+}
+
+/// `project.dataset.table`, or `project:dataset.table`. Production said
+/// "invalid argument" to fewer parts and to an empty one, and "not found"
+/// to four with dots. The colon form it was shown well formed alone, and
+/// is held here to the same rule.
+fn tableForm(table: []const u8) enum { ok, malformed, too_many } {
+    var rest = table;
+    var wanted: usize = 3;
+    if (std.mem.indexOfScalar(u8, table, ':')) |colon| {
+        if (colon == 0) return .malformed;
+        rest = table[colon + 1 ..];
+        wanted = 2;
+    }
+    var count: usize = 0;
+    var parts = std.mem.splitScalar(u8, rest, '.');
+    while (parts.next()) |part| : (count += 1) {
+        if (part.len == 0) return .malformed;
+    }
+    if (count < wanted) return .malformed;
+    return if (count > wanted) .too_many else .ok;
+}
+
+/// A `cloudStorageConfig`, with the format and the five minutes
+/// production fills in when none is said.
+fn cloudStorageOf(arena: Allocator, value: Value) Allocator.Error!Parsed(FakePubSub.CloudStorage) {
+    const object = switch (value) {
+        .object => |o| o,
+        else => return .{ .refused = try badValue(arena, "cloudStorageConfig") },
+    };
+    var config: FakePubSub.CloudStorage = .{};
+    var format_said = false;
+    var duration: ?i128 = null;
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const given = entry.value_ptr.*;
+        if (isField(key, "state")) continue;
+        if (isAnyField(key, &.{ "textConfig", "avroConfig" })) {
+            if (format_said) return .{ .refused = try oneofRefusal(arena, "cloud_storage_config", "output_format", key) };
+            format_said = true;
+            const inner = switch (given) {
+                .object => |o| o,
+                else => return .{ .refused = try badValue(arena, key) },
+            };
+            if (isField(key, "avroConfig")) config.format = .{ .avro = .{} };
+            var parts = inner.iterator();
+            while (parts.next()) |part| {
+                const name = part.key_ptr.*;
+                if (config.format != .avro or !isAnyField(name, &.{ "writeMetadata", "useTopicSchema" })) return .{ .refused = try unknownName(arena, name) };
+                const flag = boolOf(part.value_ptr.*) orelse return .{ .refused = try badValue(arena, name) };
+                if (isField(name, "writeMetadata")) config.format.avro.write_metadata = flag else config.format.avro.use_topic_schema = flag;
+            }
+        } else if (isField(key, "maxDuration")) {
+            duration = durationOf(given) orelse return .{ .refused = try badValue(arena, key) };
+        } else if (isAnyField(key, &.{ "maxBytes", "maxMessages" })) {
+            const n = intOf(given) orelse return .{ .refused = try badValue(arena, key) };
+            if (isField(key, "maxBytes")) config.max_bytes = n else config.max_messages = n;
+        } else {
+            const text: *[]const u8 = if (isField(key, "bucket"))
+                &config.bucket
+            else if (isField(key, "filenamePrefix"))
+                &config.prefix
+            else if (isField(key, "filenameSuffix"))
+                &config.suffix
+            else if (isField(key, "filenameDatetimeFormat"))
+                &config.datetime_format
+            else if (isField(key, "serviceAccountEmail"))
+                &config.service_account
+            else
+                return .{ .refused = try unknownName(arena, key) };
+            text.* = stringOf(given) orelse return .{ .refused = try badValue(arena, key) };
+        }
+    }
+    // A bucket of no form, `gs://` before it included, production
+    // answers as an outage.
+    if (config.bucket.len == 0 or std.mem.indexOfScalar(u8, config.bucket, '/') != null) return .{ .refused = try fail(arena, 503, "UNAVAILABLE", "The service was unable to fulfill your request. Please try again. [code=8a75]") };
+    const naming = "Refer to https://cloud.google.com/storage/docs/objects#naming for more information.";
+    // Production refused a line break in the prefix. That it refuses the
+    // other control characters, and the suffix alike, is the fake's own.
+    inline for (.{ "prefix", "suffix" }) |part| {
+        for (@field(config, part)) |c| {
+            if (c < ' ' or c == 0x7f) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Invalid Cloud Storage filename " ++ part ++ " given (value={s}): Disallowed unicode characters present. " ++ naming, .{@field(config, part)})) };
+        }
+    }
+    if (std.mem.endsWith(u8, config.suffix, "/")) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Invalid Cloud Storage filename suffix given (value={s}): Ends with invalid character '/'. " ++ naming, .{config.suffix})) };
+    const length = charCount(config.prefix) + charCount(config.suffix);
+    if (length > 992) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "The sum of the lengths of the Cloud Storage subscription's filename prefix and suffix is {d} characters, but the maximum allowed is 992.", .{length})) };
+    if (try datetimeFault(arena, config.datetime_format)) |why| return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Invalid Cloud Storage filename datetime format given (value={s}): {s}", .{ config.datetime_format, why })) };
+    if (duration) |ns| {
+        if (ns < 60 * std.time.ns_per_s or ns > 600 * std.time.ns_per_s) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "The value for Cloud Storage file batching duration is out of bounds. You passed {s} in the request, but the value must be between 1m and 10m.", .{try durationWords(arena, ns)})) };
+        config.max_duration_ns = @intCast(ns);
+    }
+    // 0 is "not said": no such limit.
+    if (config.max_bytes != 0 and (config.max_bytes < 1000 or config.max_bytes > 10_737_418_240)) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "The value for Cloud Storage file batching bytes is out of bounds. You passed {d} in the request, but the value must be between 1000 and 10737418240.", .{config.max_bytes})) };
+    if (config.max_messages != 0 and config.max_messages < 1000) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "The value for Cloud Storage file batching messages is too small. You passed {d} in the request, but the minimum value is 1000.", .{config.max_messages})) };
+    return .{ .ok = config };
+}
+
+fn charCount(text: []const u8) usize {
+    return std.unicode.utf8CountCodepoints(text) catch text.len;
+}
+
+/// What production says is wrong with a filename datetime format, or
+/// null: each of a year (`YYYY` or `YY`), `MM`, `DD`, `hh`, `mm` and `ss`
+/// once; at most one `T`, and at most one of `Z` and `+00:00`; between
+/// them only `-`, `_`, `:` and `/`. None at all is production's default.
+///
+/// Production's words are recorded for a year, an `hh` and an `ss` that
+/// is missing, for a second year, `ss`, `T`, `Z` and offset, and for a
+/// character it does not take; and it named a missing one before a
+/// second one, and either before a character. That `MM`, `DD` and `mm`
+/// are named so, and the order beyond that, are the fake's own.
+fn datetimeFault(arena: Allocator, format: []const u8) Allocator.Error!?[]const u8 {
+    if (format.len == 0) return null;
+    const matchers = [_]struct { []const u8, usize }{
+        .{ "YYYY", 0 }, .{ "YY", 0 }, .{ "MM", 1 }, .{ "DD", 2 }, .{ "hh", 3 },
+        .{ "mm", 4 },   .{ "ss", 5 }, .{ "T", 6 },  .{ "Z", 7 },  .{ "+00:00", 8 },
+    };
+    const names = [_][]const u8{ "year", "MM", "DD", "hh", "mm", "ss", "T", "Z" };
+    var counts: [9]usize = @splat(0);
+    var stray: ?[]const u8 = null;
+    var i: usize = 0;
+    scan: while (i < format.len) {
+        for (matchers) |matcher| {
+            if (std.mem.startsWith(u8, format[i..], matcher[0])) {
+                counts[matcher[1]] += 1;
+                i += matcher[0].len;
+                continue :scan;
+            }
+        }
+        const len = std.unicode.utf8ByteSequenceLength(format[i]) catch 1;
+        const char = format[i..@min(format.len, i + len)];
+        if (stray == null and std.mem.indexOfScalar(u8, "-_:/", format[i]) == null) stray = char;
+        i += char.len;
+    }
+    for (names[0..6], counts[0..6]) |name, count| {
+        if (count == 0) return try std.fmt.allocPrint(arena, "Required {s} matcher not present.", .{name});
+    }
+    for (names, counts[0..8]) |name, count| {
+        if (count > 1) return try std.fmt.allocPrint(arena, "More than one {s} matcher present.", .{name});
+    }
+    if (counts[7] + counts[8] > 1) return "More than one timezone offset matcher present.";
+    if (stray) |char| return try std.fmt.allocPrint(arena, "Contains disallowed characters ({s}).", .{char});
+    return null;
+}
+
+/// A `messageTransforms` list: JavaScript functions, kept and never run.
+/// At most five that are not disabled, no name twice, and no code over
+/// 20,480 bytes. The fake reads no JavaScript: code that is none at all
+/// cannot hold the function, which is what production said of it, and
+/// any other is taken.
+fn transformsOf(arena: Allocator, value: Value) Allocator.Error!Parsed([]const FakePubSub.Transform) {
+    const list = switch (value) {
+        .array => |a| a.items,
+        else => return .{ .refused = try badValue(arena, "messageTransforms") },
+    };
+    const out = try arena.alloc(FakePubSub.Transform, list.len);
+    var enabled: usize = 0;
+    for (list, out, 0..) |item, *slot, index| {
+        const object = switch (item) {
+            .object => |o| o,
+            else => return .{ .refused = try badValue(arena, "messageTransforms") },
+        };
+        var transform: FakePubSub.Transform = .{};
+        var is_function = false;
+        var it = object.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const given = entry.value_ptr.*;
+            if (isField(key, "enabled")) {
+                transform.enabled = boolOf(given) orelse return .{ .refused = try badValue(arena, key) };
+                continue;
+            }
+            if (isField(key, "disabled")) {
+                transform.disabled = boolOf(given) orelse return .{ .refused = try badValue(arena, key) };
+                continue;
+            }
+            const inner = switch (given) {
+                .object => |o| o,
+                else => return .{ .refused = if (isAnyField(key, &.{ "javascriptUdf", "aiInference", "compression" })) try badValue(arena, key) else try unknownName(arena, key) },
+            };
+            if (isField(key, "javascriptUdf")) {
+                is_function = true;
+                var parts = inner.iterator();
+                while (parts.next()) |part| {
+                    const name = part.key_ptr.*;
+                    const text = stringOf(part.value_ptr.*) orelse return .{ .refused = try badValue(arena, name) };
+                    if (isField(name, "functionName")) transform.function_name = text else if (isField(name, "code")) transform.code = text else return .{ .refused = try unknownName(arena, name) };
+                }
+            } else if (isField(key, "aiInference")) {
+                // The two other kinds production refused empty, in these
+                // words. One with something in it the fake has no answer
+                // for.
+                if (inner.count() == 0) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "The request contains an AI Inference SMT without a set endpoint.") };
+                return .{ .refused = try notModelled(arena, "an AI inference transform") };
+            } else if (isField(key, "compression")) {
+                if (inner.count() == 0) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "Compression algorithm is required for Compression message transform.") };
+                return .{ .refused = try notModelled(arena, "a compression transform") };
+            } else return .{ .refused = try unknownName(arena, key) };
+        }
+        if (!is_function) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "The request contains a MessageTransform with a missing message transform type.") };
+        if (transform.function_name.len == 0) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "The request contains a JavaScript UDF with an empty function name. Function names must be non-empty.") };
+        if (transform.code.len > 20_480) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "The `code` field of a JavaScript UDF exceeded the maximum allowed size of 20480 bytes. Code size: {d}. Function name: {s}.", .{ transform.code.len, transform.function_name })) };
+        // A name twice is refused whether or not either is disabled.
+        for (out[0..index]) |earlier| {
+            if (std.mem.eql(u8, earlier.function_name, transform.function_name)) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "The request contains multiple JavaScript UDFs with the function name: {s}. Each JavaScript UDF must have a unique function name.", .{transform.function_name})) };
+        }
+        // `enabled` counts for nothing: production ran a function sent
+        // with `enabled: false`, and counted what is not disabled.
+        enabled += @intFromBool(!transform.disabled);
+        slot.* = transform;
+    }
+    if (enabled > 5) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "The request exceeds the maximum number of enabled message transforms. Maximum enabled transforms: 5. Enabled transforms: {d}.", .{enabled})) };
+    for (out) |transform| {
+        if (transform.code.len == 0) return .{ .refused = try fail(arena, 400, "FAILED_PRECONDITION", try std.fmt.allocPrint(arena, "Provided message transform configuration is invalid: Failed to create JavaScript UDF: `{s}`. Failed to find function in provided code", .{transform.function_name})) };
+    }
+    return .{ .ok = out };
+}
+
+/// The four sources outside Google, each with its fields in the order the
+/// service numbers them, and the word it has for being refused there.
+/// Production refused every one the probes could offer, for what was at
+/// the other end, so how it reads one back was never seen: the fake
+/// writes them as it saw a Cloud Storage source written, the state first.
+const outside_sources = [_]struct { name: []const u8, fields: []const []const u8, denied: []const u8 }{
+    .{ .name = "awsKinesis", .fields = &.{ "streamArn", "consumerArn", "awsRoleArn", "gcpServiceAccount" }, .denied = "KINESIS_PERMISSION_DENIED" },
+    .{ .name = "azureEventHubs", .fields = &.{ "resourceGroup", "namespace", "eventHub", "clientId", "tenantId", "subscriptionId", "gcpServiceAccount" }, .denied = "EVENT_HUBS_PERMISSION_DENIED" },
+    .{ .name = "awsMsk", .fields = &.{ "clusterArn", "topic", "awsRoleArn", "gcpServiceAccount" }, .denied = "MSK_PERMISSION_DENIED" },
+    .{ .name = "confluentCloud", .fields = &.{ "bootstrapServer", "clusterId", "topic", "identityPoolId", "gcpServiceAccount" }, .denied = "CONFLUENT_CLOUD_PERMISSION_DENIED" },
+};
+
+/// A topic's `ingestionDataSourceSettings`: one source, and what Pub/Sub
+/// would log of it.
+fn ingestionOf(arena: Allocator, value: Value) Allocator.Error!Parsed(FakePubSub.Ingestion) {
+    const object = switch (value) {
+        .object => |o| o,
+        else => return .{ .refused = try badValue(arena, "ingestionDataSourceSettings") },
+    };
+    var severity: []const u8 = "";
+    // The source is read once it is known to be the only one: production
+    // refused a second before it looked into the first.
+    var named: ?struct { kind: ?usize, object: std.json.ObjectMap } = null;
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const inner = switch (entry.value_ptr.*) {
+            .object => |o| o,
+            else => return .{ .refused = try badValue(arena, key) },
+        };
+        if (isField(key, "platformLogsSettings")) {
+            var parts = inner.iterator();
+            while (parts.next()) |part| {
+                if (!isField(part.key_ptr.*, "severity")) return .{ .refused = try unknownName(arena, part.key_ptr.*) };
+                severity = stringOf(part.value_ptr.*) orelse return .{ .refused = try badValue(arena, "severity") };
+                if (!isSeverity(severity)) return .{ .refused = try badValue(arena, "severity") };
+            }
+            continue;
+        }
+        const kind: ?usize = if (isField(key, "cloudStorage")) null else for (outside_sources, 0..) |source, index| {
+            if (sameField(key, source.name)) break index;
+        } else return .{ .refused = try unknownName(arena, key) };
+        if (named != null) return .{ .refused = try oneofRefusal(arena, "ingestion_data_source_settings", "source", key) };
+        named = .{ .kind = kind, .object = inner };
+    }
+    const source = named orelse return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "Cloud Pub/Sub received invalid argument/s for the ingestion data source: The request's IngestionDataSourceSettings is missing a data source type.") };
+    const kind = source.kind orelse return switch (try bucketSourceOf(arena, source.object)) {
+        .ok => |bucket| .{ .ok = .{ .source = .{ .cloud_storage = bucket }, .log_severity = severity } },
+        .refused => |r| .{ .refused = r },
+    };
+    return switch (try outsideSourceOf(arena, kind, source.object)) {
+        .ok => |values| .{ .ok = .{ .source = .{ .outside = .{ .kind = kind, .values = values } }, .log_severity = severity } },
+        .refused => |r| .{ .refused = r },
+    };
+}
+
+/// The severities the service names. Production was shown `DEBUG` and
+/// `WARNING`.
+fn isSeverity(word: []const u8) bool {
+    for ([_][]const u8{ "SEVERITY_UNSPECIFIED", "DISABLED", "DEBUG", "INFO", "WARNING", "ERROR" }) |known| {
+        if (std.mem.eql(u8, word, known)) return true;
+    }
+    return false;
+}
+
+/// A bucket to import from. `gs://` before its name is taken and dropped.
+fn bucketSourceOf(arena: Allocator, object: std.json.ObjectMap) Allocator.Error!Parsed(FakePubSub.Ingestion.Bucket) {
+    const settings = "ingestion_data_source_settings.cloud_storage";
+    var source: FakePubSub.Ingestion.Bucket = .{};
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const given = entry.value_ptr.*;
+        if (isField(key, "state")) continue;
+        if (isAnyField(key, &.{ "textFormat", "avroFormat", "pubsubAvroFormat" })) {
+            // Two formats production was not shown: this is how it
+            // refused two sources, and two formats of a subscription's
+            // files.
+            if (source.format != null) return .{ .refused = try oneofRefusal(arena, settings, "input_format", key) };
+            const inner = switch (given) {
+                .object => |o| o,
+                else => return .{ .refused = try badValue(arena, key) },
+            };
+            source.format = if (isField(key, "textFormat")) .{ .text = null } else if (isField(key, "avroFormat")) .avro else .pubsub_avro;
+            var parts = inner.iterator();
+            while (parts.next()) |part| {
+                const name = part.key_ptr.*;
+                if (source.format.? != .text or !isField(name, "delimiter")) return .{ .refused = try unknownName(arena, name) };
+                const delimiter = stringOf(part.value_ptr.*) orelse return .{ .refused = try badValue(arena, name) };
+                // One byte: production took a tab, a NUL and a DEL, and
+                // refused none at all, two, and one character of two
+                // bytes.
+                if (delimiter.len != 1) return .{ .refused = try fail(arena, 400, "FAILED_PRECONDITION", "The ingestion data source state and/or configuration is not sufficient for ingestion: IngestionDataSourceSettings::Gcs::text_format::delimiter must be a single character.") };
+                source.format = .{ .text = delimiter };
+            }
+        } else if (isField(key, "minimumObjectCreateTime")) {
+            const text = stringOf(given) orelse return .{ .refused = try badValue(arena, key) };
+            const time = timestamp.parse(text) catch return .{ .refused = try badRequest(arena, settings ++ ".minimum_object_create_time", "Invalid value at '" ++ settings ++ ".minimum_object_create_time' (type.googleapis.com/google.protobuf.Timestamp), Field 'minimumObjectCreateTime', Illegal timestamp format; timestamps must end with 'Z' or have a valid timezone offset.") };
+            var buf: [timestamp.max_len]u8 = undefined;
+            source.minimum_object_create_time = try arena.dupe(u8, timestamp.format(&buf, time));
+        } else if (isField(key, "bucket")) {
+            source.bucket = stringOf(given) orelse return .{ .refused = try badValue(arena, key) };
+        } else if (isField(key, "matchGlob")) {
+            source.match_glob = stringOf(given) orelse return .{ .refused = try badValue(arena, key) };
+        } else return .{ .refused = try unknownName(arena, key) };
+    }
+    if (std.mem.startsWith(u8, source.bucket, "gs://")) source.bucket = source.bucket["gs://".len..];
+    if (std.mem.indexOfScalar(u8, source.bucket, '/') != null) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Cloud Pub/Sub received invalid argument/s for the ingestion data source: projects/-/buckets/{s} is not a valid resource name..", .{source.bucket})) };
+    // Production looked for the bucket before either of these, and was
+    // shown no bucket that was there without them.
+    if (source.bucket.len == 0) return .{ .refused = try notModelled(arena, "a Cloud Storage source with no bucket") };
+    if (source.format == null) return .{ .refused = try notModelled(arena, "a Cloud Storage source with no format") };
+    return .{ .ok = source };
+}
+
+/// One of the four sources outside Google: a text for each of its fields.
+/// A Kinesis source with nothing in it production refused for its first
+/// field, in these words; that its other three are asked for in turn is
+/// the fake's own, and the other sources' fields are not asked for at
+/// all, since production's name for them was never seen.
+fn outsideSourceOf(arena: Allocator, kind: usize, object: std.json.ObjectMap) Allocator.Error!Parsed([]const []const u8) {
+    const fields = outside_sources[kind].fields;
+    const values = try arena.alloc([]const u8, fields.len);
+    @memset(values, "");
+    var it = object.iterator();
+    each: while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (isField(key, "state")) continue;
+        for (fields, values) |field, *slot| {
+            if (!sameField(key, field)) continue;
+            slot.* = stringOf(entry.value_ptr.*) orelse return .{ .refused = try badValue(arena, key) };
+            continue :each;
+        }
+        return .{ .refused = try unknownName(arena, key) };
+    }
+    if (kind == 0) for (fields, values) |field, text| {
+        if (text.len > 0) continue;
+        var snake: std.ArrayList(u8) = .empty;
+        for (field) |c| {
+            if (std.ascii.isUpper(c)) try snake.append(arena, '_');
+            try snake.append(arena, std.ascii.toLower(c));
+        }
+        return .{ .refused = try fail(arena, 400, "FAILED_PRECONDITION", try std.fmt.allocPrint(arena, "The ingestion data source state and/or configuration is not sufficient for ingestion: Missing a required field - IngestionDataSourceSettings::AwsKinesis::{s}..", .{snake.items})) };
+    };
+    return .{ .ok = values };
+}
+
+/// The tags of a create: Resource Manager's keys and values, each pair
+/// by name (`project/key` and the value's short name) or by id
+/// (`tagKeys/1` and `tagValues/2`), in production's words where the form
+/// is wrong. A key or a value that is not there production refuses with
+/// 403; the fake has no Resource Manager, and takes any of good form.
+fn tagsOf(arena: Allocator, value: Value) Allocator.Error!Parsed([]const FakePubSub.Label) {
+    const tags = (try stringMapOf(arena, value)) orelse return .{ .refused = try badValue(arena, "tags") };
+    const same_format = "field [tags.tagValue] has issue [Both TagKey and TagValue must be provided in the same format.]";
+    for (tags) |tag| {
+        const key_by_id = isTagId(tag.key, "tagKeys/");
+        const slash = std.mem.indexOfScalar(u8, tag.key, '/');
+        const key_by_name = if (slash) |at| at > 0 and at + 1 < tag.key.len and std.mem.indexOfScalarPos(u8, tag.key, at + 1, '/') == null else false;
+        if (!key_by_id and !key_by_name) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "INVALID_ARGUMENT: field [tags.tagKey] has issue [Invalid tag key specified. Please specify a valid tag key in the format <tag namespace>/<tag key name> where the tag namespace is the ID of the organization or name of the project that the tag key is defined in or tagKeys/<tag_key_id>. For example: \"123/environment\", or \"my-project/env\", or \"tagKeys/123\".]") };
+        if (tag.value.len == 0) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "INVALID_ARGUMENT: field [tags.tagValue] has issue [The TagValue field must be populated for an entry in the Tags map.]\n" ++ same_format) };
+        const value_by_id = isTagId(tag.value, "tagValues/");
+        if (!value_by_id and std.mem.indexOfScalar(u8, tag.value, '/') != null) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "INVALID_ARGUMENT: field [tags.tagValue] has issue [Invalid tag value specified. Please specify a valid tag value. This must be the name of the value created under the specified tag key. For example: \"production\", or \"tagValues/456\".]\n" ++ same_format) };
+        if (key_by_id != value_by_id) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "INVALID_ARGUMENT: " ++ same_format) };
+    }
+    return .{ .ok = tags };
+}
+
+fn isTagId(text: []const u8, comptime prefix: []const u8) bool {
+    if (!std.mem.startsWith(u8, text, prefix) or text.len == prefix.len) return false;
+    return std.mem.indexOfScalar(u8, text[prefix.len..], '/') == null;
+}
+
 /// What this fake has no answer for: said, never guessed at.
 fn notModelled(arena: Allocator, what: []const u8) Allocator.Error!FakePubSub.Reply {
     return fail(arena, 501, "UNIMPLEMENTED", try std.fmt.allocPrint(arena, "fake: {s} is not modelled yet", .{what}));
 }
 
-fn renderTopic(arena: Allocator, topic: *const FakePubSub.Topic) Allocator.Error![]const u8 {
+/// Production's answer to a create, a read, and an update each write a
+/// thing or two their own way.
+const Answer = enum { created, as_read, after_update };
+
+fn renderTopic(arena: Allocator, topic: *const FakePubSub.Topic, how: Answer) Allocator.Error![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     var jw: Stringify = .{ .writer = &out.writer };
-    writeTopic(&jw, topic) catch return error.OutOfMemory;
+    writeTopic(&jw, topic, how) catch return error.OutOfMemory;
     return out.written();
 }
 
-fn writeTopic(jw: *Stringify, topic: *const FakePubSub.Topic) Stringify.Error!void {
+/// In the order production writes the fields, which is the order the
+/// service numbers them in: where production was never seen to write a
+/// field, the number says where it goes.
+fn writeTopic(jw: *Stringify, topic: *const FakePubSub.Topic, how: Answer) Stringify.Error!void {
     try jw.beginObject();
     try jw.objectField("name");
     try jw.write(topic.name);
@@ -3138,7 +4102,149 @@ fn writeTopic(jw: *Stringify, topic: *const FakePubSub.Topic) Stringify.Error!vo
         try jw.objectField("messageRetentionDuration");
         try writeSeconds(jw, seconds);
     }
+    if (topic.ingestion) |ingestion| {
+        // An import topic reads a state of its own, and only reads it:
+        // the answer to a create or an update has none.
+        if (how == .as_read) {
+            try jw.objectField("state");
+            try jw.write(if (ingestion.state == .active or ingestion.state == .unknown) "ACTIVE" else "INGESTION_RESOURCE_ERROR");
+        }
+        try jw.objectField("ingestionDataSourceSettings");
+        try jw.beginObject();
+        switch (ingestion.source) {
+            .cloud_storage => |source| {
+                try jw.objectField("cloudStorage");
+                try jw.beginObject();
+                try writeState(jw, ingestionWord(ingestion));
+                try jw.objectField("bucket");
+                try jw.write(source.bucket);
+                switch (source.format.?) {
+                    .text => |delimiter| {
+                        try jw.objectField("textFormat");
+                        try jw.beginObject();
+                        // With none said it is a line break, which the
+                        // answer to an update alone leaves out.
+                        const filled: ?[]const u8 = if (how == .after_update) null else "\n";
+                        if (delimiter orelse filled) |d| {
+                            try jw.objectField("delimiter");
+                            try jw.write(d);
+                        }
+                        try jw.endObject();
+                    },
+                    .avro => {
+                        try jw.objectField("avroFormat");
+                        try writeNothing(jw);
+                    },
+                    .pubsub_avro => {
+                        try jw.objectField("pubsubAvroFormat");
+                        try writeNothing(jw);
+                    },
+                }
+                if (source.minimum_object_create_time.len > 0) {
+                    try jw.objectField("minimumObjectCreateTime");
+                    try jw.write(source.minimum_object_create_time);
+                }
+                if (source.match_glob.len > 0) {
+                    try jw.objectField("matchGlob");
+                    try jw.write(source.match_glob);
+                }
+                try jw.endObject();
+            },
+            .outside => |source| {
+                try jw.objectField(outside_sources[source.kind].name);
+                try jw.beginObject();
+                try writeState(jw, ingestionWord(ingestion));
+                for (outside_sources[source.kind].fields, source.values) |field, text| {
+                    if (text.len == 0) continue;
+                    try jw.objectField(field);
+                    try jw.write(text);
+                }
+                try jw.endObject();
+            },
+        }
+        if (ingestion.log_severity.len > 0) {
+            try jw.objectField("platformLogsSettings");
+            try jw.beginObject();
+            try jw.objectField("severity");
+            try jw.write(ingestion.log_severity);
+            try jw.endObject();
+        }
+        try jw.endObject();
+    }
+    try writeTransforms(jw, topic.transforms);
     try jw.endObject();
+}
+
+/// An object with nothing in it.
+fn writeNothing(jw: *Stringify) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.endObject();
+}
+
+fn writeState(jw: *Stringify, word: ?[]const u8) Stringify.Error!void {
+    if (word) |w| {
+        try jw.objectField("state");
+        try jw.write(w);
+    }
+}
+
+/// The state of an import topic's source, as the service spells it. Each
+/// source has a word of its own for being refused at the source.
+fn ingestionWord(ingestion: FakePubSub.Ingestion) ?[]const u8 {
+    return switch (ingestion.state) {
+        .unknown => null,
+        .permission_denied => switch (ingestion.source) {
+            .cloud_storage => "CLOUD_STORAGE_PERMISSION_DENIED",
+            .outside => |source| outside_sources[source.kind].denied,
+        },
+        inline else => |state| comptime upperOf(@tagName(state)),
+    };
+}
+
+/// The state of an export subscription's writes, as the service spells
+/// it. Production was seen to say `ACTIVE` alone.
+fn exportWord(state: types.ExportState) ?[]const u8 {
+    return switch (state) {
+        .unknown => null,
+        .location_restriction => "IN_TRANSIT_LOCATION_RESTRICTION",
+        inline else => |s| comptime upperOf(@tagName(s)),
+    };
+}
+
+fn upperOf(comptime text: []const u8) []const u8 {
+    comptime {
+        var out: [text.len]u8 = undefined;
+        _ = std.ascii.upperString(&out, text);
+        const final = out;
+        return &final;
+    }
+}
+
+fn writeTransforms(jw: *Stringify, transforms: []const FakePubSub.Transform) Stringify.Error!void {
+    if (transforms.len == 0) return;
+    try jw.objectField("messageTransforms");
+    try jw.beginArray();
+    for (transforms) |transform| {
+        try jw.beginObject();
+        try jw.objectField("javascriptUdf");
+        try jw.beginObject();
+        try jw.objectField("functionName");
+        try jw.write(transform.function_name);
+        try jw.objectField("code");
+        try jw.write(transform.code);
+        try jw.endObject();
+        // Each only when true: `enabled: false` reads back as nothing.
+        if (transform.enabled) {
+            try jw.objectField("enabled");
+            try jw.write(true);
+        }
+        if (transform.disabled) {
+            try jw.objectField("disabled");
+            try jw.write(true);
+        }
+        try jw.endObject();
+    }
+    try jw.endArray();
 }
 
 /// A topic's name as a subscription or a snapshot of it reads it.
@@ -3169,30 +4275,104 @@ fn writeSnapshot(jw: *Stringify, snap: *const FakePubSub.Snapshot) Stringify.Err
     try jw.endObject();
 }
 
-fn renderSubscription(arena: Allocator, sub: *const FakePubSub.Subscription) Allocator.Error![]const u8 {
+fn renderSubscription(arena: Allocator, sub: *const FakePubSub.Subscription, how: Answer) Allocator.Error![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     var jw: Stringify = .{ .writer = &out.writer };
-    writeSubscription(&jw, sub, .as_read) catch return error.OutOfMemory;
+    writeSubscription(&jw, sub, how) catch return error.OutOfMemory;
     return out.written();
 }
 
-/// In the order production writes the fields.
-fn writeSubscription(jw: *Stringify, sub: *const FakePubSub.Subscription, how: enum { as_read, after_update }) Stringify.Error!void {
+/// `pushConfig`, which every subscription reads. Production's answer to
+/// the create of a push subscription, and to any update of any
+/// subscription, fills in `x-goog-version`; a read shows none. (A read of
+/// a version the request did say production was not asked for: here it
+/// shows.)
+fn writePushConfig(jw: *Stringify, delivery: FakePubSub.Delivery, how: Answer) Stringify.Error!void {
+    const push: ?FakePubSub.Push = switch (delivery) {
+        .push => |config| config,
+        .pull, .bigquery, .cloud_storage => null,
+    };
+    const said: ?[]const u8 = if (push) |config| config.version else null;
+    const version: ?[]const u8 = switch (how) {
+        .as_read => said,
+        .created => if (push != null) said orelse "v1" else null,
+        .after_update => said orelse "v1",
+    };
+    try jw.beginObject();
+    if (push) |config| {
+        try jw.objectField("pushEndpoint");
+        try jw.write(config.endpoint);
+    }
+    if (version) |v| {
+        try jw.objectField("attributes");
+        try jw.beginObject();
+        try jw.objectField("x-goog-version");
+        try jw.write(v);
+        try jw.endObject();
+    }
+    if (push) |config| {
+        if (config.oidc) |token| {
+            try jw.objectField("oidcToken");
+            try jw.beginObject();
+            try jw.objectField("serviceAccountEmail");
+            try jw.write(token.email);
+            if (token.audience.len > 0) {
+                try jw.objectField("audience");
+                try jw.write(token.audience);
+            }
+            try jw.endObject();
+        }
+        switch (config.wrapper) {
+            .unsaid => {},
+            .pubsub => {
+                try jw.objectField("pubsubWrapper");
+                try writeNothing(jw);
+            },
+            .none => |wrapper| {
+                try jw.objectField("noWrapper");
+                try jw.beginObject();
+                if (wrapper.write_metadata) {
+                    try jw.objectField("writeMetadata");
+                    try jw.write(true);
+                }
+                try jw.endObject();
+            },
+        }
+    }
+    try jw.endObject();
+}
+
+fn writeFlag(jw: *Stringify, comptime name: []const u8, flag: bool) Stringify.Error!void {
+    if (!flag) return;
+    try jw.objectField(name);
+    try jw.write(true);
+}
+
+fn writeText(jw: *Stringify, comptime name: []const u8, text: []const u8) Stringify.Error!void {
+    if (text.len == 0) return;
+    try jw.objectField(name);
+    try jw.write(text);
+}
+
+/// A 64-bit count, which proto3 JSON writes as a string.
+fn writeCount(jw: *Stringify, comptime name: []const u8, count: i64) Stringify.Error!void {
+    if (count == 0) return;
+    var buf: [24]u8 = undefined;
+    try jw.objectField(name);
+    try jw.write(std.fmt.bufPrint(&buf, "{d}", .{count}) catch unreachable);
+}
+
+/// In the order production writes the fields, which is the order the
+/// service numbers them in: where production was never seen to write a
+/// field, the number says where it goes.
+fn writeSubscription(jw: *Stringify, sub: *const FakePubSub.Subscription, how: Answer) Stringify.Error!void {
     try jw.beginObject();
     try jw.objectField("name");
     try jw.write(sub.name);
     try jw.objectField("topic");
     try jw.write(topicName(sub.topic));
     try jw.objectField("pushConfig");
-    try jw.beginObject();
-    if (sub.updated) {
-        try jw.objectField("attributes");
-        try jw.beginObject();
-        try jw.objectField("x-goog-version");
-        try jw.write("v1");
-        try jw.endObject();
-    }
-    try jw.endObject();
+    try writePushConfig(jw, sub.delivery, how);
     try jw.objectField("ackDeadlineSeconds");
     try jw.write(sub.ack_deadline_s);
     if (sub.retain_acked) {
@@ -3252,9 +4432,79 @@ fn writeSubscription(jw: *Stringify, sub: *const FakePubSub.Subscription, how: e
             try writeSeconds(jw, seconds);
         }
     }
+    // While an export cannot write, the subscription's own state says so.
+    var working = true;
+    switch (sub.delivery) {
+        .bigquery => |config| {
+            working = config.state == .active or config.state == .unknown;
+            try jw.objectField("bigqueryConfig");
+            try jw.beginObject();
+            try jw.objectField("table");
+            try jw.write(config.table);
+            try writeFlag(jw, "useTopicSchema", config.use_topic_schema);
+            try writeFlag(jw, "writeMetadata", config.write_metadata);
+            try writeFlag(jw, "dropUnknownFields", config.drop_unknown_fields);
+            try writeState(jw, exportWord(config.state));
+            try writeFlag(jw, "useTableSchema", config.use_table_schema);
+            try writeText(jw, "serviceAccountEmail", config.service_account);
+            try jw.endObject();
+        },
+        .cloud_storage => |config| working = config.state == .active or config.state == .unknown,
+        .pull, .push => {},
+    }
     try jw.objectField("state");
-    try jw.write("ACTIVE");
+    try jw.write(if (working) "ACTIVE" else "RESOURCE_ERROR");
+    switch (sub.delivery) {
+        .cloud_storage => |config| {
+            try jw.objectField("cloudStorageConfig");
+            try jw.beginObject();
+            try jw.objectField("bucket");
+            try jw.write(config.bucket);
+            try writeText(jw, "filenamePrefix", config.prefix);
+            try writeText(jw, "filenameSuffix", config.suffix);
+            switch (config.format) {
+                .text => {
+                    try jw.objectField("textConfig");
+                    try writeNothing(jw);
+                },
+                .avro => |avro| {
+                    try jw.objectField("avroConfig");
+                    try jw.beginObject();
+                    try writeFlag(jw, "writeMetadata", avro.write_metadata);
+                    try writeFlag(jw, "useTopicSchema", avro.use_topic_schema);
+                    try jw.endObject();
+                },
+            }
+            try jw.objectField("maxDuration");
+            try writeDuration(jw, config.max_duration_ns);
+            try writeCount(jw, "maxBytes", config.max_bytes);
+            try writeCount(jw, "maxMessages", config.max_messages);
+            try writeState(jw, exportWord(config.state));
+            try writeText(jw, "filenameDatetimeFormat", config.datetime_format);
+            try writeText(jw, "serviceAccountEmail", config.service_account);
+            try jw.endObject();
+        },
+        .pull, .push, .bigquery => {},
+    }
+    try writeTransforms(jw, sub.transforms);
     try jw.endObject();
+}
+
+/// A duration as proto3 JSON writes one: whole seconds, or with three,
+/// six or nine digits after the point.
+fn writeDuration(jw: *Stringify, ns: i64) Stringify.Error!void {
+    var buf: [40]u8 = undefined;
+    const whole = @divTrunc(ns, std.time.ns_per_s);
+    const part: u64 = @intCast(@mod(ns, std.time.ns_per_s));
+    const text = if (part == 0)
+        std.fmt.bufPrint(&buf, "{d}s", .{whole})
+    else if (part % 1_000_000 == 0)
+        std.fmt.bufPrint(&buf, "{d}.{d:0>3}s", .{ whole, part / 1_000_000 })
+    else if (part % 1000 == 0)
+        std.fmt.bufPrint(&buf, "{d}.{d:0>6}s", .{ whole, part / 1000 })
+    else
+        std.fmt.bufPrint(&buf, "{d}.{d:0>9}s", .{ whole, part });
+    try jw.write(text catch unreachable);
 }
 
 fn writeLabels(jw: *Stringify, labels: []const FakePubSub.Label) Stringify.Error!void {
@@ -3276,7 +4526,6 @@ fn writeSeconds(jw: *Stringify, seconds: i64) Stringify.Error!void {
 const testing = std.testing;
 const test_util = @import("test_util.zig");
 const Client = @import("Client.zig");
-const types = @import("types.zig");
 
 /// A fake, a clock the test moves, and a client of production's kind over
 /// both.
@@ -3361,7 +4610,7 @@ fn xs(comptime n: usize) [n]u8 {
 /// Asserts a refusal's HTTP code, status and words.
 fn expectRefused(reply: FakePubSub.Reply, code: u16, status: []const u8, message: []const u8) !void {
     try testing.expectEqual(code, reply.status);
-    const parsed = try std.json.parseFromSlice(struct { @"error": struct { code: u16, message: []const u8, status: []const u8 } }, testing.allocator, reply.body, .{});
+    const parsed = try std.json.parseFromSlice(struct { @"error": struct { code: u16, message: []const u8, status: []const u8 } }, testing.allocator, reply.body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     try testing.expectEqual(code, parsed.value.@"error".code);
     try testing.expectEqualStrings(status, parsed.value.@"error".status);
@@ -3459,8 +4708,7 @@ test "topics: made, read, changed and deleted, and refused in production's words
     try testing.expectError(error.NotFound, b.client.topic("orders").get());
     try testing.expectEqualStrings("Resource not found (resource=orders).", b.diag.message());
     // What is not modelled yet says so, and guesses nothing.
-    try testing.expectError(error.Unimplemented, b.client.topic("changed").create(.{ .message_transforms = &.{.{ .kind = .{ .javascript_udf = .{ .function_name = "same", .code = "function same(message, metadata) { return message; }" } } }} }));
-    try testing.expectEqualStrings("fake: messageTransforms is not modelled yet", b.diag.message());
+    try expectRefused(try b.raw(a, .GET, "projects/p/topics/zigps-b:getIamPolicy", ""), 501, "UNIMPLEMENTED", "fake: :getIamPolicy is not modelled yet");
 }
 
 test "lists: in name order, in pages, with tokens only this fake gave" {
@@ -3710,8 +4958,7 @@ test "subscriptions: production's defaults, its bounds, what an update may chang
     try testing.expectEqual(0, changed.value.labels.len);
     try testing.expectEqual(types.DeliveryInfo.pull, changed.value.delivery);
     // What is not modelled yet says so.
-    try testing.expectError(error.Unimplemented, b.client.subscription("pushed").create(.{ .topic_id = "zigps-b", .delivery = .{ .push = .{ .endpoint = "https://example.com/hook" } } }));
-    try testing.expectEqualStrings("fake: a push subscription is not modelled yet", b.diag.message());
+    try expectRefused(try b.raw(a, .PUT, "projects/p/subscriptions/tabled", "{\"topic\":\"projects/p/topics/zigps-b\",\"bigtableConfig\":{\"table\":\"projects/p/instances/i/tables/t\"}}"), 501, "UNIMPLEMENTED", "fake: a Bigtable subscription is not modelled yet");
 
     // A topic deleted under its subscription leaves it, and what it holds.
     var sent = try b.client.topic("zigps-b").publish(&.{.{ .data = "kept" }}, .{});
@@ -3885,7 +5132,7 @@ test "ack ids and pulls: what production refuses, in its words" {
     remade.deinit();
     try testing.expectError(error.InvalidArgument, b.client.subscription("sub-b").ack(&.{got.value.messages[0].ack_id}));
     // Routes this fake has not got.
-    try testing.expectEqual(501, (try b.raw(a, .POST, "projects/p/subscriptions/sub-a:modifyPushConfig", "{}")).status);
+    try testing.expectEqual(501, (try b.raw(a, .POST, "projects/p/subscriptions/sub-a:setIamPolicy", "{}")).status);
     try testing.expectEqual(501, (try b.raw(a, .GET, "projects/p/snapshots/snap:getIamPolicy", "")).status);
     try testing.expectEqual(404, (try b.raw(a, .GET, "projects/p/buckets", "")).status);
 }
@@ -5092,8 +6339,6 @@ test "snapshots: made, read, changed, listed and deleted, as production answers,
         \\{"name":"projects/p/snapshots/zigps-empty","topic":"projects/p/topics/zigps-t2","expireTime":"1970-01-08T00:02:00Z"}
     , (try b.raw(a, .PUT, "projects/p/snapshots/zigps-empty", "{\"subscription\":\"projects/p/subscriptions/zigps-s2\"}")).body);
     try b.client.snapshot("zigps-empty").delete();
-    // Tags are for a later milestone, and say so.
-    try testing.expectEqual(501, (try b.raw(a, .PUT, "projects/p/snapshots/zigps-tagged", "{" ++ of_s ++ ",\"tags\":{\"p/env\":\"prod\"}}")).status);
 
     // Deleted, it is gone.
     try b.client.snapshot("zigps-other").delete();
@@ -6173,6 +7418,1062 @@ test "a topic's schema: its settings as production reads and refuses them, and i
     try testing.expectEqual(types.SchemaEncoding.binary, typed.value.schema.?.encoding);
 }
 
+/// What a resource's JSON holds between two places in it.
+fn between(body: []const u8, comptime from: []const u8, comptime to: []const u8) []const u8 {
+    const start = (std.mem.indexOf(u8, body, from) orelse return "") + from.len;
+    const len = std.mem.indexOf(u8, body[start..], to) orelse return "";
+    return body[start..][0..len];
+}
+
+/// What it holds from there on.
+fn tailOf(body: []const u8, comptime from: []const u8) []const u8 {
+    const at = std.mem.indexOf(u8, body, from) orelse return "";
+    return body[at + from.len ..];
+}
+
+fn pushConfigOf(body: []const u8) []const u8 {
+    return between(body, "\"pushConfig\":", ",\"ackDeadlineSeconds\"");
+}
+
+/// `n` times `é`, two bytes each.
+fn accented(comptime n: usize) [2 * n]u8 {
+    var out: [2 * n]u8 = undefined;
+    for (0..n) |i| @memcpy(out[2 * i ..][0..2], "é");
+    return out;
+}
+
+test "push subscriptions: kept and read back as production's, refused in its words, and never pushed to" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var made = try b.client.topic("zigps-t").create(.{});
+    made.deinit();
+    const topic = "\"topic\":\"projects/p/topics/zigps-t\"";
+    const end = "https://example.com/zigps-push";
+    const version = "\"attributes\":{\"x-goog-version\":\"v1\"}";
+    const push = "projects/p/subscriptions/zigps-push";
+
+    // The answer to a create fills in the version. A read shows none.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-push","topic":"projects/p/topics/zigps-t","pushConfig":{"pushEndpoint":"https://example.com/zigps-push","attributes":{"x-goog-version":"v1"}},"ackDeadlineSeconds":10,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"state":"ACTIVE"}
+    , (try b.raw(a, .PUT, push, "{" ++ topic ++ ",\"pushConfig\":{\"pushEndpoint\":\"" ++ end ++ "\"}}")).body);
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-push","topic":"projects/p/topics/zigps-t","pushConfig":{"pushEndpoint":"https://example.com/zigps-push"},"ackDeadlineSeconds":10,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"state":"ACTIVE"}
+    , (try b.raw(a, .GET, push, "")).body);
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-push-ord","topic":"projects/p/topics/zigps-t","pushConfig":{"pushEndpoint":"https://example.com/zigps-push","attributes":{"x-goog-version":"v1"}},"ackDeadlineSeconds":10,"messageRetentionDuration":"604800s","enableMessageOrdering":true,"expirationPolicy":{"ttl":"2678400s"},"state":"ACTIVE"}
+    , (try b.raw(a, .PUT, "projects/p/subscriptions/zigps-push-ord", "{" ++ topic ++ ",\"pushConfig\":{\"pushEndpoint\":\"" ++ end ++ "\"},\"enableMessageOrdering\":true}")).body);
+
+    // What a push config may hold, as the answer to the create writes it.
+    for ([_]struct { []const u8, []const u8, []const u8 }{
+        .{ "zigps-attr", "{\"pushEndpoint\":\"" ++ end ++ "\",\"attributes\":{\"x-goog-version\":\"v1beta1\"}}", "{\"pushEndpoint\":\"" ++ end ++ "\",\"attributes\":{\"x-goog-version\":\"v1beta1\"}}" },
+        .{ "zigps-nowrap", "{\"pushEndpoint\":\"" ++ end ++ "\",\"noWrapper\":{\"writeMetadata\":true}}", "{\"pushEndpoint\":\"" ++ end ++ "\"," ++ version ++ ",\"noWrapper\":{\"writeMetadata\":true}}" },
+        .{ "zigps-wrap", "{\"pushEndpoint\":\"" ++ end ++ "\",\"pubsubWrapper\":{}}", "{\"pushEndpoint\":\"" ++ end ++ "\"," ++ version ++ ",\"pubsubWrapper\":{}}" },
+        .{ "zigps-oidc", "{\"pushEndpoint\":\"" ++ end ++ "\",\"oidcToken\":{\"serviceAccountEmail\":\"zig-gcp@p.iam.gserviceaccount.com\",\"audience\":\"zigps\"}}", "{\"pushEndpoint\":\"" ++ end ++ "\"," ++ version ++ ",\"oidcToken\":{\"serviceAccountEmail\":\"zig-gcp@p.iam.gserviceaccount.com\",\"audience\":\"zigps\"}}" },
+        .{ "zigps-oidc-wrap", "{\"noWrapper\":{},\"oidcToken\":{\"serviceAccountEmail\":\"zig-gcp@p.iam.gserviceaccount.com\"},\"push_endpoint\":\"" ++ end ++ "\"}", "{\"pushEndpoint\":\"" ++ end ++ "\"," ++ version ++ ",\"oidcToken\":{\"serviceAccountEmail\":\"zig-gcp@p.iam.gserviceaccount.com\"},\"noWrapper\":{}}" },
+        // With no endpoint it is a subscription that pulls, whatever else
+        // the config holds.
+        .{ "zigps-empty", "{}", "{}" },
+        .{ "zigps-version-alone", "{" ++ version ++ ",\"noWrapper\":{}}", "{}" },
+    }) |case| {
+        const body = (try b.raw(a, .PUT, try std.fmt.allocPrint(a, "projects/p/subscriptions/{s}", .{case[0]}), try std.fmt.allocPrint(a, "{{" ++ topic ++ ",\"pushConfig\":{s}}}", .{case[1]}))).body;
+        try testing.expectEqualStrings(case[2], pushConfigOf(body));
+    }
+    // A version the request said, a read shows: the fake's own.
+    try testing.expectEqualStrings("{\"pushEndpoint\":\"" ++ end ++ "\",\"attributes\":{\"x-goog-version\":\"v1beta1\"}}", pushConfigOf((try b.raw(a, .GET, "projects/p/subscriptions/zigps-attr", "")).body));
+    try testing.expectEqualStrings("{\"pushEndpoint\":\"" ++ end ++ "\",\"noWrapper\":{\"writeMetadata\":true}}", pushConfigOf((try b.raw(a, .GET, "projects/p/subscriptions/zigps-nowrap", "")).body));
+
+    // What a create refuses. The last production was shown only beside a
+    // version it refused.
+    const no_exactly_once = "A subscription cannot have push config set with exactly once delivery configured.";
+    for ([_]struct { []const u8, u16, []const u8, []const u8 }{
+        .{ "\"pushConfig\":{\"pushEndpoint\":\"http://example.com/zigps-push\"}", 400, "INVALID_ARGUMENT", "Invalid push endpoint given (endpoint=http://example.com/zigps-push). Refer to https://cloud.google.com/pubsub/subscriber#create for more information." },
+        .{ "\"pushConfig\":{\"pushEndpoint\":\"not a url\"}", 400, "INVALID_ARGUMENT", "Invalid push endpoint given (endpoint=not a url). Refer to https://cloud.google.com/pubsub/subscriber#create for more information." },
+        .{ "\"pushConfig\":{\"pushEndpoint\":\"https://\"}", 400, "INVALID_ARGUMENT", "Invalid push endpoint given (endpoint=https://). Refer to https://cloud.google.com/pubsub/subscriber#create for more information." },
+        .{ "\"pushConfig\":{\"pushEndpoint\":\"https://example.com/a b\"}", 400, "INVALID_ARGUMENT", "Invalid push endpoint given (endpoint=https://example.com/a b). Refer to https://cloud.google.com/pubsub/subscriber#create for more information." },
+        .{ "\"pushConfig\":{\"pushEndpoint\":\"" ++ end ++ "\",\"attributes\":{\"x-goog-version\":\"v2\",\"other\":\"x\"}}", 400, "INVALID_ARGUMENT", "Invalid push endpoint version given in push config (version=v2)." },
+        .{ "\"pushConfig\":{\"pushEndpoint\":\"" ++ end ++ "\",\"pubsubWrapper\":{},\"noWrapper\":{}}", 400, "INVALID_ARGUMENT", "Invalid value at 'push_config' (oneof), oneof field 'wrapper' is already set. Cannot set 'noWrapper'" },
+        .{ "\"pushConfig\":{\"pushEndpoint\":\"" ++ end ++ "\",\"noWrapper\":{},\"pubsubWrapper\":{}}", 400, "INVALID_ARGUMENT", "Invalid value at 'push_config' (oneof), oneof field 'wrapper' is already set. Cannot set 'pubsubWrapper'" },
+        .{ "\"pushConfig\":{\"pushEndpoint\":\"" ++ end ++ "\",\"oidcToken\":{\"audience\":\"zigps\"}}", 400, "INVALID_ARGUMENT", "You have passed an invalid argument to the service (argument=PushConfig::oidc_token::service_account_email)." },
+        .{ "\"pushConfig\":{\"pushEndpoint\":\"" ++ end ++ "\"},\"enableExactlyOnceDelivery\":true", 400, "INVALID_ARGUMENT", no_exactly_once },
+        .{ "\"pushConfig\":{\"pushEndpoint\":\"" ++ end ++ "\",\"pubsubWrapper\":{\"writeMetadata\":true}}", 400, "INVALID_ARGUMENT", "Invalid JSON payload received. Unknown name \"writeMetadata\": Cannot find field." },
+        .{ "\"pushConfig\":{\"pushEndpoint\":\"" ++ end ++ "\",\"noWrapper\":{\"nonsense\":true}}", 400, "INVALID_ARGUMENT", "Invalid JSON payload received. Unknown name \"nonsense\": Cannot find field." },
+        .{ "\"pushConfig\":{\"pushEndpoint\":\"" ++ end ++ "\",\"attributes\":{\"other\":\"x\"}}", 501, "UNIMPLEMENTED", "fake: a push attribute other than x-goog-version is not modelled yet" },
+    }) |case| {
+        try expectRefused(try b.raw(a, .PUT, "projects/p/subscriptions/zigps-bad", try std.fmt.allocPrint(a, "{{" ++ topic ++ ",{s}}}", .{case[0]})), case[1], case[2], case[3]);
+    }
+    try testing.expectEqual(404, (try b.raw(a, .GET, "projects/p/subscriptions/zigps-bad", "")).status);
+
+    // It holds what it is sent, and gives none of it: nothing is pushed.
+    var sent = try b.client.topic("zigps-t").publish(&.{ .{ .data = "one" }, .{ .data = "two" } }, .{});
+    sent.deinit();
+    try testing.expectEqual(2, b.fake.backlog("p", "zigps-push"));
+    const not_this_kind = "This method is not supported for this subscription type.";
+    try expectRefused(try b.raw(a, .POST, push ++ ":pull", "{\"maxMessages\":1,\"returnImmediately\":true}"), 400, "FAILED_PRECONDITION", not_this_kind);
+    try expectRefused(try b.raw(a, .POST, push ++ ":modifyAckDeadline", "{\"ackIds\":[\"x\"],\"ackDeadlineSeconds\":10}"), 400, "FAILED_PRECONDITION", not_this_kind);
+    try testing.expectError(error.FailedPrecondition, b.client.subscription("zigps-push").pull(.{ .return_immediately = true }));
+    // An ack production refused for its id, as on any subscription.
+    try expectRefused(try b.raw(a, .POST, push ++ ":acknowledge", "{\"ackIds\":[\"x\"]}"), 400, "INVALID_ARGUMENT", "You have passed an invalid ack ID to the service (ack_id=x).");
+    // A seek and a snapshot are taken as on any subscription.
+    try testing.expectEqualStrings("{}", (try b.raw(a, .POST, push ++ ":seek", "{\"time\":\"1970-01-01T00:00:00Z\"}")).body);
+    try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/snapshots/zigps-snap", "{\"subscription\":\"" ++ push ++ "\"}")).status);
+    try testing.expectEqual(2, b.fake.backlog("p", "zigps-push"));
+    try testing.expectEqual(0, b.fake.outstanding("p", "zigps-push"));
+
+    // modifyPushConfig replaces the config whole, and answers nothing.
+    try testing.expectEqualStrings("{}", (try b.raw(a, .POST, push ++ ":modifyPushConfig", "{\"pushConfig\":{\"pushEndpoint\":\"" ++ end ++ "2\"}}")).body);
+    try testing.expectEqualStrings("{\"pushEndpoint\":\"" ++ end ++ "2\"}", pushConfigOf((try b.raw(a, .GET, push, "")).body));
+    // So does an update by the mask `pushConfig`, and its answer fills in
+    // the version again.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-push","topic":"projects/p/topics/zigps-t","pushConfig":{"pushEndpoint":"https://example.com/zigps-push3","attributes":{"x-goog-version":"v1"},"noWrapper":{}},"ackDeadlineSeconds":10,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"state":"ACTIVE"}
+    , (try b.raw(a, .PATCH, push, "{\"subscription\":{\"pushConfig\":{\"pushEndpoint\":\"" ++ end ++ "3\",\"noWrapper\":{}}},\"updateMask\":\"pushConfig\"}")).body);
+    // By `pushConfig.pushEndpoint` the endpoint alone changes: the
+    // wrapper stays.
+    try testing.expectEqualStrings("{\"pushEndpoint\":\"" ++ end ++ "4\"," ++ version ++ ",\"noWrapper\":{}}", pushConfigOf((try b.raw(a, .PATCH, push, "{\"subscription\":{\"pushConfig\":{\"pushEndpoint\":\"" ++ end ++ "4\"}},\"updateMask\":\"pushConfig.pushEndpoint\"}")).body));
+    try testing.expectEqualStrings("{\"pushEndpoint\":\"" ++ end ++ "4\",\"noWrapper\":{}}", pushConfigOf((try b.raw(a, .GET, push, "")).body));
+    // An endpoint of no form is refused there too, and changes nothing.
+    try expectRefused(try b.raw(a, .PATCH, push, "{\"subscription\":{\"pushConfig\":{\"pushEndpoint\":\"http://example.com\"}},\"updateMask\":\"push_config.push_endpoint\"}"), 400, "INVALID_ARGUMENT", "Invalid push endpoint given (endpoint=http://example.com). Refer to https://cloud.google.com/pubsub/subscriber#create for more information.");
+    try expectRefused(try b.raw(a, .PATCH, push, "{\"subscription\":{\"pushConfig\":{\"pushEndpoint\":\"http://example.com\"}},\"updateMask\":\"pushConfig\"}"), 400, "INVALID_ARGUMENT", "Invalid push endpoint given (endpoint=http://example.com). Refer to https://cloud.google.com/pubsub/subscriber#create for more information.");
+    try testing.expectEqualStrings("{\"pushEndpoint\":\"" ++ end ++ "4\",\"noWrapper\":{}}", pushConfigOf((try b.raw(a, .GET, push, "")).body));
+    // Any other path inside the config production was not shown.
+    try expectRefused(try b.raw(a, .PATCH, push, "{\"subscription\":{},\"updateMask\":\"pushConfig.noWrapper\"}"), 501, "UNIMPLEMENTED", "fake: pushConfig.noWrapper is not modelled yet");
+
+    // With no endpoint it pulls again, and here at once: production went
+    // on refusing a pull for a moment.
+    try testing.expectEqualStrings("{}", (try b.raw(a, .POST, push ++ ":modifyPushConfig", "{\"pushConfig\":{}}")).body);
+    try testing.expectEqualStrings("{}", pushConfigOf((try b.raw(a, .GET, push, "")).body));
+    try testing.expectEqual(200, (try b.raw(a, .POST, push ++ ":pull", "{\"maxMessages\":10}")).status);
+    try testing.expectEqual(2, b.fake.outstanding("p", "zigps-push"));
+    // Back to push by the endpoint's own path, which finds no config to
+    // keep; then the mask alone, whose answer has a version and no
+    // endpoint, where a read has neither.
+    try testing.expectEqualStrings("{\"pushEndpoint\":\"" ++ end ++ "\"," ++ version ++ "}", pushConfigOf((try b.raw(a, .PATCH, push, "{\"subscription\":{\"pushConfig\":{\"pushEndpoint\":\"" ++ end ++ "\"}},\"updateMask\":\"pushConfig.pushEndpoint\"}")).body));
+    try testing.expectEqualStrings("{" ++ version ++ "}", pushConfigOf((try b.raw(a, .PATCH, push, "{\"subscription\":{},\"updateMask\":\"pushConfig\"}")).body));
+    try testing.expectEqualStrings("{}", pushConfigOf((try b.raw(a, .GET, push, "")).body));
+    // The endpoint's own path with no endpoint in the body: it pulls.
+    try testing.expectEqualStrings("{}", (try b.raw(a, .POST, push ++ ":modifyPushConfig", "{\"pushConfig\":{\"pushEndpoint\":\"" ++ end ++ "\"}}")).body);
+    try testing.expectEqualStrings("{" ++ version ++ "}", pushConfigOf((try b.raw(a, .PATCH, push, "{\"subscription\":{\"pushConfig\":{}},\"updateMask\":\"pushConfig.pushEndpoint\"}")).body));
+    try testing.expectEqualStrings("{}", (try b.raw(a, .POST, push ++ ":modifyPushConfig", "{}")).body);
+    try expectRefused(try b.raw(a, .POST, "projects/p/subscriptions/zigps-nope:modifyPushConfig", "{\"pushConfig\":{}}"), 404, "NOT_FOUND", "Resource not found (resource=zigps-nope).");
+    try expectRefused(try b.raw(a, .POST, push ++ ":modifyPushConfig", "{\"pushConfig\":{\"pushEndpoint\":\"http://example.com\"}}"), 400, "INVALID_ARGUMENT", "Invalid push endpoint given (endpoint=http://example.com). Refer to https://cloud.google.com/pubsub/subscriber#create for more information.");
+    try testing.expectEqual(400, (try b.raw(a, .POST, push ++ ":modifyPushConfig", "{\"push\":{}}")).status);
+
+    // Exactly-once delivery and a push config never meet, whichever
+    // comes second.
+    const ord = "projects/p/subscriptions/zigps-push-ord";
+    try expectRefused(try b.raw(a, .PATCH, ord, "{\"subscription\":{\"enableExactlyOnceDelivery\":true},\"updateMask\":\"enableExactlyOnceDelivery\"}"), 400, "INVALID_ARGUMENT", no_exactly_once);
+    try expectRefused(try b.raw(a, .PATCH, push, "{\"subscription\":{\"pushConfig\":{\"pushEndpoint\":\"" ++ end ++ "\"},\"enableExactlyOnceDelivery\":true},\"updateMask\":\"pushConfig,enableExactlyOnceDelivery\"}"), 400, "INVALID_ARGUMENT", no_exactly_once);
+    try testing.expectEqual(200, (try b.raw(a, .PATCH, push, "{\"subscription\":{\"enableExactlyOnceDelivery\":true},\"updateMask\":\"enableExactlyOnceDelivery\"}")).status);
+    try expectRefused(try b.raw(a, .POST, push ++ ":modifyPushConfig", "{\"pushConfig\":{\"pushEndpoint\":\"" ++ end ++ "\"}}"), 400, "INVALID_ARGUMENT", no_exactly_once);
+    try testing.expectEqualStrings("{}", pushConfigOf((try b.raw(a, .GET, push, "")).body));
+
+    // Through the client: made, read, and changed to pull, which this
+    // client asks for by naming all three kinds and giving none.
+    var hook = try b.client.subscription("hook").create(.{ .topic_id = "zigps-t", .delivery = .{ .push = .{
+        .endpoint = end,
+        .oidc_token = .{ .service_account_email = "zig-gcp@p.iam.gserviceaccount.com", .audience = "zigps" },
+        .body = .{ .unwrapped = .{ .write_metadata = true } },
+    } } });
+    defer hook.deinit();
+    try testing.expectEqualStrings(end, hook.value.delivery.push.endpoint);
+    try testing.expectEqualStrings("zigps", hook.value.delivery.push.oidc_token.?.audience);
+    try testing.expect(hook.value.delivery.push.body.unwrapped.write_metadata);
+    var pulls = try b.client.subscription("hook").update(.{ .delivery = .pull });
+    defer pulls.deinit();
+    try testing.expectEqual(types.DeliveryInfo.pull, pulls.value.delivery);
+    var pushes = try b.client.subscription("hook").update(.{ .delivery = .{ .push = .{ .endpoint = end ++ "5" } } });
+    defer pushes.deinit();
+    try testing.expectEqualStrings(end ++ "5", pushes.value.delivery.push.endpoint);
+    try testing.expectEqual(types.PushConfig.Body.wrapped, pushes.value.delivery.push.body);
+    var kept = try b.client.subscription("kept").create(.{ .topic_id = "zigps-t", .delivery = .{ .push = .{ .endpoint = end, .oidc_token = .{ .service_account_email = "zig-gcp@p.iam.gserviceaccount.com" } } } });
+    kept.deinit();
+    for ([_][]const u8{ "hook", "kept" }, [_][]const u8{ end ++ "5", end }) |id, endpoint| {
+        var read = try b.client.subscription(id).get();
+        defer read.deinit();
+        try testing.expectEqualStrings(endpoint, read.value.delivery.push.endpoint);
+    }
+
+    // A detached subscription says so first, of whatever kind: the fake's
+    // own, production was not asked.
+    try testing.expectEqual(200, (try b.raw(a, .POST, ord ++ ":detach", "")).status);
+    try expectRefused(try b.raw(a, .POST, ord ++ ":pull", "{\"maxMessages\":1}"), 400, "FAILED_PRECONDITION", "This method is not supported on detached subscriptions.");
+    try expectRefused(try b.raw(a, .POST, ord ++ ":modifyAckDeadline", "{\"ackIds\":[\"x\"],\"ackDeadlineSeconds\":10}"), 400, "FAILED_PRECONDITION", "This method is not supported on detached subscriptions.");
+}
+
+test "BigQuery subscriptions: kept and read back as production's, with a state the test sets" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var made = try b.client.topic("zigps-t").create(.{});
+    made.deinit();
+    const topic = "\"topic\":\"projects/p/topics/zigps-t\"";
+    const bq = "projects/p/subscriptions/zigps-bq";
+
+    // A create's answer and a read are the same: the state is there at
+    // once, and before the subscription's own.
+    const as_made =
+        \\{"name":"projects/p/subscriptions/zigps-bq","topic":"projects/p/topics/zigps-t","pushConfig":{},"ackDeadlineSeconds":10,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"bigqueryConfig":{"table":"p.zigps_d.msgs","writeMetadata":true,"state":"ACTIVE"},"state":"ACTIVE"}
+    ;
+    try testing.expectEqualStrings(as_made, (try b.raw(a, .PUT, bq, "{" ++ topic ++ ",\"bigqueryConfig\":{\"table\":\"p.zigps_d.msgs\",\"writeMetadata\":true}}")).body);
+    try testing.expectEqualStrings(as_made, (try b.raw(a, .GET, bq, "")).body);
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-bq-schema","topic":"projects/p/topics/zigps-t","pushConfig":{},"ackDeadlineSeconds":10,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"bigqueryConfig":{"table":"p.zigps_d.msgs","useTopicSchema":true,"state":"ACTIVE"},"state":"ACTIVE"}
+    , (try b.raw(a, .PUT, "projects/p/subscriptions/zigps-bq-schema", "{" ++ topic ++ ",\"bigqueryConfig\":{\"table\":\"p.zigps_d.msgs\",\"useTopicSchema\":true}}")).body);
+    // Every setting, in the order the service numbers them: the two
+    // above are all production was seen to write. A table's two forms,
+    // and a dataset with a hyphen, production took for well formed.
+    for ([_]struct { []const u8, []const u8, []const u8 }{
+        .{ "zigps-bq-all", "{\"serviceAccountEmail\":\"writer@p.iam.gserviceaccount.com\",\"dropUnknownFields\":true,\"writeMetadata\":true,\"useTopicSchema\":true,\"state\":\"NOT_FOUND\",\"table\":\"p:zigps_d.msgs\"}", "\"table\":\"p:zigps_d.msgs\",\"useTopicSchema\":true,\"writeMetadata\":true,\"dropUnknownFields\":true,\"state\":\"ACTIVE\",\"serviceAccountEmail\":\"writer@p.iam.gserviceaccount.com\"" },
+        .{ "zigps-bq-table", "{\"table\":\"p.zigps-d.msgs\",\"use_table_schema\":true}", "\"table\":\"p.zigps-d.msgs\",\"state\":\"ACTIVE\",\"useTableSchema\":true" },
+    }) |case| {
+        const body = (try b.raw(a, .PUT, try std.fmt.allocPrint(a, "projects/p/subscriptions/{s}", .{case[0]}), try std.fmt.allocPrint(a, "{{" ++ topic ++ ",\"bigqueryConfig\":{s}}}", .{case[1]}))).body;
+        try testing.expectEqualStrings(case[2], between(body, "\"bigqueryConfig\":{", "},\"state\""));
+    }
+
+    // What a create refuses. The fake has no tables: one that is not
+    // there, which production refuses with 403, is taken here.
+    const malformed = "Request contains an invalid argument.";
+    const one_kind = "Cannot create a subscription with multiple configurations. Only at most one of ";
+    for ([_]struct { []const u8, u16, []const u8, []const u8 }{
+        .{ "\"bigqueryConfig\":{\"table\":\"nonsense\"}", 400, "INVALID_ARGUMENT", malformed },
+        .{ "\"bigqueryConfig\":{}", 400, "INVALID_ARGUMENT", malformed },
+        .{ "\"bigqueryConfig\":{\"table\":\"zigps_d.t\"}", 400, "INVALID_ARGUMENT", malformed },
+        .{ "\"bigqueryConfig\":{\"table\":\"p.zigps_d\"}", 400, "INVALID_ARGUMENT", malformed },
+        .{ "\"bigqueryConfig\":{\"table\":\".zigps_d.t\"}", 400, "INVALID_ARGUMENT", malformed },
+        .{ "\"bigqueryConfig\":{\"table\":\"p..t\"}", 400, "INVALID_ARGUMENT", malformed },
+        .{ "\"bigqueryConfig\":{\"table\":\"p.d.\"}", 400, "INVALID_ARGUMENT", malformed },
+        .{ "\"bigqueryConfig\":{\"table\":\":d.t\"}", 400, "INVALID_ARGUMENT", malformed },
+        .{ "\"bigqueryConfig\":{\"table\":\"p:t\"}", 400, "INVALID_ARGUMENT", malformed },
+        .{ "\"bigqueryConfig\":{\"table\":\"a.b.c.d\"}", 404, "NOT_FOUND", "Requested entity was not found." },
+        .{ "\"bigqueryConfig\":{\"table\":\"p.d.t\",\"useTopicSchema\":true,\"useTableSchema\":true}", 400, "INVALID_ARGUMENT", "The options use_table_schema and use_topic_schema cannot both be set to 'true' when creating a BigQuery subscription." },
+        .{ "\"bigqueryConfig\":{\"table\":\"p.d.t\"},\"enableExactlyOnceDelivery\":true", 400, "INVALID_ARGUMENT", "A subscription cannot have bigquery config set with exactly once delivery configured." },
+        .{ "\"bigqueryConfig\":{\"table\":\"p.d.t\"},\"pushConfig\":{\"pushEndpoint\":\"https://example.com/zigps-push\"}", 400, "INVALID_ARGUMENT", one_kind ++ "PushConfig, BigQueryConfig can be specified." },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"zigps-bucket\"},\"bigqueryConfig\":{\"table\":\"p.d.t\"}", 400, "INVALID_ARGUMENT", one_kind ++ "BigQueryConfig, CloudStorageConfig can be specified." },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"zigps-bucket\"},\"pushConfig\":{\"pushEndpoint\":\"https://example.com/zigps-push\"}", 400, "INVALID_ARGUMENT", one_kind ++ "PushConfig, CloudStorageConfig can be specified." },
+        .{ "\"bigqueryConfig\":{\"table\":\"p.d.t\",\"writeMetadata\":\"yes\"}", 400, "INVALID_ARGUMENT", "Invalid value at 'writeMetadata'" },
+        .{ "\"bigqueryConfig\":{\"table\":\"p.d.t\",\"nonsense\":true}", 400, "INVALID_ARGUMENT", "Invalid JSON payload received. Unknown name \"nonsense\": Cannot find field." },
+        // All three production was not shown.
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"zigps-bucket\"},\"bigqueryConfig\":{\"table\":\"p.d.t\"},\"pushConfig\":{\"pushEndpoint\":\"https://example.com/zigps-push\"}", 501, "UNIMPLEMENTED", "fake: a subscription with all three kinds of delivery is not modelled yet" },
+    }) |case| {
+        try expectRefused(try b.raw(a, .PUT, "projects/p/subscriptions/zigps-bad", try std.fmt.allocPrint(a, "{{" ++ topic ++ ",{s}}}", .{case[0]})), case[1], case[2], case[3]);
+    }
+    try testing.expectEqual(404, (try b.raw(a, .GET, "projects/p/subscriptions/zigps-bad", "")).status);
+    // A push config with no endpoint is no second kind.
+    try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/subscriptions/zigps-bq-pull", "{" ++ topic ++ ",\"pushConfig\":{},\"bigqueryConfig\":{\"table\":\"p.d.t\"}}")).status);
+
+    // It holds what it is sent and gives none of it. That a pull is
+    // refused as on a subscription that pushes is the fake's own.
+    var sent = try b.client.topic("zigps-t").publish(&.{.{ .data = "row" }}, .{});
+    sent.deinit();
+    try testing.expectEqual(1, b.fake.backlog("p", "zigps-bq"));
+    try expectRefused(try b.raw(a, .POST, bq ++ ":pull", "{\"maxMessages\":1}"), 400, "FAILED_PRECONDITION", "This method is not supported for this subscription type.");
+    try expectRefused(try b.raw(a, .POST, bq ++ ":modifyAckDeadline", "{\"ackIds\":[\"x\"],\"ackDeadlineSeconds\":10}"), 400, "FAILED_PRECONDITION", "This method is not supported for this subscription type.");
+    try expectRefused(try b.raw(a, .POST, bq ++ ":modifyPushConfig", "{\"pushConfig\":{}}"), 501, "UNIMPLEMENTED", "fake: modifyPushConfig on a subscription that exports is not modelled yet");
+
+    // What production learns by writing rows, the test says. While it is
+    // anything but active the subscription's own state says so too.
+    b.fake.setExportState("p", "zigps-bq", .permission_denied);
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-bq","topic":"projects/p/topics/zigps-t","pushConfig":{},"ackDeadlineSeconds":10,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"bigqueryConfig":{"table":"p.zigps_d.msgs","writeMetadata":true,"state":"PERMISSION_DENIED"},"state":"RESOURCE_ERROR"}
+    , (try b.raw(a, .GET, bq, "")).body);
+    {
+        var read = try b.client.subscription("zigps-bq").get();
+        defer read.deinit();
+        try testing.expectEqual(types.ExportState.permission_denied, read.value.delivery.bigquery.state);
+        try testing.expectEqual(types.SubscriptionInfo.State.resource_error, read.value.state);
+        try testing.expect(read.value.delivery.bigquery.config.write_metadata);
+    }
+    for ([_]struct { types.ExportState, []const u8 }{
+        .{ .not_found, "\"state\":\"NOT_FOUND\"},\"state\":\"RESOURCE_ERROR\"}" },
+        .{ .schema_mismatch, "\"state\":\"SCHEMA_MISMATCH\"},\"state\":\"RESOURCE_ERROR\"}" },
+        .{ .location_restriction, "\"state\":\"IN_TRANSIT_LOCATION_RESTRICTION\"},\"state\":\"RESOURCE_ERROR\"}" },
+        // No word at all, as an emulator says none.
+        .{ .unknown, "\"writeMetadata\":true},\"state\":\"ACTIVE\"}" },
+        .{ .active, "\"state\":\"ACTIVE\"},\"state\":\"ACTIVE\"}" },
+    }) |case| {
+        b.fake.setExportState("projects/p", bq, case[0]);
+        try testing.expect(std.mem.endsWith(u8, (try b.raw(a, .GET, bq, "")).body, case[1]));
+    }
+    // Said of a subscription that exports nothing, or of none, it is
+    // nothing.
+    b.fake.setExportState("p", "zigps-bq-pull-nope", .not_found);
+    var plain = try b.client.subscription("plain").create(.{ .topic_id = "zigps-t" });
+    plain.deinit();
+    b.fake.setExportState("p", "plain", .not_found);
+    try testing.expect(std.mem.endsWith(u8, (try b.raw(a, .GET, "projects/p/subscriptions/plain", "")).body, "\"state\":\"ACTIVE\"}"));
+
+    // An update replaces the config whole, and the new one is active
+    // again. Its answer has the version every update's has.
+    b.fake.setExportState("p", "zigps-bq", .not_found);
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-bq","topic":"projects/p/topics/zigps-t","pushConfig":{"attributes":{"x-goog-version":"v1"}},"ackDeadlineSeconds":10,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"bigqueryConfig":{"table":"p.zigps_d.other","state":"ACTIVE"},"state":"ACTIVE"}
+    , (try b.raw(a, .PATCH, bq, "{\"subscription\":{\"bigqueryConfig\":{\"table\":\"p.zigps_d.other\"}},\"updateMask\":\"bigqueryConfig\"}")).body);
+    // A refused one changes nothing, and neither does another update.
+    try expectRefused(try b.raw(a, .PATCH, bq, "{\"subscription\":{\"bigqueryConfig\":{\"table\":\"nonsense\"}},\"updateMask\":\"bigquery_config\"}"), 400, "INVALID_ARGUMENT", malformed);
+    try expectRefused(try b.raw(a, .PATCH, bq, "{\"subscription\":{},\"updateMask\":\"bigqueryConfig.table\"}"), 501, "UNIMPLEMENTED", "fake: bigqueryConfig.table is not modelled yet");
+    b.fake.setExportState("p", "zigps-bq", .schema_mismatch);
+    try testing.expectEqual(200, (try b.raw(a, .PATCH, bq, "{\"subscription\":{\"ackDeadlineSeconds\":20},\"updateMask\":\"ackDeadlineSeconds\"}")).status);
+    try testing.expectEqualStrings("\"table\":\"p.zigps_d.other\",\"state\":\"SCHEMA_MISMATCH\"", between((try b.raw(a, .GET, bq, "")).body, "\"bigqueryConfig\":{", "},\"state\""));
+
+    // Through the client.
+    var rows = try b.client.subscription("rows").create(.{ .topic_id = "zigps-t", .delivery = .{ .bigquery = .{ .table = "p.d.t", .schema = .topic, .drop_unknown_fields = true, .service_account_email = "writer@p.iam.gserviceaccount.com" } } });
+    defer rows.deinit();
+    try testing.expectEqualStrings("p.d.t", rows.value.delivery.bigquery.config.table);
+    try testing.expectEqual(types.BigQueryConfig.Schema.topic, rows.value.delivery.bigquery.config.schema);
+    try testing.expect(rows.value.delivery.bigquery.config.drop_unknown_fields);
+    try testing.expectEqualStrings("writer@p.iam.gserviceaccount.com", rows.value.delivery.bigquery.config.service_account_email.?);
+    try testing.expectEqual(types.ExportState.active, rows.value.delivery.bigquery.state);
+    try testing.expectError(error.FailedPrecondition, b.client.subscription("rows").pull(.{ .return_immediately = true }));
+    var read = try b.client.subscription("rows").get();
+    defer read.deinit();
+    try testing.expectEqualStrings("p.d.t", read.value.delivery.bigquery.config.table);
+    try testing.expectEqualStrings("writer@p.iam.gserviceaccount.com", read.value.delivery.bigquery.config.service_account_email.?);
+}
+
+test "Cloud Storage subscriptions: what production fills in, its bounds on a file, and its rules for a file's name" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var made = try b.client.topic("zigps-t").create(.{});
+    made.deinit();
+    const topic = "\"topic\":\"projects/p/topics/zigps-t\"";
+    const gcs = "projects/p/subscriptions/zigps-gcs";
+
+    // Filled in: the text format, and an ack deadline as long as a file
+    // is kept open. The config is written after the subscription's
+    // state.
+    const as_made =
+        \\{"name":"projects/p/subscriptions/zigps-gcs","topic":"projects/p/topics/zigps-t","pushConfig":{},"ackDeadlineSeconds":60,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"state":"ACTIVE","cloudStorageConfig":{"bucket":"zigps-bucket","filenamePrefix":"zigps/","textConfig":{},"maxDuration":"60s","state":"ACTIVE"}}
+    ;
+    try testing.expectEqualStrings(as_made, (try b.raw(a, .PUT, gcs, "{" ++ topic ++ ",\"cloudStorageConfig\":{\"bucket\":\"zigps-bucket\",\"filenamePrefix\":\"zigps/\",\"maxDuration\":\"60s\"}}")).body);
+    try testing.expectEqualStrings(as_made, (try b.raw(a, .GET, gcs, "")).body);
+    // A deadline that was said is raised all the same, not refused.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-gcs-dur","topic":"projects/p/topics/zigps-t","pushConfig":{},"ackDeadlineSeconds":600,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"state":"ACTIVE","cloudStorageConfig":{"bucket":"zigps-bucket","textConfig":{},"maxDuration":"600s","state":"ACTIVE"}}
+    , (try b.raw(a, .PUT, "projects/p/subscriptions/zigps-gcs-dur", "{" ++ topic ++ ",\"cloudStorageConfig\":{\"bucket\":\"zigps-bucket\",\"maxDuration\":\"600s\"},\"ackDeadlineSeconds\":10}")).body);
+    // Every setting, in the order the service numbers them, which is the
+    // order of the two above. A longer deadline stays; with no duration
+    // said a file is kept open five minutes.
+    for ([_]struct { []const u8, []const u8, []const u8, []const u8 }{
+        .{ "zigps-gcs-all", "{\"serviceAccountEmail\":\"writer@p.iam.gserviceaccount.com\",\"maxMessages\":1000,\"maxBytes\":\"1000\",\"maxDuration\":\"90.5s\",\"avroConfig\":{\"useTopicSchema\":true,\"writeMetadata\":true},\"filenameDatetimeFormat\":\"YYYY-MM-DD/hh_mm_ssZ\",\"filenameSuffix\":\".avro\",\"filenamePrefix\":\"a/b/\",\"state\":\"NOT_FOUND\",\"bucket\":\"ZIGPS-BUCKET\"}", "91", "\"bucket\":\"ZIGPS-BUCKET\",\"filenamePrefix\":\"a/b/\",\"filenameSuffix\":\".avro\",\"avroConfig\":{\"writeMetadata\":true,\"useTopicSchema\":true},\"maxDuration\":\"90.500s\",\"maxBytes\":\"1000\",\"maxMessages\":\"1000\",\"state\":\"ACTIVE\",\"filenameDatetimeFormat\":\"YYYY-MM-DD/hh_mm_ssZ\",\"serviceAccountEmail\":\"writer@p.iam.gserviceaccount.com\"}}" },
+        .{ "zigps-gcs-avro", "{\"bucket\":\"zigps-bucket\",\"avroConfig\":{},\"maxDuration\":\"60.000001s\"},\"ackDeadlineSeconds\":600", "600", "\"bucket\":\"zigps-bucket\",\"avroConfig\":{},\"maxDuration\":\"60.000001s\",\"state\":\"ACTIVE\"}}" },
+        .{ "zigps-gcs-plain", "{\"bucket\":\"zigps-bucket\",\"textConfig\":{},\"maxBytes\":10737418240,\"maxMessages\":\"9223372036854775807\"}", "300", "\"bucket\":\"zigps-bucket\",\"textConfig\":{},\"maxDuration\":\"300s\",\"maxBytes\":\"10737418240\",\"maxMessages\":\"9223372036854775807\",\"state\":\"ACTIVE\"}}" },
+        .{ "zigps-gcs-nanos", "{\"bucket\":\"zigps-bucket\",\"maxDuration\":\"61.000000001s\",\"maxBytes\":0,\"maxMessages\":0}", "62", "\"bucket\":\"zigps-bucket\",\"textConfig\":{},\"maxDuration\":\"61.000000001s\",\"state\":\"ACTIVE\"}}" },
+    }) |case| {
+        const body = (try b.raw(a, .PUT, try std.fmt.allocPrint(a, "projects/p/subscriptions/{s}", .{case[0]}), try std.fmt.allocPrint(a, "{{" ++ topic ++ ",\"cloudStorageConfig\":{s}}}", .{case[1]}))).body;
+        try testing.expectEqualStrings(case[2], between(body, "\"ackDeadlineSeconds\":", ","));
+        try testing.expectEqualStrings(case[3], tailOf(body, "\"cloudStorageConfig\":{"));
+    }
+
+    // What a create refuses. A bucket of no form production answers as
+    // an outage; one that is not there, which it refuses, is taken here.
+    const outage = "The service was unable to fulfill your request. Please try again. [code=8a75]";
+    const duration = "The value for Cloud Storage file batching duration is out of bounds. You passed {s} in the request, but the value must be between 1m and 10m.";
+    const naming = " Refer to https://cloud.google.com/storage/docs/objects#naming for more information.";
+    for ([_]struct { []const u8, u16, []const u8, []const u8 }{
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"gs://zigps-bucket\"}", 503, "UNAVAILABLE", outage },
+        .{ "\"cloudStorageConfig\":{}", 503, "UNAVAILABLE", outage },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"zigps-bucket/logs\"}", 503, "UNAVAILABLE", outage },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"maxDuration\":\"30s\"}", 400, "INVALID_ARGUMENT", comptime std.fmt.comptimePrint(duration, .{"30s"}) },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"maxDuration\":\"660s\"}", 400, "INVALID_ARGUMENT", comptime std.fmt.comptimePrint(duration, .{"11m"}) },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"maxDuration\":\"59.999s\"}", 400, "INVALID_ARGUMENT", comptime std.fmt.comptimePrint(duration, .{"59.999s"}) },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"maxDuration\":\"0s\"}", 400, "INVALID_ARGUMENT", comptime std.fmt.comptimePrint(duration, .{"0"}) },
+        // By the same rule, not shown to production.
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"maxDuration\":\"600.001s\"}", 400, "INVALID_ARGUMENT", comptime std.fmt.comptimePrint(duration, .{"10m0.001s"}) },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"maxDuration\":\"3661s\"}", 400, "INVALID_ARGUMENT", comptime std.fmt.comptimePrint(duration, .{"1h1m1s"}) },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"maxDuration\":\"-90s\"}", 400, "INVALID_ARGUMENT", comptime std.fmt.comptimePrint(duration, .{"-1m30s"}) },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"maxDuration\":\"0.25s\"}", 400, "INVALID_ARGUMENT", comptime std.fmt.comptimePrint(duration, .{"0.25s"}) },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"maxDuration\":\"60\"}", 400, "INVALID_ARGUMENT", "Invalid value at 'maxDuration'" },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"maxDuration\":\"60.s\"}", 400, "INVALID_ARGUMENT", "Invalid value at 'maxDuration'" },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"maxDuration\":\"60.0000000001s\"}", 400, "INVALID_ARGUMENT", "Invalid value at 'maxDuration'" },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"maxDuration\":\"60.5xs\"}", 400, "INVALID_ARGUMENT", "Invalid value at 'maxDuration'" },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"maxBytes\":\"999\"}", 400, "INVALID_ARGUMENT", "The value for Cloud Storage file batching bytes is out of bounds. You passed 999 in the request, but the value must be between 1000 and 10737418240." },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"maxBytes\":\"10737418241\"}", 400, "INVALID_ARGUMENT", "The value for Cloud Storage file batching bytes is out of bounds. You passed 10737418241 in the request, but the value must be between 1000 and 10737418240." },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"maxMessages\":\"999\"}", 400, "INVALID_ARGUMENT", "The value for Cloud Storage file batching messages is too small. You passed 999 in the request, but the minimum value is 1000." },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"textConfig\":{},\"avroConfig\":{}}", 400, "INVALID_ARGUMENT", "Invalid value at 'cloud_storage_config' (oneof), oneof field 'output_format' is already set. Cannot set 'avroConfig'" },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"textConfig\":{\"writeMetadata\":true}}", 400, "INVALID_ARGUMENT", "Invalid JSON payload received. Unknown name \"writeMetadata\": Cannot find field." },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"avroConfig\":{\"nonsense\":true}}", 400, "INVALID_ARGUMENT", "Invalid JSON payload received. Unknown name \"nonsense\": Cannot find field." },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"filenameSuffix\":\"logs/\"}", 400, "INVALID_ARGUMENT", "Invalid Cloud Storage filename suffix given (value=logs/): Ends with invalid character '/'." ++ naming },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"filenamePrefix\":\"a\\nb\"}", 400, "INVALID_ARGUMENT", "Invalid Cloud Storage filename prefix given (value=a\nb): Disallowed unicode characters present." ++ naming },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"filenameSuffix\":\"a\\u007fb\"}", 400, "INVALID_ARGUMENT", "Invalid Cloud Storage filename suffix given (value=a\x7fb): Disallowed unicode characters present." ++ naming },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"filenamePrefix\":\"" ++ comptime xs(1100) ++ "\"}", 400, "INVALID_ARGUMENT", "The sum of the lengths of the Cloud Storage subscription's filename prefix and suffix is 1100 characters, but the maximum allowed is 992." },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\",\"filenamePrefix\":\"" ++ comptime xs(990) ++ "\",\"filenameSuffix\":\"abc\"}", 400, "INVALID_ARGUMENT", "The sum of the lengths of the Cloud Storage subscription's filename prefix and suffix is 993 characters, but the maximum allowed is 992." },
+        .{ "\"cloudStorageConfig\":{\"bucket\":\"b\"},\"enableExactlyOnceDelivery\":true", 400, "INVALID_ARGUMENT", "A subscription cannot have cloud storage config set with exactly once delivery configured." },
+    }) |case| {
+        try expectRefused(try b.raw(a, .PUT, "projects/p/subscriptions/zigps-bad", try std.fmt.allocPrint(a, "{{" ++ topic ++ ",{s}}}", .{case[0]})), case[1], case[2], case[3]);
+    }
+    try testing.expectEqual(404, (try b.raw(a, .GET, "projects/p/subscriptions/zigps-bad", "")).status);
+    // No time at all is `0` in every refusal of this kind: the fake's
+    // reading of the others, from the one production wrote.
+    try expectRefused(try b.raw(a, .PUT, "projects/p/subscriptions/zigps-bad", "{" ++ topic ++ ",\"messageRetentionDuration\":\"0s\"}"), 400, "INVALID_ARGUMENT", "The value for message retention duration is out of bounds. You passed 0 in the request, but the value must be between 10m and 744h.");
+    // What production let through to its look for the bucket: a slash
+    // inside a suffix, a prefix that ends in one, the bounds themselves,
+    // and characters counted, not bytes, toward the 992.
+    for ([_][]const u8{
+        "\"filenameSuffix\":\"a/b\"",                                                  "\"filenameSuffix\":\".txt\",\"filenamePrefix\":\"a/b/\"",
+        "\"maxDuration\":\"60s\"",                                                     "\"maxDuration\":\"600s\"",
+        "\"maxBytes\":\"1000\"",                                                       "\"maxMessages\":\"1000\"",
+        "\"filenamePrefix\":\"" ++ comptime xs(990) ++ "\",\"filenameSuffix\":\"ab\"", "\"filenamePrefix\":\"" ++ comptime accented(992) ++ "\"",
+    }, 0..) |settings, i| {
+        try testing.expectEqual(200, (try b.raw(a, .PUT, try std.fmt.allocPrint(a, "projects/p/subscriptions/zigps-ok-{d}", .{i}), try std.fmt.allocPrint(a, "{{" ++ topic ++ ",\"cloudStorageConfig\":{{\"bucket\":\"b\",{s}}}}}", .{settings}))).status);
+    }
+
+    // A file's date and time in its name: production's verdict on every
+    // format it was shown, and its words for each it refused.
+    for ([_][]const u8{ "YYYY-MM-DD/hh_mm_ssZ", "YYYYMMDDhhmmss", "YYYY-MM-DDThh:mm:ss+00:00", "YYYY-MM-DDThh:mm:ssZ", "YYYY/MM/DD/hh/mm/ss", "YYYY-MM-DD-hh-mm-ss-", "-YYYY-MM-DD-hh-mm-ss", "ssmmhhDDMMYYYY", "", "YY-MM-DDThh:mm:ssZ" }, 0..) |format, i| {
+        try testing.expectEqual(200, (try b.raw(a, .PUT, try std.fmt.allocPrint(a, "projects/p/subscriptions/zigps-dated-{d}", .{i}), try std.fmt.allocPrint(a, "{{" ++ topic ++ ",\"cloudStorageConfig\":{{\"bucket\":\"b\",\"filenameDatetimeFormat\":\"{s}\"}}}}", .{format}))).status);
+    }
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "nonsense", "Required year matcher not present." },
+        .{ "YY-MM-DD hh:mm:ss", "Contains disallowed characters ( )." },
+        .{ "YYYY-MM-DD", "Required hh matcher not present." },
+        .{ "hh:mm:ss", "Required year matcher not present." },
+        .{ "YYYY-MM-DD-hh-mm", "Required ss matcher not present." },
+        .{ "YYYY-YYYY-MM-DD-hh-mm-ss", "More than one year matcher present." },
+        .{ "YYYY-MM-DD-hh-mm-ss-ss", "More than one ss matcher present." },
+        .{ "YYYY.MM.DD.hh.mm.ss", "Contains disallowed characters (.)." },
+        .{ "yyyy-mm-dd-hh-mm-ss", "Required year matcher not present." },
+        .{ "YYYY-MM-DDThh:mm:ssZZ", "More than one Z matcher present." },
+        .{ "YYYY-MM-DDTThh:mm:ss", "More than one T matcher present." },
+        .{ "YYYY-MM-DD_hh:mm:ss_x", "Contains disallowed characters (x)." },
+        .{ "YYYY-MM-DD hh:mm:ssZ+00:00", "More than one timezone offset matcher present." },
+        // By the rule, and in the fake's own words for these matchers.
+        .{ "YYYY-DD-hh-mm-ss", "Required MM matcher not present." },
+        .{ "YYYY-MM-hh-mm-ss", "Required DD matcher not present." },
+        .{ "YYYY-MM-DD-hh-ss", "Required mm matcher not present." },
+        .{ "YYYY-MM-MM-DD-hh-mm-ss", "More than one MM matcher present." },
+        .{ "YYYY-MM-DD-DD-hh-mm-ss", "More than one DD matcher present." },
+        .{ "YYYY-MM-DD-hh-hh-mm-ss", "More than one hh matcher present." },
+        .{ "YYYY-MM-DD-hh-mm-mm-ss", "More than one mm matcher present." },
+        .{ "YYYY-YY-MM-DD-hh-mm-ss", "More than one year matcher present." },
+        .{ "YYYY-MM-DDThh:mm:ss+00:00+00:00", "More than one timezone offset matcher present." },
+        .{ "YYY-MM-DDThh:mm:ssZ", "Contains disallowed characters (Y)." },
+        .{ "YYYY-MM-DD-hh-mm-ss-é-x", "Contains disallowed characters (é)." },
+        .{ "YYYY-MM-DD-hh-mm-ss+00:0", "Contains disallowed characters (+)." },
+    }) |case| {
+        try expectRefused(
+            try b.raw(a, .PUT, "projects/p/subscriptions/zigps-bad", try std.fmt.allocPrint(a, "{{" ++ topic ++ ",\"cloudStorageConfig\":{{\"bucket\":\"b\",\"filenameDatetimeFormat\":\"{s}\"}}}}", .{case[0]})),
+            400,
+            "INVALID_ARGUMENT",
+            try std.fmt.allocPrint(a, "Invalid Cloud Storage filename datetime format given (value={s}): {s}", .{ case[0], case[1] }),
+        );
+    }
+
+    // One update that names every kind, as production was put through:
+    // what it gives is the subscription's delivery, whole.
+    var plain = try b.client.subscription("zigps-all").create(.{ .topic_id = "zigps-t" });
+    plain.deinit();
+    const all = "projects/p/subscriptions/zigps-all";
+    const kinds = ",\"updateMask\":\"pushConfig,bigqueryConfig,cloudStorageConfig\"}";
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-all","topic":"projects/p/topics/zigps-t","pushConfig":{"attributes":{"x-goog-version":"v1"}},"ackDeadlineSeconds":10,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"bigqueryConfig":{"table":"p.zigps_d.msgs","writeMetadata":true,"state":"ACTIVE"},"state":"ACTIVE"}
+    , (try b.raw(a, .PATCH, all, "{\"subscription\":{\"bigqueryConfig\":{\"table\":\"p.zigps_d.msgs\",\"writeMetadata\":true}}" ++ kinds)).body);
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-all","topic":"projects/p/topics/zigps-t","pushConfig":{},"ackDeadlineSeconds":10,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"bigqueryConfig":{"table":"p.zigps_d.msgs","writeMetadata":true,"state":"ACTIVE"},"state":"ACTIVE"}
+    , (try b.raw(a, .GET, all, "")).body);
+    // Replaced whole: what the new one does not say is gone.
+    try testing.expectEqualStrings("\"table\":\"p.zigps_d.msgs\",\"state\":\"ACTIVE\"", between((try b.raw(a, .PATCH, all, "{\"subscription\":{\"bigqueryConfig\":{\"table\":\"p.zigps_d.msgs\"}}" ++ kinds)).body, "\"bigqueryConfig\":{", "},\"state\""));
+    // To Cloud Storage: the deadline goes up to the five minutes filled
+    // in, and the BigQuery config is gone.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-all","topic":"projects/p/topics/zigps-t","pushConfig":{"attributes":{"x-goog-version":"v1"}},"ackDeadlineSeconds":300,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"state":"ACTIVE","cloudStorageConfig":{"bucket":"zigps-bucket","textConfig":{},"maxDuration":"300s","state":"ACTIVE"}}
+    , (try b.raw(a, .PATCH, all, "{\"subscription\":{\"cloudStorageConfig\":{\"bucket\":\"zigps-bucket\"}}" ++ kinds)).body);
+    // What production learns by writing files, the test says.
+    b.fake.setExportState("p", "zigps-all", .not_found);
+    try testing.expect(std.mem.endsWith(u8, (try b.raw(a, .GET, all, "")).body, "\"state\":\"RESOURCE_ERROR\",\"cloudStorageConfig\":{\"bucket\":\"zigps-bucket\",\"textConfig\":{},\"maxDuration\":\"300s\",\"state\":\"NOT_FOUND\"}}"));
+    {
+        var read = try b.client.subscription("zigps-all").get();
+        defer read.deinit();
+        try testing.expectEqual(types.ExportState.not_found, read.value.delivery.cloud_storage.state);
+        try testing.expectEqual(types.SubscriptionInfo.State.resource_error, read.value.state);
+    }
+    b.fake.setExportState("p", "zigps-all", .unknown);
+    try testing.expect(std.mem.endsWith(u8, (try b.raw(a, .GET, all, "")).body, "\"state\":\"ACTIVE\",\"cloudStorageConfig\":{\"bucket\":\"zigps-bucket\",\"textConfig\":{},\"maxDuration\":\"300s\"}}"));
+    // A pull is refused there as well: the fake's own. Its push config
+    // by itself production was not asked to change.
+    try expectRefused(try b.raw(a, .POST, all ++ ":pull", "{\"maxMessages\":1}"), 400, "FAILED_PRECONDITION", "This method is not supported for this subscription type.");
+    try expectRefused(try b.raw(a, .POST, all ++ ":modifyPushConfig", "{\"pushConfig\":{}}"), 501, "UNIMPLEMENTED", "fake: modifyPushConfig on a subscription that exports is not modelled yet");
+    // The deadline is held to the file's duration by a later update too:
+    // the fake's own.
+    try testing.expectEqualStrings("300", between((try b.raw(a, .PATCH, all, "{\"subscription\":{\"ackDeadlineSeconds\":10},\"updateMask\":\"ackDeadlineSeconds\"}")).body, "\"ackDeadlineSeconds\":", ","));
+    // To push: the deadline stays where it was.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-all","topic":"projects/p/topics/zigps-t","pushConfig":{"pushEndpoint":"https://example.com/zigps-push","attributes":{"x-goog-version":"v1"}},"ackDeadlineSeconds":300,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"state":"ACTIVE"}
+    , (try b.raw(a, .PATCH, all, "{\"subscription\":{\"pushConfig\":{\"pushEndpoint\":\"https://example.com/zigps-push\"}}" ++ kinds)).body);
+    // Two kinds given are refused, and nothing changes.
+    try expectRefused(try b.raw(a, .PATCH, all, "{\"subscription\":{\"pushConfig\":{\"pushEndpoint\":\"https://example.com/zigps-push\"},\"cloudStorageConfig\":{\"bucket\":\"zigps-bucket\"}}" ++ kinds), 400, "INVALID_ARGUMENT", "Cannot create a subscription with multiple configurations. Only at most one of PushConfig, CloudStorageConfig can be specified.");
+    // A kind the mask does not name stays, and a second beside it is
+    // refused the same way: the fake's own, production was not asked.
+    try expectRefused(try b.raw(a, .PATCH, all, "{\"subscription\":{\"bigqueryConfig\":{\"table\":\"p.d.t\"}},\"updateMask\":\"bigqueryConfig\"}"), 400, "INVALID_ARGUMENT", "Cannot create a subscription with multiple configurations. Only at most one of PushConfig, BigQueryConfig can be specified.");
+    try testing.expectEqualStrings("{\"pushEndpoint\":\"https://example.com/zigps-push\"}", pushConfigOf((try b.raw(a, .GET, all, "")).body));
+    // The mask in the other spelling.
+    try testing.expectEqualStrings("{\"pushEndpoint\":\"https://example.com/zigps-push4\",\"attributes\":{\"x-goog-version\":\"v1\"}}", pushConfigOf((try b.raw(a, .PATCH, all, "{\"subscription\":{\"pushConfig\":{\"pushEndpoint\":\"https://example.com/zigps-push4\"}},\"updateMask\":\"push_config,bigquery_config,cloud_storage_config\"}")).body));
+    // A Bigtable config named and not given changes nothing; one given
+    // the fake has no answer for.
+    try testing.expectEqualStrings("{\"pushEndpoint\":\"https://example.com/zigps-push4\",\"attributes\":{\"x-goog-version\":\"v1\"}}", pushConfigOf((try b.raw(a, .PATCH, all, "{\"subscription\":{},\"updateMask\":\"bigtableConfig\"}")).body));
+    try testing.expectEqual(501, (try b.raw(a, .PATCH, all, "{\"subscription\":{\"bigtableConfig\":{}},\"updateMask\":\"bigtableConfig\"}")).status);
+    try expectRefused(try b.raw(a, .PATCH, all, "{\"subscription\":{},\"updateMask\":\"cloudStorageConfig.bucket\"}"), 501, "UNIMPLEMENTED", "fake: cloudStorageConfig.bucket is not modelled yet");
+    // None given: it pulls.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-all","topic":"projects/p/topics/zigps-t","pushConfig":{"attributes":{"x-goog-version":"v1"}},"ackDeadlineSeconds":300,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"state":"ACTIVE"}
+    , (try b.raw(a, .PATCH, all, "{\"subscription\":{}" ++ kinds)).body);
+    try testing.expectEqualStrings("{}", pushConfigOf((try b.raw(a, .GET, all, "")).body));
+    // A refused config changes nothing.
+    try expectRefused(try b.raw(a, .PATCH, all, "{\"subscription\":{\"cloudStorageConfig\":{\"bucket\":\"gs://b\"}},\"updateMask\":\"cloud_storage_config\"}"), 503, "UNAVAILABLE", outage);
+    try testing.expect(std.mem.endsWith(u8, (try b.raw(a, .GET, all, "")).body, "\"state\":\"ACTIVE\"}"));
+
+    // Through the client.
+    var files = try b.client.subscription("files").create(.{ .topic_id = "zigps-t", .delivery = .{ .cloud_storage = .{ .bucket = "zigps-bucket", .filename_prefix = "in/", .format = .{ .avro = .{ .write_metadata = true } }, .max_duration = .fromSeconds(120), .max_bytes = 2000 } } });
+    defer files.deinit();
+    const config = files.value.delivery.cloud_storage.config;
+    try testing.expectEqualStrings("zigps-bucket", config.bucket);
+    try testing.expectEqualStrings("in/", config.filename_prefix);
+    try testing.expect(config.format.avro.write_metadata);
+    try testing.expectEqual(std.Io.Duration.fromSeconds(120), config.max_duration.?);
+    try testing.expectEqual(2000, config.max_bytes);
+    try testing.expectEqual(120, files.value.ack_deadline_seconds);
+    try testing.expectEqual(types.ExportState.active, files.value.delivery.cloud_storage.state);
+    {
+        var read = try b.client.subscription("files").get();
+        defer read.deinit();
+        try testing.expectEqualStrings("zigps-bucket", read.value.delivery.cloud_storage.config.bucket);
+        try testing.expectEqualStrings("in/", read.value.delivery.cloud_storage.config.filename_prefix);
+    }
+    var rows = try b.client.subscription("files").update(.{ .delivery = .{ .bigquery = .{ .table = "p.d.t" } } });
+    defer rows.deinit();
+    try testing.expectEqualStrings("p.d.t", rows.value.delivery.bigquery.config.table);
+}
+
+const upper_code = "function upper(message, metadata) { message.data = message.data.toUpperCase(); message.attributes['seen'] = 'yes'; return message; }";
+const upper_function = "\"javascriptUdf\":{\"functionName\":\"upper\",\"code\":\"" ++ upper_code ++ "\"}";
+
+/// A list of transforms `f0`, `f1` and so on, the last `disabled` of them
+/// disabled.
+fn functionList(a: Allocator, enabled: usize, disabled: usize) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(a, '[');
+    for (0..enabled + disabled) |i| {
+        if (i > 0) try out.append(a, ',');
+        try out.print(a, "{{\"javascriptUdf\":{{\"functionName\":\"f{d}\",\"code\":\"function f{d}(message, metadata) {{ return message; }}\"}}{s}}}", .{ i, i, if (i < enabled) "" else ",\"disabled\":true" });
+    }
+    try out.append(a, ']');
+    return out.items;
+}
+
+test "message transforms: kept on a topic and a subscription as production reads them back, and run on nothing" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const t1 = "projects/p/topics/zigps-t1";
+
+    // Read back as written, by a create and by a read.
+    const as_made = "{\"name\":\"projects/p/topics/zigps-t1\",\"messageTransforms\":[{" ++ upper_function ++ "}]}";
+    try testing.expectEqualStrings(as_made, (try b.raw(a, .PUT, t1, "{\"messageTransforms\":[{" ++ upper_function ++ "}]}")).body);
+    try testing.expectEqualStrings(as_made, (try b.raw(a, .GET, t1, "")).body);
+    // `disabled` and `enabled` are each read back when true, in that
+    // order whatever the request's; `enabled: false` reads back as
+    // nothing.
+    for ([_]struct { []const u8, []const u8, []const u8 }{
+        .{ "zigps-t12", ",\"disabled\":true", ",\"disabled\":true" },
+        .{ "zigps-t11", ",\"enabled\":false", "" },
+        .{ "zigps-t13", ",\"enabled\":true,\"disabled\":true", ",\"enabled\":true,\"disabled\":true" },
+        .{ "zigps-t14", ",\"disabled\":true,\"enabled\":true", ",\"enabled\":true,\"disabled\":true" },
+        .{ "zigps-t15", ",\"disabled\":false,\"enabled\":true", ",\"enabled\":true" },
+    }) |case| {
+        const body = (try b.raw(a, .PUT, try std.fmt.allocPrint(a, "projects/p/topics/{s}", .{case[0]}), try std.mem.concat(a, u8, &.{ "{\"messageTransforms\":[{" ++ upper_function, case[1], "}]}" }))).body;
+        try testing.expectEqualStrings(try std.mem.concat(a, u8, &.{ "{\"name\":\"projects/p/topics/", case[0], "\",\"messageTransforms\":[{" ++ upper_function, case[2], "}]}" }), body);
+    }
+    // On a subscription they are written last, after its state.
+    try testing.expectEqualStrings(
+        "{\"name\":\"projects/p/subscriptions/zigps-s22\",\"topic\":\"projects/p/topics/zigps-t1\",\"pushConfig\":{},\"ackDeadlineSeconds\":10,\"messageRetentionDuration\":\"604800s\",\"expirationPolicy\":{\"ttl\":\"2678400s\"},\"state\":\"ACTIVE\",\"messageTransforms\":[{" ++ upper_function ++ "}]}",
+        (try b.raw(a, .PUT, "projects/p/subscriptions/zigps-s22", "{\"topic\":\"projects/p/topics/zigps-t1\",\"messageTransforms\":[{" ++ upper_function ++ "}]}")).body,
+    );
+
+    // Five that are not disabled, and as many more that are.
+    try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/topics/zigps-five", try std.fmt.allocPrint(a, "{{\"messageTransforms\":{s}}}", .{try functionList(a, 5, 0)}))).status);
+    try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/topics/zigps-twelve", try std.fmt.allocPrint(a, "{{\"messageTransforms\":{s}}}", .{try functionList(a, 5, 7)}))).status);
+    try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/topics/zigps-none", "{\"messageTransforms\":[]}")).status);
+    // Code of 20,480 bytes, and no more.
+    const big = "function big(message, metadata) { return message; }//";
+    try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/topics/zigps-big", "{\"messageTransforms\":[{\"javascriptUdf\":{\"functionName\":\"big\",\"code\":\"" ++ big ++ comptime xs(20_480 - big.len) ++ "\"}}]}")).status);
+
+    // What a create refuses, of a topic and of a subscription alike.
+    const not_found = "Provided message transform configuration is invalid: Failed to create JavaScript UDF: `upper`. Failed to find function in provided code";
+    const twice = "The request contains multiple JavaScript UDFs with the function name: upper. Each JavaScript UDF must have a unique function name.";
+    for ([_]struct { []const u8, u16, []const u8, []const u8 }{
+        .{ try functionList(a, 6, 0), 400, "INVALID_ARGUMENT", "The request exceeds the maximum number of enabled message transforms. Maximum enabled transforms: 5. Enabled transforms: 6." },
+        .{ try functionList(a, 7, 2), 400, "INVALID_ARGUMENT", "The request exceeds the maximum number of enabled message transforms. Maximum enabled transforms: 5. Enabled transforms: 7." },
+        // A name twice, disabled or not.
+        .{ "[{" ++ upper_function ++ "},{" ++ upper_function ++ "}]", 400, "INVALID_ARGUMENT", twice },
+        .{ "[{" ++ upper_function ++ ",\"disabled\":true},{" ++ upper_function ++ "}]", 400, "INVALID_ARGUMENT", twice },
+        .{ "[{" ++ upper_function ++ ",\"disabled\":true},{" ++ upper_function ++ ",\"disabled\":true}]", 400, "INVALID_ARGUMENT", twice },
+        .{ "[{\"javascriptUdf\":{\"code\":\"" ++ upper_code ++ "\"}}]", 400, "INVALID_ARGUMENT", "The request contains a JavaScript UDF with an empty function name. Function names must be non-empty." },
+        .{ "[{}]", 400, "INVALID_ARGUMENT", "The request contains a MessageTransform with a missing message transform type." },
+        .{ "[{\"disabled\":true}]", 400, "INVALID_ARGUMENT", "The request contains a MessageTransform with a missing message transform type." },
+        .{ "[{\"javascriptUdf\":{\"functionName\":\"big\",\"code\":\"" ++ big ++ comptime xs(20_481 - big.len) ++ "\"}}]", 400, "INVALID_ARGUMENT", "The `code` field of a JavaScript UDF exceeded the maximum allowed size of 20480 bytes. Code size: 20481. Function name: big." },
+        // The fake reads no JavaScript: code that is none at all cannot
+        // hold the function, and that much it says as production did.
+        .{ "[{\"javascriptUdf\":{\"functionName\":\"upper\"}}]", 400, "FAILED_PRECONDITION", not_found },
+        .{ "[{\"javascriptUdf\":{\"functionName\":\"upper\",\"code\":\"\"},\"disabled\":true}]", 400, "FAILED_PRECONDITION", not_found },
+        // The two other kinds, empty as production was shown them; with
+        // something in them the fake has no answer.
+        .{ "[{\"aiInference\":{}}]", 400, "INVALID_ARGUMENT", "The request contains an AI Inference SMT without a set endpoint." },
+        .{ "[{\"compression\":{}}]", 400, "INVALID_ARGUMENT", "Compression algorithm is required for Compression message transform." },
+        .{ "[{\"aiInference\":{\"endpoint\":\"e\"}}]", 501, "UNIMPLEMENTED", "fake: an AI inference transform is not modelled yet" },
+        .{ "[{\"compression\":{\"gzip\":{}}}]", 501, "UNIMPLEMENTED", "fake: a compression transform is not modelled yet" },
+        .{ "[{\"javascriptUdf\":{\"functionName\":\"f\",\"code\":\"x\",\"nonsense\":\"x\"}}]", 400, "INVALID_ARGUMENT", "Invalid JSON payload received. Unknown name \"nonsense\": Cannot find field." },
+        .{ "[{\"nonsense\":{}}]", 400, "INVALID_ARGUMENT", "Invalid JSON payload received. Unknown name \"nonsense\": Cannot find field." },
+        .{ "[{\"javascriptUdf\":\"upper\"}]", 400, "INVALID_ARGUMENT", "Invalid value at 'javascriptUdf'" },
+        .{ "[{\"nonsense\":1}]", 400, "INVALID_ARGUMENT", "Invalid JSON payload received. Unknown name \"nonsense\": Cannot find field." },
+        .{ "{}", 400, "INVALID_ARGUMENT", "Invalid value at 'messageTransforms'" },
+    }) |case| {
+        try expectRefused(try b.raw(a, .PUT, "projects/p/topics/zigps-bad", try std.fmt.allocPrint(a, "{{\"messageTransforms\":{s}}}", .{case[0]})), case[1], case[2], case[3]);
+        try expectRefused(try b.raw(a, .PUT, "projects/p/subscriptions/zigps-bad", try std.fmt.allocPrint(a, "{{\"topic\":\"projects/p/topics/zigps-t1\",\"messageTransforms\":{s}}}", .{case[0]})), case[1], case[2], case[3]);
+    }
+    try testing.expectEqual(404, (try b.raw(a, .GET, "projects/p/topics/zigps-bad", "")).status);
+    try testing.expectEqual(404, (try b.raw(a, .GET, "projects/p/subscriptions/zigps-bad", "")).status);
+
+    // An update replaces the list whole, and with none in the body
+    // clears it.
+    const drop = "{\"javascriptUdf\":{\"functionName\":\"drop\",\"code\":\"function drop(message, metadata) { if (message.data === 'drop') return null; return message; }\"}}";
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/zigps-t1\",\"messageTransforms\":[" ++ drop ++ "]}", (try b.raw(a, .PATCH, t1, "{\"topic\":{\"messageTransforms\":[" ++ drop ++ "]},\"updateMask\":\"messageTransforms\"}")).body);
+    // A refused one changes nothing.
+    try expectRefused(try b.raw(a, .PATCH, t1, "{\"topic\":{\"messageTransforms\":[{}]},\"updateMask\":\"message_transforms\"}"), 400, "INVALID_ARGUMENT", "The request contains a MessageTransform with a missing message transform type.");
+    try expectRefused(try b.raw(a, .PATCH, t1, "{\"topic\":{},\"updateMask\":\"messageTransforms.disabled\"}"), 501, "UNIMPLEMENTED", "fake: messageTransforms.disabled is not modelled yet");
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/zigps-t1\",\"messageTransforms\":[" ++ drop ++ "]}", (try b.raw(a, .GET, t1, "")).body);
+
+    // No function runs: what this one would drop goes through, as it is.
+    {
+        var sent = try b.client.topic("zigps-t1").publish(&.{.{ .data = "drop", .attributes = &.{.{ .key = "k", .value = "v" }} }}, .{});
+        sent.deinit();
+        var got = try b.client.subscription("zigps-s22").pull(.{ .return_immediately = true });
+        defer got.deinit();
+        try testing.expectEqual(1, got.value.messages.len);
+        try testing.expectEqualStrings("drop", got.value.messages[0].data);
+        try testing.expectEqual(1, got.value.messages[0].attributes.len);
+    }
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/zigps-t1\"}", (try b.raw(a, .PATCH, t1, "{\"topic\":{},\"updateMask\":\"messageTransforms\"}")).body);
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/zigps-t1\"}", (try b.raw(a, .GET, t1, "")).body);
+
+    // A subscription's, by the mask in either spelling.
+    const s22 = "projects/p/subscriptions/zigps-s22";
+    try testing.expect(std.mem.endsWith(u8, (try b.raw(a, .PATCH, s22, "{\"subscription\":{\"messageTransforms\":[" ++ drop ++ "]},\"updateMask\":\"messageTransforms\"}")).body, ",\"state\":\"ACTIVE\",\"messageTransforms\":[" ++ drop ++ "]}"));
+    try testing.expect(std.mem.endsWith(u8, (try b.raw(a, .PATCH, s22, "{\"subscription\":{\"messageTransforms\":[{" ++ upper_function ++ ",\"disabled\":true}]},\"updateMask\":\"message_transforms\"}")).body, ",\"state\":\"ACTIVE\",\"messageTransforms\":[{" ++ upper_function ++ ",\"disabled\":true}]}"));
+    try expectRefused(try b.raw(a, .PATCH, s22, "{\"subscription\":{\"messageTransforms\":" ++ "[{" ++ upper_function ++ "},{" ++ upper_function ++ "}]" ++ "},\"updateMask\":\"messageTransforms\"}"), 400, "INVALID_ARGUMENT", twice);
+    try testing.expect(std.mem.endsWith(u8, (try b.raw(a, .GET, s22, "")).body, ",\"messageTransforms\":[{" ++ upper_function ++ ",\"disabled\":true}]}"));
+    try expectRefused(try b.raw(a, .PATCH, s22, "{\"subscription\":{},\"updateMask\":\"messageTransforms.disabled\"}"), 501, "UNIMPLEMENTED", "fake: messageTransforms.disabled is not modelled yet");
+    try testing.expect(std.mem.endsWith(u8, (try b.raw(a, .PATCH, s22, "{\"subscription\":{},\"updateMask\":\"messageTransforms\"}")).body, ",\"state\":\"ACTIVE\"}"));
+
+    // Through the client.
+    var typed = try b.client.topic("typed").create(.{ .message_transforms = &.{
+        .{ .kind = .{ .javascript_udf = .{ .function_name = "same", .code = "function same(message, metadata) { return message; }" } } },
+        .{ .kind = .{ .javascript_udf = .{ .function_name = "off", .code = "function off(message, metadata) { return null; }" } }, .disabled = true },
+    } });
+    defer typed.deinit();
+    try testing.expectEqual(2, typed.value.message_transforms.len);
+    try testing.expectEqualStrings("same", typed.value.message_transforms[0].kind.javascript_udf.function_name);
+    try testing.expect(!typed.value.message_transforms[0].disabled);
+    try testing.expect(typed.value.message_transforms[1].disabled);
+    {
+        var read = try b.client.topic("typed").get();
+        defer read.deinit();
+        try testing.expectEqualStrings("same", read.value.message_transforms[0].kind.javascript_udf.function_name);
+        try testing.expectEqualStrings("function off(message, metadata) { return null; }", read.value.message_transforms[1].kind.javascript_udf.code);
+    }
+    var cleared = try b.client.topic("typed").update(.{ .message_transforms = &.{} });
+    defer cleared.deinit();
+    try testing.expectEqual(0, cleared.value.message_transforms.len);
+    var worker = try b.client.subscription("worker").create(.{ .topic_id = "typed", .message_transforms = &.{.{ .kind = .{ .javascript_udf = .{ .function_name = "same", .code = "function same(message, metadata) { return message; }" } } }} });
+    worker.deinit();
+    var changed = try b.client.subscription("worker").update(.{ .message_transforms = &.{.{ .kind = .{ .javascript_udf = .{ .function_name = "other", .code = "function other(message, metadata) { return message; }" } }, .disabled = true }} });
+    changed.deinit();
+    var read = try b.client.subscription("worker").get();
+    defer read.deinit();
+    try testing.expectEqual(1, read.value.message_transforms.len);
+    try testing.expectEqualStrings("other", read.value.message_transforms[0].kind.javascript_udf.function_name);
+    try testing.expect(read.value.message_transforms[0].disabled);
+}
+
+test "import topics: a source kept and read back as production's, with a state the test sets, and nothing imported" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const settings = "\"ingestionDataSourceSettings\":";
+
+    // The source's state is the first thing it holds.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/topics/zigps-i1","ingestionDataSourceSettings":{"cloudStorage":{"state":"ACTIVE","bucket":"zigps-g","textFormat":{"delimiter":"|"}}}}
+    , (try b.raw(a, .PUT, "projects/p/topics/zigps-i1", "{" ++ settings ++ "{\"cloudStorage\":{\"bucket\":\"zigps-g\",\"textFormat\":{\"delimiter\":\"|\"}}}}")).body);
+    // A delimiter is one byte, whatever byte.
+    const Read = struct { ingestionDataSourceSettings: struct { cloudStorage: struct { textFormat: struct { delimiter: []const u8 } } } };
+    for ([_][]const u8{ "\\t", "\\r", "\\u0000", "\\u007f", " " }, [_][]const u8{ "\t", "\r", "\x00", "\x7f", " " }, 0..) |sent, delimiter, i| {
+        const body = (try b.raw(a, .PUT, try std.fmt.allocPrint(a, "projects/p/topics/zigps-d{d}", .{i}), try std.fmt.allocPrint(a, "{{" ++ settings ++ "{{\"cloudStorage\":{{\"bucket\":\"zigps-g\",\"textFormat\":{{\"delimiter\":\"{s}\"}}}}}}}}", .{sent}))).body;
+        try testing.expectEqualStrings(delimiter, (try std.json.parseFromSliceLeaky(Read, a, body, .{ .ignore_unknown_fields = true })).ingestionDataSourceSettings.cloudStorage.textFormat.delimiter);
+    }
+
+    // With none said the delimiter is a line break, which a create's
+    // answer fills in. A read has the topic's own state as well, right
+    // after its name; the answer to a create has none.
+    const i8_ = "projects/p/topics/zigps-i8";
+    const source = "{\"cloudStorage\":{\"state\":\"ACTIVE\",\"bucket\":\"zigps-g\",\"textFormat\":{\"delimiter\":\"\\n\"},\"matchGlob\":\"zigps/**\"},\"platformLogsSettings\":{\"severity\":\"DEBUG\"}}";
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/zigps-i8\"," ++ settings ++ source ++ "}", (try b.raw(a, .PUT, i8_, "{" ++ settings ++ "{\"cloudStorage\":{\"bucket\":\"zigps-g\",\"textFormat\":{},\"matchGlob\":\"zigps/**\"},\"platformLogsSettings\":{\"severity\":\"DEBUG\"}}}")).body);
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/zigps-i8\",\"state\":\"ACTIVE\"," ++ settings ++ source ++ "}", (try b.raw(a, .GET, i8_, "")).body);
+    // A project's list reads as a read does: the fake's own.
+    try testing.expect(std.mem.indexOf(u8, (try b.raw(a, .GET, "projects/p/topics", "")).body, "{\"name\":\"projects/p/topics/zigps-i8\",\"state\":\"ACTIVE\"," ++ settings ++ source ++ "}") != null);
+
+    // What production finds at the source, the test says: here what it
+    // said four minutes on, of a topic its service agent could not
+    // publish to.
+    b.fake.setIngestionState("p", "zigps-i8", .publish_permission_denied);
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/topics/zigps-i8","state":"INGESTION_RESOURCE_ERROR","ingestionDataSourceSettings":{"cloudStorage":{"state":"PUBLISH_PERMISSION_DENIED","bucket":"zigps-g","textFormat":{"delimiter":"\n"},"matchGlob":"zigps/**"},"platformLogsSettings":{"severity":"DEBUG"}}}
+    , (try b.raw(a, .GET, i8_, "")).body);
+    {
+        var read = try b.client.topic("zigps-i8").get();
+        defer read.deinit();
+        try testing.expectEqual(types.TopicInfo.State.ingestion_resource_error, read.value.state);
+        try testing.expectEqual(types.IngestionState.publish_permission_denied, read.value.ingestion.?.state);
+        try testing.expectEqual(types.Ingestion.LogSeverity.debug, read.value.ingestion.?.log_severity);
+        try testing.expectEqualStrings("zigps/**", read.value.ingestion.?.source.?.cloud_storage.match_glob);
+    }
+    for ([_]struct { types.IngestionState, []const u8 }{
+        .{ .permission_denied, "\"state\":\"INGESTION_RESOURCE_ERROR\"," ++ settings ++ "{\"cloudStorage\":{\"state\":\"CLOUD_STORAGE_PERMISSION_DENIED\"," },
+        .{ .bucket_not_found, "\"state\":\"INGESTION_RESOURCE_ERROR\"," ++ settings ++ "{\"cloudStorage\":{\"state\":\"BUCKET_NOT_FOUND\"," },
+        .{ .too_many_objects, "\"state\":\"INGESTION_RESOURCE_ERROR\"," ++ settings ++ "{\"cloudStorage\":{\"state\":\"TOO_MANY_OBJECTS\"," },
+        .{ .conflicting_region_constraints, "\"state\":\"INGESTION_RESOURCE_ERROR\"," ++ settings ++ "{\"cloudStorage\":{\"state\":\"CONFLICTING_REGION_CONSTRAINTS\"," },
+        // No word at all, as an emulator says none.
+        .{ .unknown, "\"state\":\"ACTIVE\"," ++ settings ++ "{\"cloudStorage\":{\"bucket\":" },
+        .{ .active, "\"state\":\"ACTIVE\"," ++ settings ++ "{\"cloudStorage\":{\"state\":\"ACTIVE\"," },
+    }) |case| {
+        b.fake.setIngestionState("p", "projects/p/topics/zigps-i8", case[0]);
+        try testing.expect(std.mem.indexOf(u8, (try b.raw(a, .GET, i8_, "")).body, case[1]) != null);
+    }
+    // Said of a topic that imports nothing, or of none, it is nothing.
+    b.fake.setIngestionState("p", "zigps-nope", .bucket_not_found);
+    var plain = try b.client.topic("plain").create(.{});
+    plain.deinit();
+    b.fake.setIngestionState("p", "plain", .bucket_not_found);
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/plain\"}", (try b.raw(a, .GET, "projects/p/topics/plain", "")).body);
+
+    // `gs://` before a bucket's name is taken, and read back without. A
+    // time reads back as proto3 writes one.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/topics/zigps-i10","ingestionDataSourceSettings":{"cloudStorage":{"state":"ACTIVE","bucket":"zigps-g","avroFormat":{},"minimumObjectCreateTime":"2030-01-01T00:00:00Z"}}}
+    , (try b.raw(a, .PUT, "projects/p/topics/zigps-i10", "{" ++ settings ++ "{\"cloudStorage\":{\"bucket\":\"gs://zigps-g\",\"avroFormat\":{},\"minimumObjectCreateTime\":\"2030-01-01T00:00:00Z\"}}}")).body);
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/topics/zigps-i11","ingestionDataSourceSettings":{"cloudStorage":{"state":"ACTIVE","bucket":"zigps-g","pubsubAvroFormat":{},"minimumObjectCreateTime":"2029-12-31T23:00:00.500Z","matchGlob":"**"},"platformLogsSettings":{"severity":"WARNING"}}}
+    , (try b.raw(a, .PUT, "projects/p/topics/zigps-i11", "{" ++ settings ++ "{\"platform_logs_settings\":{\"severity\":\"WARNING\"},\"cloud_storage\":{\"match_glob\":\"**\",\"minimum_object_create_time\":\"2030-01-01T00:00:00.5+01:00\",\"pubsub_avro_format\":{},\"state\":\"BUCKET_NOT_FOUND\",\"bucket\":\"zigps-g\"}}}")).body);
+
+    // An update replaces the settings whole, the logging with them, and
+    // what is new is active again. Its answer has no state for the topic.
+    b.fake.setIngestionState("p", "zigps-i8", .bucket_not_found);
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/topics/zigps-i8","ingestionDataSourceSettings":{"cloudStorage":{"state":"ACTIVE","bucket":"zigps-g","pubsubAvroFormat":{}}}}
+    , (try b.raw(a, .PATCH, i8_, "{\"topic\":{" ++ settings ++ "{\"cloudStorage\":{\"bucket\":\"zigps-g\",\"pubsubAvroFormat\":{}}}},\"updateMask\":\"ingestionDataSourceSettings\"}")).body);
+    // With no delimiter said, the answer to an update leaves it out,
+    // where a read says it.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/topics/zigps-i8","ingestionDataSourceSettings":{"cloudStorage":{"state":"ACTIVE","bucket":"zigps-g","textFormat":{},"matchGlob":"zigps/**"}}}
+    , (try b.raw(a, .PATCH, i8_, "{\"topic\":{" ++ settings ++ "{\"cloudStorage\":{\"bucket\":\"zigps-g\",\"textFormat\":{},\"matchGlob\":\"zigps/**\"}}},\"updateMask\":\"ingestion_data_source_settings\"}")).body);
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/topics/zigps-i8","state":"ACTIVE","ingestionDataSourceSettings":{"cloudStorage":{"state":"ACTIVE","bucket":"zigps-g","textFormat":{"delimiter":"\n"},"matchGlob":"zigps/**"}}}
+    , (try b.raw(a, .GET, i8_, "")).body);
+    // A refused one changes nothing.
+    try testing.expectEqual(400, (try b.raw(a, .PATCH, i8_, "{\"topic\":{" ++ settings ++ "{}},\"updateMask\":\"ingestionDataSourceSettings\"}")).status);
+    try expectRefused(try b.raw(a, .PATCH, i8_, "{\"topic\":{},\"updateMask\":\"ingestionDataSourceSettings.cloudStorage\"}"), 501, "UNIMPLEMENTED", "fake: ingestionDataSourceSettings.cloudStorage is not modelled yet");
+    try testing.expect(std.mem.indexOf(u8, (try b.raw(a, .GET, i8_, "")).body, "\"matchGlob\":\"zigps/**\"") != null);
+    // With none in the body the topic imports nothing, as any topic; and
+    // a topic that imported nothing takes a source.
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/zigps-i8\"}", (try b.raw(a, .PATCH, i8_, "{\"topic\":{},\"updateMask\":\"ingestionDataSourceSettings\"}")).body);
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/zigps-i8\"}", (try b.raw(a, .GET, i8_, "")).body);
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/plain\"}", (try b.raw(a, .PATCH, "projects/p/topics/plain", "{\"topic\":{},\"updateMask\":\"ingestionDataSourceSettings\"}")).body);
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/topics/plain","ingestionDataSourceSettings":{"cloudStorage":{"state":"ACTIVE","bucket":"zigps-g","textFormat":{"delimiter":"\n"}}}}
+    , (try b.raw(a, .PATCH, "projects/p/topics/plain", "{\"topic\":{" ++ settings ++ "{\"cloudStorage\":{\"bucket\":\"zigps-g\",\"textFormat\":{\"delimiter\":\"\\n\"}}}},\"updateMask\":\"ingestionDataSourceSettings\"}")).body);
+
+    // What a create refuses. The fake has no buckets: one that is not
+    // there, or that Pub/Sub may not read, is taken here.
+    const delimiter = "The ingestion data source state and/or configuration is not sufficient for ingestion: IngestionDataSourceSettings::Gcs::text_format::delimiter must be a single character.";
+    const no_source = "Cloud Pub/Sub received invalid argument/s for the ingestion data source: The request's IngestionDataSourceSettings is missing a data source type.";
+    const kinesis = "The ingestion data source state and/or configuration is not sufficient for ingestion: Missing a required field - IngestionDataSourceSettings::AwsKinesis::";
+    for ([_]struct { []const u8, u16, []const u8, []const u8 }{
+        .{ "{\"cloudStorage\":{\"bucket\":\"zigps-g\",\"textFormat\":{\"delimiter\":\"ab\"}}}", 400, "FAILED_PRECONDITION", delimiter },
+        .{ "{\"cloudStorage\":{\"bucket\":\"zigps-g\",\"textFormat\":{\"delimiter\":\"\"}}}", 400, "FAILED_PRECONDITION", delimiter },
+        .{ "{\"cloudStorage\":{\"bucket\":\"zigps-g\",\"textFormat\":{\"delimiter\":\"€\"}}}", 400, "FAILED_PRECONDITION", delimiter },
+        .{ "{\"cloudStorage\":{\"bucket\":\"zigps-g\",\"textFormat\":{\"delimiter\":\"é\"}}}", 400, "FAILED_PRECONDITION", delimiter },
+        .{ "{\"cloudStorage\":{\"bucket\":\"zigps-g\",\"textFormat\":{\"delimiter\":\"\\r\\n\"}}}", 400, "FAILED_PRECONDITION", delimiter },
+        .{ "{\"cloudStorage\":{\"bucket\":\"zigps-g/logs\",\"textFormat\":{}}}", 400, "INVALID_ARGUMENT", "Cloud Pub/Sub received invalid argument/s for the ingestion data source: projects/-/buckets/zigps-g/logs is not a valid resource name.." },
+        .{ "{\"cloudStorage\":{\"bucket\":\"gs://zigps-g/logs\",\"textFormat\":{}}}", 400, "INVALID_ARGUMENT", "Cloud Pub/Sub received invalid argument/s for the ingestion data source: projects/-/buckets/zigps-g/logs is not a valid resource name.." },
+        .{ "{\"cloudStorage\":{\"bucket\":\"zigps-g\",\"textFormat\":{},\"minimumObjectCreateTime\":\"yesterday\"}}", 400, "INVALID_ARGUMENT", "Invalid value at 'ingestion_data_source_settings.cloud_storage.minimum_object_create_time' (type.googleapis.com/google.protobuf.Timestamp), Field 'minimumObjectCreateTime', Illegal timestamp format; timestamps must end with 'Z' or have a valid timezone offset." },
+        .{ "{\"platformLogsSettings\":{\"severity\":\"WARNING\"}}", 400, "INVALID_ARGUMENT", no_source },
+        .{ "{}", 400, "INVALID_ARGUMENT", no_source },
+        .{ "{\"awsKinesis\":{}}", 400, "FAILED_PRECONDITION", kinesis ++ "stream_arn.." },
+        // Its other fields in turn: the fake's own.
+        .{ "{\"awsKinesis\":{\"streamArn\":\"s\",\"awsRoleArn\":\"r\"}}", 400, "FAILED_PRECONDITION", kinesis ++ "consumer_arn.." },
+        .{ "{\"awsKinesis\":{\"streamArn\":\"s\",\"consumerArn\":\"c\",\"awsRoleArn\":\"r\"}}", 400, "FAILED_PRECONDITION", kinesis ++ "gcp_service_account.." },
+        // Two formats, as two sources are refused: by the rule.
+        .{ "{\"cloudStorage\":{\"bucket\":\"zigps-g\",\"textFormat\":{},\"avroFormat\":{}}}", 400, "INVALID_ARGUMENT", "Invalid value at 'ingestion_data_source_settings.cloud_storage' (oneof), oneof field 'input_format' is already set. Cannot set 'avroFormat'" },
+        // What production looked for the bucket before it would say.
+        .{ "{\"cloudStorage\":{\"bucket\":\"zigps-g\"}}", 501, "UNIMPLEMENTED", "fake: a Cloud Storage source with no format is not modelled yet" },
+        .{ "{\"cloudStorage\":{\"textFormat\":{}}}", 501, "UNIMPLEMENTED", "fake: a Cloud Storage source with no bucket is not modelled yet" },
+        .{ "{\"cloudStorage\":{\"bucket\":\"zigps-g\",\"avroFormat\":{\"delimiter\":\"|\"}}}", 400, "INVALID_ARGUMENT", "Invalid JSON payload received. Unknown name \"delimiter\": Cannot find field." },
+        .{ "{\"cloudStorage\":{\"bucket\":\"zigps-g\",\"textFormat\":{}},\"platformLogsSettings\":{\"severity\":\"LOUD\"}}", 400, "INVALID_ARGUMENT", "Invalid value at 'severity'" },
+        .{ "{\"nonsense\":{}}", 400, "INVALID_ARGUMENT", "Invalid JSON payload received. Unknown name \"nonsense\": Cannot find field." },
+        .{ "{\"awsMsk\":{\"nonsense\":\"x\"}}", 400, "INVALID_ARGUMENT", "Invalid JSON payload received. Unknown name \"nonsense\": Cannot find field." },
+        .{ "{\"cloudStorage\":\"zigps-g\"}", 400, "INVALID_ARGUMENT", "Invalid value at 'cloudStorage'" },
+    }) |case| {
+        try expectRefused(try b.raw(a, .PUT, "projects/p/topics/zigps-bad", try std.fmt.allocPrint(a, "{{" ++ settings ++ "{s}}}", .{case[0]})), case[1], case[2], case[3]);
+    }
+    // Two sources, in production's whole body: refused before either is
+    // looked into, and the second named.
+    try testing.expectEqualStrings(
+        \\{"error":{"code":400,"message":"Invalid value at 'ingestion_data_source_settings' (oneof), oneof field 'source' is already set. Cannot set 'cloudStorage'","status":"INVALID_ARGUMENT","details":[{"@type":"type.googleapis.com/google.rpc.BadRequest","fieldViolations":[{"field":"ingestion_data_source_settings","description":"Invalid value at 'ingestion_data_source_settings' (oneof), oneof field 'source' is already set. Cannot set 'cloudStorage'"}]}]}}
+    , (try b.raw(a, .PUT, "projects/p/topics/zigps-bad", "{" ++ settings ++ "{\"awsKinesis\":{},\"cloudStorage\":{\"bucket\":\"b\",\"textFormat\":{}}}}")).body);
+    try expectRefused(try b.raw(a, .PUT, "projects/p/topics/zigps-bad", "{" ++ settings ++ "{\"cloudStorage\":{\"bucket\":\"b\",\"textFormat\":{}},\"confluentCloud\":{}}}"), 400, "INVALID_ARGUMENT", "Invalid value at 'ingestion_data_source_settings' (oneof), oneof field 'source' is already set. Cannot set 'confluentCloud'");
+    try testing.expectEqual(404, (try b.raw(a, .GET, "projects/p/topics/zigps-bad", "")).status);
+
+    // A source outside Google is kept as it is given. Production refused
+    // each the probes could offer, for what was at the other end, so how
+    // it reads one back is the fake's own: as it reads a bucket back.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/topics/zigps-kinesis","ingestionDataSourceSettings":{"awsKinesis":{"state":"ACTIVE","streamArn":"arn:aws:kinesis:us-east-1:111111111111:stream/zigps","consumerArn":"arn:aws:kinesis:us-east-1:111111111111:stream/zigps/consumer/c:1","awsRoleArn":"arn:aws:iam::111111111111:role/zigps","gcpServiceAccount":"zig-gcp@p.iam.gserviceaccount.com"}}}
+    , (try b.raw(a, .PUT, "projects/p/topics/zigps-kinesis", "{" ++ settings ++ "{\"aws_kinesis\":{\"gcp_service_account\":\"zig-gcp@p.iam.gserviceaccount.com\",\"aws_role_arn\":\"arn:aws:iam::111111111111:role/zigps\",\"consumer_arn\":\"arn:aws:kinesis:us-east-1:111111111111:stream/zigps/consumer/c:1\",\"stream_arn\":\"arn:aws:kinesis:us-east-1:111111111111:stream/zigps\",\"state\":\"STREAM_NOT_FOUND\"}}}")).body);
+    b.fake.setIngestionState("p", "zigps-kinesis", .permission_denied);
+    try testing.expect(std.mem.indexOf(u8, (try b.raw(a, .GET, "projects/p/topics/zigps-kinesis", "")).body, "\"state\":\"INGESTION_RESOURCE_ERROR\"," ++ settings ++ "{\"awsKinesis\":{\"state\":\"KINESIS_PERMISSION_DENIED\",\"streamArn\"") != null);
+    // The fields of the other three are not asked for: production's name
+    // for them was never seen.
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/zigps-msk\"," ++ settings ++ "{\"awsMsk\":{\"state\":\"ACTIVE\"}}}", (try b.raw(a, .PUT, "projects/p/topics/zigps-msk", "{" ++ settings ++ "{\"awsMsk\":{}}}")).body);
+    // Each of the four through the client, whose decoder is no kin of
+    // the fake's writer, with the word each has for being refused there.
+    {
+        var hubs = try b.client.topic("hubs").create(.{ .ingestion = .{ .source = .{ .azure_event_hubs = .{ .resource_group = "rg", .namespace = "ns", .event_hub = "eh", .client_id = "c", .tenant_id = "t", .subscription_id = "s", .gcp_service_account = "a@p.iam.gserviceaccount.com" } }, .log_severity = .info } });
+        defer hubs.deinit();
+        const source_read = hubs.value.ingestion.?.source.?.azure_event_hubs;
+        try testing.expectEqualStrings("rg", source_read.resource_group);
+        try testing.expectEqualStrings("ns", source_read.namespace);
+        try testing.expectEqualStrings("eh", source_read.event_hub);
+        try testing.expectEqualStrings("c", source_read.client_id);
+        try testing.expectEqualStrings("t", source_read.tenant_id);
+        try testing.expectEqualStrings("s", source_read.subscription_id);
+        try testing.expectEqualStrings("a@p.iam.gserviceaccount.com", source_read.gcp_service_account);
+        try testing.expectEqual(types.Ingestion.LogSeverity.info, hubs.value.ingestion.?.log_severity);
+        try testing.expectEqual(types.IngestionState.active, hubs.value.ingestion.?.state);
+        var msk = try b.client.topic("msk").create(.{ .ingestion = .{ .source = .{ .aws_msk = .{ .cluster_arn = "arn:c", .topic = "t", .aws_role_arn = "arn:r", .gcp_service_account = "a@p.iam.gserviceaccount.com" } } } });
+        defer msk.deinit();
+        try testing.expectEqualStrings("arn:c", msk.value.ingestion.?.source.?.aws_msk.cluster_arn);
+        try testing.expectEqualStrings("t", msk.value.ingestion.?.source.?.aws_msk.topic);
+        try testing.expectEqualStrings("arn:r", msk.value.ingestion.?.source.?.aws_msk.aws_role_arn);
+        var confluent = try b.client.topic("confluent").create(.{ .ingestion = .{ .source = .{ .confluent_cloud = .{ .bootstrap_server = "pkc.example:9092", .cluster_id = "lkc", .topic = "t", .identity_pool_id = "pool", .gcp_service_account = "a@p.iam.gserviceaccount.com" } } } });
+        defer confluent.deinit();
+        try testing.expectEqualStrings("pkc.example:9092", confluent.value.ingestion.?.source.?.confluent_cloud.bootstrap_server);
+        try testing.expectEqualStrings("lkc", confluent.value.ingestion.?.source.?.confluent_cloud.cluster_id);
+        try testing.expectEqualStrings("pool", confluent.value.ingestion.?.source.?.confluent_cloud.identity_pool_id);
+        for ([_]struct { []const u8, []const u8 }{ .{ "hubs", "EVENT_HUBS_PERMISSION_DENIED" }, .{ "msk", "MSK_PERMISSION_DENIED" }, .{ "confluent", "CONFLUENT_CLOUD_PERMISSION_DENIED" } }) |case| {
+            b.fake.setIngestionState("p", case[0], .permission_denied);
+            try testing.expect(std.mem.indexOf(u8, (try b.raw(a, .GET, try std.fmt.allocPrint(a, "projects/p/topics/{s}", .{case[0]}), "")).body, try std.fmt.allocPrint(a, "{{\"state\":\"{s}\",", .{case[1]})) != null);
+            var read = try b.client.topic(case[0]).get();
+            defer read.deinit();
+            try testing.expectEqual(types.IngestionState.permission_denied, read.value.ingestion.?.state);
+        }
+    }
+
+    // Nothing is imported, and a publish by hand is taken as on any
+    // topic.
+    var reader = try b.client.subscription("reader").create(.{ .topic_id = "zigps-i1" });
+    reader.deinit();
+    try testing.expectEqual(0, b.fake.publishedCount("p", "zigps-i1"));
+    var sent = try b.client.topic("zigps-i1").publish(&.{.{ .data = "by hand" }}, .{});
+    sent.deinit();
+    try expectPulled(b.client.subscription("reader"), &.{"by hand"}, true);
+
+    // Through the client.
+    var imported = try b.client.topic("imported").create(.{ .ingestion = .{ .source = .{ .cloud_storage = .{ .bucket = "zigps-g", .format = .{ .text = .{ .delimiter = "|" } }, .match_glob = "in/**" } }, .log_severity = .debug } });
+    defer imported.deinit();
+    try testing.expectEqualStrings("zigps-g", imported.value.ingestion.?.source.?.cloud_storage.bucket);
+    try testing.expectEqualStrings("|", imported.value.ingestion.?.source.?.cloud_storage.format.text.delimiter);
+    try testing.expectEqual(types.IngestionState.active, imported.value.ingestion.?.state);
+    {
+        var read = try b.client.topic("imported").get();
+        defer read.deinit();
+        try testing.expectEqualStrings("zigps-g", read.value.ingestion.?.source.?.cloud_storage.bucket);
+        try testing.expectEqualStrings("in/**", read.value.ingestion.?.source.?.cloud_storage.match_glob);
+        var again = try b.client.topic("hubs").get();
+        defer again.deinit();
+        try testing.expectEqualStrings("rg", again.value.ingestion.?.source.?.azure_event_hubs.resource_group);
+        try testing.expectEqualStrings("a@p.iam.gserviceaccount.com", again.value.ingestion.?.source.?.azure_event_hubs.gcp_service_account);
+    }
+    var standard = try b.client.topic("imported").update(.{ .ingestion = .clear });
+    defer standard.deinit();
+    try testing.expect(standard.value.ingestion == null);
+}
+
+test "tags: bound as a resource is made, in production's words where their form is wrong, and never read back" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const tagged = "projects/p/topics/zigps-tagged";
+
+    // By names and by ids. No answer has a tag in it, to a create or to
+    // a read: the fake says what it bound when a test asks.
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/zigps-tagged\"}", (try b.raw(a, .PUT, tagged, "{\"tags\":{\"p/env\":\"prod\",\"p/team\":\"data\"}}")).body);
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/zigps-tagged\"}", (try b.raw(a, .GET, tagged, "")).body);
+    try testing.expectEqualStrings("prod", b.fake.tagValue(tagged, "p/env").?);
+    try testing.expectEqualStrings("data", b.fake.tagValue(tagged, "p/team").?);
+    try testing.expect(b.fake.tagValue(tagged, "p/other") == null);
+    try testing.expect(b.fake.tagValue(tagged, "p/dev") == null);
+    try testing.expect(b.fake.tagValue("projects/p/topics/zigps-nope", "p/env") == null);
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/zigps-by-id\"}", (try b.raw(a, .PUT, "projects/p/topics/zigps-by-id", "{\"tags\":{\"tagKeys/281477090942061\":\"tagValues/281479426154315\"}}")).body);
+    try testing.expectEqualStrings("tagValues/281479426154315", b.fake.tagValue("projects/p/topics/zigps-by-id", "tagKeys/281477090942061").?);
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/zigps-none\"}", (try b.raw(a, .PUT, "projects/p/topics/zigps-none", "{\"tags\":{}}")).body);
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-s51","topic":"projects/p/topics/zigps-tagged","pushConfig":{},"ackDeadlineSeconds":10,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"state":"ACTIVE"}
+    , (try b.raw(a, .PUT, "projects/p/subscriptions/zigps-s51", "{\"topic\":\"projects/p/topics/zigps-tagged\",\"tags\":{\"p/env\":\"test\"}}")).body);
+    try testing.expectEqualStrings("test", b.fake.tagValue("projects/p/subscriptions/zigps-s51", "p/env").?);
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/snapshots/zigps-n52","topic":"projects/p/topics/zigps-tagged","expireTime":"1970-01-08T00:00:00Z"}
+    , (try b.raw(a, .PUT, "projects/p/snapshots/zigps-n52", "{\"subscription\":\"projects/p/subscriptions/zigps-s51\",\"tags\":{\"p/env\":\"dev\"}}")).body);
+    try testing.expectEqualStrings("dev", b.fake.tagValue("projects/p/snapshots/zigps-n52", "p/env").?);
+
+    // An update that names a topic's tags is taken, and changes nothing.
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/zigps-tagged\"}", (try b.raw(a, .PATCH, tagged, "{\"topic\":{\"tags\":{}},\"updateMask\":\"tags\"}")).body);
+    try testing.expectEqualStrings("prod", b.fake.tagValue(tagged, "p/env").?);
+    // Of a subscription's and a snapshot's production was not asked.
+    try expectRefused(try b.raw(a, .PATCH, "projects/p/subscriptions/zigps-s51", "{\"subscription\":{},\"updateMask\":\"tags\"}"), 501, "UNIMPLEMENTED", "fake: an update of a subscription's tags is not modelled yet");
+    try expectRefused(try b.raw(a, .PATCH, "projects/p/snapshots/zigps-n52", "{\"snapshot\":{},\"updateMask\":\"tags\"}"), 501, "UNIMPLEMENTED", "fake: an update of a snapshot's tags is not modelled yet");
+
+    // What a create refuses, of each of the three. The fake has no
+    // Resource Manager: a key or a value that is not there, which
+    // production refuses with 403, is taken here.
+    const key = "INVALID_ARGUMENT: field [tags.tagKey] has issue [Invalid tag key specified. Please specify a valid tag key in the format <tag namespace>/<tag key name> where the tag namespace is the ID of the organization or name of the project that the tag key is defined in or tagKeys/<tag_key_id>. For example: \"123/environment\", or \"my-project/env\", or \"tagKeys/123\".]";
+    const same_format = "field [tags.tagValue] has issue [Both TagKey and TagValue must be provided in the same format.]";
+    const bad_value = "INVALID_ARGUMENT: field [tags.tagValue] has issue [Invalid tag value specified. Please specify a valid tag value. This must be the name of the value created under the specified tag key. For example: \"production\", or \"tagValues/456\".]\n" ++ same_format;
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "{\"env\":\"prod\"}", key },
+        .{ "{\"p/zigps/extra\":\"v\"}", key },
+        .{ "{\"/env\":\"v\"}", key },
+        .{ "{\"p/\":\"v\"}", key },
+        .{ "{\"tagKeys/1/2\":\"v\"}", key },
+        .{ "{\"p/env\":\"a/b\"}", bad_value },
+        .{ "{\"p/env\":\"p/env/v\"}", bad_value },
+        .{ "{\"p/env\":\"tagValues/\"}", bad_value },
+        .{ "{\"p/env\":\"\"}", "INVALID_ARGUMENT: field [tags.tagValue] has issue [The TagValue field must be populated for an entry in the Tags map.]\n" ++ same_format },
+        .{ "{\"p/env\":\"tagValues/281475995920187\"}", "INVALID_ARGUMENT: " ++ same_format },
+        .{ "{\"tagKeys/281483349499811\":\"v\"}", "INVALID_ARGUMENT: " ++ same_format },
+        // One tag of good form does not carry another.
+        .{ "{\"p/env\":\"prod\",\"team\":\"data\"}", key },
+    }) |case| {
+        try expectRefused(try b.raw(a, .PUT, "projects/p/topics/zigps-bad", try std.fmt.allocPrint(a, "{{\"tags\":{s}}}", .{case[0]})), 400, "INVALID_ARGUMENT", case[1]);
+        try expectRefused(try b.raw(a, .PUT, "projects/p/subscriptions/zigps-bad", try std.fmt.allocPrint(a, "{{\"topic\":\"projects/p/topics/zigps-tagged\",\"tags\":{s}}}", .{case[0]})), 400, "INVALID_ARGUMENT", case[1]);
+        try expectRefused(try b.raw(a, .PUT, "projects/p/snapshots/zigps-bad", try std.fmt.allocPrint(a, "{{\"subscription\":\"projects/p/subscriptions/zigps-s51\",\"tags\":{s}}}", .{case[0]})), 400, "INVALID_ARGUMENT", case[1]);
+    }
+    try testing.expectEqual(400, (try b.raw(a, .PUT, "projects/p/topics/zigps-bad", "{\"tags\":[\"p/env\"]}")).status);
+    try testing.expectEqual(404, (try b.raw(a, .GET, "projects/p/topics/zigps-bad", "")).status);
+    try testing.expectEqual(404, (try b.raw(a, .GET, "projects/p/subscriptions/zigps-bad", "")).status);
+    try testing.expectEqual(404, (try b.raw(a, .GET, "projects/p/snapshots/zigps-bad", "")).status);
+
+    // Through the client, each of the three.
+    var topic = try b.client.topic("client-topic").create(.{ .tags = &.{.{ .key = "p/env", .value = "prod" }} });
+    topic.deinit();
+    var sub = try b.client.subscription("client-sub").create(.{ .topic_id = "client-topic", .tags = &.{.{ .key = "tagKeys/1", .value = "tagValues/2" }} });
+    sub.deinit();
+    var snap = try b.client.snapshot("client-snap").create(.{ .subscription = "client-sub", .tags = &.{.{ .key = "p/env", .value = "dev" }} });
+    snap.deinit();
+    try testing.expectEqualStrings("prod", b.fake.tagValue("projects/p/topics/client-topic", "p/env").?);
+    try testing.expectEqualStrings("tagValues/2", b.fake.tagValue("projects/p/subscriptions/client-sub", "tagKeys/1").?);
+    try testing.expectEqualStrings("dev", b.fake.tagValue("projects/p/snapshots/client-snap", "p/env").?);
+}
+
+test "what a request gives is kept apart from the request's own memory" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    const function = "{\"javascriptUdf\":{\"functionName\":\"f\",\"code\":\"function f(message, metadata) { return message; }\"},\"disabled\":true}";
+    const source = "{\"cloudStorage\":{\"bucket\":\"zigps-g\",\"textFormat\":{\"delimiter\":\"|\"},\"minimumObjectCreateTime\":\"2030-01-01T00:00:00Z\",\"matchGlob\":\"in/**\"},\"platformLogsSettings\":{\"severity\":\"DEBUG\"}}";
+    const push = "{\"pushEndpoint\":\"https://example.com/hook\",\"attributes\":{\"x-goog-version\":\"v1beta1\"},\"oidcToken\":{\"serviceAccountEmail\":\"a@p.iam.gserviceaccount.com\",\"audience\":\"aud\"}}";
+    const files = "{\"bucket\":\"zigps-b\",\"filenamePrefix\":\"in/\",\"filenameSuffix\":\".txt\",\"filenameDatetimeFormat\":\"YYYY-MM-DD/hh_mm_ssZ\",\"serviceAccountEmail\":\"w@p.iam.gserviceaccount.com\"}";
+    const steps = [_]struct { tp.Method, []const u8, []const u8 }{
+        .{ .PUT, "projects/p/topics/made", "{\"messageTransforms\":[" ++ function ++ "],\"ingestionDataSourceSettings\":" ++ source ++ ",\"tags\":{\"p/env\":\"prod\"}}" },
+        .{ .PUT, "projects/p/topics/changed", "{}" },
+        .{ .PATCH, "projects/p/topics/changed", "{\"topic\":{\"messageTransforms\":[" ++ function ++ "],\"ingestionDataSourceSettings\":{\"awsMsk\":{\"clusterArn\":\"arn:c\",\"topic\":\"t\",\"awsRoleArn\":\"arn:r\",\"gcpServiceAccount\":\"a@p.iam.gserviceaccount.com\"}}},\"updateMask\":\"messageTransforms,ingestionDataSourceSettings\"}" },
+        .{ .PUT, "projects/p/subscriptions/made", "{\"topic\":\"projects/p/topics/made\",\"pushConfig\":" ++ push ++ ",\"messageTransforms\":[" ++ function ++ "],\"tags\":{\"p/env\":\"test\"}}" },
+        .{ .PUT, "projects/p/subscriptions/changed", "{\"topic\":\"projects/p/topics/made\"}" },
+        .{ .PATCH, "projects/p/subscriptions/changed", "{\"subscription\":{\"cloudStorageConfig\":" ++ files ++ ",\"messageTransforms\":[" ++ function ++ "]},\"updateMask\":\"cloudStorageConfig,messageTransforms\"}" },
+        .{ .PUT, "projects/p/subscriptions/rows", "{\"topic\":\"projects/p/topics/made\",\"bigqueryConfig\":{\"table\":\"p.d.t\",\"serviceAccountEmail\":\"w@p.iam.gserviceaccount.com\"}}" },
+        .{ .PUT, "projects/p/subscriptions/pulls", "{\"topic\":\"projects/p/topics/made\"}" },
+        .{ .POST, "projects/p/subscriptions/pulls:modifyPushConfig", "{\"pushConfig\":" ++ push ++ "}" },
+        .{ .PUT, "projects/p/snapshots/made", "{\"subscription\":\"projects/p/subscriptions/changed\",\"tags\":{\"p/env\":\"dev\"}}" },
+    };
+    {
+        // Each request in memory of its own, body and all, that is gone
+        // before the next: under the testing allocator, written over.
+        for (steps) |step| {
+            var short: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer short.deinit();
+            const method, const path, const body = step;
+            try testing.expectEqual(200, (try b.raw(short.allocator(), method, try short.allocator().dupe(u8, path), try short.allocator().dupe(u8, body))).status);
+        }
+    }
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const read_source = "{\"cloudStorage\":{\"state\":\"ACTIVE\",\"bucket\":\"zigps-g\",\"textFormat\":{\"delimiter\":\"|\"},\"minimumObjectCreateTime\":\"2030-01-01T00:00:00Z\",\"matchGlob\":\"in/**\"},\"platformLogsSettings\":{\"severity\":\"DEBUG\"}}";
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/made\",\"state\":\"ACTIVE\",\"ingestionDataSourceSettings\":" ++ read_source ++ ",\"messageTransforms\":[" ++ function ++ "]}", (try b.raw(a, .GET, "projects/p/topics/made", "")).body);
+    try testing.expectEqualStrings("{\"name\":\"projects/p/topics/changed\",\"state\":\"ACTIVE\",\"ingestionDataSourceSettings\":{\"awsMsk\":{\"state\":\"ACTIVE\",\"clusterArn\":\"arn:c\",\"topic\":\"t\",\"awsRoleArn\":\"arn:r\",\"gcpServiceAccount\":\"a@p.iam.gserviceaccount.com\"}},\"messageTransforms\":[" ++ function ++ "]}", (try b.raw(a, .GET, "projects/p/topics/changed", "")).body);
+    try testing.expectEqualStrings(push, pushConfigOf((try b.raw(a, .GET, "projects/p/subscriptions/made", "")).body));
+    try testing.expectEqualStrings(push, pushConfigOf((try b.raw(a, .GET, "projects/p/subscriptions/pulls", "")).body));
+    try testing.expectEqualStrings("[" ++ function ++ "]}", tailOf((try b.raw(a, .GET, "projects/p/subscriptions/made", "")).body, "\"messageTransforms\":"));
+    try testing.expectEqualStrings("\"bucket\":\"zigps-b\",\"filenamePrefix\":\"in/\",\"filenameSuffix\":\".txt\",\"textConfig\":{},\"maxDuration\":\"300s\",\"state\":\"ACTIVE\",\"filenameDatetimeFormat\":\"YYYY-MM-DD/hh_mm_ssZ\",\"serviceAccountEmail\":\"w@p.iam.gserviceaccount.com\"},\"messageTransforms\":[" ++ function ++ "]}", tailOf((try b.raw(a, .GET, "projects/p/subscriptions/changed", "")).body, "\"cloudStorageConfig\":{"));
+    try testing.expectEqualStrings("\"table\":\"p.d.t\",\"state\":\"ACTIVE\",\"serviceAccountEmail\":\"w@p.iam.gserviceaccount.com\"", between((try b.raw(a, .GET, "projects/p/subscriptions/rows", "")).body, "\"bigqueryConfig\":{", "},\"state\""));
+    try testing.expectEqualStrings("prod", b.fake.tagValue("projects/p/topics/made", "p/env").?);
+    try testing.expectEqualStrings("test", b.fake.tagValue("projects/p/subscriptions/made", "p/env").?);
+    try testing.expectEqualStrings("dev", b.fake.tagValue("projects/p/snapshots/made", "p/env").?);
+}
+
+/// The client's own check of a filename datetime format was written from
+/// the same recordings by other hands: the two must give one verdict.
+fn datetimeProperty(_: void, input: []const u8) !void {
+    var g: test_util.ByteGen = .init(input);
+    var buf: [64]u8 = undefined;
+    var len: usize = 0;
+    const pieces = [_][]const u8{ "YYYY", "YY", "MM", "DD", "hh", "mm", "ss", "T", "Z", "+00:00", "-", "_", ":", "/", "Y", "+", "0", " ", ".", "x", "é" };
+    while (g.pos < g.bytes.len and len + 6 <= buf.len) {
+        const piece = pieces[g.intRange(u8, 0, pieces.len - 1)];
+        @memcpy(buf[len..][0..piece.len], piece);
+        len += piece.len;
+    }
+    const format = buf[0..len];
+    var scratch: [512]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&scratch);
+    const fault = try datetimeFault(fixed.allocator(), format);
+    const taken = if (client_checks.filenameDatetimeFormat(format, null)) |_| true else |_| false;
+    try testing.expectEqual(taken, fault == null);
+}
+
+test "fake property: a filename datetime format is taken or refused as the client's own check of it says" {
+    try test_util.fuzzBytes({}, datetimeProperty, .{ .corpus = &.{ "", "\x00\x02\x03\x04\x05\x06", "\x00\x02\x03\x0a\x04\x05\x06\x07\x08\x09", "\x01\x02\x03\x04\x05\x06\x11\x14" }, .random_runs = 2000 });
+}
+
+const client_checks = @import("validate.zig");
+
 /// What each subscription should hold, said again in as few lines as it
 /// takes: the fake is held to this after every step of a script. Three
 /// subscriptions, each with rules of its own. The first retains what is
@@ -6767,6 +9068,8 @@ fn arbitraryRequest(_: void, input: []const u8) !void {
     try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/snapshots/snap", "{\"subscription\":\"projects/p/subscriptions/worker\"}")).status);
     try testing.expectEqual(200, (try b.raw(a, .POST, "projects/p/schemas?schemaId=order", "{\"type\":\"AVRO\",\"definition\":\"\\\"string\\\"\"}")).status);
     try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/topics/typed", "{\"schemaSettings\":{\"schema\":\"projects/p/schemas/order\",\"encoding\":\"JSON\"}}")).status);
+    try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/subscriptions/pushed", "{\"topic\":\"projects/p/topics/orders\",\"pushConfig\":{\"pushEndpoint\":\"https://example.com/hook\"}}")).status);
+    try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/topics/imported", "{\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"bucket\":\"b\",\"textFormat\":{}}}}")).status);
     const paths = [_][]const u8{
         "projects/p/topics",                                 "projects/p/topics/orders",
         "projects/p/topics/orders:publish",                  "projects/p/topics/orders/subscriptions",
@@ -6786,20 +9089,29 @@ fn arbitraryRequest(_: void, input: []const u8) !void {
         "projects/p/schemas:validate",                       "projects/p/schemas:validateMessage",
         "projects/p/schemas/order@9e3779b1",                 "projects/p/schemas/order@9e3779b1:deleteRevision",
         "projects/p/topics/typed",                           "projects/p/topics/typed:publish",
+        "projects/p/subscriptions/pushed",                   "projects/p/subscriptions/pushed:modifyPushConfig",
+        "projects/p/subscriptions/pushed:pull",              "projects/p/subscriptions/worker:modifyPushConfig",
+        "projects/p/topics/imported",                        "projects/p/subscriptions/pushed:modifyAckDeadline",
     };
     const bodies = [_][]const u8{
-        "{\"messages\":[{\"data\":\"",                                      "{\"topic\":\"projects/p/topics/orders\",",
-        "{\"subscription\":{",                                              "{\"topic\":{",
-        "{\"ackIds\":[\"",                                                  "{\"maxMessages\":",
-        "{\"updateMask\":\"",                                               "",
-        "{\"topic\":\"projects/p/topics/orders\",\"filter\":\"",            "{\"topic\":\"projects/p/topics/orders\",\"deadLetterPolicy\":{",
-        "{\"topic\":\"projects/p/topics/orders\",\"retryPolicy\":{",        "{\"maxMessages\":3}",
-        "{\"messages\":[{\"orderingKey\":\"o\",\"attributes\":{\"k\":\"",   "{\"ackIds\":[\"FAKE",
-        "{\"subscription\":\"projects/p/subscriptions/worker\",",           "{\"snapshot\":\"projects/p/snapshots/snap\"}",
-        "{\"time\":\"1970-01-01T00:00:0",                                   "{\"snapshot\":{\"labels\":{",
-        "{\"type\":\"AVRO\",\"definition\":\"",                             "{\"schema\":{\"name\":\"projects/p/schemas/order\",\"type\":\"AVRO\",\"definition\":\"1\"},",
-        "{\"revisionId\":\"",                                               "{\"name\":\"projects/p/schemas/order\",\"encoding\":\"JSON\",\"message\":\"",
-        "{\"topic\":{\"schemaSettings\":{\"schema\":\"projects/p/schemas/", "{\"schemaSettings\":{\"encoding\":\"BINARY\",",
+        "{\"messages\":[{\"data\":\"",                                                                                                       "{\"topic\":\"projects/p/topics/orders\",",
+        "{\"subscription\":{",                                                                                                               "{\"topic\":{",
+        "{\"ackIds\":[\"",                                                                                                                   "{\"maxMessages\":",
+        "{\"updateMask\":\"",                                                                                                                "",
+        "{\"topic\":\"projects/p/topics/orders\",\"filter\":\"",                                                                             "{\"topic\":\"projects/p/topics/orders\",\"deadLetterPolicy\":{",
+        "{\"topic\":\"projects/p/topics/orders\",\"retryPolicy\":{",                                                                         "{\"maxMessages\":3}",
+        "{\"messages\":[{\"orderingKey\":\"o\",\"attributes\":{\"k\":\"",                                                                    "{\"ackIds\":[\"FAKE",
+        "{\"subscription\":\"projects/p/subscriptions/worker\",",                                                                            "{\"snapshot\":\"projects/p/snapshots/snap\"}",
+        "{\"time\":\"1970-01-01T00:00:0",                                                                                                    "{\"snapshot\":{\"labels\":{",
+        "{\"type\":\"AVRO\",\"definition\":\"",                                                                                              "{\"schema\":{\"name\":\"projects/p/schemas/order\",\"type\":\"AVRO\",\"definition\":\"1\"},",
+        "{\"revisionId\":\"",                                                                                                                "{\"name\":\"projects/p/schemas/order\",\"encoding\":\"JSON\",\"message\":\"",
+        "{\"topic\":{\"schemaSettings\":{\"schema\":\"projects/p/schemas/",                                                                  "{\"schemaSettings\":{\"encoding\":\"BINARY\",",
+        "{\"pushConfig\":{\"pushEndpoint\":\"https://e.x/",                                                                                  "{\"topic\":\"projects/p/topics/orders\",\"pushConfig\":{",
+        "{\"topic\":\"projects/p/topics/orders\",\"bigqueryConfig\":{\"table\":\"p.d.",                                                      "{\"topic\":\"projects/p/topics/orders\",\"cloudStorageConfig\":{\"bucket\":\"b\",",
+        "{\"topic\":\"projects/p/topics/orders\",\"cloudStorageConfig\":{\"bucket\":\"b\",\"filenameDatetimeFormat\":\"YYYY-MM-DDThh:mm:ss", "{\"messageTransforms\":[{\"javascriptUdf\":{\"functionName\":\"f\",\"code\":\"",
+        "{\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"bucket\":\"b\",\"textFormat\":{\"delimiter\":\"",                             "{\"ingestionDataSourceSettings\":{\"awsKinesis\":{\"streamArn\":\"",
+        "{\"tags\":{\"p/k\":\"",                                                                                                             "{\"subscription\":{\"pushConfig\":{\"pushEndpoint\":\"https://e.x\"}},\"updateMask\":\"pushConfig,bigqueryConfig,cloudStorageConfig\",",
+        "{\"subscription\":{\"cloudStorageConfig\":{\"bucket\":\"b\"}},\"updateMask\":\"cloudStorageConfig\"}",                              "{\"topic\":{\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"bucket\":\"b\",\"avroFormat\":{}}}},\"updateMask\":\"ingestionDataSourceSettings,messageTransforms\"}",
     };
     for (0..8) |_| {
         const method = g.pick(tp.Method, &.{ .GET, .PUT, .POST, .PATCH, .DELETE });
@@ -6808,7 +9120,8 @@ fn arbitraryRequest(_: void, input: []const u8) !void {
         // A body that starts as a real one would and ends anywhere.
         const body = try std.fmt.allocPrint(a, "{s}{s}", .{ g.pick([]const u8, &bodies), g.slice(120) });
         const reply = try b.fake.serve(method, try std.fmt.allocPrint(a, "https://pubsub.googleapis.com/v1/{s}", .{path}), body, a);
-        try testing.expect(reply.status == 200 or reply.status == 400 or reply.status == 404 or reply.status == 409 or reply.status == 501);
+        // 503 is production's own answer to a bucket of no form.
+        try testing.expect(reply.status == 200 or reply.status == 400 or reply.status == 404 or reply.status == 409 or reply.status == 501 or reply.status == 503);
         // Every answer is JSON, a refusal with its code inside.
         const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, reply.body, .{});
         if (reply.status != 200) try testing.expectEqual(@as(i64, reply.status), parsed.object.get("error").?.object.get("code").?.integer);
@@ -6958,6 +9271,45 @@ fn sessionAllocations(gpa: Allocator) !void {
         try testing.expectEqual(status, (try fake.serve(method, try std.fmt.allocPrint(a, "{s}{s}", .{ base, path }), body, a)).status);
     }
     try testing.expectEqual(2, fake.backlog("p", "reader"));
+
+    // What is kept and not done: a subscription that pushes and is given
+    // each other kind in turn, transforms, an import topic, tags.
+    const function = "{\"javascriptUdf\":{\"functionName\":\"f\",\"code\":\"function f(message, metadata) { return message; }\"}";
+    const kept = [_]struct { tp.Method, []const u8, []const u8, u16 }{
+        .{ .PUT, "subscriptions/pushed", "{\"topic\":\"projects/p/topics/orders\",\"pushConfig\":{\"pushEndpoint\":\"https://example.com/hook\",\"attributes\":{\"x-goog-version\":\"v1beta1\"},\"oidcToken\":{\"serviceAccountEmail\":\"a@p.iam.gserviceaccount.com\",\"audience\":\"x\"},\"noWrapper\":{\"writeMetadata\":true}},\"messageTransforms\":[" ++ function ++ ",\"disabled\":true}],\"tags\":{\"p/env\":\"prod\"}}", 200 },
+        .{ .GET, "subscriptions/pushed", "", 200 },
+        .{ .POST, "subscriptions/pushed:pull", "{\"maxMessages\":1}", 400 },
+        .{ .POST, "subscriptions/pushed:modifyPushConfig", "{\"pushConfig\":{\"pushEndpoint\":\"https://example.com/other\",\"pubsubWrapper\":{}}}", 200 },
+        .{ .PATCH, "subscriptions/pushed", "{\"subscription\":{\"pushConfig\":{\"pushEndpoint\":\"https://example.com/third\"}},\"updateMask\":\"pushConfig.pushEndpoint\"}", 200 },
+        .{ .PATCH, "subscriptions/pushed", "{\"subscription\":{\"bigqueryConfig\":{\"table\":\"p.d.t\",\"useTopicSchema\":true,\"serviceAccountEmail\":\"a@p.iam.gserviceaccount.com\"}},\"updateMask\":\"pushConfig,bigqueryConfig,cloudStorageConfig\"}", 200 },
+        .{ .PATCH, "subscriptions/pushed", "{\"subscription\":{\"cloudStorageConfig\":{\"bucket\":\"b\",\"filenamePrefix\":\"a/\",\"filenameSuffix\":\".avro\",\"filenameDatetimeFormat\":\"YYYY-MM-DD/hh_mm_ssZ\",\"avroConfig\":{\"writeMetadata\":true},\"maxDuration\":\"90.5s\",\"maxBytes\":\"1000\",\"maxMessages\":\"1000\",\"serviceAccountEmail\":\"a@p.iam.gserviceaccount.com\"}},\"updateMask\":\"pushConfig,bigqueryConfig,cloudStorageConfig\"}", 200 },
+        .{ .PATCH, "subscriptions/pushed", "{\"subscription\":{\"cloudStorageConfig\":{\"bucket\":\"b\",\"filenameDatetimeFormat\":\"YYYY\"}},\"updateMask\":\"cloudStorageConfig\"}", 400 },
+        .{ .PATCH, "subscriptions/pushed", "{\"subscription\":{\"cloudStorageConfig\":{\"bucket\":\"b\",\"maxDuration\":\"59.5s\"}},\"updateMask\":\"cloudStorageConfig\"}", 400 },
+        .{ .PATCH, "subscriptions/pushed", "{\"subscription\":{\"messageTransforms\":[" ++ function ++ "}]},\"updateMask\":\"messageTransforms\"}", 200 },
+        .{ .PATCH, "subscriptions/pushed", "{\"subscription\":{\"messageTransforms\":[" ++ function ++ "}," ++ function ++ "}]},\"updateMask\":\"messageTransforms\"}", 400 },
+        .{ .GET, "subscriptions", "", 200 },
+        .{ .PUT, "topics/imported", "{\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"bucket\":\"gs://b\",\"textFormat\":{\"delimiter\":\"|\"},\"minimumObjectCreateTime\":\"2030-01-01T00:00:00+01:00\",\"matchGlob\":\"a/**\"},\"platformLogsSettings\":{\"severity\":\"DEBUG\"}},\"messageTransforms\":[" ++ function ++ "}],\"tags\":{\"tagKeys/1\":\"tagValues/2\"}}", 200 },
+        .{ .GET, "topics/imported", "", 200 },
+        .{ .PATCH, "topics/imported", "{\"topic\":{\"ingestionDataSourceSettings\":{\"awsKinesis\":{\"streamArn\":\"s\",\"consumerArn\":\"c\",\"awsRoleArn\":\"r\",\"gcpServiceAccount\":\"a\"}}},\"updateMask\":\"ingestionDataSourceSettings,messageTransforms\"}", 200 },
+        .{ .PATCH, "topics/imported", "{\"topic\":{\"ingestionDataSourceSettings\":{\"awsKinesis\":{}}},\"updateMask\":\"ingestionDataSourceSettings\"}", 400 },
+        .{ .PATCH, "topics/imported", "{\"topic\":{\"ingestionDataSourceSettings\":{\"awsKinesis\":{},\"cloudStorage\":{}}},\"updateMask\":\"ingestionDataSourceSettings\"}", 400 },
+        .{ .PATCH, "topics/imported", "{\"topic\":{\"ingestionDataSourceSettings\":{\"cloudStorage\":{\"bucket\":\"b\",\"avroFormat\":{},\"minimumObjectCreateTime\":\"then\"}}},\"updateMask\":\"ingestionDataSourceSettings\"}", 400 },
+        .{ .GET, "topics", "", 200 },
+        .{ .PUT, "snapshots/tagged", "{\"subscription\":\"projects/p/subscriptions/worker\",\"tags\":{\"p/env\":\"prod\"}}", 200 },
+        .{ .PUT, "topics/untagged", "{\"tags\":{\"env\":\"prod\"}}", 400 },
+        .{ .PUT, "subscriptions/exports", "{\"topic\":\"projects/p/topics/orders\",\"bigqueryConfig\":{\"table\":\"p.d.t\"}}", 200 },
+    };
+    for (kept) |step| {
+        const method, const path, const body, const status = step;
+        try testing.expectEqual(status, (try fake.serve(method, try std.fmt.allocPrint(a, "{s}{s}", .{ base, path }), body, a)).status);
+    }
+    fake.setExportState("p", "exports", .not_found);
+    fake.setIngestionState("p", "imported", .permission_denied);
+    try testing.expect(std.mem.indexOf(u8, (try fake.serve(.GET, base ++ "subscriptions/exports", "", a)).body, "\"RESOURCE_ERROR\"") != null);
+    try testing.expect(std.mem.indexOf(u8, (try fake.serve(.GET, base ++ "topics/imported", "", a)).body, "\"KINESIS_PERMISSION_DENIED\"") != null);
+    try testing.expectEqualStrings("prod", fake.tagValue("projects/p/snapshots/tagged", "p/env").?);
+    try testing.expectEqualStrings("prod", fake.tagValue("projects/p/subscriptions/pushed", "p/env").?);
+    try testing.expectEqualStrings("tagValues/2", fake.tagValue("projects/p/topics/imported", "tagKeys/1").?);
 }
 
 test "allocation failures: a session of every call leaks nothing and breaks nothing" {
