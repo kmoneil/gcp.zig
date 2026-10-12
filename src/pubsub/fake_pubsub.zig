@@ -30,9 +30,38 @@
 //!   production's was, and once the message is out again an old id
 //!   acknowledges it. So an ack id names the message, and the lease
 //!   decides.
-//! - Order: none. Production returned twelve messages published one by
-//!   one as 03, 11, 00, 06 and so on, so a pull here returns what it has
-//!   in an order of the fake's choosing, unless `Options.shuffle` is off.
+//! - Order: none without an ordering key. Production returned twelve
+//!   messages published one by one as 03, 11, 00, 06 and so on, so a pull
+//!   here returns what it has in an order of the fake's choosing, unless
+//!   `Options.shuffle` is off.
+//! - A subscription's rules, each as production showed it:
+//!   - A filter (`fake_filter.zig`). What does not pass is never held: it
+//!     is no backlog, and never comes.
+//!   - Ordering keys. With `enableMessageOrdering` a key's messages come
+//!     in the order published. What a key has waiting comes together, in
+//!     one pull, and then **the key gives nothing more while one of its
+//!     messages is out**: one published meanwhile waits for the ack.
+//!     **A nack or a lapse of one brings back every later message of its
+//!     key, the acknowledged ones included**: an acknowledged message can
+//!     come a second time. With exactly-once delivery as well, a key
+//!     gives one message at a time.
+//!   - Dead letters. Every delivery is an attempt, sent as
+//!     `deliveryAttempt` with a policy alone. A message released after
+//!     its last attempt moves to the dead-letter topic, marked as
+//!     production marks one. Production forwards only when its service
+//!     agent holds two grants, and otherwise goes on delivering; the fake
+//!     has no IAM yet and always forwards.
+//!   - A retry policy. A message given back, or lapsed, waits the minimum
+//!     backoff, doubled with each delivery up to the maximum: the fake's
+//!     own rule, inside the delays production showed. With ordering it
+//!     holds the later messages of its key behind it.
+//!   - Retention. A message older than `messageRetentionDuration` is gone
+//!     from the subscription, out on a lease or not.
+//!   - Exactly-once delivery. An ack or a lease change that comes after
+//!     the lease lapsed is refused, id by id, in production's body, and
+//!     so is one with the id of an earlier delivery, then and ever after.
+//!     A second ack with the id that acknowledged the message is taken,
+//!     and a lease change on an acknowledged message is not.
 //! - Faults, on command: `refuseNext`, `loseAnswers`, `dropNext`.
 //!
 //! Its clock is the `io` it is given: with `core.testing.FakeClock`, a
@@ -40,11 +69,13 @@
 //! to use from several tasks at once.
 //!
 //! Not modelled yet, and answered 501 with a message that says so, never
-//! guessed at: ordering keys on a subscription, filters, dead letters,
-//! retry policies, exactly-once delivery, push and export deliveries,
-//! snapshots, seek, detach, schemas, transforms, import settings, tags and
-//! IAM. Production's delays (a deleted topic that still takes a publish)
-//! are not modelled at all: everything holds at once.
+//! guessed at: push and export deliveries, snapshots, seek, detach,
+//! schemas, transforms, import settings, tags and IAM. A filter of a
+//! shape production was not shown, or that production itself fails on,
+//! is answered the same way. Production's
+//! delays (a deleted topic that still takes a publish, the two seconds
+//! before a nacked message comes again) are not modelled at all:
+//! everything holds at once.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -53,6 +84,7 @@ const Value = std.json.Value;
 const core = @import("core");
 const tp = core.transport;
 const timestamp = core.timestamp;
+const fake_filter = @import("fake_filter.zig");
 
 pub const FakePubSub = struct {
     gpa: Allocator,
@@ -133,11 +165,85 @@ pub const FakePubSub = struct {
         /// Production answers a different `pushConfig` once a subscription
         /// has been updated.
         updated: bool = false,
+        dead_letter: ?DeadLetter = null,
+        retry: ?Retry = null,
+        /// Messages with an ordering key come in the key's order.
+        ordered: bool = false,
+        exactly_once: bool = false,
+        /// As it was sent. "": none.
+        filter_text: []const u8 = "",
+        filter: ?fake_filter.Filter = null,
         /// What it has not had acknowledged, by a number of the entry's
         /// own, in the order it arrived.
         entries: std.AutoArrayHashMapUnmanaged(u64, Entry) = .empty,
         next_seq: u64 = 1,
+        /// By an entry's number, the delivery whose id acknowledged it.
+        /// With exactly-once delivery that id is taken a second time, and
+        /// an id of an earlier delivery is not.
+        acknowledged: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+
+        /// Whether a message published to its topic reaches it. Production
+        /// tries the filter as the message arrives: what does not pass is
+        /// never held, and never comes.
+        fn takes(s: *const Subscription, m: *const Message) bool {
+            return if (s.filter) |filter| filter.matches(m.attributes) else true;
+        }
+
+        /// Whether the entry's place among the messages of its ordering
+        /// key matters here.
+        fn keyed(s: *const Subscription, entry: Entry) bool {
+            return s.ordered and entry.message.ordering_key.len > 0;
+        }
+
+        /// Whether `id` may still act on the entry: the message is out on
+        /// a lease, and with exactly-once delivery the id is that
+        /// delivery's own. Without it an old id acts on a later delivery,
+        /// as production's did. (That an id is one delivery's alone under
+        /// exactly-once delivery is Google's documentation, not measured.)
+        fn live(s: *const Subscription, index: usize, id: AckId, now: i96) bool {
+            const entry = s.entries.values()[index];
+            const until = entry.lease_until orelse return false;
+            if (until <= now) return false;
+            return !s.exactly_once or id.delivery == entry.deliveries;
+        }
+
+        /// An acknowledgement that took, by the id of `delivery`. With
+        /// ordering, a message of a key is kept, acknowledged, while an
+        /// earlier one of its key is not: that one's nack or lapse brings
+        /// it back.
+        fn take(s: *Subscription, gpa: Allocator, index: usize, delivery: u32) Allocator.Error!void {
+            try s.acknowledged.put(gpa, s.entries.keys()[index], delivery);
+            const entry = &s.entries.values()[index];
+            if (!s.keyed(entry.*)) return s.entries.orderedRemoveAt(index);
+            entry.acked = true;
+            entry.lease_until = null;
+            s.prune(entry.message.ordering_key);
+        }
+
+        /// Lets go of the acknowledged messages of a key that nothing can
+        /// bring back: the ones before its first unacknowledged message.
+        fn prune(s: *Subscription, key: []const u8) void {
+            var i: usize = 0;
+            while (i < s.entries.count()) {
+                const entry = s.entries.values()[i];
+                if (!std.mem.eql(u8, entry.message.ordering_key, key)) {
+                    i += 1;
+                } else if (entry.acked) {
+                    s.entries.orderedRemoveAt(i);
+                } else return;
+            }
+        }
     };
+
+    const DeadLetter = struct {
+        /// The topic's full name. Looked up when a message is forwarded:
+        /// it may be deleted in the meantime.
+        topic: []const u8,
+        max_attempts: u32,
+    };
+
+    /// Seconds, each 0 to 600.
+    const Retry = struct { min_s: i64, max_s: i64 };
 
     const Entry = struct {
         message: *const Message,
@@ -145,7 +251,13 @@ pub const FakePubSub = struct {
         lease_until: ?i96 = null,
         /// How many times it was delivered.
         deliveries: u32 = 0,
+        /// Not to be delivered again before then: a retry policy's backoff.
+        not_before: i96 = 0,
+        /// Acknowledged, and kept for now: see `Subscription.take`.
+        acked: bool = false,
     };
+
+    const AckId = struct { text: []const u8, seq: u64, delivery: u32 };
 
     pub fn init(gpa: Allocator, io: std.Io, options: Options) FakePubSub {
         return .{ .gpa = gpa, .io = io, .options = options, .store = .init(gpa) };
@@ -155,8 +267,12 @@ pub const FakePubSub = struct {
         for (f.topics.values()) |t| t.messages.deinit(f.gpa);
         for (f.orphans.items) |t| t.messages.deinit(f.gpa);
         f.orphans.deinit(f.gpa);
-        for (f.subscriptions.values()) |s| s.entries.deinit(f.gpa);
-        for (f.dropped.items) |s| s.entries.deinit(f.gpa);
+        for ([_][]const *Subscription{ f.subscriptions.values(), f.dropped.items }) |list| {
+            for (list) |s| {
+                s.entries.deinit(f.gpa);
+                s.acknowledged.deinit(f.gpa);
+            }
+        }
         f.dropped.deinit(f.gpa);
         f.topics.deinit(f.gpa);
         f.subscriptions.deinit(f.gpa);
@@ -206,16 +322,22 @@ pub const FakePubSub = struct {
     pub fn backlog(f: *FakePubSub, project: []const u8, subscription: []const u8) usize {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
+        // Out of memory here leaves a dead letter where it was, for the
+        // next call to forward.
+        f.settleAll(f.awakeNow()) catch {};
         const s = f.findSubscription(project, subscription) orelse return 0;
-        return s.entries.count();
+        var n: usize = 0;
+        for (s.entries.values()) |e| n += @intFromBool(!e.acked);
+        return n;
     }
 
     /// Of those, how many are out on a lease now.
     pub fn outstanding(f: *FakePubSub, project: []const u8, subscription: []const u8) usize {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
-        const s = f.findSubscription(project, subscription) orelse return 0;
         const now = f.awakeNow();
+        f.settleAll(now) catch {};
+        const s = f.findSubscription(project, subscription) orelse return 0;
         var n: usize = 0;
         for (s.entries.values()) |e| {
             if (e.lease_until) |until| {
@@ -225,10 +347,12 @@ pub const FakePubSub = struct {
         return n;
     }
 
-    /// How many messages the topic was sent. Zero for one that is not there.
+    /// How many messages the topic was sent, the dead letters forwarded to
+    /// it included. Zero for one that is not there.
     pub fn publishedCount(f: *FakePubSub, project: []const u8, topic: []const u8) usize {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
+        f.settleAll(f.awakeNow()) catch {};
         var buf: [1024]u8 = undefined;
         const name = fullName(&buf, project, "topics", topic) orelse return 0;
         const t = f.topics.get(name) orelse return 0;
@@ -290,6 +414,8 @@ pub const FakePubSub = struct {
             const status = f.faults[refuse].status;
             return fail(arena, status, statusName(status), "The service is currently unavailable.");
         }
+        // What production does on its own, it does here before each call.
+        try f.settleAll(f.awakeNow());
         const reply = try f.dispatch(method, route, body, arena);
         if (f.takeFault(lose, call)) return fail(arena, 503, "UNAVAILABLE", "The service is currently unavailable.");
         return reply;
@@ -579,7 +705,7 @@ pub const FakePubSub = struct {
             kept.id = id;
             topic.messages.appendAssumeCapacity(kept);
             for (f.subscriptions.values()) |s| {
-                if (s.topic != topic) continue;
+                if (s.topic != topic or !s.takes(kept)) continue;
                 s.entries.putAssumeCapacity(s.next_seq, .{ .message = kept });
                 s.next_seq += 1;
             }
@@ -603,6 +729,7 @@ pub const FakePubSub = struct {
         var sub: Subscription = .{ .name = name, .uid = 0, .topic = null };
         var topic_name: []const u8 = "";
         var expiration_given = false;
+        var deadline_given = false;
         var it = object.iterator();
         while (it.next()) |field| {
             const key = field.key_ptr.*;
@@ -616,6 +743,7 @@ pub const FakePubSub = struct {
                 if (seconds != 0) {
                     if (seconds < 10 or seconds > 600) return fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Invalid ack deadline given (ack_deadline={d}). The ack deadline must be between 10 and 600 seconds.", .{seconds}));
                     sub.ack_deadline_s = @intCast(seconds);
+                    deadline_given = true;
                 }
             } else if (isField(key, "labels")) {
                 sub.labels = switch (try labelsOf(arena, value)) {
@@ -642,15 +770,38 @@ pub const FakePubSub = struct {
                     else => return badValue(arena, key),
                 };
                 if (push.count() != 0) return notModelled(arena, "a push subscription");
-            } else if (isField(key, "enableMessageOrdering") or isField(key, "enableExactlyOnceDelivery")) {
-                if (boolOf(value) orelse return badValue(arena, key)) return notModelled(arena, key);
+            } else if (isField(key, "enableMessageOrdering")) {
+                sub.ordered = boolOf(value) orelse return badValue(arena, key);
+            } else if (isField(key, "enableExactlyOnceDelivery")) {
+                sub.exactly_once = boolOf(value) orelse return badValue(arena, key);
             } else if (isField(key, "filter")) {
-                if ((stringOf(value) orelse return badValue(arena, key)).len != 0) return notModelled(arena, key);
-            } else if (isAnyField(key, &.{ "deadLetterPolicy", "retryPolicy", "bigqueryConfig", "cloudStorageConfig", "messageTransforms", "tags" })) {
+                sub.filter_text = stringOf(value) orelse return badValue(arena, key);
+            } else if (isField(key, "deadLetterPolicy")) {
+                sub.dead_letter = switch (try deadLetterOf(arena, value)) {
+                    .ok => |policy| policy,
+                    .refused => |r| return r,
+                };
+            } else if (isField(key, "retryPolicy")) {
+                sub.retry = switch (try retryOf(arena, value)) {
+                    .ok => |policy| policy,
+                    .refused => |r| return r,
+                };
+            } else if (isAnyField(key, &.{ "bigqueryConfig", "cloudStorageConfig", "messageTransforms", "tags" })) {
                 return notModelled(arena, key);
             } else return unknownName(arena, key);
         }
         if (!isResourceName(topic_name, "topics")) return invalidName(arena, topic_name);
+        if (sub.filter_text.len > 0) switch (try fake_filter.parse(arena, sub.filter_text)) {
+            // Read again into the store when the subscription is kept.
+            .ok => |filter| sub.filter = filter,
+            .refused => |words| return fail(arena, 400, "INVALID_ARGUMENT", words),
+            .not_modelled => |words| return fail(arena, 501, "UNIMPLEMENTED", words),
+        };
+        // With exactly-once delivery production's own deadline is a minute.
+        if (sub.exactly_once and !deadline_given) sub.ack_deadline_s = 60;
+        if (sub.dead_letter) |policy| {
+            if (!f.topics.contains(policy.topic)) return notFound(arena, idOf(policy.topic));
+        }
         if (expirationRefusal(arena, sub.retention_s, sub.expiration_ttl_s, expiration_given)) |refusal| return try refusal;
         if (f.subscriptions.contains(name)) return alreadyExists(arena, route.id);
         const topic = f.topics.get(topic_name) orelse return notFound(arena, idOf(topic_name));
@@ -715,7 +866,22 @@ pub const FakePubSub = struct {
                     .ok => |ttl| ttl,
                     .refused => |r| return r,
                 } else 2_678_400;
-            } else if (isAnyPath(path, &.{ "pushConfig", "bigqueryConfig", "cloudStorageConfig", "deadLetterPolicy", "retryPolicy", "enableExactlyOnceDelivery", "messageTransforms" })) {
+            } else if (isPath(path, "deadLetterPolicy")) {
+                next.dead_letter = if (given) |v| switch (try deadLetterOf(arena, v)) {
+                    .ok => |policy| policy: {
+                        if (!f.topics.contains(policy.topic)) return notFound(arena, idOf(policy.topic));
+                        break :policy .{ .topic = try f.keep(policy.topic), .max_attempts = policy.max_attempts };
+                    },
+                    .refused => |r| return r,
+                } else null;
+            } else if (isPath(path, "retryPolicy")) {
+                next.retry = if (given) |v| switch (try retryOf(arena, v)) {
+                    .ok => |policy| policy,
+                    .refused => |r| return r,
+                } else null;
+            } else if (isPath(path, "enableExactlyOnceDelivery")) {
+                next.exactly_once = if (given) |v| boolOf(v) orelse return badValue(arena, path) else false;
+            } else if (isAnyPath(path, &.{ "pushConfig", "bigqueryConfig", "cloudStorageConfig", "messageTransforms" })) {
                 return notModelled(arena, path);
             } else return unknownPath(arena, "UpdateSubscriptionRequest", path, "Subscription");
         }
@@ -787,10 +953,13 @@ pub const FakePubSub = struct {
 
         const hold_until = f.awakeNow() + f.options.empty_pull_hold.nanoseconds;
         while (true) {
+            // A lease that lapses while the pull is held is settled as at
+            // any other time.
+            const now = f.awakeNow();
+            try f.settleAll(now);
             // Looked up each time round: the subscription may be deleted
             // while a pull is held.
             const sub = f.subscriptions.get(name) orelse return notFound(arena, route.id);
-            const now = f.awakeNow();
             const ready = try f.readyEntries(arena, sub, now);
             if (ready.len > 0) return f.deliver(arena, sub, ready[0..@min(ready.len, max)], now);
             if (now >= hold_until) return ok("{}");
@@ -804,19 +973,179 @@ pub const FakePubSub = struct {
         }
     }
 
-    /// The numbers of the entries a pull may give now: the ones waiting,
-    /// and the ones whose lease has lapsed. In an order of the fake's
-    /// choosing when `shuffle` is on.
+    /// Brings every subscription up to `now`. Leases lapse with time and
+    /// nothing else, and what follows a lapse (a dead letter forwarded, a
+    /// message past its retention gone) production does without being
+    /// asked, so it is done before each request.
+    fn settleAll(f: *FakePubSub, now: i96) Allocator.Error!void {
+        // By index: a forwarded dead letter may add to another's entries,
+        // never to the list of subscriptions.
+        var i: usize = 0;
+        while (i < f.subscriptions.count()) : (i += 1) try f.settle(f.subscriptions.values()[i], now);
+    }
+
+    /// One subscription, brought up to `now`: messages past its retention
+    /// go, lapsed leases end, and a message that has had its last attempt
+    /// moves to the dead-letter topic.
+    fn settle(f: *FakePubSub, sub: *Subscription, now: i96) Allocator.Error!void {
+        const wall = std.Io.Clock.real.now(f.io).nanoseconds;
+        const keep_ns = @as(i96, sub.retention_s) * std.time.ns_per_s;
+        var i: usize = 0;
+        while (i < sub.entries.count()) {
+            const entry = sub.entries.values()[i];
+            if (wall - entry.message.publish_time.nanoseconds >= keep_ns) {
+                // An acknowledged one kept behind it is younger, and goes
+                // the same way in its turn.
+                sub.entries.orderedRemoveAt(i);
+                continue;
+            }
+            if (entry.lease_until) |until| {
+                // The backoff runs from the lapse, not from when it was
+                // noticed.
+                if (until <= now and try f.released(sub, i, until)) continue;
+            }
+            i += 1;
+        }
+    }
+
+    /// A delivery that ended without an ack, by a lapse or a nack, at
+    /// `at`. After its last attempt the message is forwarded to the
+    /// dead-letter topic; otherwise it waits again, as long as the retry
+    /// policy says. On a subscription with ordering every later message
+    /// of its key is taken back with it, the acknowledged ones included:
+    /// production delivered k2 to k5 again after a nack of k2 alone, with
+    /// k3 to k5 acknowledged. (That a forwarded one takes them back too
+    /// is the fake's own choice.) True when the entry at `index` is gone.
+    /// A failure leaves everything as it was.
+    fn released(f: *FakePubSub, sub: *Subscription, index: usize, at: i96) Allocator.Error!bool {
+        const entry = sub.entries.values()[index];
+        var gone = false;
+        if (sub.dead_letter) |policy| forwarded: {
+            if (entry.deliveries < policy.max_attempts) break :forwarded;
+            // Production forwards only when its service agent may publish
+            // there and acknowledge here, and otherwise goes on delivering.
+            // With no topic to forward to, the fake goes on delivering too.
+            const dead = f.topics.get(policy.topic) orelse break :forwarded;
+            try f.forward(sub, entry, dead);
+            sub.entries.orderedRemoveAt(index);
+            gone = true;
+        }
+        if (!gone) {
+            const waiting = &sub.entries.values()[index];
+            waiting.lease_until = null;
+            if (sub.retry) |retry| waiting.not_before = at + backoff(retry, entry.deliveries) * std.time.ns_per_s;
+        }
+        if (sub.keyed(entry)) {
+            // What it remembers of the ids that acknowledged them is
+            // written over when they are acknowledged again.
+            for (sub.entries.values()[index + @intFromBool(!gone) ..]) |*later| {
+                if (!std.mem.eql(u8, later.message.ordering_key, entry.message.ordering_key)) continue;
+                later.lease_until = null;
+                later.acked = false;
+            }
+        }
+        return gone;
+    }
+
+    /// The fake's own rule, inside what production showed: the minimum,
+    /// doubling with each delivery, up to the maximum. Production's delays
+    /// under a 10 to 20 second policy were 10, 11.5, 17 and 16.5 seconds
+    /// after a nack, and 15 and 16 after a lapse.
+    fn backoff(retry: Retry, deliveries: u32) i96 {
+        const doublings: u6 = @intCast(@min(deliveries -| 1, 20));
+        return @min(retry.max_s, retry.min_s << doublings);
+    }
+
+    /// A dead letter: the message again, on the dead-letter topic, marked
+    /// with where it came from. The first two attributes are as production
+    /// wrote them (2026-09-28); the other two are Google's documentation.
+    fn forward(f: *FakePubSub, sub: *const Subscription, entry: Entry, dead: *Topic) Allocator.Error!void {
+        const store = f.store.allocator();
+        const m = entry.message;
+        const attributes = try store.alloc(Label, m.attributes.len + 4);
+        @memcpy(attributes[0..m.attributes.len], m.attributes);
+        var time_buf: [timestamp.max_len]u8 = undefined;
+        const rest = idOf(sub.name);
+        const project = sub.name["projects/".len .. sub.name.len - "/subscriptions/".len - rest.len];
+        attributes[m.attributes.len..][0..4].* = .{
+            .{ .key = "CloudPubSubDeadLetterSourceDeliveryCount", .value = try std.fmt.allocPrint(store, "{d}", .{entry.deliveries}) },
+            .{ .key = "CloudPubSubDeadLetterSourceSubscription", .value = rest },
+            .{ .key = "CloudPubSubDeadLetterSourceSubscriptionProject", .value = project },
+            .{ .key = "CloudPubSubDeadLetterSourceTopicPublishTime", .value = try store.dupe(u8, timestamp.format(&time_buf, m.publish_time)) },
+        };
+        const kept = try store.create(Message);
+        kept.* = .{ .id = f.next_message_id, .data = m.data, .attributes = attributes, .ordering_key = m.ordering_key, .publish_time = std.Io.Clock.real.now(f.io) };
+        try dead.messages.ensureUnusedCapacity(f.gpa, 1);
+        for (f.subscriptions.values()) |s| {
+            if (s.topic == dead) try s.entries.ensureUnusedCapacity(f.gpa, 1);
+        }
+        f.next_message_id += 1;
+        dead.messages.appendAssumeCapacity(kept);
+        for (f.subscriptions.values()) |s| {
+            if (s.topic != dead or !s.takes(kept)) continue;
+            s.entries.putAssumeCapacity(s.next_seq, .{ .message = kept });
+            s.next_seq += 1;
+        }
+    }
+
+    /// The numbers of the entries a pull may give at `now`, to which the
+    /// subscription is settled: the ones waiting whose backoff, if any,
+    /// has run, and that ordering does not hold back. In an order of the
+    /// fake's choosing when `shuffle` is on.
     fn readyEntries(f: *FakePubSub, arena: Allocator, sub: *Subscription, now: i96) Allocator.Error![]u64 {
         var ready: std.ArrayList(u64) = .empty;
+        // The keys that give nothing more, with ordering. A key with a
+        // message out gives none until that one is acknowledged or comes
+        // back: production held k2 fourteen seconds behind k1, and gave
+        // it a second after k1's ack. What a key has waiting it gives
+        // together, in one pull. A message waiting out its backoff holds
+        // the later ones of its key behind it. And with exactly-once
+        // delivery as well a key gives one message at a time, as
+        // production gave m1 alone of three published together.
+        var held: std.StringHashMapUnmanaged(void) = .empty;
+        if (sub.ordered) for (sub.entries.values()) |entry| {
+            if (entry.lease_until != null and sub.keyed(entry)) try held.put(arena, entry.message.ordering_key, {});
+        };
         for (sub.entries.keys(), sub.entries.values()) |seq, entry| {
-            if (entry.lease_until) |until| {
-                if (until > now) continue;
+            if (entry.acked or entry.lease_until != null) continue;
+            const key = entry.message.ordering_key;
+            if (sub.keyed(entry) and held.contains(key)) continue;
+            if (entry.not_before > now) {
+                if (sub.keyed(entry)) try held.put(arena, key, {});
+                continue;
             }
             try ready.append(arena, seq);
+            if (sub.keyed(entry) and sub.exactly_once) try held.put(arena, key, {});
         }
-        if (f.options.shuffle) f.prng.random().shuffle(u64, ready.items);
+        if (f.options.shuffle) try f.mix(arena, sub, ready.items);
         return ready.items;
+    }
+
+    /// Puts `ready`, which is in the order published, in an order of the
+    /// fake's choosing. On a subscription with ordering each key's
+    /// messages still come in their own order, as production's did: the
+    /// keys among themselves and the messages without one in any.
+    fn mix(f: *FakePubSub, arena: Allocator, sub: *const Subscription, ready: []u64) Allocator.Error!void {
+        if (!sub.ordered) return f.prng.random().shuffle(u64, ready);
+        const published = try arena.dupe(u64, ready);
+        f.prng.random().shuffle(u64, ready);
+        // Each key's places in the new order, filled with its messages in
+        // the old one.
+        const Places = struct { at: std.ArrayList(usize) = .empty, filled: usize = 0 };
+        var places: std.StringHashMapUnmanaged(Places) = .empty;
+        for (ready, 0..) |seq, at| {
+            const key = sub.entries.get(seq).?.message.ordering_key;
+            if (key.len == 0) continue;
+            const slot = try places.getOrPutValue(arena, key, .{});
+            try slot.value_ptr.at.append(arena, at);
+        }
+        for (published) |seq| {
+            const key = sub.entries.get(seq).?.message.ordering_key;
+            if (key.len == 0) continue;
+            const slot = places.getPtr(key).?;
+            ready[slot.at.items[slot.filled]] = seq;
+            slot.filled += 1;
+        }
     }
 
     fn deliver(f: *FakePubSub, arena: Allocator, sub: *Subscription, seqs: []const u64, now: i96) Allocator.Error!Reply {
@@ -855,6 +1184,11 @@ pub const FakePubSub = struct {
                 jw.write(m.ordering_key) catch return error.OutOfMemory;
             }
             jw.endObject() catch return error.OutOfMemory;
+            // Sent only with a dead-letter policy, as production sends it.
+            if (sub.dead_letter != null) {
+                jw.objectField("deliveryAttempt") catch return error.OutOfMemory;
+                jw.write(entry.deliveries + 1) catch return error.OutOfMemory;
+            }
             jw.endObject() catch return error.OutOfMemory;
         }
         jw.endArray() catch return error.OutOfMemory;
@@ -868,7 +1202,7 @@ pub const FakePubSub = struct {
         return ok(out.written());
     }
 
-    const AckRequest = struct { seqs: []const u64, seconds: ?i64 };
+    const AckRequest = struct { ids: []const AckId, seconds: ?i64 };
 
     /// The ids of an acknowledge or a modifyAckDeadline, each checked as
     /// production checks it, before any is acted on.
@@ -893,14 +1227,50 @@ pub const FakePubSub = struct {
             } else return .{ .refused = try unknownName(arena, key) };
         }
         if (ids.len == 0) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "You have not specified an ack ID in the request.") };
-        const seqs = try arena.alloc(u64, ids.len);
-        for (ids, seqs) |id, *seq| {
+        const parsed_ids = try arena.alloc(AckId, ids.len);
+        for (ids, parsed_ids) |id, *slot| {
             const text = stringOf(id) orelse return .{ .refused = try badValue(arena, "ackIds") };
             const parsed = parseAckId(text) orelse return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "You have passed an invalid ack ID to the service (ack_id={s}).", .{text})) };
             if (parsed.uid != sub.uid) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "You have passed a subscription that does not belong to the given ack ID (resource={s}).", .{sub.name})) };
-            seq.* = parsed.seq;
+            slot.* = .{ .text = text, .seq = parsed.seq, .delivery = parsed.delivery };
         }
-        return .{ .ok = .{ .sub = sub, .request = .{ .seqs = seqs, .seconds = seconds } } };
+        return .{ .ok = .{ .sub = sub, .request = .{ .ids = parsed_ids, .seconds = seconds } } };
+    }
+
+    const Judged = struct {
+        /// For each id of the request: whether it may act.
+        live: []const bool,
+        /// The ids an exactly-once refusal names, each once.
+        refused: []const []const u8,
+    };
+
+    /// Says of each id of an acknowledge or a modifyAckDeadline whether it
+    /// may act, as the request finds things, before any of them acts:
+    /// with ordering a nack takes the later messages of its key back, and
+    /// their own ids in the same request come no later for that.
+    ///
+    /// An id that may not act is answered and forgotten: the message is
+    /// taken only while it is out, and after a lapse or a nack it comes
+    /// again. With exactly-once delivery the id is refused instead, a
+    /// lapsed message's and an acknowledged one's alike. Production took
+    /// one such: a second ack with the very id that acknowledged the
+    /// message. With an id of an earlier delivery of it, it refused.
+    fn judge(arena: Allocator, sub: *const Subscription, ids: []const AckId, now: i96, lease_change: bool) Allocator.Error!Judged {
+        const live = try arena.alloc(bool, ids.len);
+        var refused: std.ArrayList([]const u8) = .empty;
+        each: for (ids, live) |id, *slot| {
+            const index = sub.entries.getIndex(id.seq);
+            // Gone, or kept behind an earlier one of its key.
+            const acknowledged = if (index) |i| sub.entries.values()[i].acked else true;
+            slot.* = !acknowledged and sub.live(index.?, id, now);
+            if (slot.* or !sub.exactly_once) continue;
+            if (acknowledged and !lease_change and sub.acknowledged.get(id.seq) == id.delivery) continue;
+            for (refused.items) |named| {
+                if (std.mem.eql(u8, named, id.text)) continue :each;
+            }
+            try refused.append(arena, id.text);
+        }
+        return .{ .live = live, .refused = refused.items };
     }
 
     fn acknowledge(f: *FakePubSub, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
@@ -908,16 +1278,17 @@ pub const FakePubSub = struct {
             .ok => |c| c,
             .refused => |r| return r,
         };
-        const now = f.awakeNow();
-        for (checked.request.seqs) |seq| {
-            const entry = checked.sub.entries.get(seq) orelse continue;
-            // Taken only while the message is out: after a lapse or a
-            // nack the ack is answered and forgotten, and the message
-            // comes again.
-            const until = entry.lease_until orelse continue;
-            if (until <= now) continue;
-            _ = checked.sub.entries.orderedRemove(seq);
+        const sub = checked.sub;
+        const judged = try judge(arena, sub, checked.request.ids, f.awakeNow(), false);
+        for (checked.request.ids, judged.live) |id, live| {
+            if (!live) continue;
+            // Looked up for each: the one before it may have been the
+            // same id.
+            const index = sub.entries.getIndex(id.seq) orelse continue;
+            if (!sub.entries.values()[index].acked) try sub.take(f.gpa, index, id.delivery);
         }
+        // The ids it does not name were taken.
+        if (judged.refused.len > 0) return exactlyOnceRefusal(arena, judged.refused);
         return ok("{}");
     }
 
@@ -928,14 +1299,22 @@ pub const FakePubSub = struct {
         };
         const seconds = checked.request.seconds orelse 0;
         if (seconds < 0 or seconds > 600) return fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Invalid ack deadline given (ack_deadline={d}). The ack deadline must be between 0 and 600 seconds.", .{seconds}));
+        const sub = checked.sub;
         const now = f.awakeNow();
-        for (checked.request.seqs) |seq| {
-            const entry = checked.sub.entries.getPtr(seq) orelse continue;
-            const until = entry.lease_until orelse continue;
-            if (until <= now) continue;
-            // Zero gives the message back at once: a nack.
-            entry.lease_until = if (seconds == 0) null else now + @as(i96, seconds) * std.time.ns_per_s;
+        const judged = try judge(arena, sub, checked.request.ids, now, true);
+        for (checked.request.ids, judged.live) |id, live| {
+            if (!live) continue;
+            // Looked up for each: a nack before it may have moved it, or
+            // forwarded it, the same id sent twice.
+            const index = sub.entries.getIndex(id.seq) orelse continue;
+            // Zero gives the message back at once: a nack. One that an
+            // earlier nack of the request took back is released all the
+            // same: it was out, and it is given back.
+            if (seconds == 0) {
+                _ = try f.released(sub, index, now);
+            } else sub.entries.values()[index].lease_until = now + @as(i96, seconds) * std.time.ns_per_s;
         }
+        if (judged.refused.len > 0) return exactlyOnceRefusal(arena, judged.refused);
         return ok("{}");
     }
 
@@ -972,6 +1351,13 @@ pub const FakePubSub = struct {
         kept.* = sub;
         kept.name = try f.keep(sub.name);
         kept.labels = try f.keepLabels(sub.labels);
+        if (sub.dead_letter) |policy| kept.dead_letter = .{ .topic = try f.keep(policy.topic), .max_attempts = policy.max_attempts };
+        kept.filter_text = try f.keep(sub.filter_text);
+        if (sub.filter != null) kept.filter = switch (try fake_filter.parse(f.store.allocator(), kept.filter_text)) {
+            .ok => |filter| filter,
+            // It was read once already, and reads the same again.
+            .refused, .not_modelled => unreachable,
+        };
         return kept;
     }
 
@@ -1333,6 +1719,52 @@ fn expirationOf(arena: Allocator, value: Value) Allocator.Error!Parsed(?i64) {
     return .{ .ok = seconds };
 }
 
+/// A dead-letter policy: a topic by its full name, and 5 to 100 delivery
+/// attempts, 5 when none is said.
+fn deadLetterOf(arena: Allocator, value: Value) Allocator.Error!Parsed(FakePubSub.DeadLetter) {
+    const object = switch (value) {
+        .object => |o| o,
+        else => return .{ .refused = try badValue(arena, "deadLetterPolicy") },
+    };
+    var topic: []const u8 = "";
+    var attempts: i64 = 0;
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (isField(key, "deadLetterTopic")) {
+            topic = stringOf(entry.value_ptr.*) orelse return .{ .refused = try badValue(arena, key) };
+        } else if (isField(key, "maxDeliveryAttempts")) {
+            attempts = intOf(entry.value_ptr.*) orelse return .{ .refused = try badValue(arena, key) };
+        } else return .{ .refused = try unknownName(arena, key) };
+    }
+    if (!isResourceName(topic, "topics")) return .{ .refused = try invalidName(arena, topic) };
+    if (attempts == 0) attempts = 5;
+    if (attempts < 5) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "The value for max_delivery_attempts is too small. You passed {d} in the request, but the minimum value is 5.", .{attempts})) };
+    if (attempts > 100) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "The value for max_delivery_attempts is too large. You passed {d} in the request, but the maximum value is 100.", .{attempts})) };
+    return .{ .ok = .{ .topic = topic, .max_attempts = @intCast(attempts) } };
+}
+
+/// A retry policy: each backoff 0 to 600 seconds, 10 and 600 when not
+/// said, and the minimum no greater than the maximum.
+fn retryOf(arena: Allocator, value: Value) Allocator.Error!Parsed(FakePubSub.Retry) {
+    const object = switch (value) {
+        .object => |o| o,
+        else => return .{ .refused = try badValue(arena, "retryPolicy") },
+    };
+    var policy: FakePubSub.Retry = .{ .min_s = 10, .max_s = 600 };
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const minimum = isField(key, "minimumBackoff");
+        if (!minimum and !isField(key, "maximumBackoff")) return .{ .refused = try unknownName(arena, key) };
+        const seconds = secondsOf(entry.value_ptr.*) orelse return .{ .refused = try badValue(arena, key) };
+        if (seconds < 0 or seconds > 600) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "The value for {s} is out of bounds. You passed {s} in the request, but the value must be between 0 and 10m.", .{ if (minimum) "minimum_backoff" else "maximum_backoff", try goDuration(arena, seconds) })) };
+        if (minimum) policy.min_s = seconds else policy.max_s = seconds;
+    }
+    if (policy.max_s < policy.min_s) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "The specified maximum_backoff {s} cannot be smaller than minimum_backoff {s}.", .{ try goDuration(arena, policy.max_s), try goDuration(arena, policy.min_s) })) };
+    return .{ .ok = policy };
+}
+
 /// A subscription cannot keep messages past its own expiry. Production
 /// holds a create and an update to that when the expiry was given.
 fn expirationRefusal(arena: Allocator, retention_s: i64, ttl_s: ?i64, given: bool) ?Allocator.Error!FakePubSub.Reply {
@@ -1414,7 +1846,7 @@ fn ackId(arena: Allocator, uid: u64, seq: u64, delivery: u32) Allocator.Error![]
     return out;
 }
 
-fn parseAckId(id: []const u8) ?struct { uid: u64, seq: u64 } {
+fn parseAckId(id: []const u8) ?struct { uid: u64, seq: u64, delivery: u32 } {
     if (!std.mem.startsWith(u8, id, ack_prefix)) return null;
     const decoder = std.base64.url_safe_no_pad.Decoder;
     const text = id[ack_prefix.len..];
@@ -1425,9 +1857,9 @@ fn parseAckId(id: []const u8) ?struct { uid: u64, seq: u64 } {
     var parts = std.mem.splitScalar(u8, plain[0..size], ':');
     const uid = std.fmt.parseInt(u64, parts.next() orelse return null, 10) catch return null;
     const seq = std.fmt.parseInt(u64, parts.next() orelse return null, 10) catch return null;
-    _ = std.fmt.parseInt(u32, parts.next() orelse return null, 10) catch return null;
+    const delivery = std.fmt.parseInt(u32, parts.next() orelse return null, 10) catch return null;
     if (parts.next() != null) return null;
-    return .{ .uid = uid, .seq = seq };
+    return .{ .uid = uid, .seq = seq, .delivery = delivery };
 }
 
 // Answers.
@@ -1486,6 +1918,48 @@ fn unknownPath(arena: Allocator, comptime request: []const u8, path: []const u8,
 
 fn immutable(arena: Allocator, comptime request: []const u8, comptime field: []const u8, comptime resource: []const u8) Allocator.Error!FakePubSub.Reply {
     return fail(arena, 400, "INVALID_ARGUMENT", "Invalid update_mask provided in the " ++ request ++ ": the '" ++ field ++ "' field in the " ++ resource ++ " is not mutable.");
+}
+
+/// Production's refusal of ack ids on a subscription with exactly-once
+/// delivery, whole, as it answered on 2026-09-27: each id it did not
+/// take, and why.
+fn exactlyOnceRefusal(arena: Allocator, ids: []const []const u8) Allocator.Error!FakePubSub.Reply {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeExactlyOnceRefusal(&jw, ids) catch return error.OutOfMemory;
+    return .{ .status = 400, .body = out.written() };
+}
+
+fn writeExactlyOnceRefusal(jw: *Stringify, ids: []const []const u8) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("error");
+    try jw.beginObject();
+    try jw.objectField("code");
+    try jw.write(400);
+    try jw.objectField("message");
+    try jw.write("Some acknowledgement ids in the request were invalid. This could be because the acknowledgement ids have expired or the acknowledgement ids were malformed.");
+    try jw.objectField("status");
+    try jw.write("INVALID_ARGUMENT");
+    try jw.objectField("details");
+    try jw.beginArray();
+    try jw.beginObject();
+    try jw.objectField("@type");
+    try jw.write("type.googleapis.com/google.rpc.ErrorInfo");
+    try jw.objectField("reason");
+    try jw.write("EXACTLY_ONCE_ACKID_FAILURE");
+    try jw.objectField("domain");
+    try jw.write("pubsub.googleapis.com");
+    try jw.objectField("metadata");
+    try jw.beginObject();
+    for (ids) |id| {
+        try jw.objectField(id);
+        try jw.write("PERMANENT_FAILURE_INVALID_ACK_ID");
+    }
+    try jw.endObject();
+    try jw.endObject();
+    try jw.endArray();
+    try jw.endObject();
+    try jw.endObject();
 }
 
 /// What this fake has no answer for: said, never guessed at.
@@ -1566,6 +2040,10 @@ fn writeSubscription(jw: *Stringify, sub: *const FakePubSub.Subscription) String
         try jw.objectField("labels");
         try writeLabels(jw, sub.labels);
     }
+    if (sub.ordered) {
+        try jw.objectField("enableMessageOrdering");
+        try jw.write(true);
+    }
     try jw.objectField("expirationPolicy");
     try jw.beginObject();
     if (sub.expiration_ttl_s) |ttl| {
@@ -1573,6 +2051,32 @@ fn writeSubscription(jw: *Stringify, sub: *const FakePubSub.Subscription) String
         try writeSeconds(jw, ttl);
     }
     try jw.endObject();
+    if (sub.filter_text.len > 0) {
+        try jw.objectField("filter");
+        try jw.write(sub.filter_text);
+    }
+    if (sub.dead_letter) |policy| {
+        try jw.objectField("deadLetterPolicy");
+        try jw.beginObject();
+        try jw.objectField("deadLetterTopic");
+        try jw.write(policy.topic);
+        try jw.objectField("maxDeliveryAttempts");
+        try jw.write(policy.max_attempts);
+        try jw.endObject();
+    }
+    if (sub.retry) |policy| {
+        try jw.objectField("retryPolicy");
+        try jw.beginObject();
+        try jw.objectField("minimumBackoff");
+        try writeSeconds(jw, policy.min_s);
+        try jw.objectField("maximumBackoff");
+        try writeSeconds(jw, policy.max_s);
+        try jw.endObject();
+    }
+    if (sub.exactly_once) {
+        try jw.objectField("enableExactlyOnceDelivery");
+        try jw.write(true);
+    }
     try jw.objectField("state");
     try jw.write("ACTIVE");
     try jw.endObject();
@@ -1668,6 +2172,11 @@ test "a message goes from a publish to a pull, and an ack takes it away" {
     var none = try b.client.subscription("worker").pull(.{ .return_immediately = true });
     defer none.deinit();
     try testing.expectEqual(0, none.value.messages.len);
+}
+
+/// `n` of the letter x, for text of a chosen length.
+fn xs(comptime n: usize) [n]u8 {
+    return @splat('x');
 }
 
 /// Asserts a refusal's HTTP code, status and words.
@@ -1844,6 +2353,19 @@ test "lists: in name order, in pages, with tokens only this fake gave" {
     defer nothing.deinit();
     try testing.expectEqual(0, nothing.value.names.len);
     try testing.expectError(error.NotFound, b.client.topic("missing").listSubscriptions(.{}));
+
+    // With no page size, or 0, a page is a hundred: the fake's own number,
+    // which production was not asked for. This client always says one.
+    for (0..96) |i| {
+        var made = try b.client.topic(try std.fmt.allocPrint(a, "t{d:0>3}", .{i})).create(.{});
+        made.deinit();
+    }
+    for ([_][]const u8{ "projects/p/topics", "projects/p/topics?pageSize=0" }) |path| {
+        const page = (try b.raw(a, .GET, path, "")).body;
+        try testing.expectEqual(100, std.mem.count(u8, page, "\"name\""));
+        try testing.expect(std.mem.indexOf(u8, page, "\"nextPageToken\"") != null);
+    }
+    try testing.expectEqual(101, std.mem.count(u8, (try b.raw(a, .GET, "projects/p/topics?pageSize=1000", "")).body, "\"name\""));
 }
 
 test "publish: ids in order, and every refusal in production's words" {
@@ -2009,9 +2531,8 @@ test "subscriptions: production's defaults, its bounds, what an update may chang
     try testing.expectEqual(0, changed.value.labels.len);
     try testing.expectEqual(types.DeliveryInfo.pull, changed.value.delivery);
     // What is not modelled yet says so.
-    try testing.expectError(error.Unimplemented, b.client.subscription("ordered").create(.{ .topic_id = "zigps-b", .enable_message_ordering = true }));
-    try testing.expectEqualStrings("fake: enableMessageOrdering is not modelled yet", b.diag.message());
-    try testing.expectError(error.Unimplemented, b.client.subscription("filtered").create(.{ .topic_id = "zigps-b", .filter = "attributes:k" }));
+    try testing.expectError(error.Unimplemented, b.client.subscription("pushed").create(.{ .topic_id = "zigps-b", .delivery = .{ .push = .{ .endpoint = "https://example.com/hook" } } }));
+    try testing.expectEqualStrings("fake: a push subscription is not modelled yet", b.diag.message());
 
     // A topic deleted under its subscription leaves it, and what it holds.
     var sent = try b.client.topic("zigps-b").publish(&.{.{ .data = "kept" }}, .{});
@@ -2322,61 +2843,1238 @@ test "a pull with nothing to give is held as long as asked, on the fake's clock"
     try testing.expectError(error.Canceled, b.client.subscription("worker").pull(.{}));
 }
 
+/// Pulls with nothing to give, and says so.
+fn expectNothing(sub: anytype) !void {
+    var got = try sub.pull(.{ .return_immediately = true });
+    defer got.deinit();
+    try testing.expectEqual(0, got.value.messages.len);
+}
+
+test "a subscription's rules: read back as production reads them back, and refused in its words" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    for ([_][]const u8{ "zigps-a", "zigps-b" }) |id| {
+        var made = try b.client.topic(id).create(.{});
+        made.deinit();
+    }
+    const topic = "\"topic\":\"projects/p/topics/zigps-a\"";
+    const dead = "\"deadLetterTopic\":\"projects/p/topics/zigps-b\"";
+
+    // Production's answers, 2026-10-12, in the order it writes the fields.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-full","topic":"projects/p/topics/zigps-a","pushConfig":{},"ackDeadlineSeconds":60,"retainAckedMessages":true,"messageRetentionDuration":"1200s","labels":{"env":"test"},"enableMessageOrdering":true,"expirationPolicy":{"ttl":"86400s"},"filter":"attributes.k = \"v\"","deadLetterPolicy":{"deadLetterTopic":"projects/p/topics/zigps-b","maxDeliveryAttempts":7},"retryPolicy":{"minimumBackoff":"5s","maximumBackoff":"60s"},"state":"ACTIVE"}
+    , (try b.raw(a, .PUT, "projects/p/subscriptions/zigps-full", "{" ++ topic ++ ",\"ackDeadlineSeconds\":60,\"enableMessageOrdering\":true,\"filter\":\"attributes.k = \\\"v\\\"\",\"retryPolicy\":{\"minimumBackoff\":\"5s\",\"maximumBackoff\":\"60s\"},\"deadLetterPolicy\":{" ++ dead ++ ",\"maxDeliveryAttempts\":7},\"retainAckedMessages\":true,\"messageRetentionDuration\":\"1200s\",\"labels\":{\"env\":\"test\"},\"expirationPolicy\":{\"ttl\":\"86400s\"}}")).body);
+    // With exactly-once delivery its own deadline is a minute.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-eo","topic":"projects/p/topics/zigps-a","pushConfig":{},"ackDeadlineSeconds":60,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"enableExactlyOnceDelivery":true,"state":"ACTIVE"}
+    , (try b.raw(a, .PUT, "projects/p/subscriptions/zigps-eo", "{" ++ topic ++ ",\"enableExactlyOnceDelivery\":true}")).body);
+    // Five attempts when none is said.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-dl","topic":"projects/p/topics/zigps-a","pushConfig":{},"ackDeadlineSeconds":10,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"deadLetterPolicy":{"deadLetterTopic":"projects/p/topics/zigps-b","maxDeliveryAttempts":5},"state":"ACTIVE"}
+    , (try b.raw(a, .PUT, "projects/p/subscriptions/zigps-dl", "{" ++ topic ++ ",\"deadLetterPolicy\":{" ++ dead ++ "}}")).body);
+    // Dead letters to its own topic are taken.
+    try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/subscriptions/zigps-own", "{" ++ topic ++ ",\"deadLetterPolicy\":{\"deadLetterTopic\":\"projects/p/topics/zigps-a\"}}")).status);
+    // A retry policy with nothing in it is 10 seconds to 600.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-rp","topic":"projects/p/topics/zigps-a","pushConfig":{},"ackDeadlineSeconds":10,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"retryPolicy":{"minimumBackoff":"10s","maximumBackoff":"600s"},"state":"ACTIVE"}
+    , (try b.raw(a, .PUT, "projects/p/subscriptions/zigps-rp", "{" ++ topic ++ ",\"retryPolicy\":{}}")).body);
+
+    // Its refusals, each in its words.
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "\"deadLetterPolicy\":{" ++ dead ++ ",\"maxDeliveryAttempts\":4}", "The value for max_delivery_attempts is too small. You passed 4 in the request, but the minimum value is 5." },
+        .{ "\"deadLetterPolicy\":{" ++ dead ++ ",\"maxDeliveryAttempts\":101}", "The value for max_delivery_attempts is too large. You passed 101 in the request, but the maximum value is 100." },
+        .{ "\"retryPolicy\":{\"minimumBackoff\":\"30s\",\"maximumBackoff\":\"10s\"}", "The specified maximum_backoff 10s cannot be smaller than minimum_backoff 30s." },
+        .{ "\"retryPolicy\":{\"minimumBackoff\":\"1s\",\"maximumBackoff\":\"601s\"}", "The value for maximum_backoff is out of bounds. You passed 10m1s in the request, but the value must be between 0 and 10m." },
+        .{ "\"filter\":\"attributes.k = \\\"" ++ comptime xs(240) ++ "\\\"\"", "Invalid filter expression: length 257 exceeds maximum allowed length of 256." },
+        .{ "\"filter\":\"attributes.kind > \\\"a\\\"\"", "Invalid filter expression: Invalid operator (line 1, columns 1 to 21)." },
+    }) |case| {
+        const setting, const words = case;
+        try expectRefused(try b.raw(a, .PUT, "projects/p/subscriptions/zigps-bad", try std.fmt.allocPrint(a, "{{" ++ topic ++ ",{s}}}", .{setting})), 400, "INVALID_ARGUMENT", words);
+    }
+    try expectRefused(try b.raw(a, .PUT, "projects/p/subscriptions/zigps-bad", "{" ++ topic ++ ",\"deadLetterPolicy\":{\"deadLetterTopic\":\"projects/p/topics/zigps-nope\"}}"), 404, "NOT_FOUND", "Resource not found (resource=zigps-nope).");
+    // The fake's own words where production was not asked: a minimum out
+    // of bounds, after production's for the maximum.
+    try expectRefused(try b.raw(a, .PUT, "projects/p/subscriptions/zigps-bad", "{" ++ topic ++ ",\"retryPolicy\":{\"minimumBackoff\":\"601s\",\"maximumBackoff\":\"600s\"}}"), 400, "INVALID_ARGUMENT", "The value for minimum_backoff is out of bounds. You passed 10m1s in the request, but the value must be between 0 and 10m.");
+    try expectRefused(try b.raw(a, .PUT, "projects/p/subscriptions/zigps-bad", "{" ++ topic ++ ",\"filter\":\"attributes.kind\"}"), 400, "INVALID_ARGUMENT", "Invalid filter expression: Expected either a function call or an expression with an operator (line 1, columns 1 to 15).");
+    // A filter of a shape production was not shown, or one it failed on
+    // itself, is not guessed at.
+    try expectRefused(try b.raw(a, .PUT, "projects/p/subscriptions/zigps-bad", "{" ++ topic ++ ",\"filter\":\"--attributes:kind\"}"), 501, "UNIMPLEMENTED", "fake: this filter is not modelled: a minus after a minus, which production answers with an internal error, at column 2");
+    try testing.expectEqual(404, (try b.raw(a, .GET, "projects/p/subscriptions/zigps-bad", "")).status);
+    // The bounds themselves are taken: 5 and 100 attempts, 0 and 600 seconds.
+    for ([_][]const u8{ "\"deadLetterPolicy\":{" ++ dead ++ ",\"maxDeliveryAttempts\":5}", "\"deadLetterPolicy\":{" ++ dead ++ ",\"maxDeliveryAttempts\":100}", "\"retryPolicy\":{\"minimumBackoff\":\"0s\",\"maximumBackoff\":\"0s\"}", "\"retryPolicy\":{\"minimumBackoff\":\"600s\",\"maximumBackoff\":\"600s\"}" }, 0..) |setting, i| {
+        try testing.expectEqual(200, (try b.raw(a, .PUT, try std.fmt.allocPrint(a, "projects/p/subscriptions/zigps-edge{d}", .{i}), try std.fmt.allocPrint(a, "{{" ++ topic ++ ",{s}}}", .{setting}))).status);
+    }
+
+    // Updates, as production answered them: a path the body leaves out
+    // goes back to its default, and a policy that way is gone.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-full","topic":"projects/p/topics/zigps-a","pushConfig":{"attributes":{"x-goog-version":"v1"}},"ackDeadlineSeconds":60,"retainAckedMessages":true,"messageRetentionDuration":"1200s","labels":{"env":"test"},"enableMessageOrdering":true,"expirationPolicy":{"ttl":"2678400s"},"filter":"attributes.k = \"v\"","deadLetterPolicy":{"deadLetterTopic":"projects/p/topics/zigps-b","maxDeliveryAttempts":7},"retryPolicy":{"minimumBackoff":"5s","maximumBackoff":"60s"},"state":"ACTIVE"}
+    , (try b.raw(a, .PATCH, "projects/p/subscriptions/zigps-full", "{\"subscription\":{},\"updateMask\":\"expirationPolicy\"}")).body);
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-full","topic":"projects/p/topics/zigps-a","pushConfig":{"attributes":{"x-goog-version":"v1"}},"ackDeadlineSeconds":60,"retainAckedMessages":true,"messageRetentionDuration":"604800s","labels":{"env":"test"},"enableMessageOrdering":true,"expirationPolicy":{"ttl":"2678400s"},"filter":"attributes.k = \"v\"","state":"ACTIVE"}
+    , (try b.raw(a, .PATCH, "projects/p/subscriptions/zigps-full", "{\"subscription\":{},\"updateMask\":\"messageRetentionDuration,retryPolicy,deadLetterPolicy\"}")).body);
+    // Set by an update, each is checked as on a create, and a refused
+    // update changes nothing.
+    try testing.expectEqual(200, (try b.raw(a, .PATCH, "projects/p/subscriptions/zigps-full", "{\"subscription\":{\"deadLetterPolicy\":{" ++ dead ++ ",\"maxDeliveryAttempts\":6},\"retryPolicy\":{\"maximumBackoff\":\"30s\"}},\"updateMask\":\"deadLetterPolicy,retryPolicy\"}")).status);
+    const policies = "\"deadLetterPolicy\":{\"deadLetterTopic\":\"projects/p/topics/zigps-b\",\"maxDeliveryAttempts\":6},\"retryPolicy\":{\"minimumBackoff\":\"10s\",\"maximumBackoff\":\"30s\"},\"state\"";
+    try testing.expect(std.mem.indexOf(u8, (try b.raw(a, .GET, "projects/p/subscriptions/zigps-full", "")).body, policies) != null);
+    try expectRefused(try b.raw(a, .PATCH, "projects/p/subscriptions/zigps-full", "{\"subscription\":{\"deadLetterPolicy\":{\"deadLetterTopic\":\"projects/p/topics/zigps-nope\"}},\"updateMask\":\"deadLetterPolicy\"}"), 404, "NOT_FOUND", "Resource not found (resource=zigps-nope).");
+    try expectRefused(try b.raw(a, .PATCH, "projects/p/subscriptions/zigps-full", "{\"subscription\":{\"deadLetterPolicy\":{" ++ dead ++ ",\"maxDeliveryAttempts\":4}},\"updateMask\":\"deadLetterPolicy\"}"), 400, "INVALID_ARGUMENT", "The value for max_delivery_attempts is too small. You passed 4 in the request, but the minimum value is 5.");
+    try expectRefused(try b.raw(a, .PATCH, "projects/p/subscriptions/zigps-full", "{\"subscription\":{\"ackDeadlineSeconds\":30,\"retryPolicy\":{\"minimumBackoff\":\"30s\",\"maximumBackoff\":\"10s\"}},\"updateMask\":\"ackDeadlineSeconds,retryPolicy\"}"), 400, "INVALID_ARGUMENT", "The specified maximum_backoff 10s cannot be smaller than minimum_backoff 30s.");
+    const kept = (try b.raw(a, .GET, "projects/p/subscriptions/zigps-full", "")).body;
+    try testing.expect(std.mem.indexOf(u8, kept, policies) != null);
+    try testing.expect(std.mem.indexOf(u8, kept, "\"ackDeadlineSeconds\":60,") != null);
+    // Exactly-once delivery is turned on and off by an update, and the
+    // deadline stays what it was.
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-eo","topic":"projects/p/topics/zigps-a","pushConfig":{"attributes":{"x-goog-version":"v1"}},"ackDeadlineSeconds":60,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"state":"ACTIVE"}
+    , (try b.raw(a, .PATCH, "projects/p/subscriptions/zigps-eo", "{\"subscription\":{},\"updateMask\":\"enableExactlyOnceDelivery\"}")).body);
+    try testing.expect(std.mem.indexOf(u8, (try b.raw(a, .PATCH, "projects/p/subscriptions/zigps-dl", "{\"subscription\":{\"enableExactlyOnceDelivery\":true},\"updateMask\":\"enable_exactly_once_delivery\"}")).body, "\"ackDeadlineSeconds\":10,\"messageRetentionDuration\":\"604800s\",\"expirationPolicy\":{\"ttl\":\"2678400s\"},\"deadLetterPolicy\":{\"deadLetterTopic\":\"projects/p/topics/zigps-b\",\"maxDeliveryAttempts\":5},\"enableExactlyOnceDelivery\":true,\"state\"") != null);
+    // A deadline that is said is kept with exactly-once delivery too.
+    try testing.expect(std.mem.indexOf(u8, (try b.raw(a, .PUT, "projects/p/subscriptions/zigps-eo10", "{" ++ topic ++ ",\"ackDeadlineSeconds\":10,\"enableExactlyOnceDelivery\":true}")).body, "\"ackDeadlineSeconds\":10,") != null);
+
+    // Through the client.
+    var made = try b.client.subscription("worker").create(.{
+        .topic_id = "zigps-a",
+        .enable_message_ordering = true,
+        .enable_exactly_once_delivery = true,
+        .filter = "attributes:k",
+        .dead_letter_policy = .{ .topic = "zigps-b", .max_delivery_attempts = 9 },
+        .retry_policy = .{ .minimum = .fromSeconds(1), .maximum = .fromSeconds(2) },
+    });
+    defer made.deinit();
+    try testing.expect(made.value.enable_message_ordering);
+    try testing.expect(made.value.enable_exactly_once_delivery);
+    try testing.expectEqualStrings("attributes:k", made.value.filter);
+    try testing.expectEqualStrings("projects/p/topics/zigps-b", made.value.dead_letter_policy.?.topic);
+    try testing.expectEqual(9, made.value.dead_letter_policy.?.max_delivery_attempts);
+    try testing.expectEqual(std.Io.Duration.fromSeconds(1), made.value.retry_policy.?.minimum);
+    try testing.expectEqual(std.Io.Duration.fromSeconds(2), made.value.retry_policy.?.maximum);
+    try testing.expectEqual(60, made.value.ack_deadline_seconds);
+    try testing.expectError(error.InvalidArgument, b.client.subscription("mixed").create(.{ .topic_id = "zigps-a", .filter = "attributes:a AND attributes:b OR attributes:c" }));
+    try testing.expectEqualStrings("Invalid filter expression: failed to parse (syntax error at line 1, column 31, token 'OR').", b.diag.message());
+    try testing.expectError(error.InvalidArgument, b.client.subscription("bare").create(.{ .topic_id = "zigps-a", .filter = "order" }));
+    try testing.expectError(error.Unimplemented, b.client.subscription("twice").create(.{ .topic_id = "zigps-a", .filter = "--attributes:k" }));
+}
+
+test "a filter: a subscription holds what passes it, of what is published and of what is forwarded to its topic" {
+    var b: Bench = undefined;
+    try b.init(.{ .shuffle = false });
+    defer b.deinit();
+    for ([_][]const u8{ "orders", "dead" }) |id| {
+        var made = try b.client.topic(id).create(.{});
+        made.deinit();
+    }
+    for ([_]struct { []const u8, types.SubscriptionConfig }{
+        .{ "everything", .{ .topic_id = "orders" } },
+        .{ "eu-orders", .{ .topic_id = "orders", .filter = "attributes.kind = \"order\" AND attributes.region = \"eu\"" } },
+        .{ "not-orders", .{ .topic_id = "orders", .filter = "NOT attributes.kind = \"order\"" } },
+        .{ "poison", .{ .topic_id = "orders", .filter = "hasPrefix(attributes.kind, \"ref\")", .dead_letter_policy = .{ .topic = "dead" } } },
+        .{ "dead-refunds", .{ .topic_id = "dead", .filter = "attributes.CloudPubSubDeadLetterSourceDeliveryCount = \"5\" AND attributes.kind = \"refund\"" } },
+        .{ "dead-orders", .{ .topic_id = "dead", .filter = "attributes.kind = \"order\"" } },
+    }) |case| {
+        var made = try b.client.subscription(case[0]).create(case[1]);
+        made.deinit();
+    }
+    // The eight messages production was sent under each of its filters.
+    const sent = [_]types.Message{
+        .{ .data = "m1", .attributes = &.{ .{ .key = "kind", .value = "order" }, .{ .key = "region", .value = "eu" } } },
+        .{ .data = "m2", .attributes = &.{ .{ .key = "kind", .value = "order" }, .{ .key = "region", .value = "us" } } },
+        .{ .data = "m3", .attributes = &.{ .{ .key = "kind", .value = "refund" }, .{ .key = "region", .value = "eu" } } },
+        .{ .data = "m4", .attributes = &.{.{ .key = "region", .value = "us" }} },
+        .{ .data = "m5", .attributes = &.{.{ .key = "kind", .value = "" }} },
+        .{ .data = "m6" },
+        .{ .data = "m7", .attributes = &.{ .{ .key = "kind", .value = "ORDER" }, .{ .key = "KIND", .value = "order" } } },
+        .{ .data = "m8", .attributes = &.{ .{ .key = "kind", .value = "a\"b" }, .{ .key = "a b", .value = "x" } } },
+    };
+    var published = try b.client.topic("orders").publish(&sent, .{});
+    published.deinit();
+    try testing.expectEqual(8, b.fake.publishedCount("p", "orders"));
+    // What does not pass is never held: it is no backlog, and never comes.
+    try testing.expectEqual(8, b.fake.backlog("p", "everything"));
+    try testing.expectEqual(1, b.fake.backlog("p", "eu-orders"));
+    try testing.expectEqual(6, b.fake.backlog("p", "not-orders"));
+    try testing.expectEqual(1, b.fake.backlog("p", "poison"));
+    var got = try b.client.subscription("eu-orders").pull(.{});
+    defer got.deinit();
+    try testing.expectEqual(1, got.value.messages.len);
+    try testing.expectEqualStrings("m1", got.value.messages[0].data);
+    var others = try b.client.subscription("not-orders").pull(.{});
+    defer others.deinit();
+    try testing.expectEqual(6, others.value.messages.len);
+    for (others.value.messages, [_][]const u8{ "m3", "m4", "m5", "m6", "m7", "m8" }) |m, data| try testing.expectEqualStrings(data, m.data);
+
+    // A dead letter is a message to the dead-letter topic like any other:
+    // its subscriptions' filters are tried on it, the attributes that mark
+    // it included.
+    for (0..5) |_| {
+        var refund = try b.client.subscription("poison").pull(.{});
+        defer refund.deinit();
+        try testing.expectEqualStrings("m3", refund.value.messages[0].data);
+        try b.client.subscription("poison").nack(&.{refund.value.messages[0].ack_id});
+    }
+    try testing.expectEqual(0, b.fake.backlog("p", "poison"));
+    try testing.expectEqual(1, b.fake.publishedCount("p", "dead"));
+    try testing.expectEqual(1, b.fake.backlog("p", "dead-refunds"));
+    try testing.expectEqual(0, b.fake.backlog("p", "dead-orders"));
+}
+
+test "ordering keys: a key gives what it has waiting together and in order, and no more until that is acknowledged or comes back" {
+    for ([_]bool{ true, false }) |shuffle| {
+        var b: Bench = undefined;
+        try b.init(.{ .shuffle = shuffle });
+        defer b.deinit();
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const orders = b.client.topic("orders");
+        var made = try orders.create(.{});
+        made.deinit();
+        const ordered = b.client.subscription("ordered");
+        const plain = b.client.subscription("plain");
+        var first_made = try ordered.create(.{ .topic_id = "orders", .enable_message_ordering = true });
+        first_made.deinit();
+        var second_made = try plain.create(.{ .topic_id = "orders" });
+        second_made.deinit();
+        var published: usize = 0;
+
+        // As production was put to it on 2026-10-12: one of a key out,
+        // and then a second published. The second waited fourteen seconds
+        // behind the first, and came a second after the first's ack.
+        var k1 = try orders.publish(&.{.{ .data = "k1" }}, .{ .ordering_key = "k" });
+        k1.deinit();
+        var first = try ordered.pull(.{});
+        defer first.deinit();
+        try testing.expectEqualStrings("k1", first.value.messages[0].data);
+        try testing.expectEqualStrings("k", first.value.messages[0].ordering_key);
+        var k2 = try orders.publish(&.{.{ .data = "k2" }}, .{ .ordering_key = "k" });
+        k2.deinit();
+        try expectNothing(ordered);
+        // Another key, and a message with none, wait for nothing.
+        var j1 = try orders.publish(&.{.{ .data = "j1" }}, .{ .ordering_key = "j" });
+        j1.deinit();
+        var free1 = try orders.publish(&.{.{ .data = "free1" }}, .{});
+        free1.deinit();
+        {
+            var others = try ordered.pull(.{});
+            defer others.deinit();
+            try testing.expectEqual(2, others.value.messages.len);
+            for (others.value.messages) |m| {
+                try testing.expect(m.data[0] != 'k');
+                try ordered.ack(&.{m.ack_id});
+            }
+        }
+        b.advance(9);
+        try expectNothing(ordered);
+        try testing.expectEqual(2, b.fake.backlog("p", "ordered"));
+        try ordered.ack(&.{first.value.messages[0].ack_id});
+        {
+            var second = try ordered.pull(.{});
+            defer second.deinit();
+            try testing.expectEqual(1, second.value.messages.len);
+            try testing.expectEqualStrings("k2", second.value.messages[0].data);
+            try ordered.ack(&.{second.value.messages[0].ack_id});
+        }
+        published += 4;
+
+        // Three of a key published together came together, in order. With
+        // the first acknowledged and the second given back, the second and
+        // the third came again together: the third was out, and was taken
+        // back with the second.
+        var three = try orders.publish(&.{ .{ .data = "m1" }, .{ .data = "m2" }, .{ .data = "m3" } }, .{ .ordering_key = "m" });
+        three.deinit();
+        published += 3;
+        {
+            var got = try ordered.pull(.{});
+            defer got.deinit();
+            try testing.expectEqual(3, got.value.messages.len);
+            for (got.value.messages, [_][]const u8{ "m1", "m2", "m3" }) |m, data| try testing.expectEqualStrings(data, m.data);
+            try ordered.ack(&.{got.value.messages[0].ack_id});
+            try expectNothing(ordered);
+            try ordered.nack(&.{got.value.messages[1].ack_id});
+            try testing.expectEqual(2, b.fake.backlog("p", "ordered"));
+            try testing.expectEqual(0, b.fake.outstanding("p", "ordered"));
+            var again = try ordered.pull(.{});
+            defer again.deinit();
+            try testing.expectEqual(2, again.value.messages.len);
+            for (again.value.messages, [_][]const u8{ "m2", "m3" }) |m, data| try testing.expectEqualStrings(data, m.data);
+            try ordered.ack(&.{ again.value.messages[0].ack_id, again.value.messages[1].ack_id });
+            try testing.expectEqual(0, b.fake.backlog("p", "ordered"));
+        }
+
+        // Production's first case: five of a key, all acknowledged but the
+        // second, and the second nacked. It came again with the third,
+        // fourth and fifth, acknowledged though they were.
+        var five = try orders.publish(&.{ .{ .data = "n1" }, .{ .data = "n2" }, .{ .data = "n3" }, .{ .data = "n4" }, .{ .data = "n5" } }, .{ .ordering_key = "n" });
+        five.deinit();
+        published += 5;
+        {
+            var got = try ordered.pull(.{});
+            defer got.deinit();
+            try testing.expectEqual(5, got.value.messages.len);
+            const ids = got.value.messages;
+            try ordered.ack(&.{ ids[4].ack_id, ids[0].ack_id, ids[2].ack_id, ids[3].ack_id });
+            try testing.expectEqual(1, b.fake.backlog("p", "ordered"));
+            try testing.expectEqual(1, b.fake.outstanding("p", "ordered"));
+            try ordered.nack(&.{ids[1].ack_id});
+            try testing.expectEqual(4, b.fake.backlog("p", "ordered"));
+            try testing.expectEqual(0, b.fake.outstanding("p", "ordered"));
+            var again = try ordered.pull(.{});
+            defer again.deinit();
+            try testing.expectEqual(4, again.value.messages.len);
+            for (again.value.messages, [_][]const u8{ "n2", "n3", "n4", "n5" }) |m, data| try testing.expectEqualStrings(data, m.data);
+            // Acknowledged behind one that is not, the later ones are kept
+            // back, and not counted.
+            const later = again.value.messages;
+            try ordered.ack(&.{ later[3].ack_id, later[1].ack_id, later[2].ack_id });
+            try testing.expectEqual(1, b.fake.backlog("p", "ordered"));
+            // A second ack of one of those, and a lease change, are
+            // answered and forgotten.
+            try ordered.ack(&.{later[2].ack_id});
+            try ordered.modifyAckDeadline(&.{later[2].ack_id}, 30);
+            try ordered.nack(&.{later[3].ack_id});
+            try testing.expectEqual(1, b.fake.backlog("p", "ordered"));
+            // With the second acknowledged all four are gone.
+            try ordered.ack(&.{later[0].ack_id});
+            try testing.expectEqual(0, b.fake.backlog("p", "ordered"));
+            b.advance(700);
+            try expectNothing(ordered);
+        }
+
+        // A lapse does as a nack does: all three of a key came again in
+        // production, none acknowledged.
+        var more = try orders.publish(&.{ .{ .data = "k6" }, .{ .data = "k7" }, .{ .data = "k8" } }, .{ .ordering_key = "k" });
+        more.deinit();
+        published += 3;
+        for (0..2) |_| {
+            var got = try ordered.pull(.{});
+            defer got.deinit();
+            try testing.expectEqual(3, got.value.messages.len);
+            for (got.value.messages, [_][]const u8{ "k6", "k7", "k8" }) |m, data| try testing.expectEqualStrings(data, m.data);
+            try expectNothing(ordered);
+            b.advance(10);
+        }
+        // With the later two acknowledged, the lapse of the first brings
+        // all three: an acknowledged message is given a second time.
+        {
+            var got = try ordered.pull(.{});
+            defer got.deinit();
+            try ordered.ack(&.{ got.value.messages[2].ack_id, got.value.messages[1].ack_id });
+            try testing.expectEqual(1, b.fake.backlog("p", "ordered"));
+            b.advance(10);
+            try testing.expectEqual(3, b.fake.backlog("p", "ordered"));
+        }
+        {
+            // The first, acknowledged, is gone for good. Of the two left,
+            // the lapse of the earlier takes the later back out of a
+            // longer lease.
+            var got = try ordered.pull(.{});
+            defer got.deinit();
+            try testing.expectEqual(3, got.value.messages.len);
+            try ordered.ack(&.{got.value.messages[0].ack_id});
+            try testing.expectEqual(2, b.fake.backlog("p", "ordered"));
+            try ordered.modifyAckDeadline(&.{got.value.messages[2].ack_id}, 600);
+            b.advance(10);
+            try testing.expectEqual(0, b.fake.outstanding("p", "ordered"));
+            var both = try ordered.pull(.{});
+            defer both.deinit();
+            try testing.expectEqual(2, both.value.messages.len);
+            for (both.value.messages, [_][]const u8{ "k7", "k8" }) |m, data| try testing.expectEqualStrings(data, m.data);
+            // The other way about, a later one's lapse leaves the earlier
+            // out, and the later one waits behind it.
+            try ordered.modifyAckDeadline(&.{both.value.messages[0].ack_id}, 600);
+            b.advance(10);
+            try testing.expectEqual(1, b.fake.outstanding("p", "ordered"));
+            try expectNothing(ordered);
+            try ordered.ack(&.{both.value.messages[0].ack_id});
+            var last = try ordered.pull(.{});
+            defer last.deinit();
+            try testing.expectEqual(1, last.value.messages.len);
+            try testing.expectEqualStrings("k8", last.value.messages[0].data);
+            try ordered.ack(&.{last.value.messages[0].ack_id});
+            try testing.expectEqual(0, b.fake.backlog("p", "ordered"));
+        }
+
+        // A pull's limit may cut a key's messages short. The rest wait
+        // until every one of those given is acknowledged.
+        var cut = try orders.publish(&.{ .{ .data = "q1" }, .{ .data = "q2" }, .{ .data = "q3" } }, .{ .ordering_key = "q" });
+        cut.deinit();
+        published += 3;
+        {
+            var got = try ordered.pull(.{ .max_messages = 2 });
+            defer got.deinit();
+            try testing.expectEqual(2, got.value.messages.len);
+            for (got.value.messages, [_][]const u8{ "q1", "q2" }) |m, data| try testing.expectEqualStrings(data, m.data);
+            try expectNothing(ordered);
+            try ordered.ack(&.{got.value.messages[0].ack_id});
+            try expectNothing(ordered);
+            try ordered.ack(&.{got.value.messages[1].ack_id});
+            var rest = try ordered.pull(.{});
+            defer rest.deinit();
+            try testing.expectEqual(1, rest.value.messages.len);
+            try testing.expectEqualStrings("q3", rest.value.messages[0].data);
+            try ordered.ack(&.{rest.value.messages[0].ack_id});
+        }
+
+        // Among themselves the keys have no order, nor have the messages
+        // with none: one pull gives all nine in an order of the fake's
+        // own, each key's still in theirs.
+        const Sent = struct { ?[]const u8, []const types.Message };
+        for ([_]Sent{
+            .{ null, &.{ .{ .data = "f1" }, .{ .data = "f2" }, .{ .data = "f3" } } },
+            .{ "x", &.{ .{ .data = "x1" }, .{ .data = "x2" }, .{ .data = "x3" } } },
+            .{ "y", &.{ .{ .data = "y1" }, .{ .data = "y2" }, .{ .data = "y3" } } },
+        }) |request| {
+            var sent = try orders.publish(request[1], .{ .ordering_key = request[0] });
+            sent.deinit();
+        }
+        published += 9;
+        {
+            var got = try ordered.pull(.{});
+            defer got.deinit();
+            try testing.expectEqual(9, got.value.messages.len);
+            var order: std.ArrayList(u8) = .empty;
+            for (got.value.messages) |m| try order.appendSlice(a, m.data);
+            for ([_][]const u8{ "x1x2x3", "y1y2y3" }) |key_order| {
+                var seen: std.ArrayList(u8) = .empty;
+                for (got.value.messages) |m| {
+                    if (m.data[0] == key_order[0]) try seen.appendSlice(a, m.data);
+                }
+                try testing.expectEqualStrings(key_order, seen.items);
+            }
+            try testing.expectEqual(!shuffle, std.mem.eql(u8, order.items, "f1f2f3x1x2x3y1y2y3"));
+            // A message with no key is on its own, with ordering too: its
+            // nack brings back no other.
+            for (got.value.messages) |m| {
+                if (!std.mem.eql(u8, m.data, "f2")) try ordered.ack(&.{m.ack_id});
+            }
+            for (got.value.messages) |m| {
+                if (std.mem.eql(u8, m.data, "f2")) try ordered.nack(&.{m.ack_id});
+            }
+            try testing.expectEqual(1, b.fake.backlog("p", "ordered"));
+        }
+
+        // Without ordering a key means nothing: all come at once, a nack
+        // brings back the one message, and what was acknowledged stays so.
+        {
+            var got = try plain.pull(.{});
+            defer got.deinit();
+            try testing.expectEqual(published, got.value.messages.len);
+            var nacked: []const u8 = "";
+            for (got.value.messages) |m| {
+                if (std.mem.eql(u8, m.data, "n2")) nacked = m.ack_id else try plain.ack(&.{m.ack_id});
+            }
+            try plain.nack(&.{nacked});
+            try testing.expectEqual(1, b.fake.backlog("p", "plain"));
+            var again = try plain.pull(.{});
+            defer again.deinit();
+            try testing.expectEqual(1, again.value.messages.len);
+            try testing.expectEqualStrings("n2", again.value.messages[0].data);
+        }
+    }
+}
+
+test "ordering with exactly-once delivery: a key gives one message at a time, the next after an ack" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    const orders = b.client.topic("orders");
+    var made = try orders.create(.{});
+    made.deinit();
+    const strict = b.client.subscription("strict");
+    var subscribed = try strict.create(.{ .topic_id = "orders", .enable_message_ordering = true, .enable_exactly_once_delivery = true });
+    subscribed.deinit();
+
+    // As production did on 2026-10-12, of three published together: the
+    // first alone, the second after the first's ack, the second again
+    // after its nack, and the third after the second's ack.
+    var three = try orders.publish(&.{ .{ .data = "m1" }, .{ .data = "m2" }, .{ .data = "m3" } }, .{ .ordering_key = "m" });
+    three.deinit();
+    var free = try orders.publish(&.{ .{ .data = "free1" }, .{ .data = "free2" } }, .{});
+    free.deinit();
+    var other = try orders.publish(&.{ .{ .data = "j1" }, .{ .data = "j2" } }, .{ .ordering_key = "j" });
+    other.deinit();
+    var held: []const u8 = "";
+    {
+        // The first of each key, and every message with none.
+        var got = try strict.pull(.{});
+        defer got.deinit();
+        try testing.expectEqual(4, got.value.messages.len);
+        for (got.value.messages) |m| {
+            if (std.mem.eql(u8, m.data, "m1")) {
+                held = try testing.allocator.dupe(u8, m.ack_id);
+            } else {
+                try testing.expect(std.mem.eql(u8, m.data, "j1") or m.data[0] == 'f');
+                if (m.data[0] == 'f') try strict.ack(&.{m.ack_id});
+            }
+        }
+    }
+    defer testing.allocator.free(held);
+    try testing.expectEqual(5, b.fake.backlog("p", "strict"));
+    try testing.expectEqual(2, b.fake.outstanding("p", "strict"));
+    b.advance(30);
+    try expectNothing(strict);
+    try strict.ack(&.{held});
+    for ([_][]const u8{ "m2", "m2", "m3" }, 0..) |data, round| {
+        var got = try strict.pull(.{});
+        defer got.deinit();
+        try testing.expectEqual(1, got.value.messages.len);
+        try testing.expectEqualStrings(data, got.value.messages[0].data);
+        try expectNothing(strict);
+        if (round == 0) try strict.nack(&.{got.value.messages[0].ack_id}) else try strict.ack(&.{got.value.messages[0].ack_id});
+    }
+    // The other key's first lapses, and comes again alone.
+    try testing.expectEqual(2, b.fake.backlog("p", "strict"));
+    b.advance(30);
+    var again = try strict.pull(.{});
+    defer again.deinit();
+    try testing.expectEqual(1, again.value.messages.len);
+    try testing.expectEqualStrings("j1", again.value.messages[0].data);
+}
+
+test "dead letters: every delivery is an attempt, sent with a policy alone, and after the last the message moves to the dead-letter topic" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    for ([_][]const u8{ "orders", "dead", "ring" }) |id| {
+        var made = try b.client.topic(id).create(.{});
+        made.deinit();
+    }
+    const worker = b.client.subscription("worker");
+    const morgue = b.client.subscription("morgue");
+    for ([_]struct { []const u8, types.SubscriptionConfig }{
+        .{ "worker", .{ .topic_id = "orders", .dead_letter_policy = .{ .topic = "dead" } } },
+        .{ "plain", .{ .topic_id = "orders" } },
+        .{ "morgue", .{ .topic_id = "dead" } },
+        .{ "loop", .{ .topic_id = "ring", .dead_letter_policy = .{ .topic = "ring", .max_delivery_attempts = 6 } } },
+    }) |case| {
+        var made = try b.client.subscription(case[0]).create(case[1]);
+        made.deinit();
+    }
+    b.advance(40);
+    var sent = try b.client.topic("orders").publish(&.{.{ .data = "poison", .attributes = &.{.{ .key = "kind", .value = "order" }} }}, .{ .ordering_key = "o" });
+    sent.deinit();
+    b.advance(2);
+
+    // Nacked each time, as production counted them: 1 to 5. With no
+    // policy no attempt is sent at all.
+    try testing.expect(std.mem.indexOf(u8, (try b.raw(a, .POST, "projects/p/subscriptions/plain:pull", "{\"maxMessages\":1}")).body, "deliveryAttempt") == null);
+    for (1..6) |attempt| {
+        try testing.expectEqual(0, b.fake.backlog("p", "morgue"));
+        var got = try worker.pull(.{});
+        defer got.deinit();
+        try testing.expectEqual(attempt, got.value.messages[0].delivery_attempt);
+        try worker.nack(&.{got.value.messages[0].ack_id});
+    }
+    // After the fifth it is forwarded, and comes here no more.
+    try testing.expectEqual(0, b.fake.backlog("p", "worker"));
+    try expectNothing(worker);
+    try testing.expectEqual(1, b.fake.publishedCount("p", "dead"));
+    {
+        // As production marked one: a new id, its own data and attributes,
+        // and where it came from.
+        var got = try morgue.pull(.{});
+        defer got.deinit();
+        const m = got.value.messages[0];
+        try testing.expectEqualStrings("poison", m.data);
+        try testing.expectEqualStrings("2", m.message_id);
+        try testing.expectEqualStrings("o", m.ordering_key);
+        try testing.expectEqual(5, m.attributes.len);
+        try testing.expectEqualStrings("order", m.attribute("kind").?);
+        try testing.expectEqualStrings("5", m.attribute("CloudPubSubDeadLetterSourceDeliveryCount").?);
+        try testing.expectEqualStrings("worker", m.attribute("CloudPubSubDeadLetterSourceSubscription").?);
+        try testing.expectEqualStrings("p", m.attribute("CloudPubSubDeadLetterSourceSubscriptionProject").?);
+        try testing.expectEqualStrings("1970-01-01T00:00:40Z", m.attribute("CloudPubSubDeadLetterSourceTopicPublishTime").?);
+        // Published when it was forwarded, and delivered like any other.
+        try testing.expectEqualStrings("1970-01-01T00:00:42Z", m.publish_time);
+        try testing.expectEqual(0, m.delivery_attempt);
+        try morgue.ack(&.{m.ack_id});
+    }
+
+    // A lapse is an attempt as a nack is: the fifth lease to run out
+    // forwards the message, at the moment it runs out.
+    var slow = try b.client.topic("orders").publish(&.{.{ .data = "slow" }}, .{});
+    slow.deinit();
+    for (1..6) |attempt| {
+        var got = try worker.pull(.{});
+        defer got.deinit();
+        try testing.expectEqual(attempt, got.value.messages[0].delivery_attempt);
+        b.advance(9);
+        try testing.expectEqual(1, b.fake.backlog("p", "worker"));
+        try testing.expectEqual(0, b.fake.backlog("p", "morgue"));
+        b.advance(1);
+    }
+    // Whatever is asked first after the lapse finds it forwarded.
+    try testing.expectEqual(2, b.fake.publishedCount("p", "dead"));
+    try testing.expectEqual(0, b.fake.backlog("p", "worker"));
+    try testing.expectEqual(1, b.fake.backlog("p", "morgue"));
+    // An ack in time ends it: four attempts and an ack forward nothing.
+    var fine = try b.client.topic("orders").publish(&.{.{ .data = "fine" }}, .{});
+    fine.deinit();
+    for (1..5) |attempt| {
+        var got = try worker.pull(.{});
+        defer got.deinit();
+        try testing.expectEqual(attempt, got.value.messages[0].delivery_attempt);
+        if (attempt < 4) try worker.nack(&.{got.value.messages[0].ack_id}) else try worker.ack(&.{got.value.messages[0].ack_id});
+    }
+    try testing.expectEqual(0, b.fake.backlog("p", "worker"));
+    try testing.expectEqual(2, b.fake.publishedCount("p", "dead"));
+
+    // What time has done is done before a request is served: a publish
+    // that comes after the last lapse gets an id after the dead letter's.
+    var slower = try b.client.topic("orders").publish(&.{.{ .data = "slower" }}, .{});
+    defer slower.deinit();
+    for (1..6) |attempt| {
+        var got = try worker.pull(.{});
+        defer got.deinit();
+        try testing.expectEqual(attempt, got.value.messages[0].delivery_attempt);
+        b.advance(10);
+    }
+    var next = try b.client.topic("orders").publish(&.{.{ .data = "next" }}, .{});
+    defer next.deinit();
+    try testing.expectEqual(try std.fmt.parseInt(u64, slower.value.message_ids[0], 10) + 2, try std.fmt.parseInt(u64, next.value.message_ids[0], 10));
+    {
+        var got = try worker.pull(.{});
+        defer got.deinit();
+        try testing.expectEqualStrings("next", got.value.messages[0].data);
+        try worker.ack(&.{got.value.messages[0].ack_id});
+    }
+    try testing.expectEqual(3, b.fake.publishedCount("p", "dead"));
+
+    // With the dead-letter topic gone the message goes on coming, as
+    // production's did for want of the grants: a sixth time, a seventh.
+    try b.client.topic("dead").delete();
+    var stuck = try b.client.topic("orders").publish(&.{.{ .data = "stuck" }}, .{});
+    stuck.deinit();
+    for (1..8) |attempt| {
+        var got = try worker.pull(.{});
+        defer got.deinit();
+        try testing.expectEqual(attempt, got.value.messages[0].delivery_attempt);
+        try worker.nack(&.{got.value.messages[0].ack_id});
+    }
+    try testing.expectEqual(1, b.fake.backlog("p", "worker"));
+    // A policy names its topic: one made again under the name gets the
+    // next that is released. The old one's subscription gets nothing.
+    var remade = try b.client.topic("dead").create(.{});
+    remade.deinit();
+    try testing.expectEqual(1, b.fake.backlog("p", "worker"));
+    {
+        var got = try worker.pull(.{});
+        defer got.deinit();
+        try testing.expectEqual(8, got.value.messages[0].delivery_attempt);
+        b.advance(10);
+    }
+    try testing.expectEqual(0, b.fake.backlog("p", "worker"));
+    try testing.expectEqual(1, b.fake.publishedCount("p", "dead"));
+    try testing.expectEqual(2, b.fake.backlog("p", "morgue"));
+
+    // A policy set by an update counts the deliveries made before it, and
+    // one taken away sends no more attempts.
+    var late = try b.client.topic("orders").publish(&.{.{ .data = "late" }}, .{});
+    late.deinit();
+    try testing.expectEqual(200, (try b.raw(a, .PATCH, "projects/p/subscriptions/worker", "{\"subscription\":{},\"updateMask\":\"deadLetterPolicy\"}")).status);
+    for (0..6) |_| {
+        var got = try worker.pull(.{});
+        defer got.deinit();
+        try testing.expectEqual(0, got.value.messages[0].delivery_attempt);
+        try worker.nack(&.{got.value.messages[0].ack_id});
+    }
+    try testing.expectEqual(200, (try b.raw(a, .PATCH, "projects/p/subscriptions/worker", "{\"subscription\":{\"deadLetterPolicy\":{\"deadLetterTopic\":\"projects/p/topics/dead\",\"maxDeliveryAttempts\":8}},\"updateMask\":\"deadLetterPolicy\"}")).status);
+    for (7..9) |attempt| {
+        try testing.expectEqual(1, b.fake.backlog("p", "worker"));
+        var got = try worker.pull(.{});
+        defer got.deinit();
+        try testing.expectEqual(attempt, got.value.messages[0].delivery_attempt);
+        try worker.nack(&.{got.value.messages[0].ack_id});
+    }
+    try testing.expectEqual(0, b.fake.backlog("p", "worker"));
+    try testing.expectEqual(2, b.fake.publishedCount("p", "dead"));
+
+    // Dead letters to its own topic, which production takes: the message
+    // comes round again as a new one, counted from one.
+    var round = try b.client.topic("ring").publish(&.{.{ .data = "round" }}, .{});
+    defer round.deinit();
+    const loop = b.client.subscription("loop");
+    for (1..7) |attempt| {
+        var got = try loop.pull(.{});
+        defer got.deinit();
+        try testing.expectEqualStrings(round.value.message_ids[0], got.value.messages[0].message_id);
+        try testing.expectEqual(attempt, got.value.messages[0].delivery_attempt);
+        try loop.nack(&.{got.value.messages[0].ack_id});
+    }
+    try testing.expectEqual(2, b.fake.publishedCount("p", "ring"));
+    try testing.expectEqual(1, b.fake.backlog("p", "loop"));
+    var returned = try loop.pull(.{});
+    defer returned.deinit();
+    try testing.expect(!std.mem.eql(u8, round.value.message_ids[0], returned.value.messages[0].message_id));
+    try testing.expectEqualStrings("round", returned.value.messages[0].data);
+    try testing.expectEqual(1, returned.value.messages[0].delivery_attempt);
+    try testing.expectEqualStrings("6", returned.value.messages[0].attribute("CloudPubSubDeadLetterSourceDeliveryCount").?);
+    try testing.expectEqualStrings("loop", returned.value.messages[0].attribute("CloudPubSubDeadLetterSourceSubscription").?);
+}
+
+test "a retry policy: a message given back or lapsed waits out its backoff, and with ordering holds its key behind it" {
+    var b: Bench = undefined;
+    try b.init(.{ .shuffle = false });
+    defer b.deinit();
+    var made = try b.client.topic("orders").create(.{});
+    made.deinit();
+    const slow = b.client.subscription("slow");
+    const fast = b.client.subscription("fast");
+    const none = b.client.subscription("none");
+    for ([_]struct { []const u8, types.SubscriptionConfig }{
+        .{ "slow", .{ .topic_id = "orders", .retry_policy = .{ .minimum = .fromSeconds(10), .maximum = .fromSeconds(20) } } },
+        .{ "fast", .{ .topic_id = "orders", .retry_policy = .{ .minimum = .zero, .maximum = .fromSeconds(600) } } },
+        .{ "none", .{ .topic_id = "orders" } },
+    }) |case| {
+        var subscribed = try b.client.subscription(case[0]).create(case[1]);
+        subscribed.deinit();
+    }
+    var sent = try b.client.topic("orders").publish(&.{.{ .data = "m" }}, .{});
+    sent.deinit();
+
+    // Without a policy, and with one of no seconds, it comes again at
+    // once. (Production's came about two seconds on, its own delay.)
+    for ([_]@TypeOf(none){ none, fast }) |sub| {
+        for (0..3) |_| {
+            var got = try sub.pull(.{});
+            defer got.deinit();
+            try testing.expectEqual(1, got.value.messages.len);
+            try sub.nack(&.{got.value.messages[0].ack_id});
+        }
+    }
+
+    // 10 to 20 seconds: the minimum after the first delivery, twice that
+    // after the second, and no more than the maximum after the third.
+    for ([_]i64{ 10, 20, 20 }) |backoff| {
+        var got = try slow.pull(.{});
+        defer got.deinit();
+        try testing.expectEqual(1, got.value.messages.len);
+        try slow.nack(&.{got.value.messages[0].ack_id});
+        try expectNothing(slow);
+        b.advance(backoff - 1);
+        try expectNothing(slow);
+        // Waiting, it is held and not out.
+        try testing.expectEqual(1, b.fake.backlog("p", "slow"));
+        try testing.expectEqual(0, b.fake.outstanding("p", "slow"));
+        b.advance(1);
+    }
+    // After a lapse the backoff runs from the lapse, whenever that is
+    // noticed: a 10 second lease, then 20 seconds more.
+    {
+        var got = try slow.pull(.{});
+        defer got.deinit();
+        try testing.expectEqual(1, got.value.messages.len);
+        b.advance(29);
+        try expectNothing(slow);
+        b.advance(1);
+        var again = try slow.pull(.{});
+        defer again.deinit();
+        try testing.expectEqual(1, again.value.messages.len);
+        // An ack with an id of an earlier delivery ends it all the same.
+        try slow.ack(&.{got.value.messages[0].ack_id});
+        try testing.expectEqual(0, b.fake.backlog("p", "slow"));
+    }
+
+    // With ordering, a message waiting out its backoff holds the later
+    // ones of its key behind it, and no other.
+    const ordered = b.client.subscription("ordered");
+    var subscribed = try ordered.create(.{ .topic_id = "orders", .enable_message_ordering = true, .retry_policy = .{ .minimum = .fromSeconds(10), .maximum = .fromSeconds(20) } });
+    subscribed.deinit();
+    var keyed = try b.client.topic("orders").publish(&.{ .{ .data = "r1" }, .{ .data = "r2" } }, .{ .ordering_key = "r" });
+    keyed.deinit();
+    {
+        var got = try ordered.pull(.{});
+        defer got.deinit();
+        try testing.expectEqual(2, got.value.messages.len);
+        try ordered.nack(&.{got.value.messages[0].ack_id});
+        // r2 was taken back with r1, and is not given past it.
+        try expectNothing(ordered);
+        var other = try b.client.topic("orders").publish(&.{.{ .data = "s1" }}, .{ .ordering_key = "s" });
+        other.deinit();
+        var free = try b.client.topic("orders").publish(&.{.{ .data = "free" }}, .{});
+        free.deinit();
+        var unheld = try ordered.pull(.{});
+        defer unheld.deinit();
+        try testing.expectEqual(2, unheld.value.messages.len);
+        try testing.expectEqualStrings("s1", unheld.value.messages[0].data);
+        try testing.expectEqualStrings("free", unheld.value.messages[1].data);
+        b.advance(9);
+        try expectNothing(ordered);
+        b.advance(1);
+        var again = try ordered.pull(.{});
+        defer again.deinit();
+        try testing.expectEqual(2, again.value.messages.len);
+        try testing.expectEqualStrings("r1", again.value.messages[0].data);
+        try testing.expectEqualStrings("r2", again.value.messages[1].data);
+    }
+}
+
+test "a retry policy: a held pull waits a backoff out on the fake's clock" {
+    var b: Bench = undefined;
+    try b.init(.{ .empty_pull_hold = .fromSeconds(30) });
+    defer b.deinit();
+    var made = try b.client.topic("orders").create(.{});
+    made.deinit();
+    const slow = b.client.subscription("slow");
+    var subscribed = try slow.create(.{ .topic_id = "orders", .retry_policy = .{ .minimum = .fromSeconds(10), .maximum = .fromSeconds(20) }, .dead_letter_policy = .{ .topic = "orders" } });
+    subscribed.deinit();
+    var sent = try b.client.topic("orders").publish(&.{.{ .data = "m" }}, .{});
+    sent.deinit();
+    var got = try slow.pull(.{});
+    defer got.deinit();
+    try slow.nack(&.{got.value.messages[0].ack_id});
+    const before = b.clock.now_ns;
+    var again = try slow.pull(.{});
+    defer again.deinit();
+    try testing.expectEqual(1, again.value.messages.len);
+    try testing.expectEqual(2, again.value.messages[0].delivery_attempt);
+    try testing.expectEqual(10 * std.time.ns_per_s, b.clock.now_ns - before);
+    // A lease that lapses while a pull is held is settled as at any other
+    // time: its backoff runs from the lapse, 10 seconds in and 20 long.
+    const then = b.clock.now_ns;
+    var third = try slow.pull(.{});
+    defer third.deinit();
+    try testing.expectEqual(1, third.value.messages.len);
+    try testing.expectEqual(3, third.value.messages[0].delivery_attempt);
+    try testing.expectEqual(30 * std.time.ns_per_s, b.clock.now_ns - then);
+}
+
+test "retention: a message older than the subscription keeps messages is gone, out on a lease or not" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var made = try b.client.topic("orders").create(.{});
+    made.deinit();
+    const brief = b.client.subscription("brief");
+    var first_made = try brief.create(.{ .topic_id = "orders", .message_retention = .fromSeconds(600) });
+    first_made.deinit();
+    var second_made = try b.client.subscription("week").create(.{ .topic_id = "orders" });
+    second_made.deinit();
+    var first = try b.client.topic("orders").publish(&.{.{ .data = "a" }}, .{});
+    first.deinit();
+    b.advance(300);
+    var second = try b.client.topic("orders").publish(&.{.{ .data = "b" }}, .{});
+    second.deinit();
+
+    var got = try brief.pull(.{});
+    defer got.deinit();
+    try testing.expectEqual(2, got.value.messages.len);
+    const a_first: usize = if (std.mem.eql(u8, got.value.messages[0].data, "a")) 0 else 1;
+    try brief.modifyAckDeadline(&.{ got.value.messages[0].ack_id, got.value.messages[1].ack_id }, 600);
+    b.advance(299);
+    try testing.expectEqual(2, b.fake.backlog("p", "brief"));
+    // Ten minutes after it was published the first is gone, though out.
+    b.advance(1);
+    try testing.expectEqual(1, b.fake.backlog("p", "brief"));
+    try testing.expectEqual(1, b.fake.outstanding("p", "brief"));
+    // An ack of it, and a nack, are answered and forgotten.
+    try brief.ack(&.{got.value.messages[a_first].ack_id});
+    try brief.nack(&.{got.value.messages[a_first].ack_id});
+    try testing.expectEqual(1, b.fake.backlog("p", "brief"));
+    // The second, given back, waits; and at its ten minutes is gone too.
+    try brief.nack(&.{got.value.messages[1 - a_first].ack_id});
+    b.advance(299);
+    try testing.expectEqual(1, b.fake.backlog("p", "brief"));
+    b.advance(1);
+    try testing.expectEqual(0, b.fake.backlog("p", "brief"));
+    try expectNothing(brief);
+    // The other subscription keeps its own time: seven days.
+    try testing.expectEqual(2, b.fake.backlog("p", "week"));
+    b.advance(604_800 - 900 - 1);
+    try testing.expectEqual(2, b.fake.backlog("p", "week"));
+    b.advance(1);
+    try testing.expectEqual(1, b.fake.backlog("p", "week"));
+    b.advance(300);
+    try testing.expectEqual(0, b.fake.backlog("p", "week"));
+}
+
+test "exactly-once delivery: an ack or a lease change that comes too late is refused, id by id, in production's words" {
+    var b: Bench = undefined;
+    try b.init(.{ .shuffle = false });
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var made = try b.client.topic("orders").create(.{});
+    made.deinit();
+    const once = b.client.subscription("once");
+    var subscribed = try once.create(.{ .topic_id = "orders", .ack_deadline_seconds = 10, .enable_exactly_once_delivery = true });
+    subscribed.deinit();
+    var sent = try b.client.topic("orders").publish(&.{ .{ .data = "a" }, .{ .data = "b" } }, .{});
+    sent.deinit();
+    const ack = "projects/p/subscriptions/once:acknowledge";
+    const modack = "projects/p/subscriptions/once:modifyAckDeadline";
+    // Production's refusal, whole, 2026-09-27.
+    const refusal = "{{\"error\":{{\"code\":400,\"message\":\"Some acknowledgement ids in the request were invalid. This could be because the acknowledgement ids have expired or the acknowledgement ids were malformed.\",\"status\":\"INVALID_ARGUMENT\",\"details\":[{{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfo\",\"reason\":\"EXACTLY_ONCE_ACKID_FAILURE\",\"domain\":\"pubsub.googleapis.com\",\"metadata\":{{\"{s}\":\"PERMANENT_FAILURE_INVALID_ACK_ID\"}}}}]}}}}";
+
+    var got = try once.pull(.{});
+    defer got.deinit();
+    const id_a = got.value.messages[0].ack_id;
+    const id_b = got.value.messages[1].ack_id;
+    // In time, every call is taken.
+    try once.modifyAckDeadline(&.{id_a}, 600);
+    b.advance(10);
+    // One live id and one lapsed in one ack: refused naming the lapsed
+    // one alone, and the live one was taken.
+    const mixed = try b.raw(a, .POST, ack, try std.fmt.allocPrint(a, "{{\"ackIds\":[\"{s}\",\"{s}\"]}}", .{ id_a, id_b }));
+    try testing.expectEqual(400, mixed.status);
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, refusal, .{id_b}), mixed.body);
+    try testing.expectEqual(1, b.fake.backlog("p", "once"));
+    // A second ack of an acknowledged message is taken.
+    try testing.expectEqualStrings("{}", (try b.raw(a, .POST, ack, try std.fmt.allocPrint(a, "{{\"ackIds\":[\"{s}\"]}}", .{id_a}))).body);
+    // A lease change is not: on an acknowledged message, or on a lapsed
+    // one, to extend it or to give it back.
+    for ([_]struct { []const u8, u32 }{ .{ id_a, 30 }, .{ id_b, 30 }, .{ id_b, 0 } }) |case| {
+        const late = try b.raw(a, .POST, modack, try std.fmt.allocPrint(a, "{{\"ackIds\":[\"{s}\"],\"ackDeadlineSeconds\":{d}}}", .{ case[0], case[1] }));
+        try testing.expectEqual(400, late.status);
+        try testing.expectEqualStrings(try std.fmt.allocPrint(a, refusal, .{case[0]}), late.body);
+    }
+    // An id that is none is refused in the plain words, with no details.
+    try expectRefused(try b.raw(a, .POST, ack, "{\"ackIds\":[\"garbage\"]}"), 400, "INVALID_ARGUMENT", "You have passed an invalid ack ID to the service (ack_id=garbage).");
+    try testing.expectEqual(1, b.fake.backlog("p", "once"));
+
+    // The message comes again under a new id, and the old one is no
+    // longer its id, out though the message is: the client is told which
+    // of its ids were taken.
+    var again = try once.pull(.{});
+    defer again.deinit();
+    try testing.expectEqualStrings("b", again.value.messages[0].data);
+    try testing.expectError(error.InvalidArgument, once.ack(&.{id_b}));
+    try testing.expectError(error.InvalidArgument, once.modifyAckDeadline(&.{id_b}, 30));
+    try testing.expectError(error.InvalidArgument, once.nack(&.{id_b}));
+    try testing.expectEqual(1, b.fake.outstanding("p", "once"));
+    var results: [2]types.AckResult = undefined;
+    try once.ackWithResults(&.{ id_b, again.value.messages[0].ack_id }, &results);
+    try testing.expectEqual(types.AckResult.invalid_ack_id, results[0]);
+    try testing.expectEqual(types.AckResult.ok, results[1]);
+    try testing.expectEqual(0, b.fake.backlog("p", "once"));
+    // Acknowledged, the id that acknowledged it is taken again, and the
+    // id of the earlier delivery is refused as before: production's
+    // answers to both, 2026-10-12.
+    try once.ack(&.{again.value.messages[0].ack_id});
+    try testing.expectError(error.InvalidArgument, once.ack(&.{id_b}));
+    try once.ackWithResults(&.{ again.value.messages[0].ack_id, id_b }, &results);
+    try testing.expectEqual(types.AckResult.ok, results[0]);
+    try testing.expectEqual(types.AckResult.invalid_ack_id, results[1]);
+
+    // An id twice in a request is named once.
+    var third = try b.client.topic("orders").publish(&.{.{ .data = "c" }}, .{});
+    third.deinit();
+    var pulled = try once.pull(.{});
+    defer pulled.deinit();
+    const id_c = pulled.value.messages[0].ack_id;
+    try once.nack(&.{id_c});
+    const twice = try b.raw(a, .POST, ack, try std.fmt.allocPrint(a, "{{\"ackIds\":[\"{s}\",\"{s}\"]}}", .{ id_c, id_c }));
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, refusal, .{id_c}), twice.body);
+    const twice_more = try b.raw(a, .POST, modack, try std.fmt.allocPrint(a, "{{\"ackIds\":[\"{s}\",\"{s}\"],\"ackDeadlineSeconds\":5}}", .{ id_c, id_c }));
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, refusal, .{id_c}), twice_more.body);
+
+    // Without exactly-once delivery the same late calls are answered and
+    // forgotten, as ever.
+    try testing.expectEqual(200, (try b.raw(a, .PATCH, "projects/p/subscriptions/once", "{\"subscription\":{},\"updateMask\":\"enableExactlyOnceDelivery\"}")).status);
+    try once.ack(&.{id_c});
+    try once.modifyAckDeadline(&.{id_c}, 30);
+    try testing.expectEqual(1, b.fake.backlog("p", "once"));
+    try testing.expectEqual(0, b.fake.outstanding("p", "once"));
+}
+
+test "ids of one request: each is judged as the request finds it, before any of them acts" {
+    var b: Bench = undefined;
+    try b.init(.{ .shuffle = false });
+    defer b.deinit();
+    for ([_][]const u8{ "orders", "dead" }) |id| {
+        var made = try b.client.topic(id).create(.{});
+        made.deinit();
+    }
+    const worker = b.client.subscription("worker");
+    var worker_made = try worker.create(.{ .topic_id = "orders", .enable_message_ordering = true, .dead_letter_policy = .{ .topic = "dead" } });
+    worker_made.deinit();
+    var morgue_made = try b.client.subscription("morgue").create(.{ .topic_id = "dead" });
+    morgue_made.deinit();
+
+    // Two of a key nacked in one request, as production took them: the
+    // nack of the first takes the second back with it, and the second's
+    // own nack comes no later for that. Each is counted as given back, so
+    // that after five rounds both have had their attempts, and both move
+    // to the dead-letter topic.
+    var pair = try b.client.topic("orders").publish(&.{ .{ .data = "q1" }, .{ .data = "q2" } }, .{ .ordering_key = "q" });
+    pair.deinit();
+    for (1..6) |attempt| {
+        try testing.expectEqual(0, b.fake.backlog("p", "morgue"));
+        var got = try worker.pull(.{});
+        defer got.deinit();
+        try testing.expectEqual(2, got.value.messages.len);
+        for (got.value.messages, [_][]const u8{ "q1", "q2" }) |m, data| {
+            try testing.expectEqualStrings(data, m.data);
+            try testing.expectEqual(attempt, m.delivery_attempt);
+        }
+        // The first id a second time changes nothing.
+        try worker.nack(&.{ got.value.messages[0].ack_id, got.value.messages[1].ack_id, got.value.messages[0].ack_id });
+        try testing.expectEqual(0, b.fake.outstanding("p", "worker"));
+    }
+    try testing.expectEqual(0, b.fake.backlog("p", "worker"));
+    try testing.expectEqual(2, b.fake.backlog("p", "morgue"));
+}
+
 /// What each subscription should hold, said again in as few lines as it
-/// takes: the fake is held to this after every step of a script.
+/// takes: the fake is held to this after every step of a script. Three
+/// subscriptions, each with rules of its own. The first has none. The
+/// second has ordering, a filter that passes what has no `skip`, and a
+/// retry policy of 5 to 20 seconds. The third has ordering, exactly-once
+/// delivery, and dead letters to the first topic after five attempts.
 const Reference = struct {
-    const Held = struct { id: u64, lease_until: ?i96 = null };
+    const Held = struct { id: u64, lease_until: ?i96 = null, deliveries: u32 = 0, not_before: i96 = 0, acked: bool = false };
+    /// What the rules ask of a message: its ordering key, 0 for none, and
+    /// whether the second subscription's filter stops it.
+    const Sent = struct { key: u8 = 0, skip: bool = false };
     const max_held = 256;
+    const deadline_s = [3]u32{ 10, 20, 10 };
+    const ordered = [3]bool{ false, true, true };
+    const max_attempts = 5;
 
     held: [3][max_held]Held = undefined,
     counts: [3]usize = @splat(0),
     /// Which topic a subscription listens to; null once that topic is gone.
     topic: [3]?u8 = .{ 0, 0, 1 },
-    deadline_s: [3]u32 = .{ 10, 20, 10 },
+    /// By message id.
+    sent: [2 * max_held]Sent = undefined,
+    /// By message id: which delivery's id acknowledged it on the third
+    /// subscription. 0: none has.
+    acknowledged_by: [2 * max_held]u32 = @splat(0),
+    next_id: u64 = 1,
 
-    fn publish(r: *Reference, topic: u8, id: u64) void {
+    /// A message comes to a topic, published or forwarded, and gets the
+    /// next id.
+    fn arrive(r: *Reference, topic: u8, what: Sent) u64 {
+        const id = r.next_id;
+        r.next_id += 1;
+        r.sent[id] = what;
         for (0..3) |s| {
-            if (r.topic[s] != topic) continue;
+            if (r.topic[s] != topic or (s == 1 and what.skip)) continue;
             r.held[s][r.counts[s]] = .{ .id = id };
             r.counts[s] += 1;
         }
+        return id;
     }
 
-    fn find(r: *Reference, s: usize, id: u64) ?*Held {
-        for (r.held[s][0..r.counts[s]]) |*h| if (h.id == id) return h;
+    fn all(r: *Reference, s: usize) []Held {
+        return r.held[s][0..r.counts[s]];
+    }
+
+    fn indexOf(r: *Reference, s: usize, id: u64) ?usize {
+        for (r.all(s), 0..) |h, i| {
+            if (h.id == id) return i;
+        }
         return null;
     }
 
-    fn out(h: Held, now: i96) bool {
-        return if (h.lease_until) |until| until > now else false;
+    /// The key that orders it on subscription `s`, or 0.
+    fn key(r: *const Reference, s: usize, h: Held) u8 {
+        return if (ordered[s]) r.sent[h.id].key else 0;
     }
 
-    fn ready(r: *const Reference, s: usize, now: i96) usize {
-        var n: usize = 0;
-        for (r.held[s][0..r.counts[s]]) |h| n += @intFromBool(!out(h, now));
-        return n;
-    }
-
-    fn outstanding(r: *const Reference, s: usize, now: i96) usize {
-        return r.counts[s] - r.ready(s, now);
-    }
-
-    fn ack(r: *Reference, s: usize, id: u64, now: i96) void {
-        const h = r.find(s, id) orelse return;
-        if (!out(h.*, now)) return;
-        h.* = r.held[s][r.counts[s] - 1];
+    fn remove(r: *Reference, s: usize, index: usize) void {
+        const held = r.all(s);
+        std.mem.copyForwards(Held, held[index .. held.len - 1], held[index + 1 ..]);
         r.counts[s] -= 1;
     }
 
-    fn modify(r: *Reference, s: usize, id: u64, seconds: u32, now: i96) void {
-        const h = r.find(s, id) orelse return;
-        if (!out(h.*, now)) return;
-        h.lease_until = if (seconds == 0) null else now + @as(i96, seconds) * std.time.ns_per_s;
+    /// A delivery over with no ack, by a nack or a lapse, at `at`. True
+    /// when the message moved on to the dead-letter topic.
+    fn release(r: *Reference, s: usize, index: usize, at: i96) bool {
+        const h = r.held[s][index];
+        const gone = s == 2 and h.deliveries >= max_attempts;
+        if (gone) {
+            r.remove(s, index);
+            _ = r.arrive(0, r.sent[h.id]);
+        } else {
+            r.held[s][index].lease_until = null;
+            const doublings: u5 = @intCast(@min(h.deliveries - 1, 3));
+            if (s == 1) r.held[s][index].not_before = at + @as(i96, @min(20, @as(u32, 5) << doublings)) * std.time.ns_per_s;
+        }
+        // The later ones of its key come back with it.
+        const k = r.key(s, h);
+        if (k != 0) for (r.all(s)[index + @intFromBool(!gone) ..]) |*later| {
+            if (r.key(s, later.*) != k) continue;
+            later.lease_until = null;
+            later.acked = false;
+        };
+        return gone;
+    }
+
+    /// Ends every lease that has run out by `now`: the subscriptions by
+    /// name, each one's messages as they came.
+    fn settle(r: *Reference, now: i96) void {
+        for (0..3) |s| {
+            var i: usize = 0;
+            while (i < r.counts[s]) {
+                if (r.held[s][i].lease_until) |until| {
+                    if (until <= now and r.release(s, i, until)) continue;
+                }
+                i += 1;
+            }
+        }
+    }
+
+    /// Whether a pull may give it at `now`, to which all is settled.
+    fn ready(r: *Reference, s: usize, index: usize, now: i96) bool {
+        const h = r.held[s][index];
+        if (h.acked or h.lease_until != null or h.not_before > now) return false;
+        const k = r.key(s, h);
+        if (k == 0) return true;
+        // A key gives nothing while one of its messages is out.
+        for (r.all(s)) |e| {
+            if (r.key(s, e) == k and e.lease_until != null) return false;
+        }
+        // Nor does one come past an earlier one of its key that waits out
+        // a backoff. With exactly-once delivery, the third subscription's,
+        // none comes past an earlier one at all.
+        for (r.all(s)[0..index]) |e| {
+            if (r.key(s, e) == k and !e.acked and (s == 2 or e.not_before > now)) return false;
+        }
+        return true;
+    }
+
+    /// Which of subscription `s` a pull may give at `now`, and how many.
+    fn readySet(r: *Reference, s: usize, now: i96, set: *[max_held]bool) usize {
+        var n: usize = 0;
+        for (0..r.counts[s]) |i| {
+            set[i] = r.ready(s, i, now);
+            n += @intFromBool(set[i]);
+        }
+        return n;
+    }
+
+    fn backlog(r: *Reference, s: usize) usize {
+        var n: usize = 0;
+        for (r.all(s)) |h| n += @intFromBool(!h.acked);
+        return n;
+    }
+
+    fn outstanding(r: *Reference, s: usize) usize {
+        var n: usize = 0;
+        for (r.all(s)) |h| n += @intFromBool(h.lease_until != null);
+        return n;
+    }
+
+    /// Whether the id of delivery `attempt` may still act on it: it is
+    /// out, and with exactly-once delivery this is that delivery.
+    fn live(s: usize, h: Held, attempt: u32) bool {
+        return h.lease_until != null and (s != 2 or attempt == h.deliveries);
+    }
+
+    /// An ack. False when the subscription refuses it.
+    fn ack(r: *Reference, s: usize, id: u64, attempt: u32) bool {
+        // Gone: with exactly-once delivery taken again only with the id
+        // that acknowledged it.
+        const index = r.indexOf(s, id) orelse return s != 2 or r.acknowledged_by[id] == attempt;
+        const h = &r.held[s][index];
+        if (h.acked) return true;
+        if (!live(s, h.*, attempt)) return s != 2;
+        if (s == 2) r.acknowledged_by[id] = attempt;
+        const k = r.key(s, h.*);
+        if (k == 0) {
+            r.remove(s, index);
+            return true;
+        }
+        // Kept while an earlier one of its key is not acknowledged.
+        h.acked = true;
+        h.lease_until = null;
+        var i: usize = 0;
+        while (i < r.counts[s]) {
+            const e = r.held[s][i];
+            if (r.key(s, e) != k) {
+                i += 1;
+            } else if (e.acked) r.remove(s, i) else break;
+        }
+        return true;
+    }
+
+    /// A lease change, a nack when `seconds` is 0. False when refused.
+    fn modify(r: *Reference, s: usize, id: u64, attempt: u32, seconds: u32, now: i96) bool {
+        const index = r.indexOf(s, id) orelse return s != 2;
+        const h = &r.held[s][index];
+        if (h.acked or !live(s, h.*, attempt)) return s != 2;
+        if (seconds == 0) {
+            _ = r.release(s, index, now);
+        } else h.lease_until = now + @as(i96, seconds) * std.time.ns_per_s;
+        return true;
     }
 };
 
 const sub_ids = [3][]const u8{ "sub0", "sub1", "sub2" };
 const topic_ids = [2][]const u8{ "top0", "top1" };
+const key_names = [3]?[]const u8{ null, "a", "b" };
+
+/// Makes subscription `s` of the model on `topic`, with its rules.
+fn makeModelSubscription(b: *Bench, s: usize, topic: u8) !void {
+    var made = try b.client.subscription(sub_ids[s]).create(switch (s) {
+        0 => .{ .topic_id = topic_ids[topic], .ack_deadline_seconds = Reference.deadline_s[0] },
+        1 => .{
+            .topic_id = topic_ids[topic],
+            .ack_deadline_seconds = Reference.deadline_s[1],
+            .enable_message_ordering = true,
+            .filter = "NOT attributes:skip",
+            .retry_policy = .{ .minimum = .fromSeconds(5), .maximum = .fromSeconds(20) },
+        },
+        else => .{
+            .topic_id = topic_ids[topic],
+            .ack_deadline_seconds = Reference.deadline_s[2],
+            .enable_message_ordering = true,
+            .enable_exactly_once_delivery = true,
+            .dead_letter_policy = .{ .topic = topic_ids[0], .max_delivery_attempts = Reference.max_attempts },
+        },
+    });
+    made.deinit();
+}
+
+/// One pull of the model: as many as the reference has ready, up to
+/// `max`, each of them ready, and a key's in their order. Marks them out.
+fn modelPull(b: *Bench, ref: *Reference, s: usize, max: u32, deliveries: *std.ArrayList(ModelDelivery), a: Allocator, incarnation: u32) !usize {
+    const now = b.clock.now_ns;
+    var was_ready: [Reference.max_held]bool = undefined;
+    const ready = ref.readySet(s, now, &was_ready);
+    var got = try b.client.subscription(sub_ids[s]).pull(.{ .max_messages = max });
+    defer got.deinit();
+    // No fewer than it has ready, up to what was asked.
+    try testing.expectEqual(@min(max, ready), got.value.messages.len);
+    for (got.value.messages) |m| {
+        const id = try std.fmt.parseInt(u64, m.message_id, 10);
+        // Never one it does not hold, and never one that is out,
+        // acknowledged, waiting out a backoff, or behind another of its
+        // key.
+        const index = ref.indexOf(s, id) orelse return error.TestUnexpectedMessage;
+        try testing.expect(was_ready[index]);
+        const held = &ref.held[s][index];
+        try testing.expectEqual(null, held.lease_until);
+        // In its key's order: every earlier one of the key that was ready
+        // came before it in this pull.
+        const k = ref.key(s, held.*);
+        if (k != 0) for (ref.all(s)[0..index], was_ready[0..index]) |e, e_ready| {
+            if (ref.key(s, e) == k and e_ready) try testing.expect(e.lease_until != null);
+        };
+        held.lease_until = now + @as(i96, Reference.deadline_s[s]) * std.time.ns_per_s;
+        held.deliveries += 1;
+        // The attempt is sent with a dead-letter policy alone.
+        try testing.expectEqual(if (s == 2) held.deliveries else 0, m.delivery_attempt);
+        try testing.expectEqualStrings(key_names[ref.sent[id].key] orelse "", m.ordering_key);
+        try testing.expectEqual(ref.sent[id].skip, m.attribute("skip") != null);
+        try deliveries.append(a, .{ .sub = s, .incarnation = incarnation, .id = id, .attempt = held.deliveries, .ack_id = try a.dupe(u8, m.ack_id) });
+    }
+    return got.value.messages.len;
+}
+
+/// Every delivery's ack id, with the subscription's incarnation then and
+/// which delivery of the message it was.
+const ModelDelivery = struct { sub: usize, incarnation: u32, id: u64, attempt: u32, ack_id: []const u8 };
 
 fn modelProperty(_: void, input: []const u8) !void {
     var g: test_util.ByteGen = .init(input);
@@ -2392,13 +4090,8 @@ fn modelProperty(_: void, input: []const u8) !void {
         var made = try b.client.topic(id).create(.{});
         made.deinit();
     }
-    for (sub_ids, 0..) |id, s| {
-        var made = try b.client.subscription(id).create(.{ .topic_id = topic_ids[ref.topic[s].?], .ack_deadline_seconds = ref.deadline_s[s] });
-        made.deinit();
-    }
-    // Every delivery's ack id, with the subscription's incarnation then.
-    const Delivery = struct { sub: usize, incarnation: u32, id: u64, ack_id: []const u8 };
-    var deliveries: std.ArrayList(Delivery) = .empty;
+    for (0..3) |s| try makeModelSubscription(&b, s, ref.topic[s].?);
+    var deliveries: std.ArrayList(ModelDelivery) = .empty;
     var incarnation: [3]u32 = @splat(0);
     var published: usize = 0;
 
@@ -2409,33 +4102,27 @@ fn modelProperty(_: void, input: []const u8) !void {
             0, 1 => {
                 const topic = g.intRange(u8, 0, 1);
                 const count = g.intRange(u8, 1, 3);
+                // One ordering key a request, as production has it.
+                const k = g.intRange(u8, 0, 2);
                 if (published + count > Reference.max_held / 2) continue;
                 var messages: [3]types.Message = undefined;
                 var bufs: [3][8]u8 = undefined;
-                for (messages[0..count], bufs[0..count]) |*m, *buf| {
-                    m.* = .{ .data = try std.fmt.bufPrint(buf, "m{d}", .{published}) };
+                var skips: [3]bool = undefined;
+                for (messages[0..count], bufs[0..count], skips[0..count]) |*m, *buf, *skip| {
+                    skip.* = g.boolean();
+                    m.* = .{ .data = try std.fmt.bufPrint(buf, "m{d}", .{published}), .attributes = if (skip.*) &.{.{ .key = "skip", .value = "1" }} else &.{} };
                     published += 1;
                 }
-                var sent = try b.client.topic(topic_ids[topic]).publish(messages[0..count], .{});
+                var sent = try b.client.topic(topic_ids[topic]).publish(messages[0..count], .{ .ordering_key = key_names[k] });
                 defer sent.deinit();
-                for (sent.value.message_ids) |text| ref.publish(topic, try std.fmt.parseInt(u64, text, 10));
+                // Ids in order, the dead letters' among them.
+                for (sent.value.message_ids, skips[0..count]) |text, skip| {
+                    try testing.expectEqual(ref.arrive(topic, .{ .key = k, .skip = skip }), try std.fmt.parseInt(u64, text, 10));
+                }
             },
             2, 3, 4 => {
                 const s = g.intRange(u8, 0, 2);
-                const max = g.intRange(u8, 1, 4);
-                var got = try b.client.subscription(sub_ids[s]).pull(.{ .max_messages = max });
-                defer got.deinit();
-                // As many as it has ready, up to what was asked: no fewer.
-                try testing.expectEqual(@min(max, ref.ready(s, now)), got.value.messages.len);
-                for (got.value.messages) |m| {
-                    const id = try std.fmt.parseInt(u64, m.message_id, 10);
-                    // Never one it does not hold, and never one that is
-                    // out on a live lease.
-                    const held = ref.find(s, id) orelse return error.TestUnexpectedMessage;
-                    try testing.expect(!Reference.out(held.*, now));
-                    held.lease_until = now + @as(i96, ref.deadline_s[s]) * std.time.ns_per_s;
-                    try deliveries.append(a, .{ .sub = s, .incarnation = incarnation[s], .id = id, .ack_id = try a.dupe(u8, m.ack_id) });
-                }
+                _ = try modelPull(&b, &ref, s, g.intRange(u8, 1, 4), &deliveries, a, incarnation[s]);
             },
             5, 6, 7 => |op| {
                 if (deliveries.items.len == 0) continue;
@@ -2443,7 +4130,7 @@ fn modelProperty(_: void, input: []const u8) !void {
                 const sub = b.client.subscription(sub_ids[d.sub]);
                 const seconds: u32 = switch (op) {
                     6 => 0,
-                    else => g.pick(u32, &.{ 5, 30, 600 }),
+                    else => ([_]u32{ 5, 30, 600 })[g.intRange(u8, 0, 2)],
                 };
                 const result = if (op == 5) sub.ack(&.{d.ack_id}) else sub.modifyAckDeadline(&.{d.ack_id}, seconds);
                 // An id from before the subscription was made again is
@@ -2452,24 +4139,29 @@ fn modelProperty(_: void, input: []const u8) !void {
                     try testing.expectError(error.InvalidArgument, result);
                     continue;
                 }
-                try result;
-                if (op == 5) ref.ack(d.sub, d.id, now) else ref.modify(d.sub, d.id, seconds, now);
+                // Refused only with exactly-once delivery, when it comes
+                // too late.
+                const taken = if (op == 5) ref.ack(d.sub, d.id, d.attempt) else ref.modify(d.sub, d.id, d.attempt, seconds, now);
+                if (taken) try result else try testing.expectError(error.InvalidArgument, result);
             },
-            8 => b.advance(g.intRange(u8, 1, 15)),
+            8 => {
+                b.advance(g.intRange(u8, 1, 15));
+                ref.settle(b.clock.now_ns);
+            },
             else => switch (g.intRange(u8, 0, 3)) {
                 // A subscription deleted and made again: it holds nothing.
                 0, 1 => {
                     const s = g.intRange(u8, 0, 2);
                     const topic = g.intRange(u8, 0, 1);
                     try b.client.subscription(sub_ids[s]).delete();
-                    var made = try b.client.subscription(sub_ids[s]).create(.{ .topic_id = topic_ids[topic], .ack_deadline_seconds = ref.deadline_s[s] });
-                    made.deinit();
+                    try makeModelSubscription(&b, s, topic);
                     ref.counts[s] = 0;
                     ref.topic[s] = topic;
                     incarnation[s] += 1;
                 },
                 // A topic deleted and made again: its subscriptions keep
-                // what they hold, and get nothing more.
+                // what they hold, and get nothing more. Dead letters go
+                // to the one that has the name now.
                 else => {
                     const topic = g.intRange(u8, 0, 1);
                     try b.client.topic(topic_ids[topic]).delete();
@@ -2482,31 +4174,32 @@ fn modelProperty(_: void, input: []const u8) !void {
             },
         }
         for (sub_ids, 0..) |id, s| {
-            try testing.expectEqual(ref.counts[s], b.fake.backlog("p", id));
-            try testing.expectEqual(ref.outstanding(s, b.clock.now_ns), b.fake.outstanding("p", id));
+            try testing.expectEqual(ref.backlog(s), b.fake.backlog("p", id));
+            try testing.expectEqual(ref.outstanding(s), b.fake.outstanding("p", id));
         }
     }
 
-    // In the end: every lease lapses, and each subscription gives exactly
-    // what it should hold, once, and then nothing.
-    b.advance(601);
+    // In the end: every lease lapses, of 600 seconds at most, and then
+    // every backoff runs out, of 20. Each subscription gives exactly what
+    // it should hold, a key's in their order, each acknowledged as it
+    // comes, until it holds nothing.
+    b.advance(600 + 20 + 1);
+    ref.settle(b.clock.now_ns);
     for (sub_ids, 0..) |id, s| {
-        var left = ref.counts[s];
-        while (left > 0) {
-            var got = try b.client.subscription(id).pull(.{ .max_messages = 1000 });
-            defer got.deinit();
-            try testing.expectEqual(left, got.value.messages.len);
-            for (got.value.messages) |m| {
-                const held = ref.find(s, try std.fmt.parseInt(u64, m.message_id, 10)) orelse return error.TestUnexpectedMessage;
-                // Once each: one already seen here is marked.
-                const seen_now = std.math.maxInt(i96);
-                try testing.expect(held.lease_until != seen_now);
-                held.lease_until = seen_now;
-                try b.client.subscription(id).ack(&.{m.ack_id});
-                left -= 1;
+        const sub = b.client.subscription(id);
+        try testing.expectEqual(ref.counts[s], b.fake.backlog("p", id));
+        while (ref.counts[s] > 0) {
+            const before = deliveries.items.len;
+            // Each round takes at least one away: with exactly-once
+            // delivery a key gives one message a round.
+            try testing.expect(try modelPull(&b, &ref, s, 1000, &deliveries, a, incarnation[s]) > 0);
+            for (deliveries.items[before..]) |d| {
+                try sub.ack(&.{d.ack_id});
+                try testing.expect(ref.ack(s, d.id, d.attempt));
             }
         }
         try testing.expectEqual(0, b.fake.backlog("p", id));
+        try expectNothing(sub);
     }
 }
 
@@ -2517,19 +4210,47 @@ fn modelProperty(_: void, input: []const u8) !void {
 
 test "fake property: after any script of calls each subscription holds exactly what a reference says" {
     try test_util.fuzzBytes({}, modelProperty, .{
+        // A script is a byte for the order of pulls, and then steps: a
+        // publish (0, topic, count less one, key, a byte a message for
+        // `skip`), a pull (2, subscription, most less one), an ack, a
+        // nack or a lease change of a delivery made so far (5, 6 or 7,
+        // two bytes of which, and for 7 how long), the clock moved (8,
+        // seconds less one), a subscription made again (9, 0, which, on
+        // which topic) or a topic (9, 2, which).
         .corpus = &.{
             "",
             // Publish, pull, let the lease lapse, ack late, pull again, ack.
-            "\x00\x00\x00\x00\x02\x00\x03\x08\x0b\x05\x00\x00\x02\x00\x03\x05\x00\x00",
-            // Publish to both, pull from all three, nack one, extend one.
-            "\x01\x00\x00\x02\x00\x01\x02\x02\x00\x03\x03\x01\x03\x04\x02\x03\x06\x00\x00\x07\x00\x01\x01\x08\x1e\x02\x00\x03",
+            "\x00\x00\x00\x00\x00\x00\x02\x00\x03\x08\x0b\x05\x00\x00\x02\x00\x03\x05\x00\x00",
+            // Dead letters: one message to the third subscription, nacked
+            // five times, then pulled from the first and acknowledged.
+            "\x00\x00\x01\x00\x01\x00\x02\x02\x00\x06\x00\x00\x02\x02\x00\x06\x00\x01\x02\x02\x00\x06\x00\x02\x02\x02\x00\x06\x00\x03\x02\x02\x00\x06\x00\x04\x02\x00\x03\x05\x00\x05",
+            // Ordering with a backoff: three of a key to the second
+            // subscription, the third acknowledged and the first nacked,
+            // nothing for five seconds, then all three again.
+            "\x00\x00\x00\x02\x02\x00\x00\x00\x02\x01\x03\x05\x00\x02\x06\x00\x00\x02\x01\x03\x08\x04\x02\x01\x03",
+            // Exactly-once: a late ack refused, the message again, its old
+            // id refused and its new one taken, then a lease change on it.
+            "\x00\x00\x01\x00\x00\x00\x02\x02\x00\x08\x09\x05\x00\x00\x02\x02\x00\x05\x00\x00\x05\x00\x01\x07\x00\x01\x00",
+            // Ordering with exactly-once: of two of a key the second comes
+            // only when the first is acknowledged, and again when nacked.
+            "\x00\x00\x01\x01\x01\x00\x00\x02\x02\x03\x02\x02\x03\x05\x00\x00\x02\x02\x03\x06\x00\x01\x02\x02\x03\x05\x00\x02",
+            // Ordering alone: a second of a key, published while the first
+            // is out, waits for the first's ack.
+            "\x00\x00\x00\x00\x02\x00\x02\x01\x00\x00\x00\x00\x02\x00\x02\x01\x03\x05\x00\x00\x02\x01\x03",
+            // A filter: of two messages the second subscription gets one.
+            "\x01\x00\x00\x01\x00\x01\x00\x02\x01\x03\x02\x00\x03",
             // A subscription made again, then an old id.
-            "\x01\x00\x00\x00\x02\x00\x02\x09\x00\x00\x00\x05\x00\x00\x00\x00\x00\x02\x00\x02",
-            // A topic deleted and made again under a subscription.
-            "\x01\x00\x00\x01\x09\x02\x00\x00\x00\x00\x02\x02\x00\x03\x02\x01\x03",
+            "\x00\x00\x00\x00\x00\x00\x02\x00\x00\x09\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00",
+            // The dead-letter topic made again: five nacks forward to the
+            // new one, where no subscription of the old listens. Then the
+            // other topic made again under the third subscription.
+            "\x00\x00\x01\x00\x00\x00\x09\x02\x00\x02\x02\x00\x06\x00\x00\x02\x02\x00\x06\x00\x01\x02\x02\x00\x06\x00\x02\x02\x02\x00\x06\x00\x03\x02\x02\x00\x06\x00\x04\x02\x00\x03\x09\x02\x01\x00\x01\x00\x00\x00\x02\x02\x03",
+            // Found by the random runs: a backoff still running when the
+            // last lease has lapsed, with later messages of its key behind.
+            "\xfa\x33\xa2\x88\xe9\x5a\xc3\xa6\x7a\xa3\xb1\x6b\x59\xd6\xa7\x86\xf8\x48\x15\xae\x08\x17\xbe\xdf\xb0\xc2\x11\x8f",
         },
         .random_runs = 400,
-        .max_len = 160,
+        .max_len = 240,
     });
 }
 
@@ -2544,7 +4265,8 @@ fn arbitraryRequest(_: void, input: []const u8) !void {
     const a = scratch.allocator();
     try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/topics/orders", "{}")).status);
     try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/subscriptions/worker", "{\"topic\":\"projects/p/topics/orders\"}")).status);
-    try testing.expectEqual(200, (try b.raw(a, .POST, "projects/p/topics/orders:publish", "{\"messages\":[{\"data\":\"eA==\"}]}")).status);
+    try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/p/subscriptions/rules", "{\"topic\":\"projects/p/topics/orders\",\"enableMessageOrdering\":true,\"enableExactlyOnceDelivery\":true,\"filter\":\"attributes:k OR NOT attributes:k\",\"deadLetterPolicy\":{\"deadLetterTopic\":\"projects/p/topics/orders\"},\"retryPolicy\":{}}")).status);
+    try testing.expectEqual(200, (try b.raw(a, .POST, "projects/p/topics/orders:publish", "{\"messages\":[{\"data\":\"eA==\",\"orderingKey\":\"o\"}]}")).status);
     const paths = [_][]const u8{
         "projects/p/topics",                                 "projects/p/topics/orders",
         "projects/p/topics/orders:publish",                  "projects/p/topics/orders/subscriptions",
@@ -2552,12 +4274,17 @@ fn arbitraryRequest(_: void, input: []const u8) !void {
         "projects/p/subscriptions/worker:pull",              "projects/p/subscriptions/worker:acknowledge",
         "projects/p/subscriptions/worker:modifyAckDeadline", "projects/p/topics/new",
         "projects/p/subscriptions/new",                      "projects/p/topics?pageSize=1&pageToken=",
+        "projects/p/subscriptions/rules",                    "projects/p/subscriptions/rules:pull",
+        "projects/p/subscriptions/rules:acknowledge",        "projects/p/subscriptions/rules:modifyAckDeadline",
     };
     const bodies = [_][]const u8{
-        "{\"messages\":[{\"data\":\"", "{\"topic\":\"projects/p/topics/orders\",",
-        "{\"subscription\":{",         "{\"topic\":{",
-        "{\"ackIds\":[\"",             "{\"maxMessages\":",
-        "{\"updateMask\":\"",          "",
+        "{\"messages\":[{\"data\":\"",                                    "{\"topic\":\"projects/p/topics/orders\",",
+        "{\"subscription\":{",                                            "{\"topic\":{",
+        "{\"ackIds\":[\"",                                                "{\"maxMessages\":",
+        "{\"updateMask\":\"",                                             "",
+        "{\"topic\":\"projects/p/topics/orders\",\"filter\":\"",          "{\"topic\":\"projects/p/topics/orders\",\"deadLetterPolicy\":{",
+        "{\"topic\":\"projects/p/topics/orders\",\"retryPolicy\":{",      "{\"maxMessages\":3}",
+        "{\"messages\":[{\"orderingKey\":\"o\",\"attributes\":{\"k\":\"", "{\"ackIds\":[\"FAKE",
     };
     for (0..8) |_| {
         const method = g.pick(tp.Method, &.{ .GET, .PUT, .POST, .PATCH, .DELETE });
@@ -2622,6 +4349,46 @@ fn sessionAllocations(gpa: Allocator) !void {
         }
     }
     try testing.expectEqual(0, fake.backlog("p", "worker"));
+
+    // A subscription with every rule: a filter read and kept, a key's
+    // messages pulled in order, and five nacks that make dead letters.
+    const rules = [_]struct { tp.Method, []const u8, []const u8 }{
+        .{ .PUT, "topics/dead", "{}" },
+        .{ .PUT, "subscriptions/rules", "{\"topic\":\"projects/p/topics/orders\",\"enableMessageOrdering\":true,\"filter\":\"attributes:k OR NOT (hasPrefix(attributes.\\\"a b\\\", \\\"c\\\\n\\\") AND attributes.d != \\\"e\\\")\",\"deadLetterPolicy\":{\"deadLetterTopic\":\"projects/p/topics/dead\"},\"retryPolicy\":{\"minimumBackoff\":\"0s\"}}" },
+        .{ .PUT, "subscriptions/morgue", "{\"topic\":\"projects/p/topics/dead\",\"filter\":\"attributes.CloudPubSubDeadLetterSourceSubscription = \\\"rules\\\"\"}" },
+        .{ .PUT, "subscriptions/bad", "{\"topic\":\"projects/p/topics/orders\",\"filter\":\"attributes.k = \\\"v\\\" AND\"}" },
+        .{ .PATCH, "subscriptions/rules", "{\"subscription\":{\"deadLetterPolicy\":{\"deadLetterTopic\":\"projects/p/topics/dead\",\"maxDeliveryAttempts\":5},\"retryPolicy\":{\"maximumBackoff\":\"0s\",\"minimumBackoff\":\"0s\"}},\"updateMask\":\"deadLetterPolicy,retryPolicy,enableExactlyOnceDelivery\"}" },
+        .{ .POST, "topics/orders:publish", "{\"messages\":[{\"data\":\"YQ==\",\"attributes\":{\"k\":\"v\"},\"orderingKey\":\"o\"},{\"data\":\"Yg==\",\"orderingKey\":\"o\"}]}" },
+    };
+    for (rules) |step| {
+        const method, const path, const body = step;
+        const reply = try fake.serve(method, try std.fmt.allocPrint(a, "{s}{s}", .{ base, path }), body, a);
+        try testing.expectEqual(@as(u16, if (std.mem.endsWith(u8, path, "/bad")) 400 else 200), reply.status);
+    }
+    var last: []const u8 = "";
+    for (0..5) |_| {
+        const reply = try fake.serve(.POST, base ++ "subscriptions/rules:pull", "{\"maxMessages\":5}", a);
+        const Wire = struct { receivedMessages: []const struct { ackId: []const u8 } = &.{} };
+        const got = try std.json.parseFromSliceLeaky(Wire, a, reply.body, .{ .ignore_unknown_fields = true });
+        try testing.expectEqual(2, got.receivedMessages.len);
+        // With no seconds said, a nack.
+        last = try std.fmt.allocPrint(a, "{{\"ackIds\":[\"{s}\",\"{s}\"]}}", .{ got.receivedMessages[0].ackId, got.receivedMessages[1].ackId });
+        try testing.expectEqual(200, (try fake.serve(.POST, base ++ "subscriptions/rules:modifyAckDeadline", last, a)).status);
+    }
+    // Forwarded, both.
+    try testing.expectEqual(0, fake.backlog("p", "rules"));
+    try testing.expectEqual(2, fake.backlog("p", "morgue"));
+    // With exactly-once delivery: an ack that takes, the same again, and
+    // a lease change on what is gone, which is refused, id by id.
+    try testing.expectEqual(200, (try fake.serve(.PATCH, base ++ "subscriptions/morgue", "{\"subscription\":{\"enableExactlyOnceDelivery\":true},\"updateMask\":\"enableExactlyOnceDelivery\"}", a)).status);
+    const dead = try fake.serve(.POST, base ++ "subscriptions/morgue:pull", "{\"maxMessages\":5}", a);
+    const Dead = struct { receivedMessages: []const struct { ackId: []const u8 } };
+    const letters = try std.json.parseFromSliceLeaky(Dead, a, dead.body, .{ .ignore_unknown_fields = true });
+    try testing.expectEqual(2, letters.receivedMessages.len);
+    const both = try std.fmt.allocPrint(a, "{{\"ackIds\":[\"{s}\",\"{s}\"]}}", .{ letters.receivedMessages[0].ackId, letters.receivedMessages[1].ackId });
+    for (0..2) |_| try testing.expectEqual(200, (try fake.serve(.POST, base ++ "subscriptions/morgue:acknowledge", both, a)).status);
+    try testing.expectEqual(400, (try fake.serve(.POST, base ++ "subscriptions/morgue:modifyAckDeadline", both, a)).status);
+    try testing.expectEqual(0, fake.backlog("p", "morgue"));
 }
 
 test "allocation failures: a session of every call leaks nothing and breaks nothing" {
