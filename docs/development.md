@@ -103,6 +103,29 @@ PUBSUB_TEST_PROJECT=my-project PUBSUB_TEST_TOKEN=$(gcloud auth print-access-toke
     zig build test-integration
 ```
 
+The unit test that holds `FakePubSub` to the emulator, over random
+scripts of 400 calls, eight seeds; it skips without the emulator, and
+`PUBSUB_DIFF_SEED` replays one seed:
+
+```sh
+PUBSUB_EMULATOR_HOST=127.0.0.1:8085 \
+    zig build test -Dmodule=pubsub "-Dtest-filter=emulator differential"
+```
+
+And the one that holds the fake's reference to production: one script
+of the fake's model property, replayed against a real project, slowly,
+because production answers in its own time. `PUBSUB_REPLAY` names the
+script: `corpus:3` for the fourth of the property's own, `seed:17` for
+240 random bytes, `hex:...` for the bytes themselves. It makes two
+topics, three subscriptions and up to three snapshots named
+`zigps-f-*`, deletes them, and grants nothing. A script takes from two
+minutes to half an hour, most of it waiting; a token lasts an hour.
+
+```sh
+PUBSUB_REPLAY=seed:17 PUBSUB_TEST_PROJECT=my-project PUBSUB_TEST_TOKEN=$(gcloud auth print-access-token) \
+    zig build test -Dmodule=pubsub "-Dtest-filter=production replay"
+```
+
 ### auth
 
 Against Google's token endpoint, with the file gcloud's login wrote, and

@@ -35,9 +35,11 @@ including the ones that did not change.
   everything holds at once. It is held to production by the answers
   production gave, kept as its tests' fixtures; by a model property over
   random scripts of calls; by a differential test against the emulator
-  in CI, over what the two were measured to agree on; and by this
+  in CI, over what the two were measured to agree on; by this
   library's own `Publisher` and `Subscriber` running through it with
-  faults on every kind of call. New guide: `docs/pubsub/testing.md`;
+  faults on every kind of call; and by the property's scripts replayed
+  against a real project, slowly, with the same reference saying what
+  each subscription should hold. New guide: `docs/pubsub/testing.md`;
   new example: `examples/in_memory.zig`.
 - pubsub: measured in production while building it, 2026-10-12, and now
   in the guides. A snapshot of a subscription whose topic is deleted is
@@ -49,6 +51,22 @@ including the ones that did not change.
   snapshot gives a subscription only messages it was itself sent, where
   in production a subscription made after the snapshot's messages gets
   them.
+- pubsub: measured in production by that replay, 2026-10-13, and now in
+  the guides.
+  - A seek ends no ack id. One from before it goes on naming its
+    message: once the message is out again an ack by the old id
+    acknowledges it and a nack gives it back. With exactly-once delivery
+    the old id is answered for as long as the lease it had runs, and
+    refused after.
+  - Delivery attempts are not counted for long: a message pulled again
+    137 seconds after its third delivery came on attempt 1, where one
+    pulled 107 seconds after came on its fourth. A message that comes
+    less often than about every two minutes may never reach its last
+    attempt, and so never be forwarded to a dead-letter topic.
+  - A subscription deleted and made again under its name answers as the
+    old one and the new by turns for about two minutes: an ack by an id
+    the new one gave was refused, and one by an id of the old one taken.
+    The emulator takes an old one's id for good.
 - auth, core, firestore, secret_manager and storage: unchanged.
 
 ## 0.36.0 (2026-10-12)

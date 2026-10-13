@@ -165,6 +165,7 @@ test {
     _ = @import("fake_filter.zig");
     _ = @import("emulator_diff.zig");
     _ = @import("fake_library.zig");
+    _ = @import("production_replay.zig");
     _ = @import("iam.zig");
     _ = @import("logging.zig");
     _ = @import("rpc.zig");

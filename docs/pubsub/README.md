@@ -131,6 +131,7 @@ emulator does not fail later in production.
 | Exactly-once: a late lease extension | taken | refused |
 | Exactly-once: a second ack of an acknowledged message | refused | taken |
 | Publishing to a deleted topic | refused at once | taken for 0.7 to 14 s in nine runs, and once for over 90 s |
+| A subscription deleted and made again under its name | the new one at once, and it takes an ack by an id the old one gave | the old one and the new by turns for about two minutes: an ack by an id the new one gave was refused 108 s on, and one by an id of the old one taken 103 s on. After that the old one's ids are refused, `error.InvalidArgument` |
 | IAM calls (0.8.36) | 501 `UNIMPLEMENTED`, `error.Unimplemented` | the policy |
 | [Message transforms](transforms.md) (0.8.36) | **kept and never run**: every message arrives untouched | run on every message |
 | An [import topic](import-topics.md)'s source (0.8.36) | kept as given, never read | connected to when the topic is made or changed, refused if it cannot be, and imported from |
