@@ -110,8 +110,18 @@ seconds. Until it has settled:
 
 - messages the seek acknowledged can still arrive;
 - an ack for a delivery made before a seek back is answered as taken,
-  and then forgotten: the message comes again. That held with
-  exactly-once delivery too, where Google's page says such an ack fails.
+  and forgotten while the message waits to come again.
+
+A seek ends no ack id, though: one from before it goes on naming its
+message (measured 2026-10-13).
+
+- Without exactly-once delivery, once the message is out again an ack
+  by the old id acknowledges it, and a nack by it gives it back.
+- With exactly-once delivery the old id is answered for as long as the
+  lease it had runs, whether or not the message is out again, and
+  acknowledges the message if it is. Once that lease is over the id is
+  refused, `error.InvalidArgument`. Google's page says such an ack
+  fails.
 
 So around a seek a handler can see a message twice. Handlers that are
 safe to run twice, which at-least-once delivery asks for anyway, need

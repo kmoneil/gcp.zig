@@ -78,9 +78,11 @@
 //!     then on is unacknowledged again, of what the subscription still
 //!     has: what it has not had acknowledged; what it retains
 //!     acknowledged, if it was there to get it; and what its topic
-//!     retains, there or not. **An ack id from before a seek is answered
-//!     and forgotten, with exactly-once delivery too**, as production's
-//!     were, and the message comes again.
+//!     retains, there or not. **A seek ends no ack id: one from before it
+//!     goes on naming its message.** It acts once the message is out
+//!     again, and is answered and forgotten until then; with exactly-once
+//!     delivery it is answered for as long as the lease it had runs, and
+//!     refused after, as production's were.
 //!   - Detach. The subscription lets go of what it holds, gets nothing
 //!     more, reads `detached`, and refuses all but a read, an update and
 //!     a delete.
@@ -344,6 +346,9 @@ pub const FakePubSub = struct {
         detached: bool = false,
         /// Ack ids of entries numbered below this are from before a seek.
         stale_below: u64 = 1,
+        /// What is kept of each entry a seek did away with, by its
+        /// number: an ack id goes on naming its message.
+        old: std.AutoHashMapUnmanaged(u64, Old) = .empty,
         policy: Policy = .{},
         ack_deadline_s: u32 = 10,
         labels: []const Label = &.{},
@@ -370,10 +375,36 @@ pub const FakePubSub = struct {
         /// own, in the order it arrived.
         entries: std.AutoArrayHashMapUnmanaged(u64, Entry) = .empty,
         next_seq: u64 = 1,
-        /// By an entry's number, the delivery whose id acknowledged it.
-        /// With exactly-once delivery that id is taken a second time, and
-        /// an id of an earlier delivery is not.
-        acknowledged: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+        /// By an entry's number, the delivery whose id acknowledged it,
+        /// and the message. With exactly-once delivery that id is taken
+        /// a second time, and an id of an earlier delivery is not.
+        acknowledged: std.AutoHashMapUnmanaged(u64, Acked) = .empty,
+
+        const Acked = struct { delivery: u32, message: *const Message };
+
+        /// An entry from before a seek.
+        const Old = struct {
+            message: *const Message,
+            /// With exactly-once delivery, the delivery that was out when
+            /// the seek came, and until when its lease runs: the seek
+            /// does not end it. Null: none was, or its id is done.
+            delivery: u32,
+            until: ?i96,
+        };
+
+        /// Whether, with exactly-once delivery, `id` is the one that
+        /// acknowledged its message.
+        fn tookIt(s: *const Subscription, id: AckId) bool {
+            return if (s.acknowledged.get(id.seq)) |acked| acked.delivery == id.delivery else false;
+        }
+
+        /// The entry that holds `message` now, if one does.
+        fn entryOf(s: *const Subscription, message: *const Message) ?usize {
+            for (s.entries.values(), 0..) |entry, index| {
+                if (entry.message == message) return index;
+            }
+            return null;
+        }
 
         /// Whether a message published to its topic reaches it. Production
         /// tries the filter as the message arrives: what does not pass is
@@ -420,8 +451,8 @@ pub const FakePubSub = struct {
         /// earlier one of its key is not: that one's nack or lapse brings
         /// it back.
         fn take(s: *Subscription, gpa: Allocator, index: usize, delivery: u32) Allocator.Error!void {
-            try s.acknowledged.put(gpa, s.entries.keys()[index], delivery);
             const entry = &s.entries.values()[index];
+            try s.acknowledged.put(gpa, s.entries.keys()[index], .{ .delivery = delivery, .message = entry.message });
             if (!s.keyed(entry.*)) return s.entries.orderedRemoveAt(index);
             entry.acked = true;
             entry.lease_until = null;
@@ -601,6 +632,7 @@ pub const FakePubSub = struct {
             for (list) |s| {
                 s.entries.deinit(f.gpa);
                 s.acknowledged.deinit(f.gpa);
+                s.old.deinit(f.gpa);
             }
         }
         f.dropped.deinit(f.gpa);
@@ -1859,10 +1891,18 @@ pub const FakePubSub = struct {
     }
 
     const Judged = struct {
-        /// For each id of the request: whether it may act.
-        live: []const bool,
+        /// For each id of the request: the number of the entry it may
+        /// act on. Null: none.
+        acts: []const ?u64,
         /// The ids an exactly-once refusal names, each once.
         refused: []const []const u8,
+    };
+
+    /// What an id is sent to do.
+    const Asked = union(enum) {
+        ack,
+        /// A lease of so many seconds from now. None: a nack.
+        lease: i64,
     };
 
     /// Says of each id of an acknowledge or a modifyAckDeadline whether it
@@ -1876,30 +1916,79 @@ pub const FakePubSub = struct {
     /// lapsed message's and an acknowledged one's alike. Production took
     /// one such: a second ack with the very id that acknowledged the
     /// message. With an id of an earlier delivery of it, it refused.
-    fn judge(arena: Allocator, sub: *const Subscription, ids: []const AckId, now: i96, lease_change: bool) Allocator.Error!Judged {
-        const live = try arena.alloc(bool, ids.len);
+    ///
+    /// A seek ends no id. One from before it goes on naming its message
+    /// (all measured 2026-10-13):
+    ///
+    /// - Without exactly-once delivery the lease decides, as ever: the id
+    ///   acts once the message is out again, to acknowledge it and to give
+    ///   it back, and is answered and forgotten until then.
+    /// - With it, the delivery the id is of goes on being out, on the
+    ///   lease it had, through the seek. While that lease runs an ack by
+    ///   the id is answered, and acknowledges the message if the message
+    ///   is out again; a longer lease is answered, and runs; a nack is
+    ///   answered if the message is out again, and gives nothing back,
+    ///   and is refused if it is not, and then the id is done. Once the
+    ///   lease is over the id is refused, but for an ack by one that was
+    ///   answered before. (What a longer lease or a nack by such an id
+    ///   does to the message's present delivery was not measured beyond
+    ///   that: nothing, here.)
+    fn judge(f: *FakePubSub, arena: Allocator, sub: *Subscription, ids: []const AckId, now: i96, asked: Asked) Allocator.Error!Judged {
+        const acts = try arena.alloc(?u64, ids.len);
         var refused: std.ArrayList([]const u8) = .empty;
-        each: for (ids, live) |id, *slot| {
-            // From before a seek: answered and forgotten, with
-            // exactly-once delivery too. Production took such acks and
-            // lease changes with 200 for 46 seconds, and delivered the
-            // messages again all the same.
-            if (id.seq < sub.stale_below) {
-                slot.* = false;
-                continue;
-            }
-            const index = sub.entries.getIndex(id.seq);
-            // Gone, or kept behind an earlier one of its key.
-            const acknowledged = if (index) |i| sub.entries.values()[i].acked else true;
-            slot.* = !acknowledged and sub.live(index.?, id, now);
-            if (slot.* or !sub.exactly_once) continue;
-            if (acknowledged and !lease_change and sub.acknowledged.get(id.seq) == id.delivery) continue;
+        each: for (ids, acts) |id, *slot| {
+            slot.* = null;
+            const answered = if (id.seq < sub.stale_below)
+                try f.judgeOld(sub, id, now, asked, slot)
+            else answered: {
+                const index = sub.entries.getIndex(id.seq);
+                // Gone, or kept behind an earlier one of its key.
+                const acknowledged = if (index) |i| sub.entries.values()[i].acked else true;
+                if (!acknowledged and sub.live(index.?, id, now)) slot.* = id.seq;
+                break :answered slot.* != null or !sub.exactly_once or (acknowledged and asked == .ack and sub.tookIt(id));
+            };
+            if (answered) continue;
             for (refused.items) |named| {
                 if (std.mem.eql(u8, named, id.text)) continue :each;
             }
             try refused.append(arena, id.text);
         }
-        return .{ .live = live, .refused = refused.items };
+        return .{ .acts = acts, .refused = refused.items };
+    }
+
+    /// An id from before a seek: whether it is answered, and in `slot`
+    /// the entry it acts on, if any. See `judge`.
+    fn judgeOld(f: *FakePubSub, sub: *Subscription, id: AckId, now: i96, asked: Asked, slot: *?u64) Allocator.Error!bool {
+        const record = sub.old.getPtr(id.seq);
+        const message = if (record) |o| o.message else if (sub.acknowledged.get(id.seq)) |acked| acked.message else null;
+        const present: ?u64 = present: {
+            const index = sub.entryOf(message orelse break :present null) orelse break :present null;
+            const entry = sub.entries.values()[index];
+            // An acknowledged one that is kept has no lease.
+            const out = entry.lease_until != null and entry.lease_until.? > now;
+            break :present if (out) sub.entries.keys()[index] else null;
+        };
+        if (!sub.exactly_once) {
+            slot.* = present;
+            return true;
+        }
+        const old = record orelse return asked == .ack and sub.tookIt(id);
+        const running = old.delivery == id.delivery and old.until != null and old.until.? > now;
+        if (!running) return asked == .ack and sub.tookIt(id);
+        switch (asked) {
+            .ack => {
+                try sub.acknowledged.put(f.gpa, id.seq, .{ .delivery = id.delivery, .message = old.message });
+                old.until = null;
+                slot.* = present;
+            },
+            .lease => |seconds| if (seconds > 0) {
+                old.until = now + @as(i96, seconds) * std.time.ns_per_s;
+            } else if (present == null) {
+                old.until = null;
+                return false;
+            },
+        }
+        return true;
     }
 
     fn acknowledge(f: *FakePubSub, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
@@ -1908,13 +1997,15 @@ pub const FakePubSub = struct {
             .refused => |r| return r,
         };
         const sub = checked.sub;
-        const judged = try judge(arena, sub, checked.request.ids, f.awakeNow(), false);
-        for (checked.request.ids, judged.live) |id, live| {
-            if (!live) continue;
+        const judged = try f.judge(arena, sub, checked.request.ids, f.awakeNow(), .ack);
+        for (checked.request.ids, judged.acts) |id, acts| {
+            const seq = acts orelse continue;
             // Looked up for each: the one before it may have been the
             // same id.
-            const index = sub.entries.getIndex(id.seq) orelse continue;
-            if (!sub.entries.values()[index].acked) try sub.take(f.gpa, index, id.delivery);
+            const index = sub.entries.getIndex(seq) orelse continue;
+            // By an id from before a seek, no delivery of this entry
+            // acknowledged it.
+            if (!sub.entries.values()[index].acked) try sub.take(f.gpa, index, if (seq == id.seq) id.delivery else 0);
         }
         // The ids it does not name were taken.
         if (judged.refused.len > 0) return exactlyOnceRefusal(arena, judged.refused);
@@ -1935,12 +2026,11 @@ pub const FakePubSub = struct {
         if (seconds < 0 or seconds > 600) return fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Invalid ack deadline given (ack_deadline={d}). The ack deadline must be between 0 and 600 seconds.", .{seconds}));
         const sub = checked.sub;
         const now = f.awakeNow();
-        const judged = try judge(arena, sub, checked.request.ids, now, true);
-        for (checked.request.ids, judged.live) |id, live| {
-            if (!live) continue;
+        const judged = try f.judge(arena, sub, checked.request.ids, now, .{ .lease = seconds });
+        for (judged.acts) |acts| {
             // Looked up for each: a nack before it may have moved it, or
             // forwarded it, the same id sent twice.
-            const index = sub.entries.getIndex(id.seq) orelse continue;
+            const index = sub.entries.getIndex(acts orelse continue) orelse continue;
             // Zero gives the message back at once: a nack. One that an
             // earlier nack of the request took back is released all the
             // same: it was out, and it is given back.
@@ -2738,8 +2828,15 @@ pub const FakePubSub = struct {
 
         // The subscription has its messages afresh: none out, none
         // counted as delivered, and every ack id it gave before stale.
+        // Each goes on naming its message, and with exactly-once
+        // delivery what was out goes on being so, by its id: see `judge`.
         var entries: std.AutoArrayHashMapUnmanaged(u64, Entry) = .empty;
         try entries.ensureTotalCapacity(f.gpa, fresh.items.len);
+        errdefer entries.deinit(f.gpa);
+        try sub.old.ensureUnusedCapacity(f.gpa, @intCast(sub.entries.count()));
+        for (sub.entries.keys(), sub.entries.values()) |seq, entry| {
+            sub.old.putAssumeCapacity(seq, .{ .message = entry.message, .delivery = entry.deliveries, .until = if (sub.exactly_once) entry.lease_until else null });
+        }
         sub.stale_below = sub.next_seq;
         for (fresh.items) |m| {
             entries.putAssumeCapacity(sub.next_seq, .{ .message = m });
@@ -6870,8 +6967,8 @@ test "seek to a snapshot: the subscription holds again what the snapshot holds, 
     try testing.expectEqual(200, (try b.raw(a, .GET, "projects/p/snapshots/before", "")).status);
 
     // With exactly-once delivery too an id from before a seek is taken,
-    // to acknowledge and to change a lease, as production took them: the
-    // message comes again all the same.
+    // to acknowledge and to change a lease, while the lease it had runs,
+    // as production took them: the message comes again all the same.
     const once = b.client.subscription("once");
     var stale = try once.pull(.{});
     defer stale.deinit();
@@ -6918,6 +7015,148 @@ test "seek to a snapshot: the subscription holds again what the snapshot holds, 
     // The old topic's subscription is still that topic's, and seeks.
     try worker.seek(.{ .snapshot = "before" });
     try testing.expectEqual(3, b.fake.backlog("p", "worker"));
+}
+
+test "an ack id from before a seek goes on naming its message, and with exactly-once delivery its delivery goes on being out" {
+    var b: Bench = undefined;
+    try b.init(.{ .shuffle = false });
+    defer b.deinit();
+    var made_topic = try b.client.topic("orders").create(.{});
+    made_topic.deinit();
+    const Step = struct {
+        /// Every message the subscription has ready, its ack ids kept.
+        fn pull(sub: anytype, a: Allocator, count: usize) ![]const []const u8 {
+            var got = try sub.pull(.{ .return_immediately = true });
+            defer got.deinit();
+            try testing.expectEqual(count, got.value.messages.len);
+            const ids = try a.alloc([]const u8, count);
+            for (ids, got.value.messages) |*id, m| id.* = try a.dupe(u8, m.ack_id);
+            return ids;
+        }
+    };
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const refused = error.InvalidArgument;
+
+    // Without exactly-once delivery the lease decides, as ever. As
+    // production was put to it on 2026-10-13: four messages, a snapshot,
+    // all pulled, a seek to the snapshot, all pulled again on leases of
+    // ten minutes.
+    const plain = b.client.subscription("plain");
+    var made_plain = try plain.create(.{ .topic_id = "orders", .ack_deadline_seconds = 600 });
+    made_plain.deinit();
+    var sent = try b.client.topic("orders").publish(&.{ .{ .data = "x0" }, .{ .data = "x1" }, .{ .data = "x2" }, .{ .data = "x3" } }, .{});
+    sent.deinit();
+    var taken = try b.client.snapshot("all").create(.{ .subscription = "plain" });
+    taken.deinit();
+    const before = try Step.pull(plain, a, 4);
+    try plain.seek(.{ .snapshot = "all" });
+    // Not out: an id from before the seek is answered and forgotten.
+    try plain.ack(&.{before[2]});
+    try testing.expectEqual(4, b.fake.backlog("p", "plain"));
+    const after = try Step.pull(plain, a, 4);
+    // Out again: an ack by x0's old id acknowledges it, and a nack by
+    // x1's gives it back, as production's did.
+    try plain.ack(&.{before[0]});
+    try plain.nack(&.{before[1]});
+    try plain.ack(&.{after[3]});
+    try testing.expectEqual(2, b.fake.backlog("p", "plain"));
+    try testing.expectEqual(1, b.fake.outstanding("p", "plain"));
+    try expectPulled(plain, &.{"x1"}, true);
+    // A longer lease by an old id is the message's too.
+    b.advance(590);
+    try plain.modifyAckDeadline(&.{before[2]}, 600);
+    b.advance(20);
+    try expectNothing(plain);
+    // And once that has run out the message is not out: an ack by the
+    // old id is answered and forgotten again.
+    b.advance(600);
+    try plain.ack(&.{before[2]});
+    try testing.expectEqual(1, b.fake.backlog("p", "plain"));
+    try expectPulled(plain, &.{"x2"}, false);
+    try plain.ack(&.{before[2]});
+    try testing.expectEqual(0, b.fake.backlog("p", "plain"));
+
+    // With exactly-once delivery, and none of them pulled again: the
+    // delivery an id is of goes on being out, on the lease it had.
+    const once = b.client.subscription("once");
+    var made_once = try once.create(.{ .topic_id = "orders", .ack_deadline_seconds = 30, .enable_exactly_once_delivery = true });
+    made_once.deinit();
+    try once.seek(.{ .snapshot = "all" });
+    const old = try Step.pull(once, a, 4);
+    try once.seek(.{ .snapshot = "all" });
+    b.advance(3);
+    // A nack is refused, and the id is done: an ack by it and a longer
+    // lease are refused though the lease it had would still run.
+    try testing.expectError(refused, once.nack(&.{old[0]}));
+    try testing.expectError(refused, once.ack(&.{old[0]}));
+    try testing.expectError(refused, once.modifyAckDeadline(&.{old[0]}, 60));
+    // An ack is answered, and again; a longer lease by an id that was
+    // answered an ack is not.
+    try once.ack(&.{old[1]});
+    try once.ack(&.{old[1]});
+    try testing.expectError(refused, once.modifyAckDeadline(&.{old[1]}, 60));
+    // A longer lease is answered, and runs: past the lease the id had,
+    // an ack by it is answered. One whose lease was left alone is refused
+    // by then, to acknowledge and to lengthen, and the one that was
+    // answered before is answered still.
+    try once.modifyAckDeadline(&.{old[2]}, 60);
+    b.advance(30);
+    try testing.expectError(refused, once.ack(&.{old[3]}));
+    try testing.expectError(refused, once.modifyAckDeadline(&.{old[3]}, 60));
+    try once.ack(&.{old[2]});
+    try once.ack(&.{old[1]});
+    // A longer lease, and then a nack: refused, and the id done.
+    try once.seek(.{ .snapshot = "all" });
+    const again = try Step.pull(once, a, 4);
+    try once.seek(.{ .snapshot = "all" });
+    try once.modifyAckDeadline(&.{again[0]}, 60);
+    try testing.expectError(refused, once.nack(&.{again[0]}));
+    try testing.expectError(refused, once.ack(&.{again[0]}));
+    // And every one of them comes again: none of that acknowledged a
+    // message, which was not out.
+    try testing.expectEqual(4, b.fake.backlog("p", "once"));
+    try testing.expectEqual(0, b.fake.outstanding("p", "once"));
+
+    // Pulled again after the seek, on leases of ten minutes, as
+    // production was put to it: an ack by x0's old id is answered and
+    // acknowledges it, so that a nack by its new id is refused; a nack by
+    // x1's old id is answered and gives nothing back.
+    const long = b.client.subscription("long");
+    var made_long = try long.create(.{ .topic_id = "orders", .ack_deadline_seconds = 600, .enable_exactly_once_delivery = true });
+    made_long.deinit();
+    try long.seek(.{ .snapshot = "all" });
+    const first = try Step.pull(long, a, 4);
+    try long.seek(.{ .snapshot = "all" });
+    b.advance(60);
+    const second = try Step.pull(long, a, 4);
+    try long.ack(&.{first[0]});
+    try long.nack(&.{first[1]});
+    try long.ack(&.{second[3]});
+    // Nor is a lease by the old id the message's: x2 stays out on the
+    // ten minutes it has, past the ten seconds its old id is given.
+    try long.modifyAckDeadline(&.{first[2]}, 10);
+    b.advance(15);
+    try testing.expectEqual(2, b.fake.outstanding("p", "long"));
+    try expectNothing(long);
+    try testing.expectError(refused, long.nack(&.{second[0]}));
+    try testing.expectError(refused, long.ack(&.{second[0]}));
+    try long.nack(&.{second[2]});
+    try testing.expectEqual(2, b.fake.backlog("p", "long"));
+    try testing.expectEqual(1, b.fake.outstanding("p", "long"));
+    try expectPulled(long, &.{"x2"}, true);
+    // The old id that acknowledged x0 is answered again.
+    try long.ack(&.{first[0]});
+    // An id from before two seeks is no other.
+    try long.seek(.{ .snapshot = "all" });
+    _ = try Step.pull(long, a, 4);
+    try long.ack(&.{second[1]});
+    try testing.expectEqual(3, b.fake.backlog("p", "long"));
+    try long.nack(&.{first[3]});
+    try testing.expectEqual(3, b.fake.outstanding("p", "long"));
+    // The one whose lease was cut to ten seconds is over.
+    try testing.expectError(refused, long.nack(&.{first[2]}));
 }
 
 test "seek to a time: what was published from then on comes again, of what the subscription or its topic retains" {
@@ -9263,22 +9502,25 @@ test "dead letters with the service agent named: forwarded only once it may publ
 /// ordering, exactly-once delivery, and dead letters to the first topic
 /// after five attempts. Of the two topics the second retains messages,
 /// ten minutes.
-const Reference = struct {
-    const Held = struct { id: u64, lease_until: ?i96 = null, deliveries: u32 = 0, not_before: i96 = 0, acked: bool = false };
+///
+/// `production_replay.zig` holds production to it as well, which is why
+/// it is public.
+pub const Reference = struct {
+    pub const Held = struct { id: u64, lease_until: ?i96 = null, deliveries: u32 = 0, not_before: i96 = 0, acked: bool = false };
     /// What the rules ask of a message: its ordering key, 0 for none,
     /// whether the second subscription's filter stops it, and which
     /// topic, of which making, it came to, and when.
-    const Sent = struct { key: u8 = 0, skip: bool = false, topic: u8 = 0, made: u32 = 0, time: i96 = 0 };
+    pub const Sent = struct { key: u8 = 0, skip: bool = false, topic: u8 = 0, made: u32 = 0, time: i96 = 0 };
     /// A topic, as one making of it: made again, it is another.
-    const Topic = struct { topic: u8, made: u32 };
+    pub const Topic = struct { topic: u8, made: u32 };
     /// A snapshot: what its subscription had not had acknowledged, and
     /// the id from which every message to its topic is its own too.
-    const Taken = struct { of: Topic, held: [max_held]u64 = undefined, count: usize = 0, from: u64 };
-    const max_held = 256;
-    const topic_retention_s = [2]?i64{ null, 600 };
-    const deadline_s = [3]u32{ 10, 20, 10 };
-    const ordered = [3]bool{ false, true, true };
-    const max_attempts = 5;
+    pub const Taken = struct { of: Topic, held: [max_held]u64 = undefined, count: usize = 0, from: u64 };
+    pub const max_held = 256;
+    pub const topic_retention_s = [2]?i64{ null, 600 };
+    pub const deadline_s = [3]u32{ 10, 20, 10 };
+    pub const ordered = [3]bool{ false, true, true };
+    pub const max_attempts = 5;
 
     held: [3][max_held]Held = undefined,
     counts: [3]usize = @splat(0),
@@ -9297,10 +9539,20 @@ const Reference = struct {
     /// subscription. 0: none has.
     acknowledged_by: [2 * max_held]u32 = @splat(0),
     next_id: u64 = 1,
+    /// Whether a message that has had its last attempt moves on to the
+    /// dead-letter topic. Not when the service agent lacks its grants:
+    /// the message then stays where it is and its attempts go on being
+    /// counted (measured 2026-10-12).
+    forwards: bool = true,
+    /// Whether a backoff doubles from the retry policy's minimum to its
+    /// maximum with each delivery, which is the fake's own rule.
+    /// Production's is somewhere between the two (measured 2026-10-12),
+    /// so what holds production to this asks for the minimum alone.
+    doubles: bool = true,
 
     /// A message comes to a topic, published or forwarded, and gets the
     /// next id. The subscriptions of the topic as it is now made get it.
-    fn arrive(r: *Reference, topic: u8, key_of: u8, skip: bool) u64 {
+    pub fn arrive(r: *Reference, topic: u8, key_of: u8, skip: bool) u64 {
         const id = r.next_id;
         r.next_id += 1;
         r.sent[id] = .{ .key = key_of, .skip = skip, .topic = topic, .made = r.made[topic], .time = r.clock };
@@ -9310,23 +9562,23 @@ const Reference = struct {
         return id;
     }
 
-    fn put(r: *Reference, s: usize, id: u64) void {
+    pub fn put(r: *Reference, s: usize, id: u64) void {
         r.held[s][r.counts[s]] = .{ .id = id };
         r.counts[s] += 1;
     }
 
     /// The second subscription's filter.
-    fn passes(r: *const Reference, s: usize, id: u64) bool {
+    pub fn passes(r: *const Reference, s: usize, id: u64) bool {
         return s != 1 or !r.sent[id].skip;
     }
 
     /// Whether a message was sent to the topic a subscription is of.
-    fn sameTopic(r: *const Reference, of: Topic, id: u64) bool {
+    pub fn sameTopic(r: *const Reference, of: Topic, id: u64) bool {
         return r.sent[id].topic == of.topic and r.sent[id].made == of.made;
     }
 
     /// Takes snapshot `slot` of subscription `s`.
-    fn take(r: *Reference, slot: usize, s: usize) void {
+    pub fn take(r: *Reference, slot: usize, s: usize) void {
         r.taken[slot] = .{ .of = r.on[s], .from = r.next_id };
         const taken = &r.taken[slot].?;
         for (r.all(s)) |h| {
@@ -9337,7 +9589,7 @@ const Reference = struct {
     }
 
     /// A seek to snapshot `slot`. False when its topic is another.
-    fn seekTo(r: *Reference, s: usize, slot: usize) bool {
+    pub fn seekTo(r: *Reference, s: usize, slot: usize) bool {
         const taken = r.taken[slot].?;
         if (taken.of.topic != r.on[s].topic or taken.of.made != r.on[s].made) return false;
         r.counts[s] = 0;
@@ -9354,7 +9606,7 @@ const Reference = struct {
     /// published from then on. It has what is not acknowledged; the
     /// first subscription what it was there for, a week; and any what its
     /// topic retains.
-    fn seekAt(r: *Reference, s: usize, time: i96) void {
+    pub fn seekAt(r: *Reference, s: usize, time: i96) void {
         var unacknowledged: [2 * max_held]bool = @splat(false);
         for (r.all(s)) |h| unacknowledged[h.id] = !h.acked;
         r.counts[s] = 0;
@@ -9368,11 +9620,11 @@ const Reference = struct {
         }
     }
 
-    fn all(r: *Reference, s: usize) []Held {
+    pub fn all(r: *Reference, s: usize) []Held {
         return r.held[s][0..r.counts[s]];
     }
 
-    fn indexOf(r: *Reference, s: usize, id: u64) ?usize {
+    pub fn indexOf(r: *Reference, s: usize, id: u64) ?usize {
         for (r.all(s), 0..) |h, i| {
             if (h.id == id) return i;
         }
@@ -9380,11 +9632,11 @@ const Reference = struct {
     }
 
     /// The key that orders it on subscription `s`, or 0.
-    fn key(r: *const Reference, s: usize, h: Held) u8 {
+    pub fn key(r: *const Reference, s: usize, h: Held) u8 {
         return if (ordered[s]) r.sent[h.id].key else 0;
     }
 
-    fn remove(r: *Reference, s: usize, index: usize) void {
+    pub fn remove(r: *Reference, s: usize, index: usize) void {
         const held = r.all(s);
         std.mem.copyForwards(Held, held[index .. held.len - 1], held[index + 1 ..]);
         r.counts[s] -= 1;
@@ -9392,15 +9644,15 @@ const Reference = struct {
 
     /// A delivery over with no ack, by a nack or a lapse, at `at`. True
     /// when the message moved on to the dead-letter topic.
-    fn release(r: *Reference, s: usize, index: usize, at: i96) bool {
+    pub fn release(r: *Reference, s: usize, index: usize, at: i96) bool {
         const h = r.held[s][index];
-        const gone = s == 2 and h.deliveries >= max_attempts;
+        const gone = r.forwards and s == 2 and h.deliveries >= max_attempts;
         if (gone) {
             r.remove(s, index);
             _ = r.arrive(0, r.sent[h.id].key, r.sent[h.id].skip);
         } else {
             r.held[s][index].lease_until = null;
-            const doublings: u5 = @intCast(@min(h.deliveries - 1, 3));
+            const doublings: u5 = if (r.doubles) @intCast(@min(h.deliveries - 1, 3)) else 0;
             if (s == 1) r.held[s][index].not_before = at + @as(i96, @min(20, @as(u32, 5) << doublings)) * std.time.ns_per_s;
         }
         // The later ones of its key come back with it.
@@ -9415,7 +9667,7 @@ const Reference = struct {
 
     /// Ends every lease that has run out by `now`: the subscriptions by
     /// name, each one's messages as they came.
-    fn settle(r: *Reference, now: i96) void {
+    pub fn settle(r: *Reference, now: i96) void {
         for (0..3) |s| {
             var i: usize = 0;
             while (i < r.counts[s]) {
@@ -9428,7 +9680,7 @@ const Reference = struct {
     }
 
     /// Whether a pull may give it at `now`, to which all is settled.
-    fn ready(r: *Reference, s: usize, index: usize, now: i96) bool {
+    pub fn ready(r: *Reference, s: usize, index: usize, now: i96) bool {
         const h = r.held[s][index];
         if (h.acked or h.lease_until != null or h.not_before > now) return false;
         const k = r.key(s, h);
@@ -9447,7 +9699,7 @@ const Reference = struct {
     }
 
     /// Which of subscription `s` a pull may give at `now`, and how many.
-    fn readySet(r: *Reference, s: usize, now: i96, set: *[max_held]bool) usize {
+    pub fn readySet(r: *Reference, s: usize, now: i96, set: *[max_held]bool) usize {
         var n: usize = 0;
         for (0..r.counts[s]) |i| {
             set[i] = r.ready(s, i, now);
@@ -9456,13 +9708,13 @@ const Reference = struct {
         return n;
     }
 
-    fn backlog(r: *Reference, s: usize) usize {
+    pub fn backlog(r: *Reference, s: usize) usize {
         var n: usize = 0;
         for (r.all(s)) |h| n += @intFromBool(!h.acked);
         return n;
     }
 
-    fn outstanding(r: *Reference, s: usize) usize {
+    pub fn outstanding(r: *Reference, s: usize) usize {
         var n: usize = 0;
         for (r.all(s)) |h| n += @intFromBool(h.lease_until != null);
         return n;
@@ -9470,12 +9722,12 @@ const Reference = struct {
 
     /// Whether the id of delivery `attempt` may still act on it: it is
     /// out, and with exactly-once delivery this is that delivery.
-    fn live(s: usize, h: Held, attempt: u32) bool {
+    pub fn live(s: usize, h: Held, attempt: u32) bool {
         return h.lease_until != null and (s != 2 or attempt == h.deliveries);
     }
 
     /// An ack. False when the subscription refuses it.
-    fn ack(r: *Reference, s: usize, id: u64, attempt: u32) bool {
+    pub fn ack(r: *Reference, s: usize, id: u64, attempt: u32) bool {
         // Gone: with exactly-once delivery taken again only with the id
         // that acknowledged it.
         const index = r.indexOf(s, id) orelse return s != 2 or r.acknowledged_by[id] == attempt;
@@ -9502,7 +9754,7 @@ const Reference = struct {
     }
 
     /// A lease change, a nack when `seconds` is 0. False when refused.
-    fn modify(r: *Reference, s: usize, id: u64, attempt: u32, seconds: u32, now: i96) bool {
+    pub fn modify(r: *Reference, s: usize, id: u64, attempt: u32, seconds: u32, now: i96) bool {
         const index = r.indexOf(s, id) orelse return s != 2;
         const h = &r.held[s][index];
         if (h.acked or !live(s, h.*, attempt)) return s != 2;
@@ -9515,34 +9767,45 @@ const Reference = struct {
 
 const sub_ids = [3][]const u8{ "sub0", "sub1", "sub2" };
 const topic_ids = [2][]const u8{ "top0", "top1" };
-const key_names = [3]?[]const u8{ null, "a", "b" };
+pub const key_names = [3]?[]const u8{ null, "a", "b" };
 
 const snapshot_ids = [3][]const u8{ "snap0", "snap1", "snap2" };
 
-fn makeModelTopic(b: *Bench, topic: u8) !void {
-    var made = try b.client.topic(topic_ids[topic]).create(.{ .message_retention = if (Reference.topic_retention_s[topic]) |seconds| .fromSeconds(seconds) else null });
-    made.deinit();
+/// How topic `topic` of the model is made.
+pub fn modelTopic(topic: u8) types.TopicConfig {
+    return .{ .message_retention = if (Reference.topic_retention_s[topic]) |seconds| .fromSeconds(seconds) else null };
 }
 
-/// Makes subscription `s` of the model on `topic`, with its rules.
-fn makeModelSubscription(b: *Bench, s: usize, topic: u8) !void {
-    var made = try b.client.subscription(sub_ids[s]).create(switch (s) {
-        0 => .{ .topic_id = topic_ids[topic], .ack_deadline_seconds = Reference.deadline_s[0], .retain_acked_messages = true },
+/// The rules subscription `s` of the model is made with, on the topic of
+/// that id, its dead letters going to the model's first topic.
+pub fn modelSubscription(s: usize, topic_id: []const u8, first_topic_id: []const u8) types.SubscriptionConfig {
+    return switch (s) {
+        0 => .{ .topic_id = topic_id, .ack_deadline_seconds = Reference.deadline_s[0], .retain_acked_messages = true },
         1 => .{
-            .topic_id = topic_ids[topic],
+            .topic_id = topic_id,
             .ack_deadline_seconds = Reference.deadline_s[1],
             .enable_message_ordering = true,
             .filter = "NOT attributes:skip",
             .retry_policy = .{ .minimum = .fromSeconds(5), .maximum = .fromSeconds(20) },
         },
         else => .{
-            .topic_id = topic_ids[topic],
+            .topic_id = topic_id,
             .ack_deadline_seconds = Reference.deadline_s[2],
             .enable_message_ordering = true,
             .enable_exactly_once_delivery = true,
-            .dead_letter_policy = .{ .topic = topic_ids[0], .max_delivery_attempts = Reference.max_attempts },
+            .dead_letter_policy = .{ .topic = first_topic_id, .max_delivery_attempts = Reference.max_attempts },
         },
-    });
+    };
+}
+
+fn makeModelTopic(b: *Bench, topic: u8) !void {
+    var made = try b.client.topic(topic_ids[topic]).create(modelTopic(topic));
+    made.deinit();
+}
+
+/// Makes subscription `s` of the model on `topic`, with its rules.
+fn makeModelSubscription(b: *Bench, s: usize, topic: u8) !void {
+    var made = try b.client.subscription(sub_ids[s]).create(modelSubscription(s, topic_ids[topic], topic_ids[0]));
     made.deinit();
 }
 
@@ -9582,11 +9845,35 @@ fn modelPull(b: *Bench, ref: *Reference, s: usize, max: u32, deliveries: *std.Ar
     return got.value.messages.len;
 }
 
+/// The service agent a script may name. It holds no grant on anything.
+pub const model_agent = "serviceAccount:service-1@gcp-sa-pubsub.iam.gserviceaccount.com";
+
 /// Every delivery's ack id, with the subscription's incarnation then and
-/// which delivery of the message it was.
-const ModelDelivery = struct { sub: usize, incarnation: u32, id: u64, attempt: u32, ack_id: []const u8 };
+/// which delivery of the message it was. With exactly-once delivery, and
+/// once a seek has come: until when the lease it had then runs, and
+/// whether an ack by its id has been answered.
+const ModelDelivery = struct { sub: usize, incarnation: u32, id: u64, attempt: u32, ack_id: []const u8, until: ?i96 = null, answered: bool = false };
 
 fn modelProperty(_: void, input: []const u8) !void {
+    _ = try modelRun(input);
+}
+
+/// What a script came to, step by step: its steps, by kind.
+const ModelRun = struct {
+    steps: usize = 0,
+    published: usize = 0,
+    pulls: usize = 0,
+    acks: usize = 0,
+    nacks: usize = 0,
+    leases: usize = 0,
+    waits: usize = 0,
+    remade: usize = 0,
+    snapshots: usize = 0,
+    seeks: usize = 0,
+};
+
+fn modelRun(input: []const u8) !ModelRun {
+    var ran: ModelRun = .{};
     var g: test_util.ByteGen = .init(input);
     // A run is a whole session of calls. The fuzzer makes tens of
     // thousands a night, and the allocator that looks for leaks, which
@@ -9594,14 +9881,18 @@ fn modelProperty(_: void, input: []const u8) !void {
     // under the fuzzer the session has a plain one. The corpus and the
     // random runs of every test run keep the one that looks.
     const gpa = if (@import("builtin").fuzz) std.heap.smp_allocator else testing.allocator;
+    // The first byte: the order of the fake's pulls, and whether Pub/Sub's
+    // service agent is named, with no grant, so that nothing is forwarded.
+    const first = g.byte();
+    const granted = first & 2 == 0;
     var b: Bench = undefined;
-    try b.initIn(gpa, .{ .shuffle = g.boolean() });
+    try b.initIn(gpa, .{ .shuffle = first & 1 == 1, .service_agent = if (granted) null else model_agent });
     defer b.deinit();
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
     const a = scratch.allocator();
 
-    var ref: Reference = .{};
+    var ref: Reference = .{ .forwards = granted };
     for (0..2) |topic| try makeModelTopic(&b, @intCast(topic));
     for (0..3) |s| try makeModelSubscription(&b, s, ref.on[s].topic);
     var deliveries: std.ArrayList(ModelDelivery) = .empty;
@@ -9622,6 +9913,7 @@ fn modelProperty(_: void, input: []const u8) !void {
                 // One ordering key a request, as production has it.
                 const k = g.intRange(u8, 0, 2);
                 if (published + count > Reference.max_held / 2) continue;
+                ran.published += count;
                 var messages: [3]types.Message = undefined;
                 var bufs: [3][8]u8 = undefined;
                 var skips: [3]bool = undefined;
@@ -9640,15 +9932,24 @@ fn modelProperty(_: void, input: []const u8) !void {
             2, 3, 4 => {
                 const s = g.intRange(u8, 0, 2);
                 _ = try modelPull(&b, &ref, s, g.intRange(u8, 1, 4), &deliveries, a, incarnation[s]);
+                ran.pulls += 1;
             },
             5, 6, 7 => |op| {
                 if (deliveries.items.len == 0) continue;
                 const which = g.intRange(u16, 0, @intCast(deliveries.items.len - 1));
-                const d = deliveries.items[which];
+                const d = &deliveries.items[which];
                 const sub = b.client.subscription(sub_ids[d.sub]);
+                switch (op) {
+                    5 => ran.acks += 1,
+                    6 => ran.nacks += 1,
+                    else => ran.leases += 1,
+                }
+                // How long is asked of a lease change alone: an ack that
+                // took a byte for it too left every script written by
+                // hand a byte out after its first ack.
                 const seconds: u32 = switch (op) {
-                    6 => 0,
-                    else => ([_]u32{ 5, 30, 600 })[g.intRange(u8, 0, 2)],
+                    7 => ([_]u32{ 5, 30, 600 })[g.intRange(u8, 0, 2)],
+                    else => 0,
                 };
                 const result = if (op == 5) sub.ack(&.{d.ack_id}) else sub.modifyAckDeadline(&.{d.ack_id}, seconds);
                 // An id from before the subscription was made again is
@@ -9657,10 +9958,40 @@ fn modelProperty(_: void, input: []const u8) !void {
                     try testing.expectError(error.InvalidArgument, result);
                     continue;
                 }
-                // One from before a seek is answered and forgotten, with
-                // exactly-once delivery too.
-                if (which < stale_before[d.sub]) {
-                    try result;
+                // One from before a seek goes on naming its message.
+                // Without exactly-once delivery it is judged as any is.
+                // With it, the delivery it is of goes on being out, on
+                // the lease it had, through the seek.
+                if (which < stale_before[d.sub] and d.sub == 2) {
+                    const out = if (ref.indexOf(2, d.id)) |index| ref.held[2][index].lease_until != null else false;
+                    const running = d.until != null and d.until.? > now;
+                    const answered = if (!running) op == 5 and d.answered else switch (op) {
+                        // An ack is answered, and acknowledges the
+                        // message if it is out again, by no delivery of
+                        // its own.
+                        5 => answered: {
+                            d.answered = true;
+                            d.until = null;
+                            if (out) {
+                                try testing.expect(ref.ack(2, d.id, ref.held[2][ref.indexOf(2, d.id).?].deliveries));
+                                ref.acknowledged_by[d.id] = 0;
+                            }
+                            break :answered true;
+                        },
+                        // A longer lease is answered, and runs.
+                        7 => answered: {
+                            d.until = now + @as(i96, seconds) * std.time.ns_per_s;
+                            break :answered true;
+                        },
+                        // A nack gives nothing back: answered if the
+                        // message is out again, and if not refused, and
+                        // the id done.
+                        else => answered: {
+                            if (!out) d.until = null;
+                            break :answered out;
+                        },
+                    };
+                    if (answered) try result else try testing.expectError(error.InvalidArgument, result);
                     continue;
                 }
                 // Refused only with exactly-once delivery, when it comes
@@ -9669,12 +10000,14 @@ fn modelProperty(_: void, input: []const u8) !void {
                 if (taken) try result else try testing.expectError(error.InvalidArgument, result);
             },
             8 => {
+                ran.waits += 1;
                 b.advance(g.intRange(u8, 1, 15));
                 ref.clock = b.clock.now_ns;
                 ref.settle(b.clock.now_ns);
             },
             // A snapshot taken, in place of the one of its name.
             10 => {
+                ran.snapshots += 1;
                 const slot = g.intRange(u8, 0, 2);
                 const s = g.intRange(u8, 0, 2);
                 const snapshot = b.client.snapshot(snapshot_ids[slot]);
@@ -9691,9 +10024,22 @@ fn modelProperty(_: void, input: []const u8) !void {
             },
             // A seek: to a snapshot, to a time some way back, or ahead.
             11 => {
+                ran.seeks += 1;
                 const s = g.intRange(u8, 0, 2);
                 const sub = b.client.subscription(sub_ids[s]);
                 const choice = g.intRange(u8, 0, 4);
+                // What is out, by which delivery, and which id has
+                // acknowledged its message: asked of the reference before
+                // the seek does away with it.
+                const Before = struct { until: ?i96, answered: bool };
+                const before = try a.alloc(Before, deliveries.items.len - stale_before[s]);
+                for (before, deliveries.items[stale_before[s]..]) |*slot, d| {
+                    slot.* = .{ .until = null, .answered = false };
+                    if (d.sub != s or d.incarnation != incarnation[s]) continue;
+                    slot.answered = ref.acknowledged_by[d.id] == d.attempt;
+                    const held = ref.held[s][ref.indexOf(s, d.id) orelse continue];
+                    if (held.deliveries == d.attempt and !held.acked) slot.until = held.lease_until;
+                }
                 if (choice < 3) {
                     const result = sub.seek(.{ .snapshot = snapshot_ids[choice] });
                     if (ref.taken[choice] == null) {
@@ -9711,12 +10057,18 @@ fn modelProperty(_: void, input: []const u8) !void {
                     try sub.seek(.{ .time = .{ .nanoseconds = time } });
                     ref.seekAt(s, time);
                 }
+                for (before, deliveries.items[stale_before[s]..]) |was, *d| {
+                    if (d.sub != s or d.incarnation != incarnation[s]) continue;
+                    d.until = was.until;
+                    d.answered = was.answered;
+                }
                 stale_before[s] = deliveries.items.len;
                 if (s == 2) ref.acknowledged_by = @splat(0);
             },
             else => switch (g.intRange(u8, 0, 3)) {
                 // A subscription deleted and made again: it holds nothing.
                 0, 1 => {
+                    ran.remade += 1;
                     const s = g.intRange(u8, 0, 2);
                     const topic = g.intRange(u8, 0, 1);
                     try b.client.subscription(sub_ids[s]).delete();
@@ -9730,6 +10082,7 @@ fn modelProperty(_: void, input: []const u8) !void {
                 // what they hold, and get nothing more. Dead letters go
                 // to the one that has the name now.
                 else => {
+                    ran.remade += 1;
                     const topic = g.intRange(u8, 0, 1);
                     try b.client.topic(topic_ids[topic]).delete();
                     try makeModelTopic(&b, topic);
@@ -9766,7 +10119,110 @@ fn modelProperty(_: void, input: []const u8) !void {
         try testing.expectEqual(0, b.fake.backlog("p", id));
         try expectNothing(sub);
     }
+    ran.steps = steps;
+    return ran;
 }
+
+// A script is bytes, and what its bytes mean is the property's to say: a
+// change there moves every script written by hand to mean something else,
+// and none of them fails for it. One did: an ack took a byte for a
+// lease's length, so that every script was a byte out after its first
+// ack, from the day the property was written until a replay against
+// production printed what the scripts did (2026-10-13).
+test "the model property's scripts written by hand do what is said of them" {
+    const said = [model_corpus.len]ModelRun{
+        .{},
+        // Publish, pull, let the lease lapse, ack late, pull again, ack.
+        .{ .steps = 6, .published = 1, .pulls = 2, .waits = 1, .acks = 2 },
+        // Five nacks, then a pull of the first subscription and an ack.
+        .{ .steps = 13, .published = 1, .pulls = 6, .nacks = 5, .acks = 1 },
+        // Three of a key, the third acknowledged and the first nacked,
+        // a pull, five seconds, a pull.
+        .{ .steps = 7, .published = 3, .pulls = 3, .acks = 1, .nacks = 1, .waits = 1 },
+        // A late ack, the message again, its old id, its new one, and a
+        // lease change.
+        .{ .steps = 8, .published = 1, .pulls = 2, .waits = 1, .acks = 3, .leases = 1 },
+        // Two of a key, four pulls, two acks and a nack between them.
+        .{ .steps = 8, .published = 2, .pulls = 4, .acks = 2, .nacks = 1 },
+        // A second of a key published while the first is out.
+        .{ .steps = 6, .published = 2, .pulls = 3, .acks = 1 },
+        // Two messages, and a pull of each of two subscriptions.
+        .{ .steps = 3, .published = 2, .pulls = 2 },
+        // A subscription made again, an old id, and a message after.
+        .{ .steps = 6, .published = 2, .pulls = 2, .remade = 1, .acks = 1 },
+        // The dead-letter topic made again, five nacks, then the other.
+        .{ .steps = 16, .published = 2, .pulls = 7, .nacks = 5, .remade = 2 },
+        // A snapshot of two that are out, both acknowledged, a seek, both
+        // again, and an id from before the seek.
+        .{ .steps = 9, .published = 2, .pulls = 3, .snapshots = 1, .acks = 3, .seeks = 1 },
+        // An ack, a seek back, a pull, a seek ahead, a pull.
+        .{ .steps = 8, .published = 1, .pulls = 3, .acks = 1, .waits = 1, .seeks = 2 },
+        // An ack, a seek back, the old id, the message again, its ack.
+        .{ .steps = 7, .published = 1, .pulls = 2, .acks = 3, .seeks = 1 },
+        // Two snapshots, four seeks, and a topic made again.
+        .{ .steps = 7, .snapshots = 2, .seeks = 4, .remade = 1 },
+        // Found by the random runs.
+        .{ .steps = 11, .pulls = 3, .waits = 1, .remade = 2, .snapshots = 1, .seeks = 1 },
+        // Seven nacks with no grant, a pull of the first subscription,
+        // an eighth delivery and its ack.
+        .{ .steps = 18, .published = 1, .pulls = 9, .nacks = 7, .acks = 1 },
+    };
+    for (model_corpus, said) |script, expected| try testing.expectEqual(expected, try modelRun(script));
+}
+
+/// The scripts the model property always runs, each a case someone
+/// thought of or a random run once found. `production_replay.zig` runs
+/// them too.
+pub const model_corpus = [_][]const u8{
+    "",
+    // Publish, pull, let the lease lapse, ack late, pull again, ack.
+    "\x00\x00\x00\x00\x00\x00\x02\x00\x03\x08\x0b\x05\x00\x00\x02\x00\x03\x05\x00\x00",
+    // Dead letters: one message to the third subscription, nacked
+    // five times, then pulled from the first and acknowledged.
+    "\x00\x00\x01\x00\x01\x00\x02\x02\x00\x06\x00\x00\x02\x02\x00\x06\x00\x01\x02\x02\x00\x06\x00\x02\x02\x02\x00\x06\x00\x03\x02\x02\x00\x06\x00\x04\x02\x00\x03\x05\x00\x05",
+    // Ordering with a backoff: three of a key to the second
+    // subscription, the third acknowledged and the first nacked,
+    // nothing for five seconds, then all three again.
+    "\x00\x00\x00\x02\x02\x00\x00\x00\x02\x01\x03\x05\x00\x02\x06\x00\x00\x02\x01\x03\x08\x04\x02\x01\x03",
+    // Exactly-once: a late ack refused, the message again, its old
+    // id refused and its new one taken, then a lease change on it.
+    "\x00\x00\x01\x00\x00\x00\x02\x02\x00\x08\x09\x05\x00\x00\x02\x02\x00\x05\x00\x00\x05\x00\x01\x07\x00\x01\x00",
+    // Ordering with exactly-once: of two of a key the second comes
+    // only when the first is acknowledged, and again when nacked.
+    "\x00\x00\x01\x01\x01\x00\x00\x02\x02\x03\x02\x02\x03\x05\x00\x00\x02\x02\x03\x06\x00\x01\x02\x02\x03\x05\x00\x02",
+    // Ordering alone: a second of a key, published while the first
+    // is out, waits for the first's ack.
+    "\x00\x00\x00\x00\x02\x00\x02\x01\x00\x00\x00\x00\x02\x00\x02\x01\x03\x05\x00\x00\x02\x01\x03",
+    // A filter: of two messages the second subscription gets one.
+    "\x01\x00\x00\x01\x00\x01\x00\x02\x01\x03\x02\x00\x03",
+    // A subscription made again, then an old id.
+    "\x00\x00\x00\x00\x00\x00\x02\x00\x00\x09\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00",
+    // The dead-letter topic made again: five nacks forward to the
+    // new one, where no subscription of the old listens. Then the
+    // other topic made again under the third subscription.
+    "\x00\x00\x01\x00\x00\x00\x09\x02\x00\x02\x02\x00\x06\x00\x00\x02\x02\x00\x06\x00\x01\x02\x02\x00\x06\x00\x02\x02\x02\x00\x06\x00\x03\x02\x02\x00\x06\x00\x04\x02\x00\x03\x09\x02\x01\x00\x01\x00\x00\x00\x02\x02\x03",
+    // A snapshot of two that are out, both acknowledged, and a
+    // seek back to it: both again, and an id from before the
+    // seek forgotten.
+    "\x00\x00\x00\x01\x00\x00\x00\x02\x00\x03\x0a\x00\x00\x05\x00\x00\x05\x00\x01\x0b\x00\x00\x02\x00\x03\x05\x00\x00\x02\x00\x03",
+    // The subscription that retains what is acknowledged, sought
+    // back in time: its message again. Then ahead: none.
+    "\x00\x00\x00\x00\x00\x00\x02\x00\x00\x05\x00\x00\x08\x04\x0b\x00\x03\x01\x02\x00\x03\x0b\x00\x04\x01\x02\x00\x03",
+    // The topic that retains messages: acknowledged with
+    // exactly-once delivery, a message comes again after a seek
+    // back, and its old id is forgotten, not refused.
+    "\x00\x00\x01\x00\x00\x00\x02\x02\x00\x05\x00\x00\x0b\x02\x03\x01\x05\x00\x00\x02\x02\x03\x05\x00\x01",
+    // A snapshot of another topic's subscription refuses the
+    // seek, and one never taken is not found.
+    "\x00\x0a\x01\x02\x0b\x00\x01\x0b\x00\x02\x09\x02\x01\x0a\x02\x02\x0b\x02\x02\x0b\x02\x01",
+    // Found by the random runs: a backoff still running when the
+    // last lease has lapsed, with later messages of its key behind.
+    "\x00\x33\xa2\x88\xe9\x5a\xc3\xa6\x7a\xa3\xb1\x6b\x59\xd6\xa7\x86\xf8\x48\x15\xae\x08\x17\xbe\xdf\xb0\xc2\x11\x8f",
+    // The service agent without its grants: nothing is forwarded, and
+    // the message comes a sixth time, a seventh and an eighth, the last
+    // acknowledged. The first subscription never has it.
+    "\x02\x00\x01\x00\x01\x00\x02\x02\x00\x06\x00\x00\x02\x02\x00\x06\x00\x01\x02\x02\x00\x06\x00\x02\x02\x02\x00\x06\x00\x03\x02\x02\x00\x06\x00\x04\x02\x02\x00\x06\x00\x05\x02\x02\x00\x06\x00\x06\x02\x00\x03\x02\x02\x00\x05\x00\x07",
+};
 
 // These two are named apart from the `fuzz` properties on purpose. A run
 // of the model property is a whole session of calls: under the fuzzer,
@@ -9776,7 +10232,9 @@ fn modelProperty(_: void, input: []const u8) !void {
 
 test "fake property: after any script of calls each subscription holds exactly what a reference says" {
     try test_util.fuzzBytes({}, modelProperty, .{
-        // A script is a byte for the order of pulls, and then steps: a
+        // A script is a byte for the order of pulls (its first bit) and
+        // for the service agent named without a grant (its second), and
+        // then steps: a
         // publish (0, topic, count less one, key, a byte a message for
         // `skip`), a pull (2, subscription, most less one), an ack, a
         // nack or a lease change of a delivery made so far (5, 6 or 7,
@@ -9786,52 +10244,7 @@ test "fake property: after any script of calls each subscription holds exactly w
         // its slot, of which subscription), and a seek (11, which
         // subscription, then a slot, or 3 and how far back in steps of
         // 20 seconds, or 4 and how far ahead).
-        .corpus = &.{
-            "",
-            // Publish, pull, let the lease lapse, ack late, pull again, ack.
-            "\x00\x00\x00\x00\x00\x00\x02\x00\x03\x08\x0b\x05\x00\x00\x02\x00\x03\x05\x00\x00",
-            // Dead letters: one message to the third subscription, nacked
-            // five times, then pulled from the first and acknowledged.
-            "\x00\x00\x01\x00\x01\x00\x02\x02\x00\x06\x00\x00\x02\x02\x00\x06\x00\x01\x02\x02\x00\x06\x00\x02\x02\x02\x00\x06\x00\x03\x02\x02\x00\x06\x00\x04\x02\x00\x03\x05\x00\x05",
-            // Ordering with a backoff: three of a key to the second
-            // subscription, the third acknowledged and the first nacked,
-            // nothing for five seconds, then all three again.
-            "\x00\x00\x00\x02\x02\x00\x00\x00\x02\x01\x03\x05\x00\x02\x06\x00\x00\x02\x01\x03\x08\x04\x02\x01\x03",
-            // Exactly-once: a late ack refused, the message again, its old
-            // id refused and its new one taken, then a lease change on it.
-            "\x00\x00\x01\x00\x00\x00\x02\x02\x00\x08\x09\x05\x00\x00\x02\x02\x00\x05\x00\x00\x05\x00\x01\x07\x00\x01\x00",
-            // Ordering with exactly-once: of two of a key the second comes
-            // only when the first is acknowledged, and again when nacked.
-            "\x00\x00\x01\x01\x01\x00\x00\x02\x02\x03\x02\x02\x03\x05\x00\x00\x02\x02\x03\x06\x00\x01\x02\x02\x03\x05\x00\x02",
-            // Ordering alone: a second of a key, published while the first
-            // is out, waits for the first's ack.
-            "\x00\x00\x00\x00\x02\x00\x02\x01\x00\x00\x00\x00\x02\x00\x02\x01\x03\x05\x00\x00\x02\x01\x03",
-            // A filter: of two messages the second subscription gets one.
-            "\x01\x00\x00\x01\x00\x01\x00\x02\x01\x03\x02\x00\x03",
-            // A subscription made again, then an old id.
-            "\x00\x00\x00\x00\x00\x00\x02\x00\x00\x09\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00",
-            // The dead-letter topic made again: five nacks forward to the
-            // new one, where no subscription of the old listens. Then the
-            // other topic made again under the third subscription.
-            "\x00\x00\x01\x00\x00\x00\x09\x02\x00\x02\x02\x00\x06\x00\x00\x02\x02\x00\x06\x00\x01\x02\x02\x00\x06\x00\x02\x02\x02\x00\x06\x00\x03\x02\x02\x00\x06\x00\x04\x02\x00\x03\x09\x02\x01\x00\x01\x00\x00\x00\x02\x02\x03",
-            // A snapshot of two that are out, both acknowledged, and a
-            // seek back to it: both again, and an id from before the
-            // seek forgotten.
-            "\x00\x00\x00\x01\x00\x00\x00\x02\x00\x03\x0a\x00\x00\x05\x00\x00\x05\x00\x01\x0b\x00\x00\x02\x00\x03\x05\x00\x00\x02\x00\x03",
-            // The subscription that retains what is acknowledged, sought
-            // back in time: its message again. Then ahead: none.
-            "\x00\x00\x00\x00\x00\x00\x02\x00\x00\x05\x00\x00\x08\x04\x0b\x00\x03\x01\x02\x00\x03\x0b\x00\x04\x01\x02\x00\x03",
-            // The topic that retains messages: acknowledged with
-            // exactly-once delivery, a message comes again after a seek
-            // back, and its old id is forgotten, not refused.
-            "\x00\x00\x01\x00\x00\x00\x02\x02\x00\x05\x00\x00\x0b\x02\x03\x01\x05\x00\x00\x02\x02\x03\x05\x00\x01",
-            // A snapshot of another topic's subscription refuses the
-            // seek, and one never taken is not found.
-            "\x00\x0a\x01\x02\x0b\x00\x01\x0b\x00\x02\x09\x02\x01\x0a\x02\x02\x0b\x02\x02\x0b\x02\x01",
-            // Found by the random runs: a backoff still running when the
-            // last lease has lapsed, with later messages of its key behind.
-            "\xfa\x33\xa2\x88\xe9\x5a\xc3\xa6\x7a\xa3\xb1\x6b\x59\xd6\xa7\x86\xf8\x48\x15\xae\x08\x17\xbe\xdf\xb0\xc2\x11\x8f",
-        },
+        .corpus = &model_corpus,
         .random_runs = 400,
         .max_len = 240,
     });

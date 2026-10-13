@@ -188,6 +188,10 @@ Some of what it does may surprise, because production does it:
 - **An ack takes only while the message is out on a lease.** After a
   lapse or a nack, an ack with the old id is answered and forgotten, and
   the message comes again. (The emulator takes a late ack.)
+- **A seek ends no ack id.** One from before it goes on naming its
+  message, and acts once the message is out again; with exactly-once
+  delivery it is answered for as long as the lease it had runs, and
+  refused after ([Replaying](replay.md#what-a-running-subscriber-sees)).
 - **With ordering, a key gives nothing more while one of its messages is
   out**, and a nack brings back every later message of the key,
   acknowledged ones included.
@@ -216,9 +220,21 @@ it, read back as production reads it back, and **not done**:
   a filter of a shape production was never shown, and a setting here and
   there that production was never asked about.
 - **Production's delays.** A seek that takes seconds to show, a deleted
-  topic that still takes a publish for a while, the moment before a
-  nacked message comes again: here everything holds at once. A test of
-  waiting belongs against production.
+  topic that still takes a publish for a while, a subscription made
+  again under its name that answers as the old one and the new by turns
+  for two minutes, the moment before a nacked message comes again: here
+  everything holds at once. A test of waiting belongs against
+  production.
+- **What production forgets.** It counts a message's delivery attempts
+  from one again when the message has not come for about two minutes,
+  and with exactly-once delivery it takes a second ack by the id that
+  acknowledged a message for a time and then refuses it (after two
+  minutes at most on a subscription with ordering and dead letters, and
+  after three and more on one without). The fake forgets neither.
+- **Production's races.** An ack that comes too late is answered and
+  forgotten; with a pull right behind it on the same connection,
+  production let it acknowledge the message as it went out again. Here
+  each call is done before the next begins.
 - **Callers and permissions.** There are no accounts: every caller holds
   every permission, and a policy is kept and never enforced, except for
   dead letters when the service agent is named.
@@ -254,6 +270,13 @@ other guides' own tables.
   of calls go to the fake and to the emulator, and the answers must
   match. Where they did not, production was asked, and settled it:
   twice for the fake, and once against it, which is now fixed.
+- **Production, slowly.** The model property's scripts are replayed
+  against a real project, with the same reference saying what each
+  subscription should hold, and with waits where production answers in
+  its own time. The first replay, on 2026-10-13, found the fake wrong
+  about ack ids from before a seek, which is fixed, and found what
+  production forgets, which is listed above.
+  [Development](../development.md#pubsub) says how to run one.
 - **This library through it.** A `Publisher` and a `Subscriber` run over
   one fake, with faults on every kind of call, and every message is
   handled, once where delivery is exactly-once. Every guide's code on

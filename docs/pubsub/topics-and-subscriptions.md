@@ -34,7 +34,12 @@ defer created.deinit();
   its last attempt, and the dead-letter topic got nothing; with them, it
   forwarded the message about 3 s after its fifth delivery was released.
   `ReceivedMessage.delivery_attempt` counts deliveries only on a
-  subscription with a dead-letter policy.
+  subscription with a dead-letter policy. **The count is not kept for
+  long**: a message that had been delivered three times came on its
+  fourth attempt when it was pulled again up to 107 seconds after the
+  third, and on attempt 1 again from 137 seconds after (measured
+  2026-10-13, five runs). So a message that comes less often than about
+  every two minutes may never reach its last attempt.
 - **`retry_policy`**: how long Pub/Sub waits before delivering a message
   again after a release or a lapsed deadline, each bound 0 to 600 s (the
   type is `pubsub.Backoff`: `pubsub.RetryPolicy` is this client's own
