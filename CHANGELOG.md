@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.37.0 (unreleased)
+## 0.37.0 (2026-10-13)
 
 - pubsub: an in-memory Pub/Sub for tests, **experimental**.
   `pubsub.testing.FakePubSub` goes where a client's transport goes
