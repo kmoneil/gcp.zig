@@ -4,6 +4,17 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.38.0 (unreleased)
+
+- firestore: now **beta**, as `pubsub` and `core` are. No call
+  changes. It earned the label by the hardening released in 0.34.0:
+  large answers read one document at a time in bounded memory, the
+  emulator suite run against production with the differences recorded,
+  and production's limits checked before a request is sent; and by its
+  two nightly fuzz jobs, `firestore` and `heavy-firestore`, running a
+  week, 2026-10-08 to 2026-10-15, without a failure.
+- auth, core, pubsub, secret_manager and storage: unchanged.
+
 ## 0.37.0 (2026-10-13)
 
 - pubsub: an in-memory Pub/Sub for tests, **experimental**.
