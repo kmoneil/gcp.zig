@@ -14,7 +14,7 @@ made and reviewed is in [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ```sh
 zig build test                         # unit, property and fuzz-corpus tests
-zig build test --seed 0x1234           # same, with different pseudo-random inputs
+zig build test --seed=0x1234           # same, with different pseudo-random inputs
 zig build test -Doptimize=ReleaseFast  # same, optimized; also ReleaseSafe
 zig build test -Dfuzz-runner --fuzz    # coverage-guided fuzzing (see below)
 zig build test-integration             # needs a server, see below

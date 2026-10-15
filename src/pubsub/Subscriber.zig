@@ -36,6 +36,11 @@
 //! `roles/pubsub.subscriber` may pull and acknowledge, but not read the
 //! subscription.
 //!
+//! A handler that must know whether its ack held, before work it must not
+//! repeat, runs under `runDeliveries` instead of `run`: it is handed a
+//! `Delivery`, whose `ack` and `nack` wait for the server's answer and
+//! return it as an `AckOutcome`.
+//!
 //! A subscriber runs once. It must not be moved after `init`, and its
 //! handler is called from `concurrency` tasks at once, so what the handler
 //! touches must tolerate that.
@@ -84,6 +89,10 @@ queue_buffer: []*Tracked,
 extend_buffer: [][]const u8,
 /// What the server said of each id in `extend_buffer`.
 extend_results: []types.AckResult,
+/// One per handler task, indexed by the task: where the outcome of a
+/// `Delivery`'s ack or release is left for the handler waiting on it.
+/// Guarded by `mutex`.
+waiters: []Waiter,
 stopping: bool,
 /// Every task must end now, cancel delivered or not: `run` is being
 /// canceled, or its drain is past the workers. The janitor heeds this
@@ -147,6 +156,80 @@ pub const Handler = struct {
         return self.vtable.handle(self.ptr, io, message);
     }
 };
+
+pub const AckOutcome = types.AckOutcome;
+
+/// A message handed to a `DeliveryHandler`, which may settle it itself.
+/// Valid until `handle` returns, as the message is. `ack` and `nack` are
+/// called from the handler's own task.
+pub const Delivery = struct {
+    message: types.ReceivedMessage,
+    /// The rest is the subscriber's: what to settle, and where the answer
+    /// is left.
+    subscriber: *Subscriber,
+    tracked: *Tracked,
+    slot: u16,
+    settled: bool = false,
+    outcome: ?AckOutcome = null,
+
+    /// Acknowledges the message and waits for what the server said: about
+    /// 100 ms and a round trip, or with exactly-once delivery up to 10
+    /// minutes while the server refuses it for now. With exactly-once
+    /// delivery, `.taken` means the message will not come again. A second
+    /// `ack` or `nack` sends nothing and returns the first one's outcome.
+    pub fn ack(self: *Delivery, io: std.Io) std.Io.Cancelable!AckOutcome {
+        return self.settle(io, .acked);
+    }
+
+    /// Releases the message for redelivery, and waits as `ack` does.
+    pub fn nack(self: *Delivery, io: std.Io) std.Io.Cancelable!AckOutcome {
+        return self.settle(io, .released);
+    }
+
+    fn settle(self: *Delivery, io: std.Io, outcome: Outcome) std.Io.Cancelable!AckOutcome {
+        if (self.settled) return self.outcome orelse .unknown;
+        self.settled = true;
+        self.subscriber.enqueue(self.tracked, outcome, self.slot);
+        self.outcome = try self.subscriber.awaitOutcome(io, self.slot);
+        return self.outcome.?;
+    }
+};
+
+/// A handler for `runDeliveries`, handed a `Delivery` it may settle itself
+/// to learn what the server said. Returning without settling acknowledges
+/// the message and an error releases it, as with `Handler`. An error after
+/// settling is counted in `Stats.handler_failures` and sends nothing more.
+pub const DeliveryHandler = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Called from one of `concurrency` tasks. The delivery, its
+        /// message and all of their fields are only valid until this
+        /// returns.
+        handle: *const fn (ptr: *anyopaque, io: std.Io, delivery: *Delivery) anyerror!void,
+    };
+
+    pub fn handle(self: DeliveryHandler, io: std.Io, delivery: *Delivery) anyerror!void {
+        return self.vtable.handle(self.ptr, io, delivery);
+    }
+};
+
+const AnyHandler = union(enum) {
+    plain: Handler,
+    delivery: DeliveryHandler,
+};
+
+/// Where a handler task waits for the outcome of its delivery. Each wait
+/// takes a new generation, so an answer meant for an earlier one, whose
+/// handler gave up waiting, is dropped.
+const Waiter = struct {
+    generation: u32 = 0,
+    waiting: bool = false,
+    outcome: ?AckOutcome = null,
+};
+
+const WaiterRef = struct { slot: u16, generation: u32 };
 
 pub const Options = struct {
     /// The subscription to pull from, such as "orders-worker".
@@ -234,6 +317,9 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) Error!Subscriber {
     errdefer gpa.free(extend_buffer);
     const extend_results = try gpa.alloc(types.AckResult, options.max_outstanding);
     errdefer gpa.free(extend_results);
+    const waiters = try gpa.alloc(Waiter, options.concurrency);
+    errdefer gpa.free(waiters);
+    @memset(waiters, .{});
 
     return .{
         .gpa = gpa,
@@ -254,6 +340,7 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) Error!Subscriber {
         .queue_buffer = queue_buffer,
         .extend_buffer = extend_buffer,
         .extend_results = extend_results,
+        .waiters = waiters,
         .stopping = false,
         .halted = false,
         .ran = false,
@@ -284,6 +371,7 @@ pub fn deinit(self: *Subscriber) void {
     self.to_ack.deinit(self.gpa);
     for (self.to_nack.items) |p| self.gpa.free(p.ack_id);
     self.to_nack.deinit(self.gpa);
+    self.gpa.free(self.waiters);
     self.gpa.free(self.extend_results);
     self.gpa.free(self.extend_buffer);
     self.gpa.free(self.queue_buffer);
@@ -330,6 +418,16 @@ pub fn stats(self: *Subscriber) Stats {
 /// Runs until `stop` or a fatal error, blocking the calling task. A
 /// subscriber runs once.
 pub fn run(self: *Subscriber, handler: Handler) Error!void {
+    return self.runWith(.{ .plain = handler });
+}
+
+/// As `run`, with a handler that may settle its own messages and learn
+/// what the server said of each.
+pub fn runDeliveries(self: *Subscriber, handler: DeliveryHandler) Error!void {
+    return self.runWith(.{ .delivery = handler });
+}
+
+fn runWith(self: *Subscriber, handler: AnyHandler) Error!void {
     const io = self.io;
     {
         self.mutex.lockUncancelable(io);
@@ -396,7 +494,7 @@ pub fn run(self: *Subscriber, handler: Handler) Error!void {
     // landed and dropped the cancel. A closed queue sends every worker home
     // whatever std does.
     defer self.queue.close(io);
-    for (0..self.concurrency) |_| workers.concurrent(io, workerLoop, .{ self, handler }) catch {
+    for (0..self.concurrency) |i| workers.concurrent(io, workerLoop, .{ self, handler, @as(u16, @intCast(i)) }) catch {
         var d: Diagnostics = .{};
         d.print("this Io cannot run concurrent tasks, which a Subscriber needs", .{});
         self.recordFatal(error.InvalidOptions, &d);
@@ -476,6 +574,8 @@ const Pending = struct {
     /// taken, so it is counted as failed without being sent, and a release
     /// is dropped.
     lease_lost: bool = false,
+    /// The handler task waiting for what the server says of it, if any.
+    waiter: ?WaiterRef = null,
 };
 
 /// One pull's response, alive until every message in it resolves: the
@@ -668,22 +768,37 @@ fn dispatch(self: *Subscriber, pulled: types.Owned(types.PullResult), receipts: 
 const Outcome = enum { acked, released };
 
 /// Moves a message from in flight to the janitor's ack or release list,
-/// and wakes whoever waits on room or on progress. Never allocates: room
-/// was kept for it when it arrived.
+/// and lets go of its memory.
 fn resolve(self: *Subscriber, tracked: *Tracked, outcome: Outcome) void {
+    self.enqueue(tracked, outcome, null);
+    self.finish(tracked);
+}
+
+/// Moves a message from in flight to the janitor's ack or release list,
+/// and wakes whoever waits on room or on progress. With `slot`, that
+/// handler task will wait for what the server says of it. Never
+/// allocates: room was kept for it when it arrived.
+fn enqueue(self: *Subscriber, tracked: *Tracked, outcome: Outcome, slot: ?u16) void {
     const io = self.io;
-    const gpa = self.gpa;
     const now = std.Io.Timestamp.now(io, .boot);
     self.mutex.lockUncancelable(io);
+    defer self.mutex.unlock(io);
     const moved = self.inflight.swapRemove(tracked.index);
     if (self.inflight.items.len > tracked.index) self.inflight.items[tracked.index].index = tracked.index;
     std.debug.assert(moved == tracked);
-    const pending: Pending = .{
+    var pending: Pending = .{
         .ack_id = tracked.ack_id,
         .resolved_at = now,
         .not_before = now,
         .lease_lost = tracked.lease_lost,
     };
+    if (slot) |s| {
+        const waiter = &self.waiters[s];
+        waiter.generation +%= 1;
+        waiter.waiting = true;
+        waiter.outcome = null;
+        pending.waiter = .{ .slot = s, .generation = waiter.generation };
+    }
     switch (outcome) {
         .acked => self.to_ack.appendAssumeCapacity(pending),
         .released => {
@@ -692,12 +807,44 @@ fn resolve(self: *Subscriber, tracked: *Tracked, outcome: Outcome) void {
         },
     }
     self.cond.broadcast(io);
-    self.mutex.unlock(io);
-    tracked.batch.release(gpa);
-    gpa.destroy(tracked);
 }
 
-fn workerLoop(self: *Subscriber, handler: Handler) std.Io.Cancelable!void {
+/// Lets go of a resolved message's share of its batch and of its
+/// tracking: the handler is done with it. The ack id went to the list.
+fn finish(self: *Subscriber, tracked: *Tracked) void {
+    tracked.batch.release(self.gpa);
+    self.gpa.destroy(tracked);
+}
+
+/// Waits for the outcome left for `slot`'s handler task. A fatal error
+/// ends the wait with `.unknown`, since no answer may come, and a halt or
+/// a cancel ends it with `error.Canceled`. Every way out stops the slot
+/// from taking an answer.
+fn awaitOutcome(self: *Subscriber, io: std.Io, slot: u16) std.Io.Cancelable!AckOutcome {
+    const waiter = &self.waiters[slot];
+    self.mutex.lockUncancelable(io);
+    defer self.mutex.unlock(io);
+    defer waiter.waiting = false;
+    while (true) {
+        if (waiter.outcome) |outcome| return outcome;
+        if (self.halted) return error.Canceled;
+        if (self.fatal != null) return .unknown;
+        try self.cond.wait(io, &self.mutex);
+    }
+}
+
+/// Leaves `outcome` for the handler task `ref` names, if it still waits
+/// for it. True when one was left, and the caller must then broadcast.
+/// The caller holds the mutex.
+fn answer(self: *Subscriber, ref: ?WaiterRef, outcome: AckOutcome) bool {
+    const r = ref orelse return false;
+    const waiter = &self.waiters[r.slot];
+    if (!waiter.waiting or waiter.generation != r.generation) return false;
+    waiter.outcome = outcome;
+    return true;
+}
+
+fn workerLoop(self: *Subscriber, handler: AnyHandler, slot: u16) std.Io.Cancelable!void {
     const io = self.io;
     while (true) {
         const tracked = self.queue.getOne(io) catch |err| switch (err) {
@@ -713,19 +860,45 @@ fn workerLoop(self: *Subscriber, handler: Handler) std.Io.Cancelable!void {
             self.resolve(tracked, .released);
             continue;
         }
-        if (handler.handle(io, tracked.message)) {
-            self.resolve(tracked, .acked);
-        } else |err| {
-            if (err == error.Canceled) {
-                self.resolve(tracked, .released);
-                return error.Canceled;
-            }
-            logging.debug("handler failed with {t}; releasing {s}", .{ err, tracked.message.message_id });
-            self.mutex.lockUncancelable(io);
-            self.counts.handler_failures += 1;
-            self.mutex.unlock(io);
-            self.resolve(tracked, .released);
+        switch (handler) {
+            .plain => |plain| try self.resolveReturned(tracked, plain.handle(io, tracked.message)),
+            .delivery => |with| {
+                var delivery: Delivery = .{ .message = tracked.message, .subscriber = self, .tracked = tracked, .slot = slot };
+                const returned = with.handle(io, &delivery);
+                if (!delivery.settled) {
+                    try self.resolveReturned(tracked, returned);
+                    continue;
+                }
+                // The handler settled it: only its memory is left, and an
+                // error to count.
+                defer self.finish(tracked);
+                returned catch |err| {
+                    if (err == error.Canceled) return error.Canceled;
+                    logging.debug("handler failed with {t} after settling {s}", .{ err, tracked.message.message_id });
+                    self.mutex.lockUncancelable(io);
+                    self.counts.handler_failures += 1;
+                    self.mutex.unlock(io);
+                };
+            },
         }
+    }
+}
+
+/// Resolves a message by what its handler returned: success acknowledges
+/// it, an error releases it, and a cancel releases it and ends the task.
+fn resolveReturned(self: *Subscriber, tracked: *Tracked, returned: anyerror!void) std.Io.Cancelable!void {
+    if (returned) {
+        self.resolve(tracked, .acked);
+    } else |err| {
+        if (err == error.Canceled) {
+            self.resolve(tracked, .released);
+            return error.Canceled;
+        }
+        logging.debug("handler failed with {t}; releasing {s}", .{ err, tracked.message.message_id });
+        self.mutex.lockUncancelable(self.io);
+        self.counts.handler_failures += 1;
+        self.mutex.unlock(self.io);
+        self.resolve(tracked, .released);
     }
 }
 
@@ -805,6 +978,10 @@ fn sendResolved(self: *Subscriber, what: IdKind, everything: bool) std.Io.Cancel
     const gpa = self.gpa;
     var due: std.ArrayList(Pending) = .empty;
     defer due.deinit(gpa);
+    // Once stopping, backoffs are over: what is refused for now gets its
+    // last try at once, and `stop` is not held for 10 minutes. A try that
+    // was on its way when `stop` came is not the last.
+    var last_try = false;
     {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -813,9 +990,10 @@ fn sendResolved(self: *Subscriber, what: IdKind, everything: bool) std.Io.Cancel
         // No memory for the snapshot: the next wake tries again.
         due.ensureTotalCapacity(gpa, list.items.len) catch return;
         const now = std.Io.Timestamp.now(io, .boot);
+        last_try = everything or self.stopping;
         var i: usize = 0;
         while (i < list.items.len) {
-            if (everything or list.items[i].not_before.nanoseconds <= now.nanoseconds) {
+            if (last_try or list.items[i].not_before.nanoseconds <= now.nanoseconds) {
                 due.appendAssumeCapacity(list.swapRemove(i));
             } else i += 1;
         }
@@ -857,12 +1035,13 @@ fn sendResolved(self: *Subscriber, what: IdKind, everything: bool) std.Io.Cancel
             @memset(results[0..sent], .transient);
         };
     }
-    self.settle(what, due.items, results[0..sent]);
+    self.settle(what, due.items, results[0..sent], last_try);
 }
 
 /// Settles sent ids by what the server said, in `due` order, skipping the
-/// ones whose lease was lost, which were not sent.
-fn settle(self: *Subscriber, what: IdKind, due: []Pending, results: []const types.AckResult) void {
+/// ones whose lease was lost, which were not sent. After a `last_try`, an
+/// id refused for now is given up rather than kept.
+fn settle(self: *Subscriber, what: IdKind, due: []Pending, results: []const types.AckResult, last_try: bool) void {
     const io = self.io;
     const gpa = self.gpa;
     const now = std.Io.Timestamp.now(io, .boot);
@@ -872,6 +1051,7 @@ fn settle(self: *Subscriber, what: IdKind, due: []Pending, results: []const type
     var given_up: usize = 0;
     var kept: usize = 0;
     var learned = false;
+    var woke = false;
     var next: usize = 0;
     self.mutex.lockUncancelable(io);
     defer self.mutex.unlock(io);
@@ -881,14 +1061,19 @@ fn settle(self: *Subscriber, what: IdKind, due: []Pending, results: []const type
             break :r results[next];
         };
         switch (result) {
-            .ok => taken += 1,
+            .ok => {
+                taken += 1;
+                woke = self.answer(p.waiter, .taken) or woke;
+            },
             .invalid_ack_id, .other => {
                 refused += 1;
                 if (result == .invalid_ack_id and !p.lease_lost) learned = true;
+                woke = self.answer(p.waiter, if (result == .invalid_ack_id) .refused else .unknown) or woke;
             },
             .transient => {
-                if (now.nanoseconds - p.resolved_at.nanoseconds >= give_up_ns) {
+                if (last_try or now.nanoseconds - p.resolved_at.nanoseconds >= give_up_ns) {
                     given_up += 1;
+                    woke = self.answer(p.waiter, .unknown) or woke;
                 } else {
                     // Kept for a later flush, compacted to the front of
                     // `due`: never ahead of the entry being read.
@@ -904,6 +1089,7 @@ fn settle(self: *Subscriber, what: IdKind, due: []Pending, results: []const type
         gpa.free(p.ack_id);
     }
     self.reinsert(what, due[0..kept]);
+    if (woke) self.cond.broadcast(io);
     if (what == .ack) {
         self.counts.acked += taken;
         self.counts.ack_failed += refused + given_up;
@@ -934,7 +1120,12 @@ fn reinsert(self: *Subscriber, what: IdKind, entries: []const Pending) void {
     const gpa = self.gpa;
     const list = self.listFor(what);
     list.ensureTotalCapacity(gpa, list.items.len + entries.len + self.inflight.items.len) catch {
-        for (entries) |p| gpa.free(p.ack_id);
+        var woke = false;
+        for (entries) |p| {
+            gpa.free(p.ack_id);
+            woke = self.answer(p.waiter, .unknown) or woke;
+        }
+        if (woke) self.cond.broadcast(self.io);
         if (what == .ack) self.counts.ack_failed += entries.len;
         return;
     };
@@ -1138,6 +1329,9 @@ const FakeSubscription = struct {
     /// A subscription that does not pull: every pull is refused as
     /// production refuses a push subscription's.
     push_subscription: bool = false,
+    /// Stop this subscriber while answering the next acknowledge request,
+    /// so that `stop` comes while the request is on its way.
+    stop_during_ack: ?*Subscriber = null,
 
     const detached_reply: Response = .{
         .status = 400,
@@ -1369,7 +1563,11 @@ const FakeSubscription = struct {
     }
 
     fn failure(f: *FakeSubscription, arena: Allocator) TransportError!Response {
-        const status: []const u8 = if (f.fail_status == 404) "NOT_FOUND" else "UNAVAILABLE";
+        const status: []const u8 = switch (f.fail_status) {
+            400 => "INVALID_ARGUMENT",
+            404 => "NOT_FOUND",
+            else => "UNAVAILABLE",
+        };
         const body = try arena.print(
             "{{\"error\":{{\"code\":{d},\"message\":\"scripted failure\",\"status\":\"{s}\"}}}}",
             .{ f.fail_status, status },
@@ -1464,6 +1662,10 @@ const FakeSubscription = struct {
         defer f.mutex.unlock(f.io);
         f.ack_calls += 1;
         for (body.ackIds) |id| try f.ack_attempts.append(f.gpa, try f.gpa.dupe(u8, id));
+        if (f.stop_during_ack) |subscriber| {
+            f.stop_during_ack = null;
+            subscriber.stop();
+        }
         if (f.hold_acks > 0) {
             f.hold_acks -= 1;
             f.held_acks += 1;
@@ -3146,7 +3348,7 @@ test "workerLoop: a cancel parked at the empty queue is taken" {
     try h.init(.{});
     defer h.deinit();
     const io = testing.io;
-    var worker = try io.concurrent(workerLoop, .{ &h.subscriber, h.handler.handler() });
+    var worker = try io.concurrent(workerLoop, .{ &h.subscriber, AnyHandler{ .plain = h.handler.handler() }, 0 });
     // Let it park in the queue's wait; a cancel landing earlier is taken
     // at the same point, the loop's only cancellation point.
     try io.sleep(.fromMilliseconds(25), .awake);
@@ -3167,7 +3369,7 @@ test "workerLoop: a handler that is itself canceled releases the message and end
         }
     };
     var ctx: u8 = 0;
-    var worker = try io.concurrent(workerLoop, .{ &h.subscriber, Handler{ .ptr = &ctx, .vtable = &.{ .handle = Canceling.handle } } });
+    var worker = try io.concurrent(workerLoop, .{ &h.subscriber, AnyHandler{ .plain = .{ .ptr = &ctx, .vtable = &.{ .handle = Canceling.handle } } }, 0 });
     try testing.expectError(error.Canceled, worker.await(io));
     // At-least-once holds: the message went back for redelivery.
     try testing.expectEqual(1, h.subscriber.stats().nacked);
@@ -3187,4 +3389,635 @@ test "tickMs: without an override, half the period, at least half a second" {
     h.subscriber.period_s = 0;
     h.subscriber.mutex.unlock(io);
     try testing.expectEqual(500, h.subscriber.tickMs());
+}
+
+/// A `DeliveryHandler` for the tests of `runDeliveries`: settles each
+/// message as `plan` says, and records what each settlement came to.
+const DeliveryProbe = struct {
+    harness: *Harness,
+    plan: Plan = .ack,
+    /// Hold a message's first delivery, before settling it, until this is
+    /// true of the harness, looking every 5 ms. Panics after 10 s.
+    hold_first_until: ?*const fn (*Harness) bool = null,
+    /// Stop the subscriber once this many records are in.
+    stop_after: ?usize = null,
+    /// Hold every handler, before settling, until this many have come in
+    /// all told, so that as many handler tasks hold a message at once.
+    /// Panics after 10 s.
+    barrier: usize = 0,
+    arrived: usize = 0,
+    mutex: std.Io.Mutex = .init,
+    records: std.ArrayList(Record) = .empty,
+    /// Deliveries of each message so far, by its data.
+    attempts: std.StringHashMapUnmanaged(usize) = .empty,
+
+    const Plan = enum {
+        /// Ack, and wait for the outcome.
+        ack,
+        /// Release the first delivery of each message, ack the next.
+        nack_first,
+        /// Ack, then ack and release again, each returning the first's.
+        ack_twice,
+        /// Ack, then return an error.
+        ack_then_fail,
+        /// Return without settling, failing the first delivery of each
+        /// message: as a plain `Handler` does.
+        unsettled_fail_first,
+    };
+
+    const Record = struct {
+        /// Owned.
+        data: []u8,
+        /// Null when the handler did not settle, or its wait was canceled.
+        outcome: ?AckOutcome,
+        canceled: bool = false,
+        /// What the second `ack` and the `nack` after it returned.
+        again: [2]?AckOutcome = .{ null, null },
+        /// The fake held the message acknowledged when `ack` returned.
+        acked_on_return: bool = false,
+        /// The message's data read the same after its settlement.
+        intact: bool = true,
+    };
+
+    fn deinit(p: *DeliveryProbe) void {
+        const gpa = testing.allocator;
+        for (p.records.items) |r| gpa.free(r.data);
+        p.records.deinit(gpa);
+        var it = p.attempts.keyIterator();
+        while (it.next()) |key| gpa.free(key.*);
+        p.attempts.deinit(gpa);
+    }
+
+    fn handler(p: *DeliveryProbe) DeliveryHandler {
+        return .{ .ptr = p, .vtable = &.{ .handle = handle } };
+    }
+
+    fn handle(ptr: *anyopaque, io: std.Io, delivery: *Delivery) anyerror!void {
+        const p: *DeliveryProbe = @ptrCast(@alignCast(ptr));
+        const gpa = testing.allocator;
+        const data = delivery.message.data;
+        const attempt = a: {
+            p.mutex.lockUncancelable(io);
+            defer p.mutex.unlock(io);
+            const entry = try p.attempts.getOrPut(gpa, data);
+            if (!entry.found_existing) {
+                entry.key_ptr.* = try gpa.dupe(u8, data);
+                entry.value_ptr.* = 0;
+            }
+            entry.value_ptr.* += 1;
+            break :a entry.value_ptr.*;
+        };
+        if (attempt == 1) if (p.hold_first_until) |released| {
+            const limit_ms = std.Io.Clock.awake.now(io).toMilliseconds() + 10_000;
+            while (!released(p.harness)) {
+                if (std.Io.Clock.awake.now(io).toMilliseconds() > limit_ms) {
+                    @panic("a held first delivery waited 10 s for its test's event");
+                }
+                try io.sleep(.fromMilliseconds(5), .awake);
+            }
+        };
+        if (p.barrier > 0) {
+            p.mutex.lockUncancelable(io);
+            p.arrived += 1;
+            p.mutex.unlock(io);
+            const limit_ms = std.Io.Clock.awake.now(io).toMilliseconds() + 10_000;
+            while (true) {
+                p.mutex.lockUncancelable(io);
+                const arrived = p.arrived;
+                p.mutex.unlock(io);
+                if (arrived >= p.barrier) break;
+                if (std.Io.Clock.awake.now(io).toMilliseconds() > limit_ms) {
+                    @panic("handlers waited 10 s for the test's barrier");
+                }
+                try io.sleep(.fromMilliseconds(2), .awake);
+            }
+        }
+        var before: [64]u8 = undefined;
+        std.debug.assert(data.len <= before.len);
+        @memcpy(before[0..data.len], data);
+
+        var record: Record = .{ .data = try gpa.dupe(u8, data), .outcome = null };
+        defer p.add(io, record);
+        if (p.plan == .unsettled_fail_first) {
+            if (attempt == 1) return error.NotToday;
+            return;
+        }
+        const nacking = p.plan == .nack_first and attempt == 1;
+        record.outcome = (if (nacking) delivery.nack(io) else delivery.ack(io)) catch |err| {
+            record.canceled = true;
+            return err;
+        };
+        record.acked_on_return = p.harness.fake.ackedData(data) >= 1;
+        record.intact = std.mem.eql(u8, before[0..data.len], delivery.message.data);
+        switch (p.plan) {
+            .ack_twice => record.again = .{ try delivery.ack(io), try delivery.nack(io) },
+            .ack_then_fail => return error.AfterTheFact,
+            else => {},
+        }
+    }
+
+    fn add(p: *DeliveryProbe, io: std.Io, record: Record) void {
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
+        p.records.append(testing.allocator, record) catch @panic("out of memory in a test");
+        if (p.stop_after) |n| if (p.records.items.len >= n) p.harness.subscriber.stop();
+    }
+
+    fn recordCount(p: *DeliveryProbe) usize {
+        p.mutex.lockUncancelable(p.harness.subscriber.io);
+        defer p.mutex.unlock(p.harness.subscriber.io);
+        return p.records.items.len;
+    }
+};
+
+/// `runDeliveries` on a task of its own, for a test that acts while it
+/// runs. `finish` panics if it has not returned within `limit_ms`: a run
+/// that never returns must name its test, not stall the suite.
+const BackgroundRun = struct {
+    returned: std.atomic.Value(bool),
+    future: std.Io.Future(Error!void),
+
+    fn start(r: *BackgroundRun, h: *Harness, probe: *DeliveryProbe) !void {
+        r.returned = .init(false);
+        r.future = try testing.io.concurrent(runDeliveriesFlagged, .{ &h.subscriber, probe.handler(), &r.returned });
+    }
+
+    fn runDeliveriesFlagged(s: *Subscriber, handler: DeliveryHandler, returned: *std.atomic.Value(bool)) Error!void {
+        defer returned.store(true, .release);
+        return s.runDeliveries(handler);
+    }
+
+    fn hasReturned(returned: *std.atomic.Value(bool)) bool {
+        return returned.load(.acquire);
+    }
+
+    fn finish(r: *BackgroundRun, limit_ms: i64) !void {
+        if (!try waitUntil(limit_ms, &r.returned, hasReturned)) {
+            @panic("Subscriber.runDeliveries did not return within the test's limit");
+        }
+        return r.future.await(testing.io);
+    }
+};
+
+/// `runWithin` for a delivery handler.
+fn runDeliveriesWithin(h: *Harness, probe: *DeliveryProbe, limit_ms: i64) !void {
+    var running: BackgroundRun = undefined;
+    try running.start(h, probe);
+    return running.finish(limit_ms);
+}
+
+test "runDeliveries: an ack waits for the server's answer, and the message stays readable" {
+    var h: Harness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    var probe: DeliveryProbe = .{ .harness = &h, .stop_after = 2 };
+    defer probe.deinit();
+    try h.fake.publish("one");
+    try h.fake.publish("two");
+    try runDeliveriesWithin(&h, &probe, 10_000);
+
+    try testing.expectEqual(2, probe.records.items.len);
+    for (probe.records.items) |r| {
+        try testing.expectEqual(AckOutcome.taken, r.outcome.?);
+        // Without exactly-once delivery too, the outcome is the server's:
+        // the fake had taken the ack when `ack` returned.
+        try testing.expect(r.acked_on_return);
+        try testing.expect(r.intact);
+    }
+    const counts = h.subscriber.stats();
+    try testing.expectEqual(2, counts.acked);
+    try testing.expectEqual(0, counts.handler_failures);
+    try expectAccounted(counts);
+}
+
+test "runDeliveries: a nack is taken, and the message comes again" {
+    var h: Harness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    var probe: DeliveryProbe = .{ .harness = &h, .plan = .nack_first, .stop_after = 2 };
+    defer probe.deinit();
+    try h.fake.publish("back");
+    try runDeliveriesWithin(&h, &probe, 10_000);
+
+    try testing.expectEqual(2, probe.records.items.len);
+    for (probe.records.items) |r| try testing.expectEqual(AckOutcome.taken, r.outcome.?);
+    // The release went out as a lease of 0 s, and was not an ack.
+    try testing.expect(!probe.records.items[0].acked_on_return);
+    try testing.expect(h.fake.modacksOf(0) >= 1);
+    try testing.expectEqual(1, h.fake.ackedData("back"));
+    const counts = h.subscriber.stats();
+    try testing.expectEqual(1, counts.nacked);
+    try testing.expectEqual(1, counts.acked);
+    try expectAccounted(counts);
+}
+
+test "runDeliveries: on an exactly-once subscription, an ack after the lease lapsed is refused" {
+    var h: Harness = undefined;
+    try h.init(.{ .concurrency = 2, .extension_period_s = null, .max_extension_s = 1, .tick_ms = 20 });
+    defer h.deinit();
+    h.fake.exactly_once = true;
+    h.fake.lease_ms = 1000;
+    // As in the plain handler's test: the first delivery outlives
+    // max_extension_s, the message comes again and is acked at once, and
+    // the first's ack then comes too late.
+    const Late = struct {
+        fn redeliveryAcked(harness: *Harness) bool {
+            return harness.fake.ackedData("late") >= 1;
+        }
+    };
+    var probe: DeliveryProbe = .{ .harness = &h, .hold_first_until = Late.redeliveryAcked, .stop_after = 2 };
+    defer probe.deinit();
+    try h.fake.publish("late");
+    try runDeliveriesWithin(&h, &probe, 20_000);
+
+    try testing.expectEqual(2, probe.records.items.len);
+    try testing.expectEqual(AckOutcome.taken, probe.records.items[0].outcome.?);
+    try testing.expectEqual(AckOutcome.refused, probe.records.items[1].outcome.?);
+    try testing.expect(h.fake.ackAttempted("ack-0"));
+    const counts = h.subscriber.stats();
+    try testing.expectEqual(1, counts.acked);
+    try testing.expectEqual(1, counts.ack_failed);
+    try expectAccounted(counts);
+}
+
+test "runDeliveries: an ack whose lease the server refused to extend is refused without being sent" {
+    var h: Harness = undefined;
+    try h.init(.{ .max_outstanding = 1, .tick_ms = 20 });
+    defer h.deinit();
+    h.fake.exactly_once = true;
+    h.fake.refuse_modacks = 1;
+    const Lost = struct {
+        fn lease(harness: *Harness) bool {
+            const s = &harness.subscriber;
+            s.mutex.lockUncancelable(s.io);
+            defer s.mutex.unlock(s.io);
+            for (s.inflight.items) |tracked| {
+                if (tracked.lease_lost) return true;
+            }
+            return false;
+        }
+    };
+    var probe: DeliveryProbe = .{ .harness = &h, .hold_first_until = Lost.lease, .stop_after = 2 };
+    defer probe.deinit();
+    try h.fake.publish("lost lease");
+    try runDeliveriesWithin(&h, &probe, 20_000);
+
+    try testing.expectEqual(2, probe.records.items.len);
+    try testing.expectEqual(AckOutcome.refused, probe.records.items[0].outcome.?);
+    try testing.expectEqual(AckOutcome.taken, probe.records.items[1].outcome.?);
+    try testing.expect(!h.fake.ackAttempted("ack-0"));
+    try expectAccounted(h.subscriber.stats());
+}
+
+test "runDeliveries: an ack refused for now is taken on a later try, and one past the limit is unknown" {
+    {
+        var h: Harness = undefined;
+        try h.init(.{ .max_attempts = 1, .tick_ms = 10 });
+        defer h.deinit();
+        h.fake.exactly_once = true;
+        h.fake.transient_acks = 2;
+        var probe: DeliveryProbe = .{ .harness = &h, .stop_after = 1 };
+        defer probe.deinit();
+        try h.fake.publish("eventually");
+        try runDeliveriesWithin(&h, &probe, 10_000);
+        try testing.expectEqual(AckOutcome.taken, probe.records.items[0].outcome.?);
+        try testing.expect(probe.records.items[0].acked_on_return);
+        h.fake.mutex.lockUncancelable(testing.io);
+        defer h.fake.mutex.unlock(testing.io);
+        try testing.expectEqual(3, h.fake.ack_calls);
+    }
+    {
+        var h: Harness = undefined;
+        try h.init(.{ .max_attempts = 1, .tick_ms = 10, .give_up_ms = 300 });
+        defer h.deinit();
+        h.fake.exactly_once = true;
+        h.fake.transient_acks = 1_000_000;
+        var probe: DeliveryProbe = .{ .harness = &h, .stop_after = 1 };
+        defer probe.deinit();
+        try h.fake.publish("never");
+        try runDeliveriesWithin(&h, &probe, 10_000);
+        try testing.expectEqual(AckOutcome.unknown, probe.records.items[0].outcome.?);
+        const counts = h.subscriber.stats();
+        try testing.expectEqual(0, counts.acked);
+        try testing.expectEqual(1, counts.ack_failed);
+        try expectAccounted(counts);
+    }
+}
+
+test "runDeliveries: an ack whose request is refused with no word per message is unknown" {
+    var h: Harness = undefined;
+    try h.init(.{ .max_attempts = 1 });
+    defer h.deinit();
+    // A 400 that names no id: every id of the request reads `.other`.
+    h.fake.fail_status = 400;
+    h.fake.fail_acks = 1;
+    var probe: DeliveryProbe = .{ .harness = &h, .stop_after = 1 };
+    defer probe.deinit();
+    try h.fake.publish("refused whole");
+    try runDeliveriesWithin(&h, &probe, 10_000);
+    try testing.expectEqual(AckOutcome.unknown, probe.records.items[0].outcome.?);
+    try testing.expectEqual(0, h.fake.ackedData("refused whole"));
+    try expectAccounted(h.subscriber.stats());
+}
+
+test "runDeliveries: a second ack or nack sends nothing and returns the first's outcome" {
+    var h: Harness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    var probe: DeliveryProbe = .{ .harness = &h, .plan = .ack_twice, .stop_after = 1 };
+    defer probe.deinit();
+    try h.fake.publish("twice");
+    try runDeliveriesWithin(&h, &probe, 10_000);
+
+    const r = probe.records.items[0];
+    try testing.expectEqual(AckOutcome.taken, r.outcome.?);
+    try testing.expectEqual(AckOutcome.taken, r.again[0].?);
+    try testing.expectEqual(AckOutcome.taken, r.again[1].?);
+    h.fake.mutex.lockUncancelable(testing.io);
+    const attempts = h.fake.ack_attempts.items.len;
+    h.fake.mutex.unlock(testing.io);
+    try testing.expectEqual(1, attempts);
+    try testing.expectEqual(0, h.fake.modacksOf(0));
+    const counts = h.subscriber.stats();
+    try testing.expectEqual(1, counts.acked);
+    try testing.expectEqual(0, counts.nacked);
+}
+
+test "runDeliveries: an error after settling is counted, and sends nothing more" {
+    var h: Harness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    var probe: DeliveryProbe = .{ .harness = &h, .plan = .ack_then_fail, .stop_after = 1 };
+    defer probe.deinit();
+    try h.fake.publish("then fails");
+    try runDeliveriesWithin(&h, &probe, 10_000);
+
+    try testing.expectEqual(AckOutcome.taken, probe.records.items[0].outcome.?);
+    const counts = h.subscriber.stats();
+    try testing.expectEqual(1, counts.handler_failures);
+    try testing.expectEqual(1, counts.acked);
+    try testing.expectEqual(0, counts.nacked);
+    try testing.expectEqual(0, h.fake.modacksOf(0));
+    try expectAccounted(counts);
+}
+
+test "runDeliveries: a handler that does not settle acks by returning and releases by failing" {
+    var h: Harness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    var probe: DeliveryProbe = .{ .harness = &h, .plan = .unsettled_fail_first, .stop_after = 2 };
+    defer probe.deinit();
+    try h.fake.publish("plain");
+    try runDeliveriesWithin(&h, &probe, 10_000);
+
+    try testing.expectEqual(2, probe.records.items.len);
+    for (probe.records.items) |r| try testing.expect(r.outcome == null);
+    try testing.expectEqual(1, h.fake.ackedData("plain"));
+    const counts = h.subscriber.stats();
+    try testing.expectEqual(1, counts.handler_failures);
+    try testing.expectEqual(1, counts.nacked);
+    try testing.expectEqual(1, counts.acked);
+    try expectAccounted(counts);
+}
+
+test "runDeliveries: handlers wait side by side, each for its own answer" {
+    var h: Harness = undefined;
+    try h.init(.{ .concurrency = 4 });
+    defer h.deinit();
+    // The first four are held until all four handler tasks hold one.
+    var probe: DeliveryProbe = .{ .harness = &h, .stop_after = 12, .barrier = 4 };
+    defer probe.deinit();
+    for (0..12) |i| {
+        var buf: [16]u8 = undefined;
+        try h.fake.publish(try std.fmt.bufPrint(&buf, "side-{d}", .{i}));
+    }
+    try runDeliveriesWithin(&h, &probe, 10_000);
+
+    try testing.expect(probe.records.items.len >= 12);
+    for (probe.records.items) |r| {
+        try testing.expectEqual(AckOutcome.taken, r.outcome.?);
+        try testing.expect(r.acked_on_return);
+    }
+    try expectAccounted(h.subscriber.stats());
+    // Each handler task waited in a place of its own.
+    for (h.subscriber.waiters) |waiter| try testing.expect(waiter.generation >= 1);
+}
+
+test "runDeliveries: stop gives an ack refused for now one more try at once, then unknown" {
+    var h: Harness = undefined;
+    // Refused for now forever, with the 10 minutes before giving up. The
+    // backoff starts at 50 ms and doubles: after the seventh refusal the
+    // next try is 3.2 s off.
+    try h.init(.{ .max_attempts = 1, .tick_ms = 50 });
+    defer h.deinit();
+    h.fake.exactly_once = true;
+    h.fake.transient_acks = 1_000_000;
+    var probe: DeliveryProbe = .{ .harness = &h };
+    defer probe.deinit();
+    try h.fake.publish("stopping");
+    var running: BackgroundRun = undefined;
+    try running.start(&h, &probe);
+    const Refused = struct {
+        fn seven(f: *FakeSubscription) bool {
+            f.mutex.lockUncancelable(testing.io);
+            defer f.mutex.unlock(testing.io);
+            return f.ack_calls >= 7;
+        }
+    };
+    const refused = try waitUntil(10_000, &h.fake, Refused.seven);
+    h.subscriber.stop();
+    const Answered = struct {
+        fn one(p: *DeliveryProbe) bool {
+            return p.recordCount() >= 1;
+        }
+    };
+    // Inside the backoff, and well inside the 10 minutes: stop waits out
+    // neither.
+    const answered = try waitUntil(1_500, &probe, Answered.one);
+    try running.finish(10_000);
+    try testing.expect(refused);
+    try testing.expect(answered);
+    try testing.expectEqual(AckOutcome.unknown, probe.records.items[0].outcome.?);
+    const counts = h.subscriber.stats();
+    try testing.expectEqual(1, counts.ack_failed);
+    try expectAccounted(counts);
+}
+
+test "runDeliveries: a fatal ack error ends the wait as unknown, and run returns it" {
+    var h: Harness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    h.fake.fail_status = 404;
+    h.fake.fail_acks = 1;
+    var probe: DeliveryProbe = .{ .harness = &h };
+    defer probe.deinit();
+    try h.fake.publish("gone");
+    try testing.expectError(error.NotFound, runDeliveriesWithin(&h, &probe, 10_000));
+    try testing.expectEqual(1, probe.records.items.len);
+    try testing.expectEqual(AckOutcome.unknown, probe.records.items[0].outcome.?);
+}
+
+test "runDeliveries: canceling run cancels a handler waiting for its answer" {
+    var h: Harness = undefined;
+    try h.init(.{ .max_attempts = 1, .tick_ms = 10 });
+    defer h.deinit();
+    h.fake.exactly_once = true;
+    h.fake.transient_acks = 1_000_000;
+    var probe: DeliveryProbe = .{ .harness = &h };
+    defer probe.deinit();
+    try h.fake.publish("canceled");
+    var running = try testing.io.concurrent(Subscriber.runDeliveries, .{ &h.subscriber, probe.handler() });
+    const Refused = struct {
+        fn once(f: *FakeSubscription) bool {
+            f.mutex.lockUncancelable(testing.io);
+            defer f.mutex.unlock(testing.io);
+            return f.ack_calls >= 1;
+        }
+    };
+    try testing.expect(try waitUntil(5_000, &h.fake, Refused.once));
+    try testing.expectError(error.Canceled, running.cancel(testing.io));
+    try testing.expectEqual(1, probe.records.items.len);
+    try testing.expect(probe.records.items[0].canceled);
+    try testing.expect(probe.records.items[0].outcome == null);
+}
+
+test "answer: only the wait an outcome was meant for takes it" {
+    var h: Harness = undefined;
+    try h.init(.{ .concurrency = 2 });
+    defer h.deinit();
+    const s = &h.subscriber;
+    s.waiters[1] = .{ .generation = 7, .waiting = true };
+    // No waiter, an earlier wait, and a wait that has ended take nothing.
+    try testing.expect(!s.answer(null, .taken));
+    try testing.expect(!s.answer(.{ .slot = 1, .generation = 6 }, .taken));
+    try testing.expect(s.waiters[1].outcome == null);
+    try testing.expect(s.answer(.{ .slot = 1, .generation = 7 }, .refused));
+    try testing.expectEqual(AckOutcome.refused, s.waiters[1].outcome.?);
+    s.waiters[1].waiting = false;
+    try testing.expect(!s.answer(.{ .slot = 1, .generation = 7 }, .taken));
+    try testing.expectEqual(AckOutcome.refused, s.waiters[1].outcome.?);
+    // The other slot was never touched.
+    try testing.expect(s.waiters[0].outcome == null);
+}
+
+test "acks put back without memory answer a handler waiting on them as unknown" {
+    const io = testing.io;
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var fake: FakeSubscription = .init(testing.allocator, io);
+    defer fake.deinit();
+    var subscriber: Subscriber = try .init(failing.allocator(), io, .{
+        .subscription_id = "worker",
+        .client = .{
+            .project_id = "p",
+            .endpoint = .{ .url = "localhost:1", .emulator = true },
+            .transport = fake.transport(),
+        },
+    });
+    defer subscriber.deinit();
+    subscriber.waiters[0] = .{ .generation = 3, .waiting = true };
+    const held = [_]Pending{.{
+        .ack_id = try failing.allocator().dupe(u8, "held-0"),
+        .resolved_at = .{ .nanoseconds = 0 },
+        .not_before = .{ .nanoseconds = 0 },
+        .waiter = .{ .slot = 0, .generation = 3 },
+    }};
+    failing.fail_index = failing.alloc_index;
+    subscriber.mutex.lockUncancelable(io);
+    subscriber.reinsert(.ack, &held);
+    subscriber.mutex.unlock(io);
+    try testing.expectEqual(1, subscriber.stats().ack_failed);
+    try testing.expectEqual(AckOutcome.unknown, subscriber.waiters[0].outcome.?);
+}
+
+test "awaitOutcome: a halt ends the wait even when no cancel lands" {
+    var h: Harness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    const s = &h.subscriber;
+    s.waiters[0] = .{ .generation = 1, .waiting = true };
+    const Waiting = struct {
+        fn wait(sub: *Subscriber, returned: *std.atomic.Value(bool)) std.Io.Cancelable!AckOutcome {
+            defer returned.store(true, .release);
+            return sub.awaitOutcome(sub.io, 0);
+        }
+        fn hasReturned(returned: *std.atomic.Value(bool)) bool {
+            return returned.load(.acquire);
+        }
+    };
+    var returned: std.atomic.Value(bool) = .init(false);
+    var waiting = try testing.io.concurrent(Waiting.wait, .{ s, &returned });
+    try testing.io.sleep(.fromMilliseconds(20), .awake);
+    // The flag stands in for a cancel std swallowed
+    // (docs/zig-std-workarounds.md): nothing cancels the wait.
+    s.halt();
+    if (!try waitUntil(5_000, &returned, Waiting.hasReturned)) @panic("a halted wait went on waiting");
+    try testing.expectError(error.Canceled, waiting.await(testing.io));
+    try testing.expect(!s.waiters[0].waiting);
+}
+
+test "Subscriber: an ack refused for now as stop comes still gets one more try" {
+    // Regression: an ack whose try was on its way when stop came, and was
+    // refused for now, was given up at once instead of tried again; the
+    // last-flush test caught it about once in ten runs.
+    var h: Harness = undefined;
+    try h.init(.{ .max_attempts = 1 });
+    defer h.deinit();
+    h.fake.exactly_once = true;
+    h.fake.transient_acks = 1;
+    h.fake.stop_during_ack = &h.subscriber;
+    try h.fake.publish("in flight");
+    try runWithin(&h, 10_000);
+    const counts = h.subscriber.stats();
+    try testing.expectEqual(1, counts.acked);
+    try testing.expectEqual(0, counts.ack_failed);
+    try expectAccounted(counts);
+    try testing.expectEqual(1, h.fake.ackedData("in flight"));
+}
+
+test "sendResolved: without memory, an ack a handler waits on is answered or kept, never lost" {
+    const io = testing.io;
+    // Each allocation of a flush fails in turn: the snapshot, the ids, the
+    // results, and the client's own in sending and reading the answer.
+    var nth: usize = 0;
+    while (true) : (nth += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+        var fake: FakeSubscription = .init(testing.allocator, io);
+        defer fake.deinit();
+        var subscriber: Subscriber = try .init(failing.allocator(), io, .{
+            .subscription_id = "worker",
+            .client = .{
+                .project_id = "p",
+                .endpoint = .{ .url = "localhost:1", .emulator = true },
+                .transport = fake.transport(),
+                .retry = .{ .max_attempts = 1 },
+            },
+        });
+        defer subscriber.deinit();
+        try fake.publish("waited on");
+        const pulled = try subscriber.puller.subscription("worker").pull(.{ .max_messages = 1 });
+        try dispatchForTest(&subscriber, pulled);
+        const tracked = try subscriber.queue.getOne(io);
+        subscriber.enqueue(tracked, .acked, 0);
+        subscriber.finish(tracked);
+
+        failing.fail_index = failing.alloc_index + nth;
+        try subscriber.sendResolved(.ack, false);
+        const induced = failing.has_induced_failure;
+        failing.fail_index = std.math.maxInt(usize);
+
+        const answered = subscriber.waiters[0].outcome;
+        const kept = subscriber.to_ack.items.len;
+        if (answered) |outcome| {
+            try testing.expectEqual(AckOutcome.taken, outcome);
+            try testing.expectEqual(0, kept);
+        } else {
+            // Kept for the next flush, still waited on.
+            try testing.expectEqual(1, kept);
+            try testing.expect(subscriber.to_ack.items[0].waiter != null);
+            try testing.expect(induced);
+        }
+        if (!induced) break;
+    }
+    // Every allocation of the flush was failed once.
+    try testing.expect(nth >= 3);
 }

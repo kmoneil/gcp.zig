@@ -484,6 +484,21 @@ pub const AckResult = enum {
     other,
 };
 
+/// What a `Subscriber.Delivery`'s ack or release came to, as the server
+/// answered it.
+pub const AckOutcome = enum {
+    /// The server took it. With exactly-once delivery, an acknowledged
+    /// message is not delivered again.
+    taken,
+    /// Refused for good: the lease had lapsed, or the server had refused to
+    /// extend it. The message may come again.
+    refused,
+    /// No answer said either: refusals for now outlasted the retries, the
+    /// request failed in a way that names no message, or the subscriber
+    /// stopped first. The message may come again.
+    unknown,
+};
+
 pub const SubscriptionPage = struct {
     subscriptions: []const SubscriptionInfo,
     /// Pass as `page_token` to get the next page. Null on the last page.
