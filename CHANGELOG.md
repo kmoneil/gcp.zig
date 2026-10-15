@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.38.0 (unreleased)
+## 0.38.0 (2026-10-15)
 
 - firestore: now **beta**, as `pubsub` and `core` are. No call
   changes. It earned the label by the hardening released in 0.34.0:
