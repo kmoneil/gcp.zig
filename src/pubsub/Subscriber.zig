@@ -4187,9 +4187,13 @@ test "extendLeases: an ack refused for now is extended with exactly-once deliver
     // A lost lease is not extended again.
     try s.extendLeases();
     try testing.expectEqual(2, h.fake.modacksOf(60));
-    // Nor is one past max_extension_s.
+    // Nor is one past max_extension_s. Counted back from now: a CI runner
+    // may have booted less than max_extension_s ago, and then the boot
+    // clock's zero is not past it.
     s.to_ack.items[0].lease_lost = false;
-    s.to_ack.items[0].received_at = .{ .nanoseconds = 0 };
+    s.to_ack.items[0].received_at = .{
+        .nanoseconds = std.Io.Timestamp.now(io, .boot).nanoseconds - (@as(i96, s.max_extension_s) + 1) * std.time.ns_per_s,
+    };
     try s.extendLeases();
     try testing.expectEqual(2, h.fake.modacksOf(60));
 }
