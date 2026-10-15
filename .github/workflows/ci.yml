@@ -493,11 +493,15 @@ jobs:
         # Under the fuzzer both run on a plain allocator: the one that
         # looks for leaks made a run of the model 36 ms on a Mac. With
         # it, 400K runs of each took 9 minutes there, so 1M is about 22,
-        # to be sized from its first nights.
+        # to be sized from its first nights. slow-auth, at 80K since 10-13,
+        # took 125, 43 and 53 minutes on 10-13, 10-14 and 10-15 (runs
+        # 38383800859, 38536592821 and 38704211921): one night can cost
+        # three times another at the same count, as at 100K, so it drops
+        # to 60K, about 94 minutes on a night like 10-13's.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 630K }
           - { job: auth, module: auth, filter: fuzz, iterations: 850K }
-          - { job: slow-auth, module: auth, filter: slow property, iterations: 80K }
+          - { job: slow-auth, module: auth, filter: slow property, iterations: 60K }
           - { job: pubsub, module: pubsub, filter: fuzz, iterations: 1150K }
           - { job: slow-pubsub, module: pubsub, filter: slow property Publisher, iterations: 1900K }
           - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 65K }
