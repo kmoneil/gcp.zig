@@ -94,6 +94,11 @@ pub fn build(b: *std.Build) void {
         } else std.process.fatal("-Dmodule={s} names no module; use core, auth, pubsub, secret_manager, storage or firestore", .{name});
     }
     const test_step = b.step("test", "Run unit, property and fuzz-corpus tests");
+    // The same tests without what `test` compiles beside them, the examples
+    // and the suites that need a server: CI's optimized jobs spend their
+    // time compiling, and its Debug jobs build those already.
+    const unit_step = b.step("test-unit", "Run unit, property and fuzz-corpus tests, compiling nothing else");
+    test_step.dependOn(unit_step);
     for (unit_modules) |entry| {
         if (only_module) |name| if (!std.mem.eql(u8, entry[0], name)) continue;
         const unit_tests = b.addTest(.{
@@ -103,7 +108,7 @@ pub fn build(b: *std.Build) void {
             .test_runner = test_runner,
             .use_llvm = if (fuzz_runner) true else null,
         });
-        test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+        unit_step.dependOn(&b.addRunArtifact(unit_tests).step);
     }
 
     // Signed URLs held to outside answers: Google's conformance vectors,
@@ -127,7 +132,7 @@ pub fn build(b: *std.Build) void {
         .use_llvm = if (fuzz_runner) true else null,
     });
     if (only_module == null or std.mem.eql(u8, only_module.?, "storage")) {
-        test_step.dependOn(&b.addRunArtifact(signing_tests).step);
+        unit_step.dependOn(&b.addRunArtifact(signing_tests).step);
     }
 
     // The code the documentation shows, run beside pubsub's unit tests so
@@ -151,7 +156,7 @@ pub fn build(b: *std.Build) void {
         .use_llvm = if (fuzz_runner) true else null,
     });
     if (only_module == null or std.mem.eql(u8, only_module.?, "pubsub")) {
-        test_step.dependOn(&b.addRunArtifact(docs_tests).step);
+        unit_step.dependOn(&b.addRunArtifact(docs_tests).step);
     }
 
     // Line coverage of the unit tests, measured by kcov, which must be on

@@ -29,7 +29,9 @@ python3 tools/check_docs.py            # the docs' links, anchors and snippets
 ```
 
 `zig build test` also compiles every example and the suites that run
-against Google, so none of them can rot between runs.
+against Google, so none of them can rot between runs. `zig build
+test-unit` runs the same tests and compiles nothing else, which is what
+CI's optimized jobs run.
 
 ## Fuzzing
 
