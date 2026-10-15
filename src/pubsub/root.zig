@@ -53,6 +53,7 @@ pub const SubscriptionConfig = @import("types.zig").SubscriptionConfig;
 pub const SubscriptionInfo = @import("types.zig").SubscriptionInfo;
 pub const SubscriptionPage = @import("types.zig").SubscriptionPage;
 pub const AckResult = @import("types.zig").AckResult;
+pub const AckOutcome = @import("types.zig").AckOutcome;
 pub const Label = @import("types.zig").Label;
 pub const Change = @import("types.zig").Change;
 pub const MessageStoragePolicy = @import("types.zig").MessageStoragePolicy;
