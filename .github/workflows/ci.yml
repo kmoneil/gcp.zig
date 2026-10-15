@@ -279,7 +279,9 @@ jobs:
           fi
 
   # The unit tests with the optimizer on. Bugs that depend on it, such as a
-  # read of undefined memory, can pass in Debug and fail here.
+  # read of undefined memory, can pass in Debug and fail here. `test-unit`
+  # leaves out the examples and the server suites, which the test job
+  # compiles in Debug: optimized, they took most of this job's time.
   release:
     strategy:
       fail-fast: false
@@ -293,11 +295,13 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
+          # One cache per mode: under one key the two legs raced to save it.
+          cache-key: ${{ matrix.optimize }}
 
       - name: Unit, property and fuzz-corpus tests
         env:
           OPTIMIZE: ${{ matrix.optimize }}
-        run: zig build test "-Doptimize=$OPTIMIZE" --summary all
+        run: zig build test-unit "-Doptimize=$OPTIMIZE" --summary all
 
   # The unit tests on macOS and Windows. The integration tests need the
   # emulator's container, which only the Linux runners have.
