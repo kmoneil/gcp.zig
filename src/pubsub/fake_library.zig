@@ -26,6 +26,9 @@ const Seen = struct {
     by_number: [messages]u32 = @splat(0),
     ids: std.StringHashMapUnmanaged(u32) = .empty,
     handled: usize = 0,
+    /// Under `deliveryHandler`: what the acks the handler waited for came
+    /// to.
+    outcomes: std.EnumArray(types.AckOutcome, usize) = .initFill(0),
 
     fn deinit(self: *Seen) void {
         var it = self.ids.keyIterator();
@@ -35,6 +38,20 @@ const Seen = struct {
 
     fn handler(self: *Seen) Subscriber.Handler {
         return .{ .ptr = self, .vtable = &.{ .handle = handle } };
+    }
+
+    /// The same, acking each message itself and waiting for the outcome.
+    fn deliveryHandler(self: *Seen) Subscriber.DeliveryHandler {
+        return .{ .ptr = self, .vtable = &.{ .handle = handleDelivery } };
+    }
+
+    fn handleDelivery(ptr: *anyopaque, io: std.Io, delivery: *Subscriber.Delivery) anyerror!void {
+        const self: *Seen = @ptrCast(@alignCast(ptr));
+        try handle(ptr, io, delivery.message);
+        const outcome = try delivery.ack(io);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.outcomes.getPtr(outcome).* += 1;
     }
 
     fn handle(ptr: *anyopaque, io: std.Io, message: types.ReceivedMessage) anyerror!void {
@@ -92,7 +109,14 @@ const Faults = enum {
     without,
 };
 
-fn through(exactly_once: bool, faults: Faults) !void {
+const Handling = enum {
+    /// Returning acks: the handler never hears what came of it.
+    plain,
+    /// The handler acks itself and waits for what the server said.
+    waiting_for_acks,
+};
+
+fn through(exactly_once: bool, faults: Faults, handling: Handling) !void {
     const gpa = testing.allocator;
     const io = testing.io;
     var fake: FakePubSub = .init(gpa, io, .{ .empty_pull_hold = .fromMilliseconds(20) });
@@ -116,7 +140,10 @@ fn through(exactly_once: bool, faults: Faults) !void {
     defer seen.deinit();
     var subscriber = try Subscriber.init(gpa, io, .{ .subscription_id = "worker", .client = options, .concurrency = 3 });
     defer subscriber.deinit();
-    var subscribing = try io.concurrent(Subscriber.run, .{ &subscriber, seen.handler() });
+    var subscribing = switch (handling) {
+        .plain => try io.concurrent(Subscriber.run, .{ &subscriber, seen.handler() }),
+        .waiting_for_acks => try io.concurrent(Subscriber.runDeliveries, .{ &subscriber, seen.deliveryHandler() }),
+    };
     // A failure below must not leave a task running on a fake that is
     // about to be freed.
     errdefer {
@@ -179,14 +206,26 @@ fn through(exactly_once: bool, faults: Faults) !void {
         while (it.next()) |count| try testing.expectEqual(1, count.*);
         try testing.expectEqual(sent, seen.handled);
     }
+    if (handling == .waiting_for_acks) {
+        // Refused, lost and dropped as they were, every ack a handler
+        // waited for was taken in the end, and it heard so.
+        try testing.expectEqual(seen.handled, seen.outcomes.get(.taken));
+        try testing.expectEqual(0, seen.outcomes.get(.refused));
+        try testing.expectEqual(0, seen.outcomes.get(.unknown));
+    }
 }
 
 test "fake, the library through it: what a Publisher sends, a Subscriber handles, with faults on every kind of call" {
-    try through(false, .with_a_lost_publish);
-    try through(false, .without);
+    try through(false, .with_a_lost_publish, .plain);
+    try through(false, .without, .plain);
 }
 
 test "fake, the library through it: with exactly-once delivery each message is handled once" {
-    try through(true, .without);
-    try through(true, .with_a_lost_publish);
+    try through(true, .without, .plain);
+    try through(true, .with_a_lost_publish, .plain);
+}
+
+test "fake, the library through it: a handler that waits for its acks hears each was taken, faults or not" {
+    try through(true, .without, .waiting_for_acks);
+    try through(false, .with_a_lost_publish, .waiting_for_acks);
 }

@@ -576,6 +576,10 @@ const Pending = struct {
     lease_lost: bool = false,
     /// The handler task waiting for what the server says of it, if any.
     waiter: ?WaiterRef = null,
+    /// When the message arrived, on the boot clock: with exactly-once
+    /// delivery, an ack refused for now keeps its lease until
+    /// `max_extension_s` after this.
+    received_at: std.Io.Timestamp = .{ .nanoseconds = 0 },
 };
 
 /// One pull's response, alive until every message in it resolves: the
@@ -791,6 +795,7 @@ fn enqueue(self: *Subscriber, tracked: *Tracked, outcome: Outcome, slot: ?u16) v
         .resolved_at = now,
         .not_before = now,
         .lease_lost = tracked.lease_lost,
+        .received_at = tracked.received_at,
     };
     if (slot) |s| {
         const waiter = &self.waiters[s];
@@ -1161,10 +1166,12 @@ fn learnExactlyOnce(self: *Subscriber) void {
 }
 
 /// Extends the lease of every message in flight for less than
-/// `max_extension_s`. A lease the server refuses to extend is lost: it is
-/// extended no more, and its ack will be counted as failed without being
-/// sent. A failure with no word per message leaves the leases to lapse on
-/// their own, and the next tick tries again.
+/// `max_extension_s`, and with exactly-once delivery of every message whose
+/// ack the server refused for now and is to be sent again. A lease the
+/// server refuses to extend is lost: it is extended no more, and its ack
+/// will be counted as failed without being sent. A failure with no word per
+/// message leaves the leases to lapse on their own, and the next tick tries
+/// again.
 fn extendLeases(self: *Subscriber) std.Io.Cancelable!void {
     const io = self.io;
     var count: usize = 0;
@@ -1182,6 +1189,16 @@ fn extendLeases(self: *Subscriber) std.Io.Cancelable!void {
             self.extend_buffer[count] = tracked.ack_id;
             count += 1;
         }
+        // Without its lease, an ack sent again could only be refused. As
+        // many as the buffer holds beside the messages in flight; the rest
+        // wait for a later tick.
+        if (self.exactly_once) for (self.to_ack.items) |p| {
+            if (count == self.extend_buffer.len) break;
+            if (p.lease_lost or p.refusals == 0) continue;
+            if (now.nanoseconds - p.received_at.nanoseconds > cutoff_ns) continue;
+            self.extend_buffer[count] = p.ack_id;
+            count += 1;
+        };
     }
     if (count == 0) return;
     const ids = self.extend_buffer[0..count];
@@ -1208,14 +1225,19 @@ fn extendLeases(self: *Subscriber) std.Io.Cancelable!void {
         // again.
         .transient => {},
         .invalid_ack_id, .other => {
-            // Found only if it is still in flight; one that resolved since
-            // has its ack refused the ordinary way.
-            for (self.inflight.items) |tracked| {
+            // In flight, or waiting on the ack list, where a message that
+            // resolved since has gone too: either way its ack can no
+            // longer be taken.
+            const found = for (self.inflight.items) |tracked| {
                 if (tracked.ack_id.ptr != id.ptr) continue;
                 tracked.lease_lost = true;
-                lost += 1;
-                break;
-            }
+                break true;
+            } else for (self.to_ack.items) |*p| {
+                if (p.ack_id.ptr != id.ptr) continue;
+                p.lease_lost = true;
+                break true;
+            } else false;
+            if (found) lost += 1;
             if (result == .invalid_ack_id) self.learnExactlyOnce();
         },
     };
@@ -1908,6 +1930,9 @@ const TestHandler = struct {
     /// them does this to the harness before it returns: its own message is
     /// still out on its lease then, and its ack still to come.
     after_seen: ?struct { count: usize, do: *const fn (*Harness) anyerror!void } = null,
+    /// Under `deliveryHandler`: what each ack it waited for came to, by
+    /// the delivery's ack id. Owned.
+    outcomes: std.ArrayList(struct { ack_id: []u8, outcome: AckOutcome }) = .empty,
 
     fn deinit(h: *TestHandler) void {
         for (h.seen.items) |data| h.gpa.free(data);
@@ -1915,6 +1940,27 @@ const TestHandler = struct {
         var it = h.attempts.keyIterator();
         while (it.next()) |key| h.gpa.free(key.*);
         h.attempts.deinit(h.gpa);
+        for (h.outcomes.items) |o| h.gpa.free(o.ack_id);
+        h.outcomes.deinit(h.gpa);
+    }
+
+    /// The same handler for `runDeliveries`: what `handle` returns for, it
+    /// acks itself, and waits for the outcome.
+    fn deliveryHandler(h: *TestHandler) DeliveryHandler {
+        return .{ .ptr = h, .vtable = &.{ .handle = handleDelivery } };
+    }
+
+    fn handleDelivery(ptr: *anyopaque, io: std.Io, delivery: *Delivery) anyerror!void {
+        const h: *TestHandler = @ptrCast(@alignCast(ptr));
+        try handle(ptr, io, delivery.message);
+        const outcome = try delivery.ack(io);
+        h.mutex.lockUncancelable(io);
+        defer h.mutex.unlock(io);
+        const ack_id = try h.gpa.dupe(u8, delivery.message.ack_id);
+        h.outcomes.append(h.gpa, .{ .ack_id = ack_id, .outcome = outcome }) catch |err| {
+            h.gpa.free(ack_id);
+            return err;
+        };
     }
 
     fn handler(h: *TestHandler) Handler {
@@ -2842,13 +2888,19 @@ fn chaosProperty(_: void, input: []const u8) !void {
     // the run, which brings every message again and makes the ack ids out
     // then stale.
     if (g.boolean()) h.handler.after_seen = .{ .count = g.intRange(u8, 1, message_count), .do = Seeks.back };
+    // Last again: handlers that ack themselves and wait for the outcome.
+    const with_results = g.boolean();
     for (0..message_count) |i| {
         var buf: [16]u8 = undefined;
         try h.fake.publish(try std.fmt.bufPrint(&buf, "chaos-{d}", .{i}));
     }
 
     // Whatever the mix, every message is handled and the loop stops clean.
-    try h.subscriber.run(h.handler.handler());
+    if (with_results) {
+        try h.subscriber.runDeliveries(h.handler.deliveryHandler());
+    } else {
+        try h.subscriber.run(h.handler.handler());
+    }
     try testing.expect(h.handler.seenCount() >= message_count);
     // No message is lost, seek or no seek: each one was handled, or is
     // still the server's to deliver.
@@ -2872,9 +2924,34 @@ fn chaosProperty(_: void, input: []const u8) !void {
     // server took, no more.
     try testing.expectEqual(counts.received, counts.acked + counts.ack_failed + counts.nacked + counts.receipt_refused);
     try testing.expectEqual(counts.acked, h.fake.ackedCount());
-    // Nothing is acknowledged that a handler did not handle.
     h.fake.mutex.lockUncancelable(testing.io);
     defer h.fake.mutex.unlock(testing.io);
+    if (with_results) {
+        // Every ack a handler waited for came to what the server did: one
+        // taken is held acknowledged, one refused is not. Every handled
+        // message was acked with a wait, so the outcomes are the counts.
+        var taken: u64 = 0;
+        var not_taken: u64 = 0;
+        for (h.handler.outcomes.items) |o| {
+            const acked = for (h.fake.acked.items) |id| {
+                if (std.mem.eql(u8, id, o.ack_id)) break true;
+            } else false;
+            switch (o.outcome) {
+                .taken => {
+                    taken += 1;
+                    if (!acked) return error.TestTakenButNotAcked;
+                },
+                .refused => {
+                    not_taken += 1;
+                    if (acked) return error.TestRefusedButAcked;
+                },
+                .unknown => not_taken += 1,
+            }
+        }
+        try testing.expectEqual(counts.acked, taken);
+        try testing.expectEqual(counts.acked + counts.ack_failed, taken + not_taken);
+    }
+    // Nothing is acknowledged that a handler did not handle.
     for (h.fake.acked_data.items) |data| {
         for (h.handler.seen.items) |seen| {
             if (std.mem.eql(u8, seen, data)) break;
@@ -2907,6 +2984,12 @@ test "slow property Subscriber: random loads, failures and limits never lose a m
             "\x0c\x02\x01\x00\x00\x04\x00\x01\x00",
             "\x17\x03\x00\x01\x01\x07\x00\x01\x16",
             "\x0b\x02\x00\x00\x01\x05\x01\x14\x02\x01\x01\x10\x00\x01\x05",
+            // Handlers that ack themselves and wait: a plain subscription
+            // with failing acks; the exactly-once one with refusals of
+            // every kind; and that one with a seek back as well.
+            "\x0c\x02\x00\x01\x02\x04\x00\x00\x01",
+            "\x0b\x02\x00\x00\x01\x05\x01\x14\x02\x01\x01\x32\x01\x00\x01",
+            "\x0b\x02\x00\x00\x01\x05\x01\x14\x02\x01\x01\x10\x00\x01\x05\x01",
         },
     });
 }
@@ -4020,4 +4103,93 @@ test "sendResolved: without memory, an ack a handler waits on is answered or kep
     }
     // Every allocation of the flush was failed once.
     try testing.expect(nth >= 3);
+}
+
+test "runDeliveries: with exactly-once delivery, an ack refused for now keeps its lease, and is taken after the lease would have lapsed" {
+    var h: Harness = undefined;
+    // The subscription is read, and says it has exactly-once delivery.
+    try h.init(.{ .extension_period_s = null, .max_attempts = 1, .tick_ms = 20 });
+    defer h.deinit();
+    h.fake.exactly_once = true;
+    // Leases of 300 ms; the ack is refused for now six times, backing off
+    // 20 ms and doubling, so its seventh try comes about 1.3 s on.
+    h.fake.lease_ms = 300;
+    h.fake.transient_acks = 6;
+    var probe: DeliveryProbe = .{ .harness = &h, .stop_after = 1 };
+    defer probe.deinit();
+    try h.fake.publish("kept");
+    try runDeliveriesWithin(&h, &probe, 20_000);
+
+    try testing.expectEqual(AckOutcome.taken, probe.records.items[0].outcome.?);
+    try testing.expectEqual(1, h.fake.ackedData("kept"));
+    h.fake.mutex.lockUncancelable(testing.io);
+    const calls = h.fake.ack_calls;
+    h.fake.mutex.unlock(testing.io);
+    try testing.expectEqual(7, calls);
+    const counts = h.subscriber.stats();
+    try testing.expectEqual(1, counts.acked);
+    try testing.expectEqual(0, counts.ack_failed);
+    try expectAccounted(counts);
+}
+
+test "runDeliveries: past max_extension_s, the lease of an ack refused for now lapses, and the ack is refused" {
+    var h: Harness = undefined;
+    try h.init(.{ .extension_period_s = null, .max_extension_s = 1, .max_attempts = 1, .tick_ms = 20, .give_up_ms = 10_000 });
+    defer h.deinit();
+    h.fake.exactly_once = true;
+    h.fake.lease_ms = 300;
+    // Seven refusals for now: the eighth try comes about 2.5 s on, past
+    // the second at which extending stops and the 300 ms lease after it.
+    h.fake.transient_acks = 7;
+    var probe: DeliveryProbe = .{ .harness = &h, .stop_after = 1 };
+    defer probe.deinit();
+    try h.fake.publish("lapses");
+    try runDeliveriesWithin(&h, &probe, 20_000);
+
+    try testing.expectEqual(AckOutcome.refused, probe.records.items[0].outcome.?);
+    try testing.expectEqual(0, h.fake.ackedData("lapses"));
+    try expectAccounted(h.subscriber.stats());
+}
+
+test "extendLeases: an ack refused for now is extended with exactly-once delivery only, and a refusal there loses its lease" {
+    var h: Harness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    const io = testing.io;
+    const s = &h.subscriber;
+    h.fake.exactly_once = true;
+    try h.fake.publish("waiting");
+    const pulled = try s.puller.subscription("worker").pull(.{ .max_messages = 1 });
+    try dispatchForTest(s, pulled);
+    const tracked = try s.queue.getOne(io);
+    s.resolve(tracked, .acked);
+    // Waiting for its first try, due within 100 ms: not extended.
+    s.exactly_once = true;
+    try s.extendLeases();
+    try testing.expectEqual(0, h.fake.modacksOf(60));
+    s.exactly_once = false;
+    // As a refusal for now leaves it: on the list, to be sent again.
+    s.to_ack.items[0].refusals = 1;
+    s.to_ack.items[0].received_at = std.Io.Timestamp.now(io, .boot);
+
+    // Not run, so its leases go the fallback 60 s. While it does not know
+    // of exactly-once delivery, the waiting ack is not extended.
+    try s.extendLeases();
+    try testing.expectEqual(0, h.fake.modacksOf(60));
+    s.exactly_once = true;
+    try s.extendLeases();
+    try testing.expectEqual(1, h.fake.modacksOf(60));
+    try testing.expectEqual(1, s.stats().extended);
+    // Refused there: the lease is lost, so the ack will never be sent.
+    h.fake.refuse_modacks = 1;
+    try s.extendLeases();
+    try testing.expect(s.to_ack.items[0].lease_lost);
+    // A lost lease is not extended again.
+    try s.extendLeases();
+    try testing.expectEqual(2, h.fake.modacksOf(60));
+    // Nor is one past max_extension_s.
+    s.to_ack.items[0].lease_lost = false;
+    s.to_ack.items[0].received_at = .{ .nanoseconds = 0 };
+    try s.extendLeases();
+    try testing.expectEqual(2, h.fake.modacksOf(60));
 }

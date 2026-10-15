@@ -7,9 +7,11 @@
 //!     PUBSUB_EMULATOR_HOST=localhost:8085 zig build example-worker -- orders orders-worker
 //!
 //! Arguments: topic id (default "orders"), subscription id (default
-//! "orders-worker"), and `--follow` to keep waiting for messages instead
-//! of stopping once the backlog is drained. Configuration is as for the
-//! publish example.
+//! "orders-worker"), `--follow` to keep waiting for messages instead of
+//! stopping once the backlog is drained, and `--confirm` to acknowledge
+//! each message from the handler and print what the server said of it
+//! (`Subscriber.runDeliveries`). Configuration is as for the publish
+//! example.
 
 const std = @import("std");
 const pubsub = @import("pubsub");
@@ -40,6 +42,22 @@ const Printer = struct {
         for (message.attributes) |a| try self.out.print("    {s} = {s}\n", .{ a.key, a.value });
         try self.out.flush();
     }
+
+    fn deliveryHandler(self: *Printer) pubsub.Subscriber.DeliveryHandler {
+        return .{ .ptr = self, .vtable = &.{ .handle = handleDelivery } };
+    }
+
+    /// With `--confirm`: prints the message, acknowledges it, and prints
+    /// what the server said.
+    fn handleDelivery(ptr: *anyopaque, io: std.Io, delivery: *pubsub.Subscriber.Delivery) anyerror!void {
+        const self: *Printer = @ptrCast(@alignCast(ptr));
+        try handle(ptr, io, delivery.message);
+        const outcome = try delivery.ack(io);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        try self.out.print("    ack of {s}: {t}\n", .{ delivery.message.message_id, outcome });
+        try self.out.flush();
+    }
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -47,10 +65,13 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
     var positional: [2][]const u8 = .{ "orders", "orders-worker" };
     var follow = false;
+    var confirm = false;
     var n: usize = 0;
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--follow")) {
             follow = true;
+        } else if (std.mem.eql(u8, arg, "--confirm")) {
+            confirm = true;
         } else if (n < positional.len) {
             positional[n] = arg;
             n += 1;
@@ -103,7 +124,10 @@ pub fn main(init: std.process.Init) !void {
     }) catch |err| return fail(err, &diag);
     defer subscriber.deinit();
 
-    var running = try init.io.concurrent(pubsub.Subscriber.run, .{ &subscriber, printer.handler() });
+    var running = if (confirm)
+        try init.io.concurrent(pubsub.Subscriber.runDeliveries, .{ &subscriber, printer.deliveryHandler() })
+    else
+        try init.io.concurrent(pubsub.Subscriber.run, .{ &subscriber, printer.handler() });
     if (!follow) {
         // Stop once the backlog is drained: everything received resolved,
         // and five quiet seconds passed. The window is generous because
