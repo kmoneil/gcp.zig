@@ -3,7 +3,8 @@
 # Subscribing
 
 **On this page:** [A worker loop](#a-worker-loop) ·
-[Exactly-once delivery](#exactly-once-delivery)
+[Exactly-once delivery](#exactly-once-delivery) ·
+[Knowing whether an ack held](#knowing-whether-an-ack-held)
 
 ## A worker loop
 
@@ -116,3 +117,87 @@ refused, after sending every id, and `Diagnostics` counts them.
 Google's guarantee holds only when subscribers connect to the service in
 the same region, and it asks for streaming pull, which this client does
 not have, where throughput must be high.
+
+## Knowing whether an ack held
+
+A handler that returns has its message acknowledged about 100 ms later,
+and never hears what came of it. One that must know, before work it must
+not repeat, runs under `runDeliveries` instead of `run`. It is handed a
+`Delivery`, whose `ack` waits for the server's answer:
+
+<!-- snippet: tests/docs_examples.zig#pubsub-ack-outcome -->
+```zig
+/// Ships each order once. What can be done twice comes before the ack;
+/// what must happen once waits for the ack to be taken.
+const Shipping = struct {
+    gpa: std.mem.Allocator,
+    mutex: std.Io.Mutex = .init,
+    /// By message id. A real one is a database.
+    orders: std.StringHashMapUnmanaged(enum { reserved, shipped }) = .empty,
+
+    fn handler(self: *Shipping) pubsub.Subscriber.DeliveryHandler {
+        return .{ .ptr = self, .vtable = &.{ .handle = handle } };
+    }
+
+    fn handle(ptr: *anyopaque, io: std.Io, delivery: *pubsub.Subscriber.Delivery) anyerror!void {
+        const self: *Shipping = @ptrCast(@alignCast(ptr));
+        const id = delivery.message.message_id;
+        try self.reserve(io, id); // harmless when the message comes again
+        switch (try delivery.ack(io)) {
+            // With exactly-once delivery, it will not come again.
+            .taken => self.ship(io, id),
+            // It may come again, and will find its reservation.
+            .refused, .unknown => {},
+        }
+    }
+
+    fn reserve(self: *Shipping, io: std.Io, id: []const u8) !void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.orders.contains(id)) return;
+        const owned = try self.gpa.dupe(u8, id);
+        errdefer self.gpa.free(owned);
+        try self.orders.put(self.gpa, owned, .reserved);
+    }
+
+    fn ship(self: *Shipping, io: std.Io, id: []const u8) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.orders.getPtr(id).?.* = .shipped;
+    }
+};
+```
+
+`ack` returns a `pubsub.AckOutcome`:
+
+| Outcome | The server | The message |
+| --- | --- | --- |
+| `.taken` | took the acknowledgement | with exactly-once delivery, does not come again |
+| `.refused` | refused it for good: the lease had lapsed, or the server had refused to extend it | may come again |
+| `.unknown` | said neither: refusals for now outlasted 10 minutes of retries, the request was refused naming no message, or the subscriber stopped or failed first | may come again |
+
+The ack goes out in the ordinary batch, so the wait is about 100 ms and a
+round trip, and with exactly-once delivery up to 10 minutes while the
+server refuses it for now. Meanwhile the message's lease is still
+extended, up to `max_extension_s`, so a later try can be taken; plain
+handlers' acks keep their leases the same way. `nack` releases the
+message and waits for the answer as `ack` does. A second `ack` or `nack`
+sends nothing and returns the first one's outcome. A handler that
+settles nothing acks by returning and releases with an error, as a plain
+one does. When `stop` comes, an ack refused for now gets one more try at
+once, and is `.unknown` if refused again: `stop` never waits out the
+10 minutes.
+
+**Which comes first, the work or the ack.** Work done after the ack is
+lost if the process dies in between; work done before it is repeated if
+the ack fails. Google's advice for exactly-once delivery, which the
+example follows, is to keep a record of each message's progress until
+its ack holds: what can be done twice is done before the ack, and what
+must happen once after `.taken`.
+
+**Without exactly-once delivery**, `.taken` promises nothing about
+redelivery: Pub/Sub may deliver any message again. The outcome is still
+the server's answer. Google's own clients answer success at once there,
+before the ack is even sent; this one waits, because it may not know yet
+that a subscription has exactly-once delivery, which it learns from
+reading the subscription or from a first refusal.

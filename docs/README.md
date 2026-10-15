@@ -20,7 +20,7 @@ Google, not only what Google documents, and where the emulators differ.
 | Guide | What's in it |
 | --- | --- |
 | [Overview](pubsub/README.md) | A first program, the calls, pulling, retries, limits, and where the emulator differs |
-| [Subscribing](pubsub/subscribing.md) | `Subscriber`, a worker loop that extends leases and shuts down cleanly; exactly-once delivery |
+| [Subscribing](pubsub/subscribing.md) | `Subscriber`, a worker loop that extends leases and shuts down cleanly; exactly-once delivery; knowing whether an ack held |
 | [Publishing](pubsub/publishing.md) | `Publisher`, which batches from many tasks; caps, ordering keys and compression |
 | [Topics and subscriptions](pubsub/topics-and-subscriptions.md) | Dead letters, retry policies, filters, retention, expiration, labels, updates, and IAM |
 | [Delivery](pubsub/delivery.md) | Push, BigQuery and Cloud Storage subscriptions: the body options, the export states, and changing kind |

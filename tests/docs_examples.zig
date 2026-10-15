@@ -1049,3 +1049,100 @@ test "every Pub/Sub guide's code, against the in-memory Pub/Sub as well" {
         try std.testing.expectEqualStrings("prod", m.fake.tagValue("projects/my-project/topics/orders", "my-project/env").?);
     }
 }
+
+// snippet: pubsub-ack-outcome
+/// Ships each order once. What can be done twice comes before the ack;
+/// what must happen once waits for the ack to be taken.
+const Shipping = struct {
+    gpa: std.mem.Allocator,
+    mutex: std.Io.Mutex = .init,
+    /// By message id. A real one is a database.
+    orders: std.StringHashMapUnmanaged(enum { reserved, shipped }) = .empty,
+
+    fn handler(self: *Shipping) pubsub.Subscriber.DeliveryHandler {
+        return .{ .ptr = self, .vtable = &.{ .handle = handle } };
+    }
+
+    fn handle(ptr: *anyopaque, io: std.Io, delivery: *pubsub.Subscriber.Delivery) anyerror!void {
+        const self: *Shipping = @ptrCast(@alignCast(ptr));
+        const id = delivery.message.message_id;
+        try self.reserve(io, id); // harmless when the message comes again
+        switch (try delivery.ack(io)) {
+            // With exactly-once delivery, it will not come again.
+            .taken => self.ship(io, id),
+            // It may come again, and will find its reservation.
+            .refused, .unknown => {},
+        }
+    }
+
+    fn reserve(self: *Shipping, io: std.Io, id: []const u8) !void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.orders.contains(id)) return;
+        const owned = try self.gpa.dupe(u8, id);
+        errdefer self.gpa.free(owned);
+        try self.orders.put(self.gpa, owned, .reserved);
+    }
+
+    fn ship(self: *Shipping, io: std.Io, id: []const u8) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.orders.getPtr(id).?.* = .shipped;
+    }
+};
+// end snippet
+
+fn shippedCount(shipping: *Shipping, io: std.Io) usize {
+    shipping.mutex.lockUncancelable(io);
+    defer shipping.mutex.unlock(io);
+    var n: usize = 0;
+    var it = shipping.orders.valueIterator();
+    while (it.next()) |state| {
+        if (state.* == .shipped) n += 1;
+    }
+    return n;
+}
+
+test "the subscribing guide's code, against the in-memory Pub/Sub" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var fake: pubsub.testing.FakePubSub = .init(gpa, io, .{ .empty_pull_hold = .fromMilliseconds(20) });
+    defer fake.deinit();
+    var token: pubsub.StaticToken = .{ .token = "none" };
+    const options: pubsub.Client.Options = .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    };
+    var client = try pubsub.Client.init(gpa, io, options);
+    defer client.deinit();
+    var topic = try client.topic("orders").create(.{});
+    topic.deinit();
+    var made = try client.subscription("orders-worker").create(.{ .topic_id = "orders", .enable_exactly_once_delivery = true });
+    made.deinit();
+    var sent = try client.topic("orders").publish(&.{ .{ .data = "a" }, .{ .data = "b" }, .{ .data = "c" } }, .{});
+    sent.deinit();
+
+    var shipping: Shipping = .{ .gpa = gpa };
+    defer {
+        var it = shipping.orders.keyIterator();
+        while (it.next()) |key| gpa.free(key.*);
+        shipping.orders.deinit(gpa);
+    }
+    var subscriber = try pubsub.Subscriber.init(gpa, io, .{ .subscription_id = "orders-worker", .client = options });
+    defer subscriber.deinit();
+    var running = try io.concurrent(pubsub.Subscriber.runDeliveries, .{ &subscriber, shipping.handler() });
+    var waited_ms: usize = 0;
+    while (shippedCount(&shipping, io) < 3) : (waited_ms += 5) {
+        if (waited_ms > 10_000) {
+            subscriber.stop();
+            running.await(io) catch {};
+            return error.TestNotShipped;
+        }
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+    subscriber.stop();
+    try running.await(io);
+    try std.testing.expectEqual(3, shipping.orders.count());
+    try std.testing.expectEqual(0, fake.backlog("my-project", "orders-worker"));
+}

@@ -41,7 +41,7 @@ Against production, pass a `.token_provider` as well:
 
 | Guide | What's in it |
 | --- | --- |
-| [Subscribing](subscribing.md) | `Subscriber`, a worker loop that extends leases, bounds work and shuts down cleanly; exactly-once delivery |
+| [Subscribing](subscribing.md) | `Subscriber`, a worker loop that extends leases, bounds work and shuts down cleanly; exactly-once delivery; knowing whether an ack held |
 | [Publishing](publishing.md) | `Publisher`, which batches messages from many tasks; ordering keys; compression |
 | [Topics and subscriptions](topics-and-subscriptions.md) | Dead letters, retry policies, filters, retention, expiration and labels; updates; IAM |
 | [Delivery](delivery.md) | Push, BigQuery and Cloud Storage subscriptions: Pub/Sub delivers itself; the body options, the export states, and changing kind |

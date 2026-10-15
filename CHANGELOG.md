@@ -13,7 +13,26 @@ including the ones that did not change.
   and production's limits checked before a request is sent; and by its
   two nightly fuzz jobs, `firestore` and `heavy-firestore`, running a
   week, 2026-10-08 to 2026-10-15, without a failure.
-- auth, core, pubsub, secret_manager and storage: unchanged.
+- pubsub: a `Subscriber` handler can learn whether its ack held.
+  `Subscriber.runDeliveries` runs a `DeliveryHandler`, which is handed a
+  `Delivery`: its `ack` and `nack` go out in the ordinary batch and wait
+  for the server's answer, a `pubsub.AckOutcome`. `.taken`: with
+  exactly-once delivery the message will not come again. `.refused`: the
+  lease had lapsed. `.unknown`: no answer said either. A second `ack` or
+  `nack` returns the first one's outcome; a handler that settles nothing
+  acks by returning, as before. Without exactly-once delivery the outcome
+  is still the server's answer, where Google's clients say success at
+  once. `run` and `Handler` are unchanged. New section in
+  `docs/pubsub/subscribing.md`; `examples/worker.zig --confirm`.
+- pubsub: with exactly-once delivery, an ack the server refused for now
+  keeps its lease extended while it waits to be sent again, up to
+  `max_extension_s`, so that a later try can be taken. It was left to
+  lapse, after which every try was refused.
+- pubsub: once `stop` is called, an ack refused for now is sent again at
+  once instead of after its backoff, and given up if refused again. A
+  handler waiting on it hears `.unknown` then, rather than after the
+  10 minutes of retries.
+- auth, core, secret_manager and storage: unchanged.
 
 ## 0.37.0 (2026-10-13)
 

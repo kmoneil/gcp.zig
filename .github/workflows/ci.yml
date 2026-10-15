@@ -145,6 +145,12 @@ jobs:
           zig build example-publish -- orders 3
           zig build example-publisher -- orders 500 4
           zig build example-worker
+          # Acked from the handler, which prints what the server said. At
+          # least the two: the emulator can hold a fresh subscription's
+          # first messages back for a while, and hand them over here.
+          zig build example-publish -- orders 2
+          zig build example-worker -- orders orders-worker --confirm | tee "$RUNNER_TEMP/confirm.log"
+          test "$(grep -c ': taken$' "$RUNNER_TEMP/confirm.log")" -ge 2
           # No emulator in this one: the library's own in-memory Pub/Sub.
           zig build example-in_memory -- 300
           # A file up and back down through gcs_cp, byte for byte, in
