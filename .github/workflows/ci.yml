@@ -503,14 +503,18 @@ jobs:
         # took 125, 43 and 53 minutes on 10-13, 10-14 and 10-15 (runs
         # 38383800859, 38536592821 and 38704211921): one night can cost
         # three times another at the same count, as at 100K, so it drops
-        # to 60K, about 94 minutes on a night like 10-13's.
+        # to 60K, about 94 minutes on a night like 10-13's. Ack results
+        # (0.38.0) added runDeliveries to the Subscriber property's draws,
+        # and slow-subscriber took 132 minutes at 65K on 10-16 (run
+        # 38871479649), where it had taken 80 and 76 before: it drops to
+        # 44K, about 89 minutes at that night's 2.03 minutes a thousand.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 630K }
           - { job: auth, module: auth, filter: fuzz, iterations: 850K }
           - { job: slow-auth, module: auth, filter: slow property, iterations: 60K }
           - { job: pubsub, module: pubsub, filter: fuzz, iterations: 1150K }
           - { job: slow-pubsub, module: pubsub, filter: slow property Publisher, iterations: 1900K }
-          - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 65K }
+          - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 44K }
           - { job: heavy-pubsub, module: pubsub, filter: heavy property, iterations: 9M }
           - { job: fake-pubsub, module: pubsub, filter: fake property, iterations: 1M }
           - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 5500K }
