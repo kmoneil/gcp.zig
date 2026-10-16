@@ -13,6 +13,7 @@ const Allocator = std.mem.Allocator;
 const core = @import("core");
 
 const Query = @import("Query.zig");
+const Tail = @import("Tail.zig");
 const budget_mod = @import("budget.zig");
 const config = @import("config.zig");
 const codec = @import("codec.zig");
@@ -280,6 +281,12 @@ fn scopeProblem(scope: types.Scope) []const u8 {
 /// The read count: calls in the last 60 seconds and when the next is free.
 pub fn readBudget(self: *Client) types.ReadStatus {
     return self.budget.status(self.io);
+}
+
+/// A tail by polling over `entries.list`. Nothing is sent until `Tail.poll`;
+/// the options are checked here, as a query's are. It borrows the client.
+pub fn tail(self: *Client, options: types.TailOptions) Error!Tail {
+    return Tail.init(self, options);
 }
 
 /// One page of a container's or a view's log names: only logs that have

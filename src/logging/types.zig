@@ -359,3 +359,62 @@ pub const Picker = struct {
     /// the app needs view names from elsewhere, or reads the parent itself.
     list_denied: bool,
 };
+
+/// Where a tail is: a time, and the `insertId` of the last entry returned
+/// at that time when a poll stopped partway through it ("" otherwise).
+pub const Cursor = struct {
+    timestamp: std.Io.Timestamp,
+    insert_id: []const u8 = "",
+};
+
+/// What `Client.tail` follows, and how.
+pub const TailOptions = struct {
+    /// 1 to 100. Empty: the client's project.
+    scopes: []const Scope = &.{},
+    /// The Logging query language, as a query takes it.
+    filter: []const u8 = "",
+    min_severity: ?Severity = null,
+    log_id: ?[]const u8 = null,
+    resource_type: ?[]const u8 = null,
+    /// Where to begin: a cursor kept from an earlier tail. Null: now, less
+    /// `settle_ms`.
+    from: ?Cursor = null,
+    /// Entries newer than now less this wait for the next poll, so those
+    /// still arriving have time to.
+    settle_ms: u32 = 5_000,
+    /// Each poll reads this far back behind its cursor, for entries that
+    /// arrived late. At least `settle_ms`.
+    overlap_ms: u32 = 60_000,
+    page_size: u32 = 1000,
+    /// `entries.list` calls one poll may make, empty pages included.
+    max_calls_per_poll: u32 = 3,
+    /// As `QueryOptions.server_timeout_s`.
+    server_timeout_s: u32 = 0,
+};
+
+/// What one poll returned.
+pub const TailBatch = struct {
+    /// Entries not returned before, oldest first.
+    entries: []const Entry,
+    /// More was waiting than the poll's calls allowed: the tail is behind,
+    /// and the next poll goes on from here.
+    behind: bool,
+    /// Why the poll stopped early, with what it had: the read budget or the
+    /// server's quota (`error.ResourceExhausted`), or a call that failed
+    /// after entries came. The next poll tries again from the cursor.
+    stopped: ?anyerror,
+};
+
+pub const TailStats = struct {
+    polls: u64 = 0,
+    calls: u64 = 0,
+    entries: u64 = 0,
+    /// Seen again in an overlap and dropped.
+    duplicates: u64 = 0,
+    /// Arrived after a poll had passed their timestamp, and caught by the
+    /// overlap.
+    late: u64 = 0,
+    /// How far behind the cursor the latest-arriving late entry was: how
+    /// close `overlap_ms` came to missing it.
+    latest_late_ms: u64 = 0,
+};

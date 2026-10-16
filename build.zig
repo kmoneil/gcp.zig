@@ -415,9 +415,10 @@ pub fn build(b: *std.Build) void {
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read" }) |name| {
+    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail" }) |name| {
         // whoami, secret, gcs_cp, gcs_sign, gcs_notify, quickstart, iam,
-        // secret_rotation, firestore and logs_read pick their own credentials.
+        // secret_rotation, firestore, logs_read and logs_tail pick their own
+        // credentials.
         const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "secret"))
@@ -430,7 +431,7 @@ pub fn build(b: *std.Build) void {
             &.{ .{ .name = "secret_manager", .module = secret_manager }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "firestore"))
             &.{ .{ .name = "firestore", .module = firestore }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "logs_read"))
+        else if (std.mem.eql(u8, name, "logs_read") or std.mem.eql(u8, name, "logs_tail"))
             &.{ .{ .name = "logging", .module = logging }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "gcs_notify") or std.mem.eql(u8, name, "quickstart"))
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
