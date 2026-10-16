@@ -508,6 +508,10 @@ jobs:
         # and slow-subscriber took 132 minutes at 65K on 10-16 (run
         # 38871479649), where it had taken 80 and 76 before: it drops to
         # 44K, about 89 minutes at that night's 2.03 minutes a thousand.
+        # logging (0.39.0) starts at estimates from a local run, to be
+        # re-sized from its first nights: its three fuzz properties took
+        # 1.35 ms a run together, so 2M; the tail's slow property 31 ms,
+        # so 90K.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 630K }
           - { job: auth, module: auth, filter: fuzz, iterations: 850K }
@@ -526,6 +530,8 @@ jobs:
           - { job: fault-gzip, module: storage, filter: fault property gzip|fault property compressed, iterations: 150 }
           - { job: firestore, module: firestore, filter: fuzz, iterations: 3200K }
           - { job: heavy-firestore, module: firestore, filter: heavy property, iterations: 1400K }
+          - { job: logging, module: logging, filter: fuzz, iterations: 2M }
+          - { job: slow-logging, module: logging, filter: slow property, iterations: 90K }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     # actions: read finds and downloads the corpus an earlier run kept.

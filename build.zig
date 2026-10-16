@@ -157,6 +157,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "secret_manager", .module = secret_manager },
                 .{ .name = "firestore", .module = firestore },
                 .{ .name = "storage", .module = storage },
+                .{ .name = "logging", .module = logging },
                 .{ .name = "core", .module = core },
             },
         }),
@@ -374,6 +375,24 @@ pub fn build(b: *std.Build) void {
     });
     gcp_step.dependOn(&streamed(b, firestore_gcp_tests).step);
     test_step.dependOn(&firestore_gcp_tests.step);
+    // Cloud Logging against a real project: GCP_TEST_PROJECT and
+    // GCP_TEST_TOKEN, a token that may write and read logs.
+    const logging_gcp_tests = b.addTest(.{
+        .name = "logging-gcp-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/logging_gcp_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "logging", .module = logging },
+                .{ .name = "core", .module = core },
+            },
+        }),
+        .filters = test_filters,
+        .test_runner = test_runner,
+    });
+    gcp_step.dependOn(&streamed(b, logging_gcp_tests).step);
+    test_step.dependOn(&logging_gcp_tests.step);
     // Signed URLs against a real bucket, which is the only place a
     // signature is checked: GCP_TEST_BUCKET, GCP_TEST_TOKEN, and a signer,
     // GCP_TEST_SIGNER_KEY or GCP_TEST_SIGNER_EMAIL.

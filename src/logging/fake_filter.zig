@@ -949,7 +949,7 @@ fn clauseValue(g: *core.testing.ByteGen, buf: []u8) []const u8 {
 fn joinProperty(_: void, input: []const u8) !void {
     const filter_mod = @import("filter.zig");
     var g: core.testing.ByteGen = .init(input);
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(@import("test_util.zig").propertyAllocator());
     defer arena.deinit();
     const a = arena.allocator();
     const callers = [_][]const u8{

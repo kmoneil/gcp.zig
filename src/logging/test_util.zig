@@ -19,6 +19,13 @@ pub const fuzzBytes = core.testing.fuzzBytes;
 pub const max_fuzz_input = core.testing.max_fuzz_input;
 pub const repeat = core.testing.repeat;
 pub const no_grow_allocator = core.testing.no_grow_allocator;
+/// The allocator a property runs on: the one that looks for leaks in every
+/// test run, a plain one under the fuzzer, where the leak checker's record
+/// of every allocation is most of a run's cost and grows without end, as
+/// the Pub/Sub fake's properties found.
+pub fn propertyAllocator() std.mem.Allocator {
+    return if (@import("builtin").fuzz) std.heap.smp_allocator else std.testing.allocator;
+}
 
 /// A real `Client` wired to a `FakeTransport` and a `FakeClock`. Initialize
 /// it in place with `init`: the client points into the harness.
