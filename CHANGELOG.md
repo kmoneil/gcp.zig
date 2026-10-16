@@ -4,6 +4,33 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.39.0 (unreleased)
+
+- logging: new module, **experimental**: the read side of Cloud
+  Logging, over REST. `Client.query` builds and fixes one `entries.list`
+  request, and `Query.page` fetches its pages one a call, every page
+  sending the request its first did, as page tokens require. An empty
+  page with a token is an ordinary answer, the server having run out of
+  time, and only a null token ends a listing. The caller's filter is sent
+  as written, inside parentheses, with `since`, `until`, `min_severity`,
+  `log_id` and `resource_type` joined to it on lines of their own. No
+  time window is added unasked. Entries carry their envelope typed and
+  their JSON and proto payloads as the bytes received, numbers as written,
+  with `Payload.parse` for a `std.json.Value`, and the whole entry's
+  bytes for fields not typed. A `ReadBudget` counts `entries.list` calls
+  against the read quota, 60 a minute per project: a call past it is not
+  sent, and `Client.readBudget` says when the next is free. A 429 is
+  never retried, and holds calls back until the quota window it names
+  ends. `QueryOptions.server_timeout_s` lets the server search longer
+  than its 10 s before it answers with a short or empty page. Page sizes
+  above 1000 are allowed, as production served them.
+  `logging.testing.FakeLogging` keeps entries in memory and lists,
+  pages, filters and refuses as production did when measured, in its
+  words. `examples/logs_read.zig`, with `--fake` for no network. Tail by
+  polling, log names, buckets and views follow before the release; a
+  live tail is not possible over REST, as measured.
+- auth, core, firestore, pubsub, secret_manager and storage: unchanged.
+
 ## 0.38.0 (2026-10-15)
 
 - firestore: now **beta**, as `pubsub` and `core` are. No call
