@@ -72,8 +72,9 @@ the properties too slow to share one: auth's RSA signing
 `slow-subscriber`) and its heavy properties (`heavy-pubsub`), storage's
 slow and heavy properties (`slow-storage`, `heavy-storage`), and its
 fault properties, which drive whole transfers through injected faults
-(`fault-storage`, `fault-gzip`), and Firestore's model of writes against
-its fake (`heavy-firestore`). A test that fails while being fuzzed
+(`fault-storage`, `fault-gzip`), Firestore's model of writes against
+its fake (`heavy-firestore`), and Logging's tail by polling against its
+fake (`slow-logging`). A test that fails while being fuzzed
 fails its job, and the input is attached to the run as
 `fuzz-failure-<job>`, such as `fuzz-failure-pubsub`.
 
@@ -188,6 +189,23 @@ gcloud firestore indexes composite create --database=$DB \
 FIRESTORE_TEST_PRODUCTION=1 GCP_TEST_PROJECT=my-project FIRESTORE_TEST_DATABASE=$DB \
     GCP_TEST_TOKEN=$(gcloud auth print-access-token) \
     zig build test-integration -Dtest-filter=firestore_integration
+```
+
+### Cloud Logging
+
+Cloud Logging has no emulator, so its tests need a real project and a
+token that may write and read logs. Each test writes its entries to a
+`zigps-lg-*` log of its own, through `entries:write` by hand, and deletes
+the log after; entries a crashed run leaves expire with `_Default`'s 30
+days. Reads are free, and the entries fit far inside the free ingestion.
+Logging shows what was written after about 13 seconds, so the tests poll,
+and a run takes about five minutes. The last test replays a set of
+scripts against production and against `FakeLogging`, and fails on any
+answer the two do not share.
+
+```sh
+GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth print-access-token) \
+    zig build test-integration-gcp -Dtest-filter=logging
 ```
 
 ### Secret Manager and bucket settings
