@@ -384,6 +384,121 @@ const WireHttpRequest = struct {
     protocol: ?[]const u8 = null,
 };
 
+// Logs, buckets and views
+
+/// A page of `logs.list`: names as sent, ids decoded.
+pub fn decodeLogPage(arena: Allocator, body: []const u8) DecodeError!types.LogPage {
+    const wire = try decodeWire(struct { logNames: ?[]const []const u8 = null, nextPageToken: ?[]const u8 = null }, arena, body);
+    const log_names = wire.logNames orelse &.{};
+    const ids = try arena.alloc([]const u8, log_names.len);
+    for (log_names, ids) |name, *id| id.* = try names.logIdOf(arena, name);
+    return .{ .log_names = log_names, .log_ids = ids, .next_page_token = nonEmpty(wire.nextPageToken) };
+}
+
+const WireBucket = struct {
+    name: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    createTime: ?[]const u8 = null,
+    updateTime: ?[]const u8 = null,
+    retentionDays: ?Int64 = null,
+    locked: ?bool = null,
+    lifecycleState: ?std.json.Value = null,
+    analyticsEnabled: ?bool = null,
+    restrictedFields: ?[]const []const u8 = null,
+};
+
+const WireView = struct {
+    name: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    filter: ?[]const u8 = null,
+    createTime: ?[]const u8 = null,
+    updateTime: ?[]const u8 = null,
+};
+
+pub fn decodeBucket(arena: Allocator, body: []const u8) DecodeError!types.BucketInfo {
+    return bucketOf(try decodeWire(WireBucket, arena, body));
+}
+
+pub fn decodeBucketPage(arena: Allocator, body: []const u8) DecodeError!types.BucketPage {
+    const wire = try decodeWire(struct { buckets: ?[]const WireBucket = null, nextPageToken: ?[]const u8 = null }, arena, body);
+    const list = wire.buckets orelse &.{};
+    const out = try arena.alloc(types.BucketInfo, list.len);
+    for (list, out) |w, *b| b.* = try bucketOf(w);
+    return .{ .buckets = out, .next_page_token = nonEmpty(wire.nextPageToken) };
+}
+
+pub fn decodeView(arena: Allocator, body: []const u8) DecodeError!types.ViewInfo {
+    return viewOf(try decodeWire(WireView, arena, body));
+}
+
+pub fn decodeViewPage(arena: Allocator, body: []const u8) DecodeError!types.ViewPage {
+    const wire = try decodeWire(struct { views: ?[]const WireView = null, nextPageToken: ?[]const u8 = null }, arena, body);
+    const list = wire.views orelse &.{};
+    const out = try arena.alloc(types.ViewInfo, list.len);
+    for (list, out) |w, *v| v.* = try viewOf(w);
+    return .{ .views = out, .next_page_token = nonEmpty(wire.nextPageToken) };
+}
+
+fn decodeWire(comptime T: type, arena: Allocator, body: []const u8) DecodeError!T {
+    return std.json.parseFromSliceLeaky(T, arena, body, parse_options) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidResponse,
+    };
+}
+
+fn nonEmpty(token: ?[]const u8) ?[]const u8 {
+    const t = token orelse return null;
+    return if (t.len == 0) null else t;
+}
+
+fn optionalTime(text: ?[]const u8) DecodeError!?std.Io.Timestamp {
+    const t = text orelse return null;
+    return core.timestamp.parse(t) catch error.InvalidResponse;
+}
+
+fn bucketOf(w: WireBucket) DecodeError!types.BucketInfo {
+    return .{
+        .name = names.parseBucketName(w.name orelse return error.InvalidResponse) orelse return error.InvalidResponse,
+        .description = w.description orelse "",
+        .create_time = try optionalTime(w.createTime),
+        .update_time = try optionalTime(w.updateTime),
+        .retention_days = if (w.retentionDays) |d| std.math.cast(u32, d.value) orelse return error.InvalidResponse else 0,
+        .locked = w.locked orelse false,
+        .state = bucketState(w.lifecycleState),
+        .analytics_enabled = w.analyticsEnabled orelse false,
+        .restricted_fields = w.restrictedFields orelse &.{},
+    };
+}
+
+/// A name, or a number as `enum-encoding=int` sends it; one this version
+/// does not know is `.unknown`.
+fn bucketState(value: ?std.json.Value) types.BucketState {
+    const states = [_]types.BucketState{ .unspecified, .active, .delete_requested, .updating, .creating, .failed };
+    const by_name = std.StaticStringMap(types.BucketState).initComptime(.{
+        .{ "LIFECYCLE_STATE_UNSPECIFIED", .unspecified },
+        .{ "ACTIVE", .active },
+        .{ "DELETE_REQUESTED", .delete_requested },
+        .{ "UPDATING", .updating },
+        .{ "CREATING", .creating },
+        .{ "FAILED", .failed },
+    });
+    return switch (value orelse return .unspecified) {
+        .string => |s| by_name.get(s) orelse .unknown,
+        .integer => |n| if (n >= 0 and n < states.len) states[@intCast(n)] else .unknown,
+        else => .unknown,
+    };
+}
+
+fn viewOf(w: WireView) DecodeError!types.ViewInfo {
+    return .{
+        .name = names.parseViewName(w.name orelse return error.InvalidResponse) orelse return error.InvalidResponse,
+        .description = w.description orelse "",
+        .filter = w.filter orelse "",
+        .create_time = try optionalTime(w.createTime),
+        .update_time = try optionalTime(w.updateTime),
+    };
+}
+
 const testing = std.testing;
 
 test "golden: the request, with and without a filter and a token" {

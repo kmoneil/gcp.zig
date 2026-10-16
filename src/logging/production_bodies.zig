@@ -227,6 +227,60 @@ pub const searching =
     \\{"nextPageToken":"ep0BCpgBAdjKCLpWPoVEPPMkdeoYVoX4AMGaf3DFl0QRHpe4lxxJoQoI9cAKlrp6Qs6oSKHPk5VqcmpA1Q8qqBndawK4-QuQBJFtlLpNdgDOkSWr16ppDgXtVipwToCZVZeGoKI4bPvYML6WCru5MOSfYL-eFWIHoqN33lODT_cNKqVG2Vi63ElVp_ERKRxRYzq62z2zt9puMFDpNAkQAA"}
 ;
 
+/// The project's buckets, every location. HTTP 200.
+pub const buckets_page_status = 200;
+pub const buckets_page =
+    \\{"buckets":[{"name":"projects/extractctl/locations/global/buckets/_Default","description":"Default bucket","retentionDays":30,"lifecycleState":"ACTIVE"},{"name":"projects/extractctl/locations/global/buckets/_Required","description":"Audit bucket","locked":true,"retentionDays":400,"lifecycleState":"ACTIVE"}]}
+;
+
+/// The views of `_Default`. HTTP 200.
+pub const views_default_status = 200;
+pub const views_default =
+    \\{"views":[{"name":"projects/extractctl/locations/global/buckets/_Default/views/_AllLogs","description":"Access to all logs"},{"name":"projects/extractctl/locations/global/buckets/_Default/views/_Default","description":"Access to all logs except data access logs","filter":"NOT LOG_ID(\"cloudaudit.googleapis.com/data_access\") AND NOT LOG_ID(\"externalaudit.googleapis.com/data_access\")"}]}
+;
+
+/// The views of `_Required`. HTTP 200.
+pub const views_required_status = 200;
+pub const views_required =
+    \\{"views":[{"name":"projects/extractctl/locations/global/buckets/_Required/views/_AllLogs","description":"Access to all logs"}]}
+;
+
+/// `views.list` with location `-`. HTTP 404.
+pub const views_wildcard_status = 404;
+pub const views_wildcard =
+    \\{
+    \\  "error": {
+    \\    "code": 404,
+    \\    "message": "Cloud Logging does not support location: -",
+    \\    "status": "NOT_FOUND"
+    \\  }
+    \\}
+;
+
+/// A view that does not exist. HTTP 404.
+pub const view_missing_status = 404;
+pub const view_missing =
+    \\{
+    \\  "error": {
+    \\    "code": 404,
+    \\    "message": "projects/extractctl/locations/global/buckets/_Default/views/zigps-none does not exist",
+    \\    "status": "NOT_FOUND"
+    \\  }
+    \\}
+;
+
+/// A bucket that does not exist. HTTP 404.
+pub const bucket_missing_status = 404;
+pub const bucket_missing =
+    \\{
+    \\  "error": {
+    \\    "code": 404,
+    \\    "message": "Bucket `zigps-none` in location `global` does not exist",
+    \\    "status": "NOT_FOUND"
+    \\  }
+    \\}
+;
+
 const std = @import("std");
 const core = @import("core");
 const codec = @import("codec.zig");
@@ -390,4 +444,68 @@ test "production: the fake refuses what production refused, in its words" {
     defer arena.deinit();
     const quota = try fake.serve(.POST, "https://logging.googleapis.com/v2/entries:list", "{\"resourceNames\":[\"projects/p\"]}", arena.allocator());
     try testing.expectEqualStrings((try core.errors.decodeErrorBody(arena.allocator(), refused_quota)).?.message, (try core.errors.decodeErrorBody(arena.allocator(), quota.body)).?.message);
+}
+
+test "production: the fake's buckets, views and refusals are production's" {
+    var clock: test_util.FakeClock = .{};
+    var fake: FakeLogging = .init(testing.allocator, clock.io());
+    defer fake.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = "https://logging.googleapis.com/v2/projects/extractctl";
+    // The two buckets and their views, field for field.
+    const buckets = try fake.serve(.GET, base ++ "/locations/-/buckets?prettyPrint=false", "", a);
+    try expectSameJson(a, buckets_page, buckets.body);
+    const default_views = try fake.serve(.GET, base ++ "/locations/global/buckets/_Default/views?prettyPrint=false", "", a);
+    try expectSameJson(a, views_default, default_views.body);
+    const required_views = try fake.serve(.GET, base ++ "/locations/global/buckets/_Required/views", "", a);
+    try expectSameJson(a, views_required, required_views.body);
+    for ([_]struct { []const u8, u16, []const u8 }{
+        .{ "/locations/-/buckets/-/views", views_wildcard_status, views_wildcard },
+        .{ "/locations/global/buckets/_Default/views/zigps-none", view_missing_status, view_missing },
+        .{ "/locations/global/buckets/zigps-none", bucket_missing_status, bucket_missing },
+    }) |case| {
+        const reply = try fake.serve(.GET, try std.fmt.allocPrint(a, "{s}{s}", .{ base, case[0] }), "", a);
+        try testing.expectEqual(case[1], reply.status);
+        const ours = (try core.errors.decodeErrorBody(a, reply.body)).?;
+        const theirs = (try core.errors.decodeErrorBody(a, case[2])).?;
+        try testing.expectEqualStrings(theirs.status, ours.status);
+        try testing.expectEqualStrings(theirs.message, ours.message);
+    }
+}
+
+/// Equal as JSON values: the same fields and values, in any order.
+fn expectSameJson(a: std.mem.Allocator, want: []const u8, got: []const u8) !void {
+    const w = try std.json.parseFromSliceLeaky(std.json.Value, a, want, .{});
+    const g = try std.json.parseFromSliceLeaky(std.json.Value, a, got, .{});
+    if (!sameValue(w, g)) {
+        std.debug.print("want: {s}\ngot:  {s}\n", .{ want, got });
+        return error.TestExpectedEqual;
+    }
+}
+
+fn sameValue(x: std.json.Value, y: std.json.Value) bool {
+    switch (x) {
+        .object => |xo| {
+            if (y != .object or xo.count() != y.object.count()) return false;
+            var it = xo.iterator();
+            while (it.next()) |kv| {
+                const other = y.object.get(kv.key_ptr.*) orelse return false;
+                if (!sameValue(kv.value_ptr.*, other)) return false;
+            }
+            return true;
+        },
+        .array => |xa| {
+            if (y != .array or xa.items.len != y.array.items.len) return false;
+            for (xa.items, y.array.items) |xi, yi| if (!sameValue(xi, yi)) return false;
+            return true;
+        },
+        .string => |s| return y == .string and std.mem.eql(u8, s, y.string),
+        .integer => |i| return y == .integer and i == y.integer,
+        .bool => |b| return y == .bool and b == y.bool,
+        .null => return y == .null,
+        .float => |f| return y == .float and f == y.float,
+        .number_string => |s| return y == .number_string and std.mem.eql(u8, s, y.number_string),
+    }
 }

@@ -14,6 +14,7 @@ const core = @import("core");
 
 const Query = @import("Query.zig");
 const budget_mod = @import("budget.zig");
+const config = @import("config.zig");
 const codec = @import("codec.zig");
 const errors = @import("errors.zig");
 const filter = @import("filter.zig");
@@ -270,15 +271,49 @@ fn scopeProblem(scope: types.Scope) []const u8 {
         .organization => "an organization id is 1 to 32 digits",
         .billing_account => "a billing account id is three groups of six letters or digits joined by '-'",
     };
-    const view = scope.view;
-    if (!validate.isLocation(view.location)) return "a location is lowercase letters, digits and '-', such as \"global\"";
-    if (!validate.isBucketId(view.bucket)) return "a bucket id is 1 to 100 letters, digits, '_', '-' or '.'";
+    const v = scope.view;
+    if (!validate.isLocation(v.location)) return "a location is lowercase letters, digits and '-', such as \"global\"";
+    if (!validate.isBucketId(v.bucket)) return "a bucket id is 1 to 100 letters, digits, '_', '-' or '.'";
     return "a view id is 1 to 100 letters, digits, '_' or '-'";
 }
 
 /// The read count: calls in the last 60 seconds and when the next is free.
 pub fn readBudget(self: *Client) types.ReadStatus {
     return self.budget.status(self.io);
+}
+
+/// One page of a container's or a view's log names: only logs that have
+/// entries, in byte order.
+pub fn listLogs(self: *Client, options: types.ListLogsOptions) Error!types.Owned(types.LogPage) {
+    return config.listLogs(self, options);
+}
+
+/// One page of a parent's buckets, in one location or every one.
+pub fn listBuckets(self: *Client, options: types.ListBucketsOptions) Error!types.Owned(types.BucketPage) {
+    return config.listBuckets(self, options);
+}
+
+/// One bucket. A missing one is `error.NotFound`.
+pub fn bucket(self: *Client, name: types.BucketName) Error!types.Owned(types.BucketInfo) {
+    return config.bucket(self, name);
+}
+
+/// One page of a bucket's views. There is no wildcard: production refused
+/// location `-` here ("Cloud Logging does not support location: -").
+pub fn listViews(self: *Client, bucket_name: types.BucketName, options: types.PageOptions) Error!types.Owned(types.ViewPage) {
+    return config.listViews(self, bucket_name, options);
+}
+
+/// One view. A missing one is `error.NotFound`.
+pub fn view(self: *Client, name: types.ViewName) Error!types.Owned(types.ViewInfo) {
+    return config.view(self, name);
+}
+
+/// Every bucket of `parent` with its views, ordered for a picker: one
+/// bucket list across locations and one view list a bucket, every page
+/// followed. Meant to be cached: it is a call a bucket.
+pub fn picker(self: *Client, parent: types.Parent) Error!types.Owned(types.Picker) {
+    return config.picker(self, parent);
 }
 
 const testing = std.testing;

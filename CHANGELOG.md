@@ -26,9 +26,17 @@ including the ones that did not change.
   above 1000 are allowed, as production served them.
   `logging.testing.FakeLogging` keeps entries in memory and lists,
   pages, filters and refuses as production did when measured, in its
-  words. `examples/logs_read.zig`, with `--fake` for no network. Tail by
-  polling, log names, buckets and views follow before the release; a
-  live tail is not possible over REST, as measured.
+  words. `examples/logs_read.zig`, with `--fake` for no network.
+- logging: log names, buckets and views. `Client.listLogs` lists a
+  container's or a view's logs; `listBuckets` (every location unless one
+  is named), `bucket`, `listViews` and `view` read the rest; and
+  `Client.picker` gathers a parent's buckets with their views in the
+  order a person looks for them, `_Default` first, a refused list
+  reported rather than failed. The fake keeps each parent's `_Default`
+  and `_Required` as production has them, buckets and views a test
+  adds, and `_Default`'s view leaving out data access audit logs. A tail
+  by polling follows before the release; a live tail is not possible
+  over REST, as measured.
 - auth, core, firestore, pubsub, secret_manager and storage: unchanged.
 
 ## 0.38.0 (2026-10-15)
