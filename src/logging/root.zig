@@ -13,6 +13,7 @@ const core = @import("core");
 
 pub const Client = @import("Client.zig");
 pub const Query = @import("Query.zig");
+pub const Tail = @import("Tail.zig");
 pub const ReadBudget = @import("budget.zig").ReadBudget;
 
 pub const TokenProvider = core.TokenProvider;
@@ -53,6 +54,10 @@ pub const ViewInfo = @import("types.zig").ViewInfo;
 pub const ViewPage = @import("types.zig").ViewPage;
 pub const PickerBucket = @import("types.zig").PickerBucket;
 pub const Picker = @import("types.zig").Picker;
+pub const Cursor = @import("types.zig").Cursor;
+pub const TailOptions = @import("types.zig").TailOptions;
+pub const TailBatch = @import("types.zig").TailBatch;
+pub const TailStats = @import("types.zig").TailStats;
 
 /// Parses an entry's `timestamp` (RFC 3339) to nanoseconds since the Unix
 /// epoch.
@@ -83,6 +88,7 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("Client.zig");
     _ = @import("Query.zig");
+    _ = @import("Tail.zig");
     _ = @import("budget.zig");
     _ = @import("codec.zig");
     _ = @import("config.zig");

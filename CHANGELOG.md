@@ -34,9 +34,18 @@ including the ones that did not change.
   order a person looks for them, `_Default` first, a refused list
   reported rather than failed. The fake keeps each parent's `_Default`
   and `_Required` as production has them, buckets and views a test
-  adds, and `_Default`'s view leaving out data access audit logs. A tail
-  by polling follows before the release; a live tail is not possible
-  over REST, as measured.
+  adds, and `_Default`'s view leaving out data access audit logs.
+- logging: a tail by polling, `Client.tail`, since a live tail is not
+  possible over REST, as measured: a complete request ends the stream at
+  once, and one left open draws a 502. Each `Tail.poll` reads one window,
+  oldest first, from the cursor less `overlap_ms` (60 s) for entries
+  that arrived late, to now less `settle_ms` (5 s), up to
+  `max_calls_per_poll` calls, and returns each entry once. A poll that
+  runs out of calls says `behind` and the next reads on without the
+  overlap; one stopped by the read quota returns what it had. The
+  cursor can be kept and a tail resumed from it. `Tail.stats` counts
+  entries seen again and late ones, and how close the latest late one
+  came to the overlap. `examples/logs_tail.zig`, with `--fake`.
 - auth, core, firestore, pubsub, secret_manager and storage: unchanged.
 
 ## 0.38.0 (2026-10-15)

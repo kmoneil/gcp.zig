@@ -511,3 +511,23 @@ test "picker: every allocation failure is OutOfMemory without leaks" {
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
 }
+
+test "picker: of a folder, an organization and a billing account" {
+    inline for (.{
+        .{ types.Parent{ .folder = "12" }, "folders/12" },
+        .{ types.Parent{ .organization = "34" }, "organizations/34" },
+        .{ types.Parent{ .billing_account = "012345-567890-ABCDEF" }, "billingAccounts/012345-567890-ABCDEF" },
+    }) |case| {
+        var h: test_util.Harness = undefined;
+        try h.init(&.{
+            .{ .respond = .{ .body = "{\"buckets\":[{\"name\":\"" ++ case[1] ++ "/locations/global/buckets/_Default\"}]}" } },
+            .{ .respond = .{ .body = "{\"views\":[{\"name\":\"" ++ case[1] ++ "/locations/global/buckets/_Default/views/_AllLogs\"}]}" } },
+        }, .{});
+        defer h.deinit();
+        var p = try h.client.picker(case[0]);
+        defer p.deinit();
+        try h.expectRequest(0, .GET, base ++ "/v2/" ++ case[1] ++ "/locations/-/buckets?prettyPrint=false", null);
+        try testing.expectEqual(std.meta.activeTag(case[0]), std.meta.activeTag(p.value.buckets[0].info.name.parent));
+        try testing.expectEqualStrings("_AllLogs", p.value.buckets[0].views[0].name.view);
+    }
+}
