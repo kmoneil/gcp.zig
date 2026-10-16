@@ -262,3 +262,100 @@ pub const ReadStatus = struct {
     /// How long until the next call may go: 0 when one may go now.
     next_free_ms: u64,
 };
+
+/// What `Client.listLogs` lists: a container's logs, or a view's.
+pub const ListLogsOptions = struct {
+    /// Null: the client's project.
+    scope: ?Scope = null,
+    /// 0: the server's choice.
+    page_size: u32 = 0,
+    page_token: ?[]const u8 = null,
+};
+
+/// One page of log names. Production lists only logs that have entries,
+/// in byte order, and listed the probe's new logs within 100 s of their
+/// first entry.
+pub const LogPage = struct {
+    /// As sent, each log id URL-encoded: "projects/P/logs/a%2Fb".
+    log_names: []const []const u8,
+    /// Decoded, in the same order: "a/b".
+    log_ids: []const []const u8,
+    next_page_token: ?[]const u8,
+};
+
+/// What `Client.listBuckets` lists.
+pub const ListBucketsOptions = struct {
+    /// Null: the client's project.
+    parent: ?Parent = null,
+    /// Null: every location, the API's `-`.
+    location: ?[]const u8 = null,
+    /// 0: the server's choice.
+    page_size: u32 = 0,
+    page_token: ?[]const u8 = null,
+};
+
+/// A page size and a token, for lists that take nothing else.
+pub const PageOptions = struct {
+    /// 0: the server's choice.
+    page_size: u32 = 0,
+    page_token: ?[]const u8 = null,
+};
+
+/// Where a bucket is in its life. A deleted one stays `delete_requested`
+/// for 7 days, and Logging still routes entries to it meanwhile.
+pub const BucketState = enum { active, delete_requested, updating, creating, failed, unspecified, unknown };
+
+pub const BucketInfo = struct {
+    name: BucketName,
+    description: []const u8,
+    /// Absent on `_Default` and `_Required`.
+    create_time: ?std.Io.Timestamp,
+    update_time: ?std.Io.Timestamp,
+    /// 0 when absent.
+    retention_days: u32,
+    /// Its retention can no longer change.
+    locked: bool,
+    state: BucketState,
+    analytics_enabled: bool,
+    /// Field paths hidden in this bucket.
+    restricted_fields: []const []const u8,
+};
+
+pub const BucketPage = struct {
+    buckets: []const BucketInfo,
+    next_page_token: ?[]const u8,
+};
+
+pub const ViewInfo = struct {
+    name: ViewName,
+    description: []const u8,
+    /// What the view shows of its bucket, such as `NOT
+    /// LOG_ID("cloudaudit.googleapis.com/data_access")`; "" for all of it.
+    filter: []const u8,
+    create_time: ?std.Io.Timestamp,
+    update_time: ?std.Io.Timestamp,
+};
+
+pub const ViewPage = struct {
+    views: []const ViewInfo,
+    next_page_token: ?[]const u8,
+};
+
+/// One bucket of a picker, with its views.
+pub const PickerBucket = struct {
+    info: BucketInfo,
+    /// `_Default` first, then `_AllLogs`, then the rest by id.
+    views: []const ViewInfo,
+    /// The caller may not list this bucket's views.
+    views_denied: bool,
+};
+
+/// A parent's buckets and their views, ordered for a picker: `_Default`
+/// first, then `_Required`, then the rest by location and id. The server
+/// documents no order of its own.
+pub const Picker = struct {
+    buckets: []const PickerBucket,
+    /// The caller may not list buckets, as a Logs View Accessor cannot:
+    /// the app needs view names from elsewhere, or reads the parent itself.
+    list_denied: bool,
+};

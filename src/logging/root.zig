@@ -42,6 +42,17 @@ pub const Entry = @import("types.zig").Entry;
 pub const QueryOptions = @import("types.zig").QueryOptions;
 pub const EntryPage = @import("types.zig").EntryPage;
 pub const ReadStatus = @import("types.zig").ReadStatus;
+pub const ListLogsOptions = @import("types.zig").ListLogsOptions;
+pub const LogPage = @import("types.zig").LogPage;
+pub const ListBucketsOptions = @import("types.zig").ListBucketsOptions;
+pub const PageOptions = @import("types.zig").PageOptions;
+pub const BucketState = @import("types.zig").BucketState;
+pub const BucketInfo = @import("types.zig").BucketInfo;
+pub const BucketPage = @import("types.zig").BucketPage;
+pub const ViewInfo = @import("types.zig").ViewInfo;
+pub const ViewPage = @import("types.zig").ViewPage;
+pub const PickerBucket = @import("types.zig").PickerBucket;
+pub const Picker = @import("types.zig").Picker;
 
 /// Parses an entry's `timestamp` (RFC 3339) to nanoseconds since the Unix
 /// epoch.
@@ -74,6 +85,7 @@ test {
     _ = @import("Query.zig");
     _ = @import("budget.zig");
     _ = @import("codec.zig");
+    _ = @import("config.zig");
     _ = @import("errors.zig");
     _ = @import("fake_filter.zig");
     _ = @import("fake_logging.zig");

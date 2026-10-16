@@ -83,7 +83,82 @@ pub fn logName(arena: Allocator, parent: types.Parent, log_id: []const u8) Alloc
     return out.toOwnedSlice();
 }
 
+/// A parent at the start of a resource name, and what follows its id
+/// (with the `/` before it, or "").
+pub fn parseParent(text: []const u8) ?struct { parent: types.Parent, rest: []const u8 } {
+    const slash = std.mem.indexOfScalar(u8, text, '/') orelse return null;
+    const kind = text[0..slash];
+    const after = text[slash + 1 ..];
+    const end = std.mem.indexOfScalar(u8, after, '/') orelse after.len;
+    const id = after[0..end];
+    if (id.len == 0) return null;
+    const parent: types.Parent = if (std.mem.eql(u8, kind, "projects"))
+        .{ .project = id }
+    else if (std.mem.eql(u8, kind, "folders"))
+        .{ .folder = id }
+    else if (std.mem.eql(u8, kind, "organizations"))
+        .{ .organization = id }
+    else if (std.mem.eql(u8, kind, "billingAccounts"))
+        .{ .billing_account = id }
+    else
+        return null;
+    return .{ .parent = parent, .rest = after[end..] };
+}
+
+/// `PARENT/locations/L/buckets/B`, the parts pointing into `text`.
+pub fn parseBucketName(text: []const u8) ?types.BucketName {
+    const p = parseParent(text) orelse return null;
+    var it = std.mem.splitScalar(u8, p.rest, '/');
+    if ((it.next() orelse return null).len != 0) return null;
+    if (!std.mem.eql(u8, it.next() orelse return null, "locations")) return null;
+    const location = it.next() orelse return null;
+    if (!std.mem.eql(u8, it.next() orelse return null, "buckets")) return null;
+    const bucket = it.next() orelse return null;
+    if (location.len == 0 or bucket.len == 0 or it.next() != null) return null;
+    return .{ .parent = p.parent, .location = location, .bucket = bucket };
+}
+
+/// `PARENT/locations/L/buckets/B/views/V`, the parts pointing into `text`.
+pub fn parseViewName(text: []const u8) ?types.ViewName {
+    const at = std.mem.lastIndexOf(u8, text, "/views/") orelse return null;
+    const bucket = parseBucketName(text[0..at]) orelse return null;
+    const view = text[at + "/views/".len ..];
+    if (view.len == 0 or std.mem.indexOfScalar(u8, view, '/') != null) return null;
+    return .{ .parent = bucket.parent, .location = bucket.location, .bucket = bucket.bucket, .view = view };
+}
+
 const testing = std.testing;
+
+test "resource names read back into their parts" {
+    const b = parseBucketName("projects/extractctl/locations/global/buckets/_Default").?;
+    try testing.expectEqualStrings("extractctl", b.parent.project);
+    try testing.expectEqualStrings("global", b.location);
+    try testing.expectEqualStrings("_Default", b.bucket);
+    const v = parseViewName("folders/12/locations/eu/buckets/audit/views/_AllLogs").?;
+    try testing.expectEqualStrings("12", v.parent.folder);
+    try testing.expectEqualStrings("eu", v.location);
+    try testing.expectEqualStrings("audit", v.bucket);
+    try testing.expectEqualStrings("_AllLogs", v.view);
+    try testing.expectEqualStrings("9", parseParent("organizations/9").?.parent.organization);
+    try testing.expectEqualStrings("012345-567890-ABCDEF", parseParent("billingAccounts/012345-567890-ABCDEF/logs").?.parent.billing_account);
+    for ([_][]const u8{
+        "",
+        "projects",
+        "projects/",
+        "teams/x/locations/global/buckets/b",
+        "projects/p/locations/global",
+        "projects/p/places/global/buckets/b",
+        "projects/p/locations/global/pails/b",
+        "projects/p/locations//buckets/b",
+        "projects/p/locations/global/buckets/",
+        "projects/p/locations/global/buckets/b/extra",
+    }) |bad| try testing.expectEqual(null, parseBucketName(bad));
+    for ([_][]const u8{
+        "projects/p/locations/global/buckets/b/views/",
+        "projects/p/locations/global/buckets/b/views/v/w",
+        "projects/p/views/v",
+    }) |bad| try testing.expectEqual(null, parseViewName(bad));
+}
 
 test "scope names" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);

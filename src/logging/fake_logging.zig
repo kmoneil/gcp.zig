@@ -70,6 +70,12 @@ pub const FakeLogging = struct {
     faults: [4]Fault = @splat(.{}),
     /// `entries.list` calls served, faults included.
     list_calls: usize = 0,
+    /// Buckets by full name, in the order made: a parent's `_Default` and
+    /// `_Required` first, made when the parent is first seen. In `store`.
+    buckets: std.StringArrayHashMapUnmanaged(*Bucket) = .empty,
+    /// Parents whose bucket list is refused, and buckets whose view list
+    /// is, by name. In `store`.
+    denied: std.StringHashMapUnmanaged(void) = .empty,
 
     /// An entry as a test writes it.
     pub const Entry = struct {
@@ -122,6 +128,50 @@ pub const FakeLogging = struct {
         span_id: []const u8,
         location: []const u8,
         bucket: []const u8,
+    };
+
+    const Bucket = struct {
+        name: []const u8,
+        /// "projects/p".
+        parent: []const u8,
+        location: []const u8,
+        id: []const u8,
+        description: []const u8,
+        retention_days: u32,
+        locked: bool,
+        state: types.BucketState,
+        /// Null for the two a parent is made with.
+        create_ns: ?i96,
+        analytics_enabled: bool,
+        restricted_fields: []const []const u8,
+        views: std.ArrayListUnmanaged(View) = .empty,
+    };
+
+    const View = struct {
+        /// The full name: "projects/p/locations/global/buckets/b/views/v".
+        name: []const u8,
+        id: []const u8,
+        description: []const u8,
+        filter: []const u8,
+        create_ns: ?i96,
+    };
+
+    /// The filter of `_Default`'s own `_Default` view, as production
+    /// listed it on 2026-10-16.
+    const default_view_filter = "NOT LOG_ID(\"cloudaudit.googleapis.com/data_access\") AND NOT LOG_ID(\"externalaudit.googleapis.com/data_access\")";
+
+    /// A bucket a test adds. It gets an `_AllLogs` view, as Logging gives
+    /// every bucket one.
+    pub const BucketOptions = struct {
+        parent: types.Parent,
+        location: []const u8 = "global",
+        id: []const u8,
+        description: []const u8 = "",
+        retention_days: u32 = 30,
+        locked: bool = false,
+        state: types.BucketState = .active,
+        analytics_enabled: bool = false,
+        restricted_fields: []const []const u8 = &.{},
     };
 
     const Fault = struct { n: usize = 0, status: u16 = 0, max: usize = 0 };
@@ -212,6 +262,122 @@ pub const FakeLogging = struct {
             .bucket = try a.dupe(u8, entry.bucket),
         };
         try f.entries.append(f.gpa, stored);
+        try f.ensureParent(stored.parent);
+    }
+
+    /// Makes `parent`'s `_Default` and `_Required`, as production has them,
+    /// the first time the parent is seen.
+    fn ensureParent(f: *FakeLogging, parent: []const u8) Allocator.Error!void {
+        const a = f.store.allocator();
+        const default_name = try std.fmt.allocPrint(a, "{s}/locations/global/buckets/_Default", .{parent});
+        if (f.buckets.contains(default_name)) return;
+        const owned_parent = try a.dupe(u8, parent);
+        const default_bucket = try a.create(Bucket);
+        default_bucket.* = .{ .name = default_name, .parent = owned_parent, .location = "global", .id = "_Default", .description = "Default bucket", .retention_days = 30, .locked = false, .state = .active, .create_ns = null, .analytics_enabled = false, .restricted_fields = &.{} };
+        try default_bucket.views.append(a, .{ .name = try std.fmt.allocPrint(a, "{s}/views/_AllLogs", .{default_name}), .id = "_AllLogs", .description = "Access to all logs", .filter = "", .create_ns = null });
+        try default_bucket.views.append(a, .{ .name = try std.fmt.allocPrint(a, "{s}/views/_Default", .{default_name}), .id = "_Default", .description = "Access to all logs except data access logs", .filter = default_view_filter, .create_ns = null });
+        try f.buckets.put(a, default_name, default_bucket);
+        const required_name = try std.fmt.allocPrint(a, "{s}/locations/global/buckets/_Required", .{parent});
+        const required = try a.create(Bucket);
+        required.* = .{ .name = required_name, .parent = owned_parent, .location = "global", .id = "_Required", .description = "Audit bucket", .retention_days = 400, .locked = true, .state = .active, .create_ns = null, .analytics_enabled = false, .restricted_fields = &.{} };
+        try required.views.append(a, .{ .name = try std.fmt.allocPrint(a, "{s}/views/_AllLogs", .{required_name}), .id = "_AllLogs", .description = "Access to all logs", .filter = "", .create_ns = null });
+        try f.buckets.put(a, required_name, required);
+    }
+
+    fn parentText(a: Allocator, parent: types.Parent) Allocator.Error![]const u8 {
+        var out: std.Io.Writer.Allocating = .init(a);
+        names.writeParent(&out.writer, parent) catch return error.OutOfMemory;
+        return out.toOwnedSlice();
+    }
+
+    fn bucketText(a: Allocator, name: types.BucketName) Allocator.Error![]const u8 {
+        var out: std.Io.Writer.Allocating = .init(a);
+        names.writeBucket(&out.writer, name) catch return error.OutOfMemory;
+        return out.toOwnedSlice();
+    }
+
+    /// Adds a bucket, with an `_AllLogs` view. `error.InvalidEntry` for one
+    /// that is there already.
+    pub fn addBucket(f: *FakeLogging, options: BucketOptions) WriteError!void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        const a = f.store.allocator();
+        const parent = try parentText(a, options.parent);
+        try f.ensureParent(parent);
+        const name = try bucketText(a, .{ .parent = options.parent, .location = options.location, .bucket = options.id });
+        if (f.buckets.contains(name)) return error.InvalidEntry;
+        const fields = try a.alloc([]const u8, options.restricted_fields.len);
+        for (options.restricted_fields, fields) |s, *o| o.* = try a.dupe(u8, s);
+        const b = try a.create(Bucket);
+        b.* = .{
+            .name = name,
+            .parent = parent,
+            .location = try a.dupe(u8, options.location),
+            .id = try a.dupe(u8, options.id),
+            .description = try a.dupe(u8, options.description),
+            .retention_days = options.retention_days,
+            .locked = options.locked,
+            .state = options.state,
+            .create_ns = f.now(),
+            .analytics_enabled = options.analytics_enabled,
+            .restricted_fields = fields,
+        };
+        try b.views.append(a, .{ .name = try std.fmt.allocPrint(a, "{s}/views/_AllLogs", .{name}), .id = "_AllLogs", .description = "Access to all logs", .filter = "", .create_ns = f.now() });
+        try f.buckets.put(a, name, b);
+    }
+
+    /// Adds a view to a bucket that exists. `error.InvalidEntry` otherwise,
+    /// or for a view that is there already.
+    pub fn addView(f: *FakeLogging, bucket_name: types.BucketName, id: []const u8, filter: []const u8) WriteError!void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        const a = f.store.allocator();
+        try f.ensureParent(try parentText(a, bucket_name.parent));
+        const b = f.buckets.get(try bucketText(a, bucket_name)) orelse return error.InvalidEntry;
+        for (b.views.items) |v| if (std.mem.eql(u8, v.id, id)) return error.InvalidEntry;
+        try b.views.append(a, .{ .name = try std.fmt.allocPrint(a, "{s}/views/{s}", .{ b.name, id }), .id = try a.dupe(u8, id), .description = "", .filter = try a.dupe(u8, filter), .create_ns = f.now() });
+    }
+
+    /// Removes a view, as production lets `_AllLogs` be deleted.
+    /// `error.InvalidEntry` for one that is not there.
+    pub fn removeView(f: *FakeLogging, name: types.ViewName) WriteError!void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        const a = f.store.allocator();
+        try f.ensureParent(try parentText(a, name.parent));
+        const b = f.buckets.get(try bucketText(a, .{ .parent = name.parent, .location = name.location, .bucket = name.bucket })) orelse return error.InvalidEntry;
+        for (b.views.items, 0..) |v, i| if (std.mem.eql(u8, v.id, name.view)) {
+            _ = b.views.orderedRemove(i);
+            return;
+        };
+        return error.InvalidEntry;
+    }
+
+    /// Sets a bucket's lifecycle state, such as `.delete_requested`.
+    pub fn setBucketState(f: *FakeLogging, name: types.BucketName, state: types.BucketState) WriteError!void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        const a = f.store.allocator();
+        try f.ensureParent(try parentText(a, name.parent));
+        const b = f.buckets.get(try bucketText(a, name)) orelse return error.InvalidEntry;
+        b.state = state;
+    }
+
+    /// Refuses `parent`'s bucket list from now on, 403, as a caller with
+    /// only a view accessor's role is refused.
+    pub fn denyBucketList(f: *FakeLogging, parent: types.Parent) Allocator.Error!void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        const a = f.store.allocator();
+        try f.denied.put(a, try parentText(a, parent), {});
+    }
+
+    /// Refuses a bucket's view list from now on, 403.
+    pub fn denyViewList(f: *FakeLogging, bucket_name: types.BucketName) Allocator.Error!void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        const a = f.store.allocator();
+        try f.denied.put(a, try bucketText(a, bucket_name), {});
     }
 
     fn dupeLabels(a: Allocator, labels: []const types.Label) Allocator.Error![]const types.Label {
@@ -288,7 +454,211 @@ pub const FakeLogging = struct {
             if (f.takeFault(refuse)) |fault| return refusal(arena, fault.status, @intCast(@divFloor(f.now(), std.time.ns_per_s)));
             return f.list(arena, body);
         }
+        if (method == .GET and std.mem.startsWith(u8, route, "/v2/")) {
+            const query = if (std.mem.indexOfScalar(u8, path, '?')) |q| path[q + 1 ..] else "";
+            return f.config(arena, route["/v2/".len..], query);
+        }
         return notModelled(arena, "this call");
+    }
+
+    /// The calls of `config.zig`: logs, buckets, views.
+    fn config(f: *FakeLogging, arena: Allocator, name: []const u8, query: []const u8) Allocator.Error!Reply {
+        const page_size = std.fmt.parseInt(usize, queryValue(query, "pageSize") orelse "0", 10) catch return notModelled(arena, "a pageSize that is no number");
+        const offset: usize = if (queryValue(query, "pageToken")) |t| decodeOffset(arena, t) orelse return notModelled(arena, "a page token this fake did not issue") else 0;
+        if (std.mem.endsWith(u8, name, "/logs")) return f.listLogNames(arena, name[0 .. name.len - "/logs".len], page_size, offset);
+        if (std.mem.endsWith(u8, name, "/buckets")) {
+            const parent_part = name[0 .. name.len - "/buckets".len];
+            const loc_at = std.mem.lastIndexOf(u8, parent_part, "/locations/") orelse return notModelled(arena, "a bucket list this fake cannot read");
+            const parent = parent_part[0..loc_at];
+            const location = parent_part[loc_at + "/locations/".len ..];
+            if (names.parseParent(parent) == null or names.parseParent(parent).?.rest.len != 0) return notModelled(arena, "a bucket list this fake cannot read");
+            try f.ensureParent(parent);
+            if (f.denied.contains(parent)) return fail(arena, 403, "PERMISSION_DENIED", "The caller does not have permission");
+            var found: std.ArrayList(*const Bucket) = .empty;
+            for (f.buckets.values()) |b| {
+                if (!std.mem.eql(u8, b.parent, parent)) continue;
+                if (!std.mem.eql(u8, location, "-") and !std.mem.eql(u8, location, b.location)) continue;
+                try found.append(arena, b);
+            }
+            return f.renderList(arena, "buckets", found.items, page_size, offset);
+        }
+        if (std.mem.endsWith(u8, name, "/views")) {
+            const bucket_part = name[0 .. name.len - "/views".len];
+            const parsed = names.parseBucketName(bucket_part) orelse return notModelled(arena, "a view list this fake cannot read");
+            if (std.mem.eql(u8, parsed.location, "-")) return fail(arena, 404, "NOT_FOUND", "Cloud Logging does not support location: -");
+            try f.ensureParent(try parentText(arena, parsed.parent));
+            const b = f.buckets.get(bucket_part) orelse return missingBucket(arena, parsed);
+            if (f.denied.contains(bucket_part)) return fail(arena, 403, "PERMISSION_DENIED", "The caller does not have permission");
+            var found: std.ArrayList(ViewRef) = .empty;
+            for (b.views.items) |*v| try found.append(arena, .{ .bucket = b, .view = v });
+            return f.renderList(arena, "views", found.items, page_size, offset);
+        }
+        if (names.parseViewName(name)) |v| {
+            try f.ensureParent(try parentText(arena, v.parent));
+            const b = f.buckets.get(name[0..std.mem.lastIndexOf(u8, name, "/views/").?]) orelse return missingBucket(arena, .{ .parent = v.parent, .location = v.location, .bucket = v.bucket });
+            for (b.views.items) |*view| if (std.mem.eql(u8, view.id, v.view)) {
+                return ok(try renderOne(arena, ViewRef{ .bucket = b, .view = view }));
+            };
+            return fail(arena, 404, "NOT_FOUND", try std.fmt.allocPrint(arena, "{s} does not exist", .{name}));
+        }
+        if (names.parseBucketName(name)) |parsed| {
+            try f.ensureParent(try parentText(arena, parsed.parent));
+            const b = f.buckets.get(name) orelse return missingBucket(arena, parsed);
+            return ok(try renderOne(arena, @as(*const Bucket, b)));
+        }
+        return notModelled(arena, "this call");
+    }
+
+    const ViewRef = struct { bucket: *const Bucket, view: *const View };
+
+    /// Production's words, measured on 2026-10-16.
+    fn missingBucket(arena: Allocator, name: types.BucketName) Allocator.Error!Reply {
+        return fail(arena, 404, "NOT_FOUND", try std.fmt.allocPrint(arena, "Bucket `{s}` in location `{s}` does not exist", .{ name.bucket, name.location }));
+    }
+
+    /// The names of the logs that have entries in `scope_name`, a parent
+    /// or a view, in byte order, as production listed them.
+    fn listLogNames(f: *FakeLogging, arena: Allocator, scope_name: []const u8, page_size: usize, offset: usize) Allocator.Error!Reply {
+        var scope = parseScope(scope_name) orelse return notModelled(arena, "a log list this fake cannot read");
+        try f.ensureParent(scope.parent);
+        if (try f.resolveView(arena, &scope)) |refused| return refused;
+        const now_ns = f.now();
+        var seen: std.StringArrayHashMapUnmanaged(void) = .empty;
+        for (f.entries.items) |e| {
+            if (e.visible_at > now_ns or !inAnyScope(e, &.{scope})) continue;
+            try seen.put(arena, e.log_name, {});
+        }
+        const log_names = seen.keys();
+        std.mem.sort([]const u8, log_names, {}, struct {
+            fn less(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.order(u8, x, y) == .lt;
+            }
+        }.less);
+        return f.renderList(arena, "logNames", log_names, page_size, offset);
+    }
+
+    /// Checks a view scope against the views that exist, and reads its
+    /// filter: null when it may be read, or the refusal to answer with.
+    fn resolveView(f: *FakeLogging, arena: Allocator, scope: *Scope) Allocator.Error!?Reply {
+        const v = scope.view orelse return null;
+        const bucket_name = try std.fmt.allocPrint(arena, "{s}/locations/{s}/buckets/{s}", .{ scope.parent, v.location, v.bucket });
+        const view_name = try std.fmt.allocPrint(arena, "{s}/views/{s}", .{ bucket_name, v.view });
+        const b = f.buckets.get(bucket_name) orelse return try fail(arena, 404, "NOT_FOUND", try std.fmt.allocPrint(arena, "{s} does not exist", .{view_name}));
+        for (b.views.items) |view| if (std.mem.eql(u8, view.id, v.view)) {
+            if (view.filter.len == 0) return null;
+            if (std.mem.eql(u8, view.filter, default_view_filter)) {
+                scope.exclude_data_access = true;
+                return null;
+            }
+            return try notModelled(arena, "a view with a filter of its own");
+        };
+        return try fail(arena, 404, "NOT_FOUND", try std.fmt.allocPrint(arena, "{s} does not exist", .{view_name}));
+    }
+
+    fn renderList(f: *FakeLogging, arena: Allocator, comptime field: []const u8, items: anytype, page_size: usize, offset: usize) Allocator.Error!Reply {
+        _ = f;
+        const start = @min(offset, items.len);
+        const end = if (page_size == 0) items.len else @min(items.len, start + page_size);
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        writeList(&jw, field, items[start..end], if (end < items.len) try encodeOffset(arena, end) else null) catch return error.OutOfMemory;
+        return ok(try out.toOwnedSlice());
+    }
+
+    fn writeList(jw: *Stringify, comptime field: []const u8, items: anytype, token: ?[]const u8) Stringify.Error!void {
+        try jw.beginObject();
+        if (items.len > 0) {
+            try jw.objectField(field);
+            try jw.beginArray();
+            for (items) |item| try writeItem(jw, item);
+            try jw.endArray();
+        }
+        if (token) |t| {
+            try jw.objectField("nextPageToken");
+            try jw.write(t);
+        }
+        try jw.endObject();
+    }
+
+    fn renderOne(arena: Allocator, item: anytype) Allocator.Error![]const u8 {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        writeItem(&jw, item) catch return error.OutOfMemory;
+        return out.toOwnedSlice();
+    }
+
+    /// A log name, a bucket or a view, with the fields production sent.
+    fn writeItem(jw: *Stringify, item: anytype) Stringify.Error!void {
+        switch (@TypeOf(item)) {
+            []const u8 => try jw.write(item),
+            *const Bucket => {
+                const b = item;
+                try jw.beginObject();
+                try jw.objectField("name");
+                try jw.write(b.name);
+                try jw.objectField("description");
+                try jw.write(b.description);
+                if (b.create_ns) |t| try writeTime(jw, "createTime", t);
+                if (b.locked) {
+                    try jw.objectField("locked");
+                    try jw.write(true);
+                }
+                try jw.objectField("retentionDays");
+                try jw.write(b.retention_days);
+                try jw.objectField("lifecycleState");
+                try jw.write(switch (b.state) {
+                    .active => "ACTIVE",
+                    .delete_requested => "DELETE_REQUESTED",
+                    .updating => "UPDATING",
+                    .creating => "CREATING",
+                    .failed => "FAILED",
+                    .unspecified, .unknown => "LIFECYCLE_STATE_UNSPECIFIED",
+                });
+                if (b.analytics_enabled) {
+                    try jw.objectField("analyticsEnabled");
+                    try jw.write(true);
+                }
+                if (b.restricted_fields.len > 0) {
+                    try jw.objectField("restrictedFields");
+                    try jw.write(b.restricted_fields);
+                }
+                try jw.endObject();
+            },
+            ViewRef => {
+                try jw.beginObject();
+                try jw.objectField("name");
+                try jw.write(item.view.name);
+                try jw.objectField("description");
+                try jw.write(item.view.description);
+                if (item.view.filter.len > 0) {
+                    try jw.objectField("filter");
+                    try jw.write(item.view.filter);
+                }
+                if (item.view.create_ns) |t| try writeTime(jw, "createTime", t);
+                try jw.endObject();
+            },
+            else => @compileError("no rendering for " ++ @typeName(@TypeOf(item))),
+        }
+    }
+
+    fn queryValue(query: []const u8, name: []const u8) ?[]const u8 {
+        var it = std.mem.splitScalar(u8, query, '&');
+        while (it.next()) |pair| {
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
+        }
+        return null;
+    }
+
+    fn encodeOffset(arena: Allocator, offset: usize) Allocator.Error![]const u8 {
+        return std.fmt.allocPrint(arena, "fake-offset-{d}", .{offset});
+    }
+
+    fn decodeOffset(arena: Allocator, token: []const u8) ?usize {
+        _ = arena;
+        const prefix = "fake-offset-";
+        if (!std.mem.startsWith(u8, token, prefix)) return null;
+        return std.fmt.parseInt(usize, token[prefix.len..], 10) catch null;
     }
 
     fn pathOf(url: []const u8) []const u8 {
@@ -313,6 +683,8 @@ pub const FakeLogging = struct {
         parent: []const u8,
         /// For a view: which bucket, and which view.
         view: ?struct { location: []const u8, bucket: []const u8, view: []const u8 } = null,
+        /// `_Default`'s `_Default` view leaves data access audit logs out.
+        exclude_data_access: bool = false,
     };
 
     fn list(f: *FakeLogging, arena: Allocator, body: []const u8) Allocator.Error!Reply {
@@ -347,6 +719,8 @@ pub const FakeLogging = struct {
         for (resource_names, scopes) |name, *scope| {
             if (std.mem.eql(u8, name, "projects")) return failInfo(arena, 400, "INVALID_ARGUMENT", "Name \"projects\" is missing the parent component. Expected the form projects/[PROJECT_ID]", "QUERY_INVALID_RESOURCE_NAME", &.{.{ "resource", "projects" }});
             scope.* = parseScope(name) orelse return notModelled(arena, "a resource name this fake cannot read");
+            try f.ensureParent(scope.parent);
+            if (try f.resolveView(arena, scope)) |refused| return refused;
         }
         // As production answered each on 2026-10-16: no order, "" and
         // "timestamp" are ascending, and the direction is lowercase.
@@ -442,13 +816,15 @@ pub const FakeLogging = struct {
         return .{ .parent = parent, .view = .{ .location = got[0], .bucket = got[1], .view = got[2] } };
     }
 
+    /// Whether `e` is in one of `scopes`, each view checked by
+    /// `resolveView` already.
     fn inAnyScope(e: *const Stored, scopes: []const Scope) bool {
         for (scopes) |s| {
             if (!std.mem.eql(u8, s.parent, e.parent)) continue;
             const v = s.view orelse return true;
             if (!std.mem.eql(u8, v.location, e.location) or !std.mem.eql(u8, v.bucket, e.bucket)) continue;
-            if (std.mem.eql(u8, v.view, "_AllLogs")) return true;
-            if (std.mem.eql(u8, v.view, "_Default") and std.mem.eql(u8, v.bucket, "_Default")) return true;
+            if (s.exclude_data_access and (std.mem.eql(u8, e.log_id, "cloudaudit.googleapis.com/data_access") or std.mem.eql(u8, e.log_id, "externalaudit.googleapis.com/data_access"))) continue;
+            return true;
         }
         return false;
     }
@@ -913,10 +1289,13 @@ test "fake: views, other parents, and every entry field read back through the cl
     defer arena.deinit();
     const a = arena.allocator();
     const folder: types.Parent = .{ .folder = "12" };
+    try r.fake.addBucket(.{ .parent = folder, .location = "europe-west1", .id = "audit" });
     try testing.expectEqualStrings("default-bucket full", try r.listAll(a, .{ .scopes = &.{.{ .parent = folder }} }));
     try testing.expectEqualStrings("full", try r.listAll(a, .{ .scopes = &.{.{ .view = .{ .parent = folder, .location = "europe-west1", .bucket = "audit", .view = "_AllLogs" } }} }));
     try testing.expectEqualStrings("default-bucket", try r.listAll(a, .{ .scopes = &.{.{ .view = .{ .parent = folder, .location = "global", .bucket = "_Default", .view = "_Default" } }} }));
-    try testing.expectEqualStrings("", try r.listAll(a, .{ .scopes = &.{.{ .view = .{ .parent = folder, .location = "global", .bucket = "audit", .view = "_Default" } }} }));
+    // A view the bucket does not have, in production's words.
+    try testing.expectError(error.NotFound, r.listAll(a, .{ .scopes = &.{.{ .view = .{ .parent = folder, .location = "europe-west1", .bucket = "audit", .view = "_Default" } }} }));
+    try testing.expectEqualStrings("folders/12/locations/europe-west1/buckets/audit/views/_Default does not exist", r.diag.message());
 
     var q = try r.client.query(.{ .scopes = &.{.{ .parent = folder }}, .min_severity = .warning });
     defer q.deinit();
@@ -1022,7 +1401,7 @@ test "fake: requests no client sends" {
     const plain_order = try r.fake.serve(.POST, url, "{\"resourceNames\":[\"projects/p\"],\"orderBy\":\"timestamp\"}", a);
     try testing.expectEqual(200, plain_order.status);
     try testing.expect(std.mem.indexOf(u8, plain_order.body, "early").? < std.mem.indexOf(u8, plain_order.body, "late").?);
-    const other = try r.fake.serve(.GET, "https://logging.googleapis.com/v2/projects/p/logs", "", a);
+    const other = try r.fake.serve(.GET, "https://logging.googleapis.com/v2/projects/p/sinks", "", a);
     try testing.expectEqual(501, other.status);
     try testing.expectError(error.InvalidEntry, r.fake.write(.{ .log_name = "projects/p", .timestamp = at(0) }));
     try testing.expectError(error.InvalidEntry, r.fake.write(.{ .log_name = "projects/p/logs/a", .timestamp = at(0), .payload = .{ .json = "[1]" } }));
@@ -1194,4 +1573,146 @@ test "fake: a filter it can read but not try on an entry is not modelled" {
     defer arena.deinit();
     try testing.expectError(error.Unimplemented, r.listAll(arena.allocator(), .{ .filter = "jsonPayload.list = 1" }));
     try testing.expect(std.mem.indexOf(u8, r.diag.message(), "JSON array or object") != null);
+}
+
+test "fake: buckets and views, made, listed, changed and refused through the client" {
+    var r: Rig = undefined;
+    try r.init();
+    defer r.deinit();
+    const p: types.Parent = .{ .project = "p" };
+    try r.fake.addBucket(.{ .parent = p, .location = "europe-west1", .id = "audit", .description = "for auditors", .retention_days = 90, .restricted_fields = &.{"jsonPayload.ssn"} });
+    try r.fake.addBucket(.{ .parent = p, .location = "us", .id = "app", .analytics_enabled = true });
+    const audit: types.BucketName = .{ .parent = p, .location = "europe-west1", .bucket = "audit" };
+    try r.fake.addView(audit, "only-errors", "");
+    try testing.expectError(error.InvalidEntry, r.fake.addView(audit, "only-errors", ""));
+    try testing.expectError(error.InvalidEntry, r.fake.addBucket(.{ .parent = p, .location = "us", .id = "app" }));
+    try testing.expectError(error.InvalidEntry, r.fake.addView(.{ .parent = p, .location = "us", .bucket = "none" }, "v", ""));
+    try r.fake.setBucketState(.{ .parent = p, .location = "us", .bucket = "app" }, .delete_requested);
+    // _AllLogs can be deleted.
+    try r.fake.removeView(.{ .parent = p, .location = "us", .bucket = "app", .view = "_AllLogs" });
+    try testing.expectError(error.InvalidEntry, r.fake.removeView(.{ .parent = p, .location = "us", .bucket = "app", .view = "_AllLogs" }));
+
+    var all = try r.client.listBuckets(.{});
+    defer all.deinit();
+    try testing.expectEqual(4, all.value.buckets.len);
+    var eu = try r.client.listBuckets(.{ .location = "europe-west1" });
+    defer eu.deinit();
+    try testing.expectEqual(1, eu.value.buckets.len);
+    const b = eu.value.buckets[0];
+    try testing.expectEqualStrings("for auditors", b.description);
+    try testing.expectEqual(90, b.retention_days);
+    try testing.expectEqualStrings("jsonPayload.ssn", b.restricted_fields[0]);
+    try testing.expect(b.create_time != null);
+
+    var picker = try r.client.picker(p);
+    defer picker.deinit();
+    const got = picker.value.buckets;
+    try testing.expectEqualStrings("_Default", got[0].info.name.bucket);
+    try testing.expectEqual(2, got[0].views.len);
+    try testing.expectEqualStrings("_Default", got[0].views[0].name.view);
+    try testing.expectEqualStrings("_AllLogs", got[0].views[1].name.view);
+    try testing.expectEqualStrings("_Required", got[1].info.name.bucket);
+    try testing.expectEqualStrings("audit", got[2].info.name.bucket);
+    try testing.expectEqual(2, got[2].views.len);
+    try testing.expectEqualStrings("app", got[3].info.name.bucket);
+    try testing.expectEqual(.delete_requested, got[3].info.state);
+    try testing.expect(got[3].info.analytics_enabled);
+    try testing.expectEqual(0, got[3].views.len);
+
+    var one = try r.client.view(.{ .parent = p, .location = "europe-west1", .bucket = "audit", .view = "only-errors" });
+    defer one.deinit();
+    try testing.expectEqualStrings("p", one.value.name.parent.project);
+    var bucket_one = try r.client.bucket(audit);
+    defer bucket_one.deinit();
+    try testing.expectEqualStrings("audit", bucket_one.value.name.bucket);
+
+    try r.fake.denyViewList(audit);
+    var partly = try r.client.picker(p);
+    defer partly.deinit();
+    try testing.expect(partly.value.buckets[2].views_denied);
+    try r.fake.denyBucketList(p);
+    var refused = try r.client.picker(p);
+    defer refused.deinit();
+    try testing.expect(refused.value.list_denied);
+    try testing.expectError(error.PermissionDenied, r.client.listViews(audit, .{}));
+}
+
+test "fake: log names in byte order, a view's leaving out data access logs, paged" {
+    var r: Rig = undefined;
+    try r.init();
+    defer r.deinit();
+    const p: types.Parent = .{ .project = "p" };
+    for ([_][]const u8{ "ping", "cloudaudit.googleapis.com/data_access", "GCEGuestAgent", "cloudaudit.googleapis.com/activity", "ping" }, 0..) |id, i| {
+        try r.fake.write(.{ .log_name = try r.fake.logName(p, id), .timestamp = at(@intCast(i)) });
+    }
+    try r.fake.write(.{ .log_name = try r.fake.logName(p, "late"), .timestamp = at(9), .visible_at = at(60) });
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var all = try r.client.listLogs(.{});
+    defer all.deinit();
+    const want = [_][]const u8{ "GCEGuestAgent", "cloudaudit.googleapis.com/activity", "cloudaudit.googleapis.com/data_access", "ping" };
+    try testing.expectEqual(want.len, all.value.log_ids.len);
+    for (want, all.value.log_ids) |w, g| try testing.expectEqualStrings(w, g);
+
+    const default_view: types.Scope = .{ .view = .{ .parent = p, .location = "global", .bucket = "_Default", .view = "_Default" } };
+    var of_view = try r.client.listLogs(.{ .scope = default_view });
+    defer of_view.deinit();
+    try testing.expectEqual(3, of_view.value.log_ids.len);
+    for (of_view.value.log_ids) |id| try testing.expect(!std.mem.endsWith(u8, id, "data_access"));
+    // The same view filters entries too.
+    var q = try r.client.query(.{ .scopes = &.{default_view}, .order = .oldest_first });
+    defer q.deinit();
+    var page = try q.page(null);
+    defer page.deinit();
+    try testing.expectEqual(4, page.value.entries.len);
+
+    // A page of two, then the rest.
+    var pages: std.ArrayList(u8) = .empty;
+    var token: ?[]const u8 = null;
+    while (true) {
+        var lp = try r.client.listLogs(.{ .page_size = 2, .page_token = token });
+        defer lp.deinit();
+        for (lp.value.log_ids) |id| try pages.appendSlice(a, id[0..1]);
+        try pages.append(a, '|');
+        token = if (lp.value.next_page_token) |t| try a.dupe(u8, t) else break;
+    }
+    try testing.expectEqualStrings("Gc|cp|", pages.items);
+    r.clock.now_ns = at(60).nanoseconds;
+    var later = try r.client.listLogs(.{});
+    defer later.deinit();
+    try testing.expectEqual(5, later.value.log_ids.len);
+}
+
+test "fake: views of a location '-', and requests it does not model" {
+    var r: Rig = undefined;
+    try r.init();
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { []const u8, u16, []const u8 }{
+        .{ "/v2/projects/p/locations/-/buckets/-/views", 404, "Cloud Logging does not support location: -" },
+        .{ "/v2/projects/p/locations/global/buckets/none/views", 404, "Bucket `none` in location `global` does not exist" },
+        .{ "/v2/projects/p/locations/global/buckets/none/views/v", 404, "Bucket `none` in location `global` does not exist" },
+        .{ "/v2/projects/p/logs?pageToken=garbage", 501, "page token" },
+        .{ "/v2/projects/p/logs?pageSize=x", 501, "pageSize" },
+        .{ "/v2/teams/t/logs", 501, "log list" },
+        .{ "/v2/teams/t/locations/global/buckets", 501, "bucket list" },
+        .{ "/v2/projects/p/places/global/buckets", 501, "bucket list" },
+        .{ "/v2/projects/p/locations/global/buckets/b/extra/views", 501, "view list" },
+        .{ "/v2/projects/p/locations/global/buckets/_Default/views/_AllLogs/logs/x", 501, "this call" },
+    };
+    for (cases) |case| {
+        const reply = try r.fake.serve(.GET, try std.fmt.allocPrint(a, "https://logging.googleapis.com{s}", .{case[0]}), "", a);
+        try testing.expectEqual(case[1], reply.status);
+        if (std.mem.indexOf(u8, reply.body, case[2]) == null) {
+            std.debug.print("{s}: {s}\n", .{ case[0], reply.body });
+            return error.TestExpectedEqual;
+        }
+    }
+    // A view with a filter of its own is not read.
+    try r.fake.addView(.{ .parent = .{ .project = "p" }, .location = "global", .bucket = "_Default" }, "mine", "resource.type = \"gce_instance\"");
+    try testing.expectError(error.Unimplemented, r.listAll(a, .{ .scopes = &.{.{ .view = .{ .parent = .{ .project = "p" }, .location = "global", .bucket = "_Default", .view = "mine" } }} }));
 }
