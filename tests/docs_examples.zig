@@ -1146,3 +1146,187 @@ test "the subscribing guide's code, against the in-memory Pub/Sub" {
     try std.testing.expectEqual(3, shipping.orders.count());
     try std.testing.expectEqual(0, fake.backlog("my-project", "orders-worker"));
 }
+
+const logging = @import("logging");
+
+/// How many entries the Logging guides' code showed.
+var shown: usize = 0;
+
+fn show(entry: logging.Entry) void {
+    _ = entry;
+    shown += 1;
+}
+
+fn note(what: []const u8) void {
+    _ = what;
+}
+
+// snippet: logging-first
+/// The last hour's errors from Cloud Run, newest first, two pages of them.
+fn newestErrors(client: *logging.Client, now: std.Io.Timestamp) !void {
+    var query = try client.query(.{
+        .filter = "resource.type = \"cloud_run_revision\"",
+        .min_severity = .@"error",
+        .since = .{ .nanoseconds = now.nanoseconds - std.time.ns_per_hour },
+        .until = now,
+    });
+    defer query.deinit();
+
+    var first = try query.page(null);
+    defer first.deinit();
+    for (first.value.entries) |entry| show(entry);
+    // An empty page with a token is the server out of time, not out of
+    // entries: only a null token ends the listing.
+    if (first.value.next_page_token) |token| {
+        var second = try query.page(token);
+        defer second.deinit();
+        for (second.value.entries) |entry| show(entry);
+    }
+}
+// end snippet
+
+// snippet: logging-pages
+/// Every entry of a query, page after page, stopping after `max_empty`
+/// empty pages in a row.
+fn readAll(query: *logging.Query, max_empty: usize, seen: *usize) !void {
+    var token: ?[]const u8 = null;
+    var empty_in_a_row: usize = 0;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    while (true) {
+        var page = try query.page(token);
+        defer page.deinit();
+        seen.* += page.value.entries.len;
+        empty_in_a_row = if (page.value.entries.len == 0) empty_in_a_row + 1 else 0;
+        const next = page.value.next_page_token orelse return;
+        if (empty_in_a_row >= max_empty) return;
+        token = try arena.allocator().dupe(u8, next);
+    }
+}
+// end snippet
+
+fn sharedBudget(gpa: std.mem.Allocator, io: std.Io, token: logging.TokenProvider) !void {
+    // snippet: logging-budget
+    var budget: logging.ReadBudget = .init(60);
+    var table = try logging.Client.init(gpa, io, .{
+        .project_id = "my-project",
+        .token_provider = token,
+        .read_budget = &budget,
+    });
+    defer table.deinit();
+    var tail = try logging.Client.init(gpa, io, .{
+        .project_id = "my-project",
+        .token_provider = token,
+        .read_budget = &budget,
+    });
+    defer tail.deinit();
+    // end snippet
+    try std.testing.expectEqual(table.budget, tail.budget);
+}
+
+fn tailFor(client: *logging.Client, io: std.Io, polls: usize) !void {
+    var polls_left = polls;
+    // snippet: logging-tail
+    var tail = try client.tail(.{
+        .filter = "resource.type = \"cloud_run_revision\"",
+        .min_severity = .warning,
+    });
+    defer tail.deinit();
+    while (polls_left > 0) : (polls_left -= 1) {
+        try io.sleep(.fromSeconds(5), .awake);
+        var batch = try tail.poll();
+        defer batch.deinit();
+        for (batch.value.entries) |entry| show(entry);
+        if (batch.value.behind) note("catching up");
+        if (batch.value.stopped) |_| note("paused for the read quota");
+    }
+    // end snippet
+}
+
+fn pick(client: *logging.Client, gpa: std.mem.Allocator, arena: std.mem.Allocator, choices: *std.ArrayList([]const u8)) !void {
+    // snippet: logging-picker
+    var picker = try client.picker(.{ .project = "my-project" });
+    defer picker.deinit();
+    if (picker.value.list_denied) {
+        // A Logs View Accessor may read views but not list them.
+        return error.AskForViewNames;
+    }
+    // The picker's memory goes with it: keep copies.
+    for (picker.value.buckets) |b| {
+        for (b.views) |v| try choices.append(gpa, try arena.dupe(u8, v.name.view));
+    }
+    // end snippet
+}
+
+test "the Logging guides' code, against a fake" {
+    var clock: logging.testing.FakeClock = .{ .now_ns = 1_792_141_200 * std.time.ns_per_s };
+    const io = clock.io();
+    var fake: logging.testing.FakeLogging = .init(std.testing.allocator, io);
+    defer fake.deinit();
+    const name = try fake.logName(.{ .project = "my-project" }, "run.googleapis.com/stderr");
+    for (0..3) |i| try fake.write(.{
+        .log_name = name,
+        .timestamp = .{ .nanoseconds = clock.now_ns - @as(i96, @intCast(i + 1)) * std.time.ns_per_min },
+        .severity = .@"error",
+        .resource_type = "cloud_run_revision",
+        .payload = .{ .text = "payment failed" },
+    });
+    var token: logging.StaticToken = .{ .token = "test" };
+    var client = try logging.Client.init(std.testing.allocator, io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+
+    shown = 0;
+    fake.shortenNext(1, 2);
+    try newestErrors(&client, .{ .nanoseconds = clock.now_ns });
+    try std.testing.expectEqual(3, shown);
+
+    var query = try client.query(.{ .page_size = 1 });
+    defer query.deinit();
+    var seen: usize = 0;
+    fake.searchingNext(1);
+    try readAll(&query, 2, &seen);
+    try std.testing.expectEqual(3, seen);
+
+    try sharedBudget(std.testing.allocator, io, token.provider());
+
+    shown = 0;
+    try fake.write(.{ .log_name = name, .timestamp = .{ .nanoseconds = clock.now_ns + std.time.ns_per_s }, .severity = .warning, .resource_type = "cloud_run_revision" });
+    try tailFor(&client, io, 2);
+    try std.testing.expectEqual(1, shown);
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var choices: std.ArrayList([]const u8) = .empty;
+    defer choices.deinit(std.testing.allocator);
+    try pick(&client, std.testing.allocator, arena.allocator(), &choices);
+    try std.testing.expectEqual(3, choices.items.len);
+    try std.testing.expectEqualStrings("_Default", choices.items[0]);
+    try std.testing.expectEqualStrings("_AllLogs", choices.items[1]);
+}
+
+// snippet: logging-fake
+test "the newest error, from a fake" {
+    var clock: logging.testing.FakeClock = .{ .now_ns = 1_792_141_200 * std.time.ns_per_s };
+    var fake: logging.testing.FakeLogging = .init(std.testing.allocator, clock.io());
+    defer fake.deinit();
+    const name = try fake.logName(.{ .project = "test" }, "app");
+    try fake.write(.{ .log_name = name, .timestamp = .{ .nanoseconds = clock.now_ns - std.time.ns_per_s }, .severity = .@"error", .payload = .{ .text = "boom" } });
+
+    var token: logging.StaticToken = .{ .token = "test" };
+    var client = try logging.Client.init(std.testing.allocator, clock.io(), .{
+        .project_id = "test",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    var query = try client.query(.{ .min_severity = .warning });
+    defer query.deinit();
+    var page = try query.page(null);
+    defer page.deinit();
+    try std.testing.expectEqualStrings("boom", page.value.entries[0].payload.text);
+}
+// end snippet

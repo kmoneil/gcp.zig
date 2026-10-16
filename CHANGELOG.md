@@ -46,6 +46,12 @@ including the ones that did not change.
   cursor can be kept and a tail resumed from it. `Tail.stats` counts
   entries seen again and late ones, and how close the latest late one
   came to the overlap. `examples/logs_tail.zig`, with `--fake`.
+- logging: guides in `docs/logging/` (listing, filters, tailing, logs,
+  buckets and views, testing), each fact in them measured in production;
+  a production suite, `tests/logging_gcp_integration.zig`, that also
+  replays a set of scripts against production and the fake and holds the
+  fake to what production answered; and two nightly fuzz jobs, `logging`
+  and `slow-logging`.
 - auth, core, firestore, pubsub, secret_manager and storage: unchanged.
 
 ## 0.38.0 (2026-10-15)

@@ -66,6 +66,17 @@ Google, not only what Google documents, and where the emulators differ.
 | [Transactions](firestore/transactions.md) | A handler run again on contention, read-only transactions, and transactions by hand |
 | [The emulator](firestore/emulator.md) | What the emulator does differently from production, and how the tests hold the fake to both |
 
+## 📜 Cloud Logging
+
+| Guide | What's in it |
+| --- | --- |
+| [Overview](logging/README.md) | A first program, the calls, and what production showed when measured (experimental) |
+| [Listing entries](logging/listing.md) | Queries and their pages, page tokens, the time range, order and page size, the read quota and `ReadBudget`, what an entry carries, errors |
+| [Filters](logging/filters.md) | How the client joins your filter to its clauses, and how production read the query language |
+| [Tailing](logging/tail.md) | A tail by polling: the window, late entries, falling behind, keeping the cursor, and why there is no live tail |
+| [Logs, buckets and views](logging/picker.md) | Log names, buckets and views, and a picker that orders them for a person |
+| [Testing](logging/testing.md) | An in-memory Cloud Logging for your own tests, with production's answers (experimental) |
+
 ## 🛠️ Working on zig-gcp
 
 | Guide | What's in it |

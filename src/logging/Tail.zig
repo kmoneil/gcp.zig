@@ -350,10 +350,14 @@ const Rig = struct {
     client: Client,
 
     fn init(r: *Rig, read_calls_per_minute: u32) !void {
+        return r.initWith(testing.allocator, read_calls_per_minute);
+    }
+
+    fn initWith(r: *Rig, gpa: Allocator, read_calls_per_minute: u32) !void {
         r.* = .{ .clock = .{ .now_ns = base_s * std.time.ns_per_s }, .fake = undefined, .token = .{}, .diag = .{}, .client = undefined };
-        r.fake = .init(testing.allocator, r.clock.io());
+        r.fake = .init(gpa, r.clock.io());
         errdefer r.fake.deinit();
-        r.client = try .init(testing.allocator, r.clock.io(), .{
+        r.client = try .init(gpa, r.clock.io(), .{
             .project_id = "p",
             .token_provider = r.token.provider(),
             .transport = r.fake.transport(),
@@ -632,7 +636,7 @@ const Arrival = struct { id: [4]u8, ts_ms: i64, visible_ms: i64 };
 fn tailProperty(_: void, input: []const u8) !void {
     var g: test_util.ByteGen = .init(input);
     var r: Rig = undefined;
-    try r.init(0);
+    try r.initWith(test_util.propertyAllocator(), 0);
     defer r.deinit();
     const settle_s: i64 = g.pick(i64, &.{ 1, 2, 5 });
     const overlap_s: i64 = settle_s + g.pick(i64, &.{ 0, 5, 20 });

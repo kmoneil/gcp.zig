@@ -1109,10 +1109,14 @@ const Rig = struct {
     client: Client,
 
     fn init(r: *Rig) !void {
+        return r.initWith(testing.allocator);
+    }
+
+    fn initWith(r: *Rig, gpa: Allocator) !void {
         r.* = .{ .clock = .{ .now_ns = base_s * std.time.ns_per_s }, .fake = undefined, .token = .{}, .diag = .{}, .client = undefined };
-        r.fake = .init(testing.allocator, r.clock.io());
+        r.fake = .init(gpa, r.clock.io());
         errdefer r.fake.deinit();
-        r.client = try .init(testing.allocator, r.clock.io(), .{
+        r.client = try .init(gpa, r.clock.io(), .{
             .project_id = "p",
             .token_provider = r.token.provider(),
             .transport = r.fake.transport(),
@@ -1428,9 +1432,9 @@ test "fake: insert ids are assigned when a test gives none, and every page is va
 fn roundTripProperty(_: void, input: []const u8) !void {
     var g: test_util.ByteGen = .init(input);
     var r: Rig = undefined;
-    try r.init();
+    try r.initWith(test_util.propertyAllocator());
     defer r.deinit();
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(test_util.propertyAllocator());
     defer arena.deinit();
     const a = arena.allocator();
 

@@ -761,7 +761,8 @@ fn within(body: []const u8, part: []const u8) bool {
 }
 
 fn decodeProperty(_: void, input: []const u8) !void {
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    const gpa = test_util.propertyAllocator();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const page = decodeEntryPage(arena.allocator(), input) catch |err| switch (err) {
         error.InvalidResponse => return,
@@ -777,7 +778,7 @@ fn decodeProperty(_: void, input: []const u8) !void {
             else => {},
         }
         if (e.payload == .json or e.payload == .proto) {
-            var parsed = try e.payload.parse(testing.allocator);
+            var parsed = try e.payload.parse(gpa);
             parsed.deinit();
         }
     }
