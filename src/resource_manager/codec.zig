@@ -25,14 +25,35 @@ pub fn decodeProject(out: Allocator, scratch: Allocator, body: []const u8) Decod
 
 /// A page of `projects.search`: `{}` is an empty last page.
 pub fn decodeProjectPage(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.ProjectPage {
+    return decodePage(types.Project, out, scratch, body);
+}
+
+/// A page of `projects.search`, `folders.search` or
+/// `organizations.search`, by `T`.
+pub fn decodePage(comptime T: type, out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.Page(T) {
     const root = try parse(scratch, body);
     const obj = try object(root);
-    const list = try field(obj, "projects", .array);
-    const items = try out.alloc(types.Project, if (list) |l| l.items.len else 0);
+    const list = try field(obj, listField(T), .array);
+    const items = try out.alloc(T, if (list) |l| l.items.len else 0);
     if (list) |l| for (l.items, items) |v, *p| {
-        p.* = try project(out, v);
+        p.* = switch (T) {
+            types.Project => try project(out, v),
+            types.Folder => try folder(out, v),
+            types.Organization => try organization(out, v),
+            else => @compileError("no page of " ++ @typeName(T)),
+        };
     };
     return .{ .items = items, .next_page_token = try token(out, obj) };
+}
+
+/// The key a page lists its items under.
+pub fn listField(comptime T: type) []const u8 {
+    return switch (T) {
+        types.Project => "projects",
+        types.Folder => "folders",
+        types.Organization => "organizations",
+        else => @compileError("no page of " ++ @typeName(T)),
+    };
 }
 
 fn parse(scratch: Allocator, body: []const u8) DecodeError!Value {
@@ -98,6 +119,48 @@ fn project(out: Allocator, v: Value) DecodeError!types.Project {
         p.labels = list;
     }
     return p;
+}
+
+fn folder(out: Allocator, v: Value) DecodeError!types.Folder {
+    const obj = try object(v);
+    const name = try field(obj, "name", .string) orelse return error.InvalidResponse;
+    const id = idOf(name, "folders/") orelse return error.InvalidResponse;
+    const owned = try out.dupe(u8, name);
+    var f: types.Folder = .{ .name = owned, .id = owned[owned.len - id.len ..] };
+    if (try field(obj, "parent", .string)) |s| {
+        if (s.len > 0) f.parent = try parent(out, s);
+    }
+    if (try field(obj, "displayName", .string)) |s| f.display_name = try out.dupe(u8, s);
+    f.state = try state(obj);
+    f.create_time = try time(obj, "createTime");
+    f.update_time = try time(obj, "updateTime");
+    f.delete_time = try time(obj, "deleteTime");
+    if (try field(obj, "etag", .string)) |s| f.etag = try out.dupe(u8, s);
+    return f;
+}
+
+fn organization(out: Allocator, v: Value) DecodeError!types.Organization {
+    const obj = try object(v);
+    const name = try field(obj, "name", .string) orelse return error.InvalidResponse;
+    const id = idOf(name, "organizations/") orelse return error.InvalidResponse;
+    const owned = try out.dupe(u8, name);
+    var o: types.Organization = .{ .name = owned, .id = owned[owned.len - id.len ..] };
+    if (try field(obj, "displayName", .string)) |s| o.display_name = try out.dupe(u8, s);
+    if (try field(obj, "directoryCustomerId", .string)) |s| o.directory_customer_id = try out.dupe(u8, s);
+    o.state = try state(obj);
+    o.create_time = try time(obj, "createTime");
+    o.update_time = try time(obj, "updateTime");
+    o.delete_time = try time(obj, "deleteTime");
+    if (try field(obj, "etag", .string)) |s| o.etag = try out.dupe(u8, s);
+    return o;
+}
+
+/// The digits after `prefix`, or null when `name` is not that.
+fn idOf(name: []const u8, prefix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, name, prefix)) return null;
+    const digits = name[prefix.len..];
+    if (!validate.isNumber(digits)) return null;
+    return digits;
 }
 
 /// The digits of "projects/415104041262".
@@ -279,6 +342,53 @@ test "decode: pages, empty and with a token" {
     }
 }
 
+test "decode: folders and organizations, as discovery describes them" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const folders = try decodePage(types.Folder, a, a,
+        \\{"folders":[{"name":"folders/876","parent":"organizations/123","displayName":"Payments","state":"ACTIVE","createTime":"2021-03-04T10:11:12Z","updateTime":"2021-03-04T10:11:12Z","etag":"e","managementProject":"p","configuredCapabilities":["c"]},
+        \\ {"name":"folders/877","parent":"folders/876","displayName":"Prod","state":"DELETE_REQUESTED","deleteTime":"2026-10-01T00:00:00Z"}],"nextPageToken":"t"}
+    );
+    try testing.expectEqual(2, folders.items.len);
+    const f = folders.items[0];
+    try testing.expectEqualStrings("folders/876", f.name);
+    try testing.expectEqualStrings("876", f.id);
+    try testing.expectEqual(.organization, f.parent.?.kind);
+    try testing.expectEqualStrings("Payments", f.display_name.?);
+    try testing.expectEqual(.active, f.state);
+    try testing.expect(f.create_time != null and f.update_time != null);
+    try testing.expectEqualStrings("e", f.etag.?);
+    try testing.expectEqual(.folder, folders.items[1].parent.?.kind);
+    try testing.expectEqual(.delete_requested, folders.items[1].state);
+    try testing.expect(folders.items[1].delete_time != null);
+    try testing.expectEqualStrings("t", folders.next_page_token.?);
+
+    const orgs = try decodePage(types.Organization, a, a,
+        \\{"organizations":[{"name":"organizations/123","displayName":"example.com","directoryCustomerId":"C0abc","state":"ACTIVE","createTime":"2020-01-01T00:00:00Z","updateTime":"2020-01-01T00:00:00Z","deleteTime":"2020-01-02T00:00:00Z","etag":"o"}]}
+    );
+    const o = orgs.items[0];
+    try testing.expectEqualStrings("123", o.id);
+    try testing.expectEqualStrings("example.com", o.display_name.?);
+    try testing.expectEqualStrings("C0abc", o.directory_customer_id.?);
+    try testing.expectEqual(.active, o.state);
+    try testing.expect(o.create_time != null and o.update_time != null and o.delete_time != null);
+    try testing.expectEqualStrings("o", o.etag.?);
+
+    // The service account's answer: it reads none.
+    const none = try decodePage(types.Folder, a, a, bodies.folders_empty);
+    try testing.expectEqual(0, none.items.len);
+    for ([_][]const u8{ "{\"folders\":[{}]}", "{\"folders\":[{\"name\":\"projects/1\"}]}", "{\"folders\":[{\"name\":\"folders/x\"}]}", "{\"folders\":[{\"name\":\"folders/1\",\"parent\":1}]}" }) |body|
+        try testing.expectError(error.InvalidResponse, decodePage(types.Folder, a, a, body));
+    for ([_][]const u8{ "{\"organizations\":[{\"name\":\"folders/1\"}]}", "{\"organizations\":[{\"name\":\"organizations/1\",\"displayName\":1}]}", "{\"projects\":[]}" }) |body| {
+        const got = decodePage(types.Organization, a, a, body);
+        if (std.mem.indexOf(u8, body, "projects") != null) {
+            // Another kind's key is an unknown field: an empty page.
+            try testing.expectEqual(0, (try got).items.len);
+        } else try testing.expectError(error.InvalidResponse, got);
+    }
+}
+
 test "decode: every allocation failure is OutOfMemory without leaks" {
     const Run = struct {
         fn run(gpa: Allocator) !void {
@@ -298,6 +408,17 @@ const test_util = @import("test_util.zig");
 
 fn arbitraryProperty(_: void, input: []const u8) !void {
     const gpa = test_util.propertyAllocator();
+    // The body as a folder page and an organization page.
+    inline for (.{ types.Folder, types.Organization }) |T| {
+        var as: std.heap.ArenaAllocator = .init(gpa);
+        defer as.deinit();
+        if (decodePage(T, as.allocator(), as.allocator(), input)) |other| {
+            for (other.items) |item| try testing.expectEqualStrings(item.id, item.name[item.name.len - item.id.len ..]);
+        } else |err| switch (err) {
+            error.InvalidResponse => {},
+            else => return err,
+        }
+    }
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     var scratch: std.heap.ArenaAllocator = .init(gpa);

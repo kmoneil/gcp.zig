@@ -5,6 +5,8 @@
 //! cache and filter locally. `Client.searchProjects` fixes one search and
 //! `search.page` fetches its pages, one a call. `Client.getProject` reads
 //! one project, strongly consistent where search is not.
+//! `Client.parentNames` gives display text for the folders and
+//! organizations a caller can read, for showing where a project sits.
 //!
 //! No quota project is sent unless asked for, as gcloud does for every
 //! project command: a quota project with the API off breaks a search that
@@ -16,6 +18,8 @@ const core = @import("core");
 pub const Client = @import("Client.zig");
 pub const Search = @import("search.zig").Search;
 pub const ProjectSearch = Search(Project);
+pub const FolderSearch = Search(Folder);
+pub const OrganizationSearch = Search(Organization);
 
 pub const TokenProvider = core.TokenProvider;
 pub const StaticToken = core.StaticToken;
@@ -37,6 +41,12 @@ pub const ProjectPage = @import("types.zig").ProjectPage;
 pub const SearchOptions = @import("types.zig").SearchOptions;
 pub const WalkOptions = @import("types.zig").WalkOptions;
 pub const ProjectList = @import("types.zig").ProjectList;
+pub const Folder = @import("types.zig").Folder;
+pub const Organization = @import("types.zig").Organization;
+pub const FolderPage = @import("types.zig").FolderPage;
+pub const OrganizationPage = @import("types.zig").OrganizationPage;
+pub const ParentOptions = @import("types.zig").ParentOptions;
+pub const ParentNames = @import("types.zig").ParentNames;
 pub const QuotaProject = @import("types.zig").QuotaProject;
 pub const ConsumerRefusal = @import("types.zig").ConsumerRefusal;
 

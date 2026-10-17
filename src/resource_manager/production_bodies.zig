@@ -562,6 +562,11 @@ test "production: the fake's projects are production's, key for key" {
     try expectSameShape(a, search_extractctl, found.body);
     const got = try fake.serve(.{ .method = .GET, .url = "https://cloudresourcemanager.googleapis.com/v3/projects/extractctl?prettyPrint=false", .bearer = "sa-token" }, a);
     try expectSameShape(a, get_extractctl, got.body);
+    // The service account reads no folder or organization.
+    const folders = try fake.serve(.{ .method = .GET, .url = "https://cloudresourcemanager.googleapis.com/v3/folders:search?prettyPrint=false", .bearer = "sa-token" }, a);
+    try testing.expectEqualStrings(folders_empty, folders.body);
+    const orgs = try fake.serve(.{ .method = .GET, .url = "https://cloudresourcemanager.googleapis.com/v3/organizations:search?prettyPrint=false", .bearer = "sa-token" }, a);
+    try testing.expectEqualStrings("{}", orgs.body);
     const public = try fake.serve(.{ .method = .GET, .url = "https://cloudresourcemanager.googleapis.com/v3/projects/bigquery-public-data?prettyPrint=false", .bearer = "sa-token" }, a);
     try testing.expectEqual(200, public.status);
     try expectSameShape(a, get_public, public.body);

@@ -15,7 +15,8 @@ const rpc = @import("rpc.zig");
 const types = @import("types.zig");
 const Error = errors.Error;
 
-/// A search of `T`s: `types.Project`.
+/// A search of `T`s: `types.Project`, `types.Folder` or
+/// `types.Organization`.
 pub fn Search(comptime T: type) type {
     return struct {
         client: *Client,
@@ -28,7 +29,20 @@ pub fn Search(comptime T: type) type {
         const Self = @This();
 
         /// What a decoding failure calls the response.
-        const what = if (T == types.Project) "project search" else @compileError("no search of " ++ @typeName(T));
+        const what = switch (T) {
+            types.Project => "project search",
+            types.Folder => "folder search",
+            types.Organization => "organization search",
+            else => @compileError("no search of " ++ @typeName(T)),
+        };
+
+        /// The path a search of `T`s sends.
+        pub const route = switch (T) {
+            types.Project => "/v3/projects:search",
+            types.Folder => "/v3/folders:search",
+            types.Organization => "/v3/organizations:search",
+            else => @compileError("no search of " ++ @typeName(T)),
+        };
 
         pub fn deinit(self: *Self) void {
             self.arena.deinit();
@@ -65,7 +79,7 @@ pub fn Search(comptime T: type) type {
             const body = try rpc.get(client, &response, path, page_token != null);
             var scratch: std.heap.ArenaAllocator = .init(client.gpa);
             defer scratch.deinit();
-            return codec.decodeProjectPage(out, scratch.allocator(), body) catch |err| rpc.decodeFailed(client, err, what);
+            return codec.decodePage(T, out, scratch.allocator(), body) catch |err| rpc.decodeFailed(client, err, what);
         }
     };
 }

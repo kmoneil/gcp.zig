@@ -48,6 +48,7 @@ const Allocator = std.mem.Allocator;
 const Stringify = std.json.Stringify;
 const core = @import("core");
 const tp = core.transport;
+const codec = @import("codec.zig");
 const fake_query = @import("fake_query.zig");
 const types = @import("types.zig");
 const validate = @import("validate.zig");
@@ -61,8 +62,10 @@ pub const FakeResourceManager = struct {
     /// `deinit`.
     store: std.heap.ArenaAllocator,
     projects: std.ArrayList(*Stored) = .empty,
-    /// Folder name ("folders/7") to its parent's name. In `store`.
-    folders: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// By name ("folders/7"), in the order added. In `store`.
+    folders: std.StringArrayHashMapUnmanaged(*StoredFolder) = .empty,
+    /// By name ("organizations/3"), in the order added. In `store`.
+    organizations: std.StringArrayHashMapUnmanaged(*StoredOrganization) = .empty,
     /// By bearer token. In `store`.
     principals: std.StringHashMapUnmanaged(*Principal) = .empty,
     listings: std.ArrayList(Listing) = .empty,
@@ -145,12 +148,52 @@ pub const FakeResourceManager = struct {
         quota_use: std.StringHashMapUnmanaged(void) = .empty,
     };
 
+    /// What a search lists.
+    const Kind = enum { project, folder, organization };
+
+    /// A folder as a test adds it.
+    pub const Folder = struct {
+        /// "folders/N".
+        name: []const u8,
+        /// "folders/N" or "organizations/N".
+        parent: []const u8,
+        display_name: ?[]const u8 = null,
+        state: types.State = .active,
+    };
+
+    /// An organization as a test adds it.
+    pub const Organization = struct {
+        /// "organizations/N".
+        name: []const u8,
+        /// Its primary domain, which production gives as its display name.
+        domain: []const u8,
+        directory_customer_id: ?[]const u8 = null,
+        state: types.State = .active,
+    };
+
+    const StoredFolder = struct {
+        name: []const u8,
+        parent: []const u8,
+        display_name: ?[]const u8,
+        state: types.State,
+        create_ns: i96,
+    };
+
+    const StoredOrganization = struct {
+        name: []const u8,
+        domain: []const u8,
+        directory_customer_id: ?[]const u8,
+        state: types.State,
+        create_ns: i96,
+    };
+
     const Listing = struct {
+        kind: Kind,
         principal: *const Principal,
         query: []const u8,
         page_size: []const u8,
         created_ns: i96,
-        /// Each project's JSON, in the listing's order.
+        /// Each item's JSON, in the listing's order.
         items: []const []const u8,
     };
 
@@ -219,16 +262,45 @@ pub const FakeResourceManager = struct {
         f.changed(stored);
     }
 
-    /// Adds a folder under `parent`, "folders/N" or "organizations/N", for
-    /// grants to pass down. `error.InvalidEntry` for a name production
-    /// would not have, or one there already.
-    pub fn addFolder(f: *FakeResourceManager, name: []const u8, parent: []const u8) WriteError!void {
+    /// Adds a folder, which passes grants down to what is under it and
+    /// which a caller granted on it or above it reads in a folder search.
+    /// `error.InvalidEntry` for a name production would not have, or one
+    /// there already.
+    pub fn addFolder(f: *FakeResourceManager, folder: Folder) WriteError!void {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         const a = f.store.allocator();
-        if (!std.mem.startsWith(u8, name, "folders/") or !isParentName(name) or !isParentName(parent)) return error.InvalidEntry;
-        if (f.folders.contains(name)) return error.InvalidEntry;
-        try f.folders.put(a, try a.dupe(u8, name), try a.dupe(u8, parent));
+        if (!std.mem.startsWith(u8, folder.name, "folders/") or !isParentName(folder.name) or !isParentName(folder.parent)) return error.InvalidEntry;
+        if (f.folders.contains(folder.name)) return error.InvalidEntry;
+        const stored = try a.create(StoredFolder);
+        stored.* = .{
+            .name = try a.dupe(u8, folder.name),
+            .parent = try a.dupe(u8, folder.parent),
+            .display_name = if (folder.display_name) |d| try a.dupe(u8, d) else null,
+            .state = folder.state,
+            .create_ns = f.now(),
+        };
+        try f.folders.put(a, stored.name, stored);
+    }
+
+    /// Adds an organization, which a caller granted on it reads in an
+    /// organization search. `error.InvalidEntry` for a name production
+    /// would not have, or one there already.
+    pub fn addOrganization(f: *FakeResourceManager, org: Organization) WriteError!void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        const a = f.store.allocator();
+        if (!std.mem.startsWith(u8, org.name, "organizations/") or !isParentName(org.name)) return error.InvalidEntry;
+        if (f.organizations.contains(org.name)) return error.InvalidEntry;
+        const stored = try a.create(StoredOrganization);
+        stored.* = .{
+            .name = try a.dupe(u8, org.name),
+            .domain = try a.dupe(u8, org.domain),
+            .directory_customer_id = if (org.directory_customer_id) |d| try a.dupe(u8, d) else null,
+            .state = org.state,
+            .create_ns = f.now(),
+        };
+        try f.organizations.put(a, stored.name, stored);
     }
 
     /// Adds a caller, by its bearer token, charged to `home` (a project
@@ -355,12 +427,17 @@ pub const FakeResourceManager = struct {
         if (principal.grants.contains(s.project_id)) return true;
         var buf: [20]u8 = undefined;
         if (principal.grants.contains(std.fmt.bufPrint(&buf, "{d}", .{s.number}) catch unreachable)) return true;
-        var at = parent;
+        return f.seesFrom(principal, parent);
+    }
+
+    /// Whether `principal` holds a grant on `name` or anywhere above it.
+    fn seesFrom(f: *const FakeResourceManager, principal: *const Principal, name: ?[]const u8) bool {
+        var at = name;
         var depth: usize = 0;
-        while (at) |name| : (depth += 1) {
+        while (at) |n| : (depth += 1) {
             if (depth > 64) return false;
-            if (principal.grants.contains(name)) return true;
-            at = f.folders.get(name);
+            if (principal.grants.contains(n)) return true;
+            at = if (f.folders.get(n)) |folder| folder.parent else null;
         }
         return false;
     }
@@ -432,11 +509,13 @@ pub const FakeResourceManager = struct {
         const query = if (q_at) |q| path[q + 1 ..] else "";
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
-        if (req.method == .GET and std.mem.eql(u8, route, "/v3/projects:search")) {
-            f.search_calls += 1;
-            if (f.takeFault(drop) != null) return error.ConnectionResetByPeer;
-            if (f.takeFault(refuse)) |fault| return refusal(arena, fault.status);
-            return f.search(arena, req, query);
+        inline for (.{ .{ "/v3/projects:search", Kind.project }, .{ "/v3/folders:search", Kind.folder }, .{ "/v3/organizations:search", Kind.organization } }) |r| {
+            if (req.method == .GET and std.mem.eql(u8, route, r[0])) {
+                f.search_calls += 1;
+                if (f.takeFault(drop) != null) return error.ConnectionResetByPeer;
+                if (f.takeFault(refuse)) |fault| return refusal(arena, fault.status);
+                return f.search(arena, req, query, r[1]);
+            }
         }
         if (req.method == .GET and std.mem.startsWith(u8, route, "/v3/projects/")) {
             f.get_calls += 1;
@@ -507,16 +586,22 @@ pub const FakeResourceManager = struct {
         return .{ .key = try std.fmt.allocPrint(arena, "{d}", .{project.number}) };
     }
 
-    const search_method = "google.cloud.resourcemanager.v3.Projects.SearchProjects";
+    fn searchMethod(kind: Kind) []const u8 {
+        return switch (kind) {
+            .project => "google.cloud.resourcemanager.v3.Projects.SearchProjects",
+            .folder => "google.cloud.resourcemanager.v3.Folders.SearchFolders",
+            .organization => "google.cloud.resourcemanager.v3.Organizations.SearchOrganizations",
+        };
+    }
     const get_method = "google.cloud.resourcemanager.v3.Projects.GetProject";
     const service = "cloudresourcemanager.googleapis.com";
 
-    fn search(f: *FakeResourceManager, arena: Allocator, req: tp.Request, query: []const u8) Allocator.Error!Reply {
+    fn search(f: *FakeResourceManager, arena: Allocator, req: tp.Request, query: []const u8, kind: Kind) Allocator.Error!Reply {
         const params = try parseParams(arena, query) orelse return notModelled(arena, "a query string this fake cannot read");
         for (params) |p| {
             if (!isOneOf(p.name, &.{ "query", "pageSize", "pageToken", "prettyPrint" })) return notModelled(arena, try std.fmt.allocPrint(arena, "the parameter {s}", .{p.name}));
         }
-        const principal = switch (try f.caller(arena, req, search_method)) {
+        const principal = switch (try f.caller(arena, req, searchMethod(kind))) {
             .principal => |p| p,
             .refused => |r| return r,
         };
@@ -547,13 +632,14 @@ pub const FakeResourceManager = struct {
         var listing_index: usize = undefined;
         var offset: usize = 0;
         if (token.len == 0) {
-            listing_index = try f.newListing(arena, principal, query_text, size_text) orelse
-                return f.queryRefusal(arena, query_text);
+            listing_index = try f.newListing(arena, kind, principal, query_text, size_text) orelse
+                return f.queryRefusal(arena, kind, query_text);
         } else {
             const at = decodeToken(token) orelse return fail(arena, 400, "INVALID_ARGUMENT", "Request contains an invalid argument.");
             if (at.listing >= f.listings.items.len) return fail(arena, 400, "INVALID_ARGUMENT", "Request contains an invalid argument.");
             const l = f.listings.items[at.listing];
             if (at.offset > l.items.len) return fail(arena, 400, "INVALID_ARGUMENT", "Request contains an invalid argument.");
+            if (l.kind != kind) return notModelled(arena, "a token from another kind of search");
             if (l.principal != principal) return notModelled(arena, "a token sent by another caller");
             if (!std.mem.eql(u8, l.query, query_text)) return notModelled(arena, "a token sent with another query");
             if (!std.mem.eql(u8, l.page_size, size_text)) return notModelled(arena, "a token sent with another page size");
@@ -574,13 +660,37 @@ pub const FakeResourceManager = struct {
             f.tokens_issued += 1;
             break :next try encodeToken(arena, listing_index, end, f.tokens_issued);
         } else null;
-        writePage(&out.writer, l.items[offset..end], next) catch return error.OutOfMemory;
+        writePage(&out.writer, switch (kind) {
+            .project => "projects",
+            .folder => "folders",
+            .organization => "organizations",
+        }, l.items[offset..end], next) catch return error.OutOfMemory;
         return ok(try out.toOwnedSlice());
     }
 
     /// Reads `query_text`, and lists what it finds for `principal` in a
     /// new order: the listing's index, or null when the query is refused.
-    fn newListing(f: *FakeResourceManager, arena: Allocator, principal: *const Principal, query_text: []const u8, size_text: []const u8) Allocator.Error!?usize {
+    fn newListing(f: *FakeResourceManager, arena: Allocator, kind: Kind, principal: *const Principal, query_text: []const u8, size_text: []const u8) Allocator.Error!?usize {
+        const a = f.store.allocator();
+        const items = switch (kind) {
+            .project => try f.projectItems(arena, principal, query_text) orelse return null,
+            .folder => try f.folderItems(arena, principal, query_text) orelse return null,
+            .organization => try f.organizationItems(arena, principal, query_text) orelse return null,
+        };
+        try f.listings.append(f.gpa, .{
+            .kind = kind,
+            .principal = principal,
+            .query = try a.dupe(u8, query_text),
+            .page_size = try a.dupe(u8, size_text),
+            .created_ns = f.now(),
+            .items = items,
+        });
+        return f.listings.items.len - 1;
+    }
+
+    /// The JSON of every project `principal` sees that `query_text` finds,
+    /// in a new order, or null when the query is refused.
+    fn projectItems(f: *FakeResourceManager, arena: Allocator, principal: *const Principal, query_text: []const u8) Allocator.Error!?[]const []const u8 {
         const a = f.store.allocator();
         const parsed = try fake_query.parse(arena, query_text);
         const q = switch (parsed) {
@@ -601,20 +711,44 @@ pub const FakeResourceManager = struct {
         f.prng.random().shuffle(*Stored, found.items);
         const items = try a.alloc([]const u8, found.items.len);
         for (found.items, items) |s, *item| item.* = try render(a, s, s.searched.?, false);
-        try f.listings.append(f.gpa, .{
-            .principal = principal,
-            .query = try a.dupe(u8, query_text),
-            .page_size = try a.dupe(u8, size_text),
-            .created_ns = f.now(),
-            .items = items,
-        });
-        return f.listings.items.len - 1;
+        return items;
+    }
+
+    /// The folders `principal` reads: granted on them or above them. Only
+    /// the empty query was measured, so any other is refused.
+    fn folderItems(f: *FakeResourceManager, arena: Allocator, principal: *const Principal, query_text: []const u8) Allocator.Error!?[]const []const u8 {
+        if (query_text.len > 0) return null;
+        const a = f.store.allocator();
+        var found: std.ArrayList(*StoredFolder) = .empty;
+        for (f.folders.values()) |folder| if (f.seesFrom(principal, folder.name)) try found.append(arena, folder);
+        f.prng.random().shuffle(*StoredFolder, found.items);
+        const items = try a.alloc([]const u8, found.items.len);
+        for (found.items, items) |folder, *item| item.* = try renderFolder(a, folder);
+        return items;
+    }
+
+    /// The organizations `principal` is granted on. Only the empty query
+    /// was measured, so any other is refused.
+    fn organizationItems(f: *FakeResourceManager, arena: Allocator, principal: *const Principal, query_text: []const u8) Allocator.Error!?[]const []const u8 {
+        if (query_text.len > 0) return null;
+        const a = f.store.allocator();
+        var found: std.ArrayList(*StoredOrganization) = .empty;
+        for (f.organizations.values()) |org| if (principal.grants.contains(org.name)) try found.append(arena, org);
+        f.prng.random().shuffle(*StoredOrganization, found.items);
+        const items = try a.alloc([]const u8, found.items.len);
+        for (found.items, items) |org, *item| item.* = try renderOrganization(a, org);
+        return items;
     }
 
     /// Why `newListing` refused `query_text`, in production's words or as
     /// not modelled.
-    fn queryRefusal(f: *FakeResourceManager, arena: Allocator, query_text: []const u8) Allocator.Error!Reply {
+    fn queryRefusal(f: *FakeResourceManager, arena: Allocator, kind: Kind, query_text: []const u8) Allocator.Error!Reply {
         _ = f;
+        switch (kind) {
+            .project => {},
+            .folder => return notModelled(arena, "a folder query"),
+            .organization => return notModelled(arena, "an organization query"),
+        }
         return switch (try fake_query.parse(arena, query_text)) {
             .refused => |r| switch (r.kind) {
                 .production => fieldRefusal(arena, r.field, issueOf(r.message)),
@@ -669,11 +803,7 @@ fn writeProject(jw: *Stringify, s: *const FakeResourceManager.Stored, v: FakeRes
     try jw.objectField("projectId");
     try jw.write(s.project_id);
     try jw.objectField("state");
-    try jw.write(switch (v.state) {
-        .active => "ACTIVE",
-        .delete_requested => "DELETE_REQUESTED",
-        .unspecified, .unknown => "STATE_UNSPECIFIED",
-    });
+    try jw.write(stateName(v.state));
     if (v.display_name) |d| {
         try jw.objectField("displayName");
         try jw.write(d);
@@ -695,16 +825,78 @@ fn writeProject(jw: *Stringify, s: *const FakeResourceManager.Stored, v: FakeRes
     try jw.endObject();
 }
 
+fn stateName(state: types.State) []const u8 {
+    return switch (state) {
+        .active => "ACTIVE",
+        .delete_requested => "DELETE_REQUESTED",
+        .unspecified, .unknown => "STATE_UNSPECIFIED",
+    };
+}
+
+/// A folder's JSON, its keys in the proto's order.
+fn renderFolder(arena: Allocator, folder: *const FakeResourceManager.StoredFolder) Allocator.Error![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeFolder(&jw, folder) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeFolder(jw: *Stringify, folder: *const FakeResourceManager.StoredFolder) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("name");
+    try jw.write(folder.name);
+    try jw.objectField("parent");
+    try jw.write(folder.parent);
+    if (folder.display_name) |d| {
+        try jw.objectField("displayName");
+        try jw.write(d);
+    }
+    try jw.objectField("state");
+    try jw.write(stateName(folder.state));
+    try writeTime(jw, "createTime", folder.create_ns);
+    try writeTime(jw, "updateTime", folder.create_ns);
+    try jw.objectField("etag");
+    try jw.print("\"W/\\\"{x:0>16}\\\"\"", .{std.hash.Wyhash.hash(0, folder.name)});
+    try jw.endObject();
+}
+
+/// An organization's JSON, its keys in the proto's order.
+fn renderOrganization(arena: Allocator, org: *const FakeResourceManager.StoredOrganization) Allocator.Error![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeOrganization(&jw, org) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeOrganization(jw: *Stringify, org: *const FakeResourceManager.StoredOrganization) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("name");
+    try jw.write(org.name);
+    try jw.objectField("displayName");
+    try jw.write(org.domain);
+    if (org.directory_customer_id) |d| {
+        try jw.objectField("directoryCustomerId");
+        try jw.write(d);
+    }
+    try jw.objectField("state");
+    try jw.write(stateName(org.state));
+    try writeTime(jw, "createTime", org.create_ns);
+    try writeTime(jw, "updateTime", org.create_ns);
+    try jw.objectField("etag");
+    try jw.print("\"W/\\\"{x:0>16}\\\"\"", .{std.hash.Wyhash.hash(0, org.name)});
+    try jw.endObject();
+}
+
 fn writeTime(jw: *Stringify, name: []const u8, ns: i96) Stringify.Error!void {
     var buf: [core.timestamp.max_len]u8 = undefined;
     try jw.objectField(name);
     try jw.write(core.timestamp.format(&buf, .{ .nanoseconds = ns }));
 }
 
-fn writePage(w: *std.Io.Writer, items: []const []const u8, token: ?[]const u8) std.Io.Writer.Error!void {
+fn writePage(w: *std.Io.Writer, field: []const u8, items: []const []const u8, token: ?[]const u8) std.Io.Writer.Error!void {
     try w.writeByte('{');
     if (items.len > 0) {
-        try w.writeAll("\"projects\":[");
+        try w.print("\"{s}\":[", .{field});
         for (items, 0..) |item, i| {
             if (i > 0) try w.writeByte(',');
             try w.writeAll(item);
@@ -985,8 +1177,8 @@ test "visibility: grants on a project and above it; a public project is read but
     try r.init(.{}, .none);
     defer r.deinit();
     const f = &r.fake;
-    try f.addFolder("folders/10", "organizations/1");
-    try f.addFolder("folders/11", "folders/10");
+    try f.addFolder(.{ .name = "folders/10", .parent = "organizations/1" });
+    try f.addFolder(.{ .name = "folders/11", .parent = "folders/10" });
     try f.addProject(.{ .number = 1, .project_id = "app-oauth" });
     try f.addProject(.{ .number = 2, .project_id = "mine", .display_name = "Mine" });
     try f.addProject(.{ .number = 3, .project_id = "deep", .parent = "folders/11" });
@@ -1022,6 +1214,63 @@ test "visibility: grants on a project and above it; a public project is read but
     var robot = try r.client.allProjects(.{});
     defer robot.deinit();
     try expectIds(&.{"elsewhere"}, robot.value.projects);
+}
+
+test "parent names: folders three deep, an organization, a parent the caller cannot read, a project with none" {
+    var r: Rig = undefined;
+    try r.init(.{}, .none);
+    defer r.deinit();
+    const f = &r.fake;
+    try f.addOrganization(.{ .name = "organizations/1", .domain = "example.com", .directory_customer_id = "C01" });
+    try f.addOrganization(.{ .name = "organizations/2", .domain = "elsewhere.com" });
+    try f.addFolder(.{ .name = "folders/10", .parent = "organizations/1", .display_name = "Engineering" });
+    try f.addFolder(.{ .name = "folders/11", .parent = "folders/10", .display_name = "Payments" });
+    try f.addFolder(.{ .name = "folders/12", .parent = "folders/11", .display_name = "Prod", .state = .delete_requested });
+    try f.addFolder(.{ .name = "folders/20", .parent = "organizations/2", .display_name = "Hidden" });
+    try f.addProject(.{ .number = 1, .project_id = "pay-prod", .parent = "folders/12" });
+    try f.addProject(.{ .number = 2, .project_id = "shared-with-me", .parent = "folders/20" });
+    try f.addProject(.{ .number = 3, .project_id = "my-own" });
+    try f.addPrincipal("person-token", "my-own");
+    try f.grant("person-token", "organizations/1");
+    try f.grant("person-token", "shared-with-me");
+    try f.grant("person-token", "my-own");
+
+    var list = try r.client.allProjects(.{});
+    defer list.deinit();
+    try expectIds(&.{ "my-own", "pay-prod", "shared-with-me" }, list.value.projects);
+    var names = try r.client.parentNames(.{});
+    defer names.deinit();
+    const n = &names.value;
+    try testing.expectEqual(3, n.folders.len);
+    try testing.expectEqual(1, n.organizations.len);
+    try testing.expectEqualStrings("C01", n.organizations[0].directory_customer_id.?);
+    try testing.expectEqual(.delete_requested, n.folder("folders/12").?.state);
+
+    const a = testing.allocator;
+    const deep = try n.path(a, list.value.projects[1].parent.?);
+    defer a.free(deep);
+    try testing.expectEqual(4, deep.len);
+    for ([_][]const u8{ "Prod", "Payments", "Engineering", "example.com" }, deep) |want, got| try testing.expectEqualStrings(want, got);
+    // A project shared with the caller, its folder unreadable: the name.
+    try testing.expectEqualStrings("folders/20", n.label(list.value.projects[2].parent.?));
+    try testing.expectEqual(null, list.value.projects[0].parent);
+
+    // Folder and organization queries were not measured, and a token goes
+    // with its own kind of search.
+    var folders = try r.client.searchFolders(.{ .query = "displayName:Pay*" });
+    defer folders.deinit();
+    try testing.expectError(error.Unimplemented, folders.page(null));
+    var orgs = try r.client.searchOrganizations(.{ .query = "domain:example.com" });
+    defer orgs.deinit();
+    try testing.expectError(error.Unimplemented, orgs.page(null));
+    var projects = try r.client.searchProjects(.{ .page_size = 1 });
+    defer projects.deinit();
+    var first = try projects.page(null);
+    defer first.deinit();
+    var plain = try r.client.searchFolders(.{ .page_size = 1 });
+    defer plain.deinit();
+    try testing.expectError(error.Unimplemented, plain.page(first.value.next_page_token));
+    try testing.expect(std.mem.indexOf(u8, r.diag.message(), "another kind of search") != null);
 }
 
 test "callers: no token and an unknown one are production's 401" {
@@ -1285,7 +1534,7 @@ test "requests it does not model are 501, never guessed at" {
     for ([_][]const u8{
         "/v3/projects:search?fields=projects",       "/v3/projects:search?query=%zz",
         "/v3/projects:search?pageSize=1&pageSize=2", "/v3/projects/a/b",
-        "/v3/projects/a?alt=json",                   "/v3/folders:search",
+        "/v3/projects/a?alt=json",                   "/v3/folders:search?query=x",
         "/v1/projects",
     }) |path| {
         const url = try std.fmt.allocPrint(a, "https://cloudresourcemanager.googleapis.com{s}", .{path});
@@ -1308,9 +1557,13 @@ test "test setup it refuses" {
     try testing.expectError(error.InvalidEntry, f.addProject(.{ .number = 4, .project_id = "12345" }));
     try testing.expectError(error.InvalidEntry, f.addProject(.{ .number = 5, .project_id = "c-project", .parent = "folder/1" }));
     try testing.expectError(error.InvalidEntry, f.addProject(.{ .number = 6, .project_id = "d-project", .labels = &.{ .{ .key = "k", .value = "1" }, .{ .key = "k", .value = "2" } } }));
-    try testing.expectError(error.InvalidEntry, f.addFolder("organizations/1", "organizations/2"));
-    try f.addFolder("folders/1", "organizations/2");
-    try testing.expectError(error.InvalidEntry, f.addFolder("folders/1", "organizations/2"));
+    try testing.expectError(error.InvalidEntry, f.addFolder(.{ .name = "organizations/1", .parent = "organizations/2" }));
+    try testing.expectError(error.InvalidEntry, f.addFolder(.{ .name = "folders/2", .parent = "projects/1" }));
+    try f.addFolder(.{ .name = "folders/1", .parent = "organizations/2" });
+    try testing.expectError(error.InvalidEntry, f.addFolder(.{ .name = "folders/1", .parent = "organizations/2" }));
+    try testing.expectError(error.InvalidEntry, f.addOrganization(.{ .name = "folders/3", .domain = "x.com" }));
+    try f.addOrganization(.{ .name = "organizations/2", .domain = "x.com" });
+    try testing.expectError(error.InvalidEntry, f.addOrganization(.{ .name = "organizations/2", .domain = "y.com" }));
     try testing.expectError(error.InvalidEntry, f.grant("nobody", "a-project"));
     try testing.expectError(error.InvalidEntry, f.allowQuotaUse("nobody", "a-project"));
     try f.addPrincipal("t", "home");
@@ -1332,8 +1585,8 @@ fn walkProperty(_: void, input: []const u8) !void {
         .seed = g.int(u64),
     });
     defer fake.deinit();
-    try fake.addFolder("folders/10", "organizations/1");
-    try fake.addFolder("folders/11", "folders/10");
+    try fake.addFolder(.{ .name = "folders/10", .parent = "organizations/1" });
+    try fake.addFolder(.{ .name = "folders/11", .parent = "folders/10" });
     try fake.addPrincipal("person-token", "home");
 
     const Want = struct { number: u64, id: [12]u8, searchable_at: i96, visible: bool, active: bool };
@@ -1436,4 +1689,76 @@ test "slow property allProjects: every project the caller may see that search sh
         .random_runs = 150,
         .max_len = 300,
     });
+}
+
+fn parentNamesProperty(_: void, input: []const u8) !void {
+    const gpa = test_util.propertyAllocator();
+    var g: test_util.ByteGen = .init(input);
+    var clock: test_util.FakeClock = .{ .now_ns = 1_792_141_200 * std.time.ns_per_s };
+    var fake: FakeResourceManager = .init(gpa, clock.io(), .{ .default_page_size = g.intRange(u32, 1, 5), .max_page_size = 5, .seed = g.int(u64) });
+    defer fake.deinit();
+    try fake.addPrincipal("person-token", "home");
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A random forest: organizations, then folders under any earlier node.
+    const Node = struct { name: []const u8, parent: ?[]const u8, label: ?[]const u8, granted: bool };
+    var nodes: std.ArrayList(Node) = .empty;
+    for (0..g.intRange(usize, 1, 3)) |i| {
+        const name = try std.fmt.allocPrint(a, "organizations/{d}", .{i + 1});
+        const domain = try std.fmt.allocPrint(a, "org{d}.com", .{i + 1});
+        try fake.addOrganization(.{ .name = name, .domain = domain });
+        const granted = g.boolean();
+        if (granted) try fake.grant("person-token", name);
+        try nodes.append(a, .{ .name = name, .parent = null, .label = domain, .granted = granted });
+    }
+    for (0..g.intRange(usize, 0, 12)) |i| {
+        const name = try std.fmt.allocPrint(a, "folders/{d}", .{100 + i});
+        const parent = nodes.items[g.intRange(usize, 0, nodes.items.len - 1)].name;
+        const label: ?[]const u8 = if (g.boolean()) try std.fmt.allocPrint(a, "F{d}", .{i}) else null;
+        try fake.addFolder(.{ .name = name, .parent = parent, .display_name = label });
+        const granted = g.intRange(u8, 0, 3) == 0;
+        if (granted) try fake.grant("person-token", name);
+        try nodes.append(a, .{ .name = name, .parent = parent, .label = label, .granted = granted });
+    }
+
+    var token = core.StaticToken{ .token = "person-token" };
+    var client = try Client.init(gpa, clock.io(), .{ .token_provider = token.provider(), .transport = fake.transport() });
+    defer client.deinit();
+    var names = try client.parentNames(.{ .page_size = g.intRange(u31, 0, 6), .page_interval_ms = 0 });
+    defer names.deinit();
+    try testing.expect(names.value.complete);
+
+    for (nodes.items) |start| {
+        // The plain model: a node is readable when it or a node above it is
+        // granted; its label is its display name then, else its name; the
+        // path climbs through readable folders.
+        var want: std.ArrayList([]const u8) = .empty;
+        var at: ?[]const u8 = start.name;
+        while (at) |name| {
+            const node = for (nodes.items) |n| {
+                if (std.mem.eql(u8, n.name, name)) break n;
+            } else unreachable;
+            var readable = false;
+            var up: ?[]const u8 = name;
+            while (up) |u| {
+                const above = for (nodes.items) |n| {
+                    if (std.mem.eql(u8, n.name, u)) break n;
+                } else unreachable;
+                if (above.granted) readable = true;
+                up = above.parent;
+            }
+            try want.append(a, if (readable and node.label != null) node.label.? else name);
+            at = if (readable) node.parent else null;
+        }
+        const parent = try codec.parent(a, start.name);
+        const got = try names.value.path(a, parent);
+        try testing.expectEqual(want.items.len, got.len);
+        for (want.items, got) |w, x| try testing.expectEqualStrings(w, x);
+    }
+}
+
+test "fuzz parent names: every path climbs the tree as far as the caller can read, as a plain model does" {
+    try test_util.fuzzBytes({}, parentNamesProperty, .{ .corpus = &.{ "", "\x03\x00\x00\x00\x00\x00\x00\x00\x00\x01\x01\x01\x0c" } });
 }
