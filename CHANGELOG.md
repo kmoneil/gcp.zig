@@ -45,6 +45,13 @@ including the ones that did not change.
   searched, the project charged for each call, the search quota, a lag
   before search sees a change, and an order that differs between
   searches. `examples/projects_list.zig`, with `--fake` for no network.
+- resource_manager: guides in `docs/resource_manager/` (listing
+  projects, the project charged, testing), each fact in them measured in
+  production; a production suite,
+  `tests/resource_manager_gcp_integration.zig`, read only, that also
+  replays a set of scripts against production and the fake and holds the
+  fake to what production answered; and two nightly fuzz jobs,
+  `resource_manager` and `slow-resource_manager`.
 - auth, core, firestore, logging, pubsub, secret_manager and storage:
   unchanged.
 

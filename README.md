@@ -54,15 +54,16 @@ Pub/Sub, Cloud Storage, Secret Manager and Firestore, with credentials that find
 | 🔥 | [`firestore`](docs/firestore/README.md) | Cloud Firestore: documents read and written under preconditions, commits with field transforms, batched reads, queries and aggregations over collections and collection groups, large answers read one document at a time as they arrive, transactions run again on contention; the default database or a named one | beta |
 | 🔑 | [`secret_manager`](docs/secret-manager/README.md) | Secret Manager v1: a secret's bytes, verified and wiped after use; versions; secrets global or regional, their settings, notifications, rotation, encryption keys and IAM policies | experimental |
 | 📜 | [`logging`](docs/logging/README.md) | Cloud Logging v2, the read side: entries a page at a time under the read quota, a tail by polling, log names, buckets and views for a picker; an in-memory Cloud Logging for your own tests | experimental |
+| 🗂️ | [`resource_manager`](docs/resource_manager/README.md) | Cloud Resource Manager v3: every project a credential can see, in one list for a project switcher; one project as it is now; the folders and organizations above them, by name; an in-memory Resource Manager for your own tests | experimental |
 | 🪪 | [`auth`](docs/auth.md) | Credentials for the other modules: the metadata server, gcloud's login, service account keys, workload identity federation and impersonation; signing on this machine or through IAM | experimental |
 | ⚙️ | [`core`](docs/essentials.md) | What the service modules share: the HTTP transport, retries, `Diagnostics`, CRC-32C at the CPU's speed, IAM policies, the `TokenProvider` and `Signer` seams, and test fakes. Each service re-exports what its callers need. | beta |
 
 ```mermaid
 flowchart LR
-    app(["your program"]) --> pubsub & storage & secret_manager & firestore & logging
+    app(["your program"]) --> pubsub & storage & secret_manager & firestore & logging & resource_manager
     app --> auth
-    auth -. credentials .-> pubsub & storage & secret_manager & firestore & logging
-    pubsub & storage & secret_manager & firestore & logging & auth --> core
+    auth -. credentials .-> pubsub & storage & secret_manager & firestore & logging & resource_manager
+    pubsub & storage & secret_manager & firestore & logging & resource_manager & auth --> core
 ```
 
 The service modules never import one another, or `auth`: credentials
@@ -87,6 +88,7 @@ exe.root_module.addImport("secret_manager", gcp.module("secret_manager"));
 exe.root_module.addImport("storage", gcp.module("storage"));
 exe.root_module.addImport("firestore", gcp.module("firestore"));
 exe.root_module.addImport("logging", gcp.module("logging"));
+exe.root_module.addImport("resource_manager", gcp.module("resource_manager"));
 ```
 
 ## Quick start
@@ -153,6 +155,7 @@ says how.
 | 🔑 [Secret Manager](docs/secret-manager/README.md) | Reading secrets safely, changing them under an etag, notifications and rotation, regional secrets |
 | 🔥 [Firestore](docs/firestore/README.md) | Documents and their values, masks and preconditions, transforms and commits, queries and aggregations, transactions, and where the emulator differs |
 | 📜 [Cloud Logging](docs/logging/README.md) | Listing entries under the read quota, filters as production read them, a tail by polling, logs, buckets and views, and testing with a fake |
+| 🗂️ [Resource Manager](docs/resource_manager/README.md) | The projects a credential can see, for a switcher; the query language as production read it; the project each call is charged to; and testing with a fake |
 | 🛠️ [Development](docs/development.md) | Building, testing, fuzzing, coverage, and every integration suite |
 
 The [documentation index](docs/README.md) lists every page.
@@ -177,6 +180,7 @@ The [documentation index](docs/README.md) lists every page.
 | [`firestore`](examples/firestore.zig) | Writes, reads, updates, counts, queries and lists documents, and moves an amount between two in a transaction | `zig build example-firestore -- set cities/LA population=3900000` |
 | [`logs_read`](examples/logs_read.zig) | Lists log entries newest first, a page at a time, and says when a page came back empty with a token | `zig build example-logs_read -- --fake` |
 | [`logs_tail`](examples/logs_tail.zig) | Tails a filter by polling, each entry once, late ones caught by the overlap | `zig build example-logs_tail -- --fake` |
+| [`projects_list`](examples/projects_list.zig) | Lists every project the credentials can see, where each sits, and matches a few letters locally as a switcher would | `zig build example-projects_list -- --fake --match=pay` |
 
 `publish`, `publisher` and `worker` use the emulator when
 `PUBSUB_EMULATOR_HOST` is set, and otherwise a token in

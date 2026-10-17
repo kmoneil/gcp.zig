@@ -73,8 +73,9 @@ the properties too slow to share one: auth's RSA signing
 slow and heavy properties (`slow-storage`, `heavy-storage`), and its
 fault properties, which drive whole transfers through injected faults
 (`fault-storage`, `fault-gzip`), Firestore's model of writes against
-its fake (`heavy-firestore`), and Logging's tail by polling against its
-fake (`slow-logging`). A test that fails while being fuzzed
+its fake (`heavy-firestore`), Logging's tail by polling against its
+fake (`slow-logging`), and Resource Manager's walk of every page against
+its fake (`slow-resource_manager`). A test that fails while being fuzzed
 fails its job, and the input is attached to the run as
 `fuzz-failure-<job>`, such as `fuzz-failure-pubsub`.
 
@@ -206,6 +207,22 @@ answer the two do not share.
 ```sh
 GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth print-access-token) \
     zig build test-integration-gcp -Dtest-filter=logging
+```
+
+### Resource Manager
+
+Resource Manager has no emulator, so its tests need a token and the id
+of a project its principal can see. They only read: nothing is created,
+enabled or granted, and calls are free. Two tests name
+`bigquery-public-data` as the quota project, which no test principal may
+charge, to record production's refusal. The last test replays a set of
+scripts against production and against `FakeResourceManager`, set up as
+production answered, and fails on any answer the two do not share. A run
+takes a few seconds.
+
+```sh
+GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth print-access-token) \
+    zig build test-integration-gcp -Dtest-filter=resource_manager
 ```
 
 ### Secret Manager and bucket settings
