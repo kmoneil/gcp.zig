@@ -94,6 +94,14 @@ client.topic("orders").create(.{}) catch |err| {
 `error.ServerCancelled` is the server's CANCELLED status.
 `error.Canceled` means this task's `std.Io` operation was canceled.
 
+A refusal can ask its client to wait before trying again, by
+`Retry-After` (seconds, or an HTTP-date), `retry-after-ms`, or a
+`google.rpc.RetryInfo` detail in the error body. The longest of them is
+kept in `Diagnostics.retry_after_ms`, in milliseconds, whether or not
+the call was retried: the earliest time to try again, for an app that
+schedules its own next try. Measured on 2026-10-17, none of the services
+these modules call sends one; Google's front end does for some APIs.
+
 Cloud Storage's error bodies carry no canonical status, so there the
 HTTP code decides the error, and `Diagnostics.status()` keeps the
 server's `reason`, such as `notFound`. A few refusals are told apart by
@@ -112,6 +120,16 @@ UNAVAILABLE (and HTTP 502), DEADLINE_EXCEEDED, connections that were
 refused, reset or timed out, and failed TLS handshakes (std reports a
 connection dropped mid-handshake as a TLS failure). A call refused as
 unauthenticated, HTTP 401, gets a fresh token and one more try.
+
+A delay the server asked for is a floor: a retry waits the larger of
+its backoff and that delay. A delay longer than the policy's
+`max_backoff_ms` is not waited at all: the call returns its failure at
+once, the delay in `Diagnostics.retry_after_ms`, rather than hold a task
+asleep on the server's word. A delay never makes a refusal retryable
+that is not: a Logging or Resource Manager 429 is still returned, its
+delay kept. Every retry loop in the library, a module's own included
+(token fetches, IAM grants that start over, transfers that resume),
+waits by this rule.
 
 What else is safe to repeat depends on the call, and each module says:
 

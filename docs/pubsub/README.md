@@ -94,6 +94,13 @@ when the server has closed an idle connection. Retried creates and
 deletes can report `AlreadyExists` or `NotFound` for an attempt that
 succeeded but whose response was lost.
 
+A refusal that asks for a delay is waited at least that long, and one
+asking for longer than `max_backoff_ms` ends the retries at once, the
+delay in `Diagnostics.retry_after_ms`. That holds for the Publisher's
+retries within a batch's deadline too, and for `ackWithResults`: ids
+still refused when a delay is past the cap come back `.transient`, and
+the call's `Diagnostics` keeps the delay beside its summary.
+
 ## Limits
 
 The client checks these before sending and fails with

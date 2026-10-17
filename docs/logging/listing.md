@@ -165,4 +165,8 @@ project. A view's name is `PARENT/locations/L/buckets/B/views/V`:
 
 `Diagnostics` keeps the server's message. 5xx answers and dropped
 connections are retried by the client's `RetryPolicy`, each attempt
-counted against the budget; a 429 and a 4xx never are.
+counted against the budget; a 429 and a 4xx never are. A refusal that
+asks for a delay is kept in `Diagnostics.retry_after_ms`, waited by a
+retry, and after a 429 holds the client's later reads back for the
+longer of the quota window and that delay. Production's 429 asks for
+none.

@@ -209,13 +209,13 @@ pub const FakeResourceManager = struct {
 
     const Window = struct { minute: i96, count: u32 };
 
-    const Fault = struct { n: usize = 0, status: u16 = 0, max: usize = 0 };
+    const Fault = struct { n: usize = 0, status: u16 = 0, max: usize = 0, delay: ?core.retry_after.Asked = null };
     const refuse = 0;
     const drop = 1;
     const empty = 2;
     const short = 3;
 
-    pub const Reply = struct { status: u16, body: []const u8 };
+    pub const Reply = struct { status: u16, headers: []const tp.Header = &.{}, body: []const u8 };
 
     pub const WriteError = error{ OutOfMemory, InvalidEntry };
 
@@ -458,6 +458,14 @@ pub const FakeResourceManager = struct {
         f.setFault(refuse, .{ .n = n, .status = status });
     }
 
+    /// Answers them as `refuseNext` does, and asks the client to wait
+    /// `delay.ms` before trying again, in `delay.form`: for a test of how
+    /// an app schedules its next search. Resource Manager's own 429 sends
+    /// none.
+    pub fn refuseNextWithDelay(f: *FakeResourceManager, n: usize, status: u16, delay: core.retry_after.Asked) void {
+        f.setFault(refuse, .{ .n = n, .status = status, .delay = delay });
+    }
+
     /// Closes their connection before any answer.
     pub fn dropNext(f: *FakeResourceManager, n: usize) void {
         f.setFault(drop, .{ .n = n });
@@ -506,7 +514,7 @@ pub const FakeResourceManager = struct {
     fn send(ptr: *anyopaque, req: tp.Request, arena: Allocator) tp.Error!tp.Response {
         const f: *FakeResourceManager = @ptrCast(@alignCast(ptr));
         const reply = try f.serve(req, arena);
-        return .{ .status = reply.status, .body = reply.body };
+        return .{ .status = reply.status, .headers = reply.headers, .body = reply.body };
     }
 
     /// One request, as `send` serves it: for a test that wants to send
@@ -522,7 +530,7 @@ pub const FakeResourceManager = struct {
             if (req.method == .GET and std.mem.eql(u8, route, r[0])) {
                 f.search_calls += 1;
                 if (f.takeFault(drop) != null) return error.ConnectionResetByPeer;
-                if (f.takeFault(refuse)) |fault| return refusal(arena, fault.status);
+                if (f.takeFault(refuse)) |fault| return asking(arena, try refusal(arena, fault.status), fault.delay);
                 return f.search(arena, req, query, r[1]);
             }
         }
@@ -1173,6 +1181,12 @@ fn refusal(arena: Allocator, status: u16) Allocator.Error!FakeResourceManager.Re
     };
 }
 
+/// `reply`, asking for the delay a scripted refusal carries, if any.
+fn asking(arena: Allocator, reply: FakeResourceManager.Reply, delay: ?core.retry_after.Asked) Allocator.Error!FakeResourceManager.Reply {
+    const d = delay orelse return reply;
+    return .{ .status = reply.status, .headers = try d.headers(arena), .body = try d.intoBody(arena, reply.body) };
+}
+
 /// What this fake has no answer for: said, never guessed at.
 fn notModelled(arena: Allocator, what: []const u8) Allocator.Error!FakeResourceManager.Reply {
     return fail(arena, 501, "UNIMPLEMENTED", try std.fmt.allocPrint(arena, "fake: {s} is not modelled yet", .{what}));
@@ -1613,6 +1627,31 @@ test "faults: refusals and drops, retried as the client retries them" {
     f.refuseNext(1, 418);
     try testing.expectError(error.Unknown, r.client.allProjects(.{}));
     try testing.expectEqualStrings("fake: refused", r.diag.message());
+}
+
+test "faults: a refusal can ask for a delay, kept for the caller, and one past the cap is not retried" {
+    var r: Rig = undefined;
+    try r.init(.{}, .none);
+    defer r.deinit();
+    const f = &r.fake;
+    try f.addPrincipal("person-token", "home");
+    // A 429 is never retried here: the delay is the caller's to honour.
+    f.refuseNextWithDelay(1, 429, .{ .ms = 30_000, .form = .retry_info });
+    try testing.expectError(error.ResourceExhausted, r.client.allProjects(.{}));
+    try testing.expect(std.mem.indexOf(u8, r.diag.message(), "Quota exceeded") != null);
+    try testing.expectEqual(30_000, r.diag.retry_after_ms.?);
+    try testing.expectEqual(1, f.searchCalls());
+    // The rig's policy waits at most 0 ms, so a 503 asking for any delay
+    // ends at once, where one asking for none is retried.
+    f.refuseNextWithDelay(1, 503, .{ .ms = 1 });
+    try testing.expectError(error.Unavailable, r.client.allProjects(.{}));
+    try testing.expectEqual(2, f.searchCalls());
+    // All three forms: the header's whole second is the longest.
+    try testing.expectEqual(1_000, r.diag.retry_after_ms.?);
+    f.refuseNext(1, 503);
+    var list = try r.client.allProjects(.{});
+    list.deinit();
+    try testing.expectEqual(4, f.searchCalls());
 }
 
 test "queries through the client: production's refusals are InvalidQuery; what is not modelled says so" {

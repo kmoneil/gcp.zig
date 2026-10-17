@@ -65,8 +65,9 @@ test "the switcher finds a project by a few letters, from a fake" {
 - **The query language**, as the table in [Listing
   projects](projects.md#the-query-language-as-production-read-it) shows,
   refused in production's words where production refused.
-- **Faults** on searches: `refuseNext`, `dropNext`, `emptyNext`,
-  `shortenNext`.
+- **Faults** on searches: `refuseNext`, `refuseNextWithDelay` for a
+  refusal that asks the client to wait, in any of the three forms,
+  `dropNext`, `emptyNext`, `shortenNext`.
 
 ## What it does not model
 

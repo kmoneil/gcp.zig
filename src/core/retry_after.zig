@@ -18,6 +18,9 @@
 //! library covers sends any of the three: Logging's and Cloud Storage's 429s
 //! carry neither header and no RetryInfo. Google's front end sends all three
 //! for Gemini-family hosts, and Spanner sends RetryInfo on ABORTED.
+//!
+//! `Asked` writes a delay in any of the forms, for the fakes, whose scripted
+//! refusals stand in for a server that asks.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -204,6 +207,82 @@ fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
     return era * 146097 + doe - 719468;
 }
 
+/// A delay a server asks for, and the form or forms it asks in: what the
+/// fakes script on the refusals they inject, so that a caller's offline
+/// checks can drive its own scheduling.
+pub const Asked = struct {
+    ms: u32,
+    form: Form = .all,
+
+    pub const Form = enum {
+        /// `Retry-After`, in whole seconds, rounded up.
+        retry_after,
+        /// `retry-after-ms`.
+        retry_after_ms,
+        /// A `google.rpc.RetryInfo` detail in the error body.
+        retry_info,
+        /// All three at once, as Google's front end sends them.
+        all,
+    };
+
+    /// The headers that carry it, in `arena`.
+    pub fn headers(a: Asked, arena: Allocator) Allocator.Error![]const transport.Header {
+        var list: std.ArrayList(transport.Header) = .empty;
+        if (a.form == .retry_after or a.form == .all) {
+            try list.append(arena, .{ .name = "Retry-After", .value = try std.fmt.allocPrint(arena, "{d}", .{a.seconds()}) });
+        }
+        if (a.form == .retry_after_ms or a.form == .all) {
+            try list.append(arena, .{ .name = "retry-after-ms", .value = try std.fmt.allocPrint(arena, "{d}", .{a.ms}) });
+        }
+        return list.items;
+    }
+
+    /// `body` with a RetryInfo detail added to its `error.details` when the
+    /// form has one, in `arena`. A body that is not a Google API error body
+    /// comes back as it is.
+    pub fn intoBody(a: Asked, arena: Allocator, body: []const u8) Allocator.Error![]const u8 {
+        if (a.form != .retry_info and a.form != .all) return body;
+        var root = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return body,
+        };
+        if (root != .object) return body;
+        const err_value = root.object.getPtr("error") orelse return body;
+        if (err_value.* != .object) return body;
+        const details: *std.json.Array = details: {
+            if (err_value.object.getPtr("details")) |d| if (d.* == .array) break :details &d.array;
+            try err_value.object.put(arena, "details", .{ .array = .init(arena) });
+            break :details &err_value.object.getPtr("details").?.array;
+        };
+        var detail: std.json.ObjectMap = .empty;
+        try detail.put(arena, "@type", .{ .string = "type.googleapis.com/google.rpc.RetryInfo" });
+        try detail.put(arena, "retryDelay", .{ .string = try a.retryDelay(arena) });
+        try details.append(.{ .object = detail });
+        return std.json.Stringify.valueAlloc(arena, root, .{});
+    }
+
+    /// What a client that reads every form, as `serverDelayMs` does, takes
+    /// it for: the header's seconds are rounded up, and the largest wins.
+    pub fn readMs(a: Asked) u32 {
+        return switch (a.form) {
+            .retry_after, .all => saturate(@as(u128, a.seconds()) * std.time.ms_per_s),
+            .retry_after_ms, .retry_info => a.ms,
+        };
+    }
+
+    fn seconds(a: Asked) u32 {
+        return a.ms / std.time.ms_per_s + @intFromBool(a.ms % std.time.ms_per_s != 0);
+    }
+
+    /// A Duration as Google writes one: "2s", or "1.500s".
+    fn retryDelay(a: Asked, arena: Allocator) Allocator.Error![]const u8 {
+        const whole = a.ms / std.time.ms_per_s;
+        const part = a.ms % std.time.ms_per_s;
+        if (part == 0) return std.fmt.allocPrint(arena, "{d}s", .{whole});
+        return std.fmt.allocPrint(arena, "{d}.{d:0>3}s", .{ whole, part });
+    }
+};
+
 const testing = std.testing;
 const test_util = @import("testing.zig");
 
@@ -353,6 +432,91 @@ test "serverDelayMs: every allocation failure is OutOfMemory without leaks" {
         }
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+}
+
+test "Asked: each form, written as servers write it, and read back" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = "{\"error\":{\"code\":503,\"message\":\"busy\",\"status\":\"UNAVAILABLE\"}}";
+
+    const header_only: Asked = .{ .ms = 1_500, .form = .retry_after };
+    const sent = try header_only.headers(a);
+    try testing.expectEqual(1, sent.len);
+    try testing.expectEqualStrings("Retry-After", sent[0].name);
+    try testing.expectEqualStrings("2", sent[0].value);
+    try testing.expectEqualStrings(body, try header_only.intoBody(a, body));
+    try testing.expectEqual(2_000, header_only.readMs());
+
+    const ms_only: Asked = .{ .ms = 1_500, .form = .retry_after_ms };
+    try testing.expectEqualStrings("retry-after-ms", (try ms_only.headers(a))[0].name);
+    try testing.expectEqualStrings("1500", (try ms_only.headers(a))[0].value);
+    try testing.expectEqual(1_500, ms_only.readMs());
+
+    const info: Asked = .{ .ms = 1_500, .form = .retry_info };
+    try testing.expectEqual(0, (try info.headers(a)).len);
+    try testing.expectEqualStrings(
+        "{\"error\":{\"code\":503,\"message\":\"busy\",\"status\":\"UNAVAILABLE\",\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"1.500s\"}]}}",
+        try info.intoBody(a, body),
+    );
+    try testing.expectEqual(1_500, info.readMs());
+    // Whole seconds are written as such, and details already there stay.
+    try testing.expectEqualStrings(
+        "{\"error\":{\"details\":[{\"@type\":\"x\"},{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"30s\"}]}}",
+        try (Asked{ .ms = 30_000, .form = .retry_info }).intoBody(a, "{\"error\":{\"details\":[{\"@type\":\"x\"}]}}"),
+    );
+    // Not an error body: left alone.
+    for ([_][]const u8{ "", "nope", "[1]", "{\"error\":\"busy\"}" }) |other| {
+        try testing.expectEqualStrings(other, try info.intoBody(a, other));
+    }
+
+    const all: Asked = .{ .ms = 1_500 };
+    try testing.expectEqual(2, (try all.headers(a)).len);
+    // All three: the body carries the delay too, unrounded.
+    try testing.expectEqual(1_500, try errors.decodeRetryDelayMs(a, try all.intoBody(a, body)));
+    try testing.expectEqual(2_000, all.readMs());
+    try testing.expectEqual(2_000, try serverDelayMs(a, try all.headers(a), try all.intoBody(a, body), at(0)));
+    // The longest delay there is: the header's seconds saturate.
+    try testing.expectEqual(max_ms, (Asked{ .ms = max_ms }).readMs());
+    try testing.expectEqual(0, (Asked{ .ms = 0 }).readMs());
+}
+
+test "Asked: every allocation failure is OutOfMemory without leaks" {
+    const Run = struct {
+        fn run(gpa: Allocator) !void {
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            const a: Asked = .{ .ms = 2_250 };
+            _ = try a.headers(arena.allocator());
+            _ = try a.intoBody(arena.allocator(), "{\"error\":{\"code\":429,\"details\":[{\"@type\":\"x\"}]}}");
+        }
+    };
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+}
+
+fn askedProperty(_: void, input: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(std.heap.smp_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var g: test_util.ByteGen = .init(input);
+    // Whatever is asked, in whatever form, on whatever body: what is read
+    // back is `readMs`, or, from a body that holds no error, the headers'.
+    const asked: Asked = .{ .ms = g.int(u32), .form = g.pick(Asked.Form, &.{ .retry_after, .retry_after_ms, .retry_info, .all }) };
+    const body = g.pick([]const u8, &.{
+        "{\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\"}}",
+        "{\"error\":{\"code\":429,\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfo\",\"reason\":\"RATE_LIMIT_EXCEEDED\"}]}}",
+        "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"0s\"}]}}",
+        "Service Unavailable",
+        "",
+    });
+    const got = try serverDelayMs(a, try asked.headers(a), try asked.intoBody(a, body), at(1_792_255_951));
+    const errored = std.mem.startsWith(u8, body, "{");
+    const want: ?u32 = if (errored or asked.form != .retry_info) asked.readMs() else null;
+    try testing.expectEqual(want, got);
+}
+
+test "fuzz Asked: any delay in any form reads back as readMs says" {
+    try test_util.fuzzBytes({}, askedProperty, .{ .corpus = &.{ "", "\xff\xff\xff\xff\x03", "\xdc\x05\x00\x00\x02\x00" } });
 }
 
 fn durationProperty(_: void, input: []const u8) !void {
