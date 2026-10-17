@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.41.0 (unreleased)
+## 0.41.0 (2026-10-17)
 
 - core: a server's retry delay is read and honoured. When a refused
   response asks its client to wait, by `Retry-After` (seconds, or an
