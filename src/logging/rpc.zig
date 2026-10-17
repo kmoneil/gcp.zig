@@ -39,6 +39,7 @@ fn engine(client: *Client) Engine {
         .retry = client.retry,
         .request_timeout_ms = client.request_timeout_ms,
         .diagnostics = client.diagnostics,
+        .server_delay_out = &client.server_delay_ms,
     };
 }
 
@@ -88,9 +89,13 @@ pub fn listEntries(client: *Client, response: *std.heap.ArenaAllocator, body: []
         if (e.execute(response, .{ .method = .POST, .path = list_path, .body = body, .headers = headers, .retry = false, .error_body_out = &error_body })) |page| {
             return page;
         } else |err| {
-            if (err == error.ResourceExhausted) client.budget.pauseFor(client.io, try quotaPauseNs(client, error_body));
+            if (err == error.ResourceExhausted) {
+                // The quota window's end, or longer if the server asked.
+                const asked: i96 = @as(i96, client.server_delay_ms orelse 0) * std.time.ns_per_ms;
+                client.budget.pauseFor(client.io, @max(try quotaPauseNs(client, error_body), asked));
+            }
             if (attempt >= client.retry.max_attempts or !retryable(err, diag.http_status)) return mapped(client, err, diag);
-            const delay_ms = client.retry.backoffMs(attempt, core.rpc.entropy(client.io));
+            const delay_ms = client.retry.waitMs(attempt, core.rpc.entropy(client.io), client.server_delay_ms) orelse return mapped(client, err, diag);
             log.warn("POST /v2/entries:list failed with {t}; retrying in {d} ms (attempt {d} of {d})", .{
                 err, delay_ms, attempt + 1, client.retry.max_attempts,
             });
@@ -160,6 +165,31 @@ pub fn decodeFailed(client: *Client, err: codec.DecodeError, what: []const u8) E
         if (client.diagnostics) |d| d.print("the {s} response could not be decoded", .{what});
     }
     return err;
+}
+
+test "listEntries: a server's delay is waited, one past the cap returns, and a 429's widens the pause" {
+    const test_util = @import("test_util.zig");
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "3" }}, .body = "{\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\"}}" } },
+        .{ .respond = .{ .body = "{}" } },
+        .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "60" }}, .body = "{\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\"}}" } },
+        .{ .respond = .{ .status = 429, .headers = &.{.{ .name = "Retry-After", .value = "30" }}, .body = "{\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\"}}" } },
+    }, .{});
+    defer h.deinit();
+    var q = try h.client.query(.{});
+    defer q.deinit();
+    var p = try q.page(null);
+    p.deinit();
+    try std.testing.expectEqual(3_000, h.clock.sleepMs(0));
+    // Past the 10 s cap: one attempt, the delay kept.
+    try std.testing.expectError(error.Unavailable, q.page(null));
+    try h.expectRequestCount(3);
+    try std.testing.expectEqual(60_000, h.diag.retry_after_ms.?);
+    // A 429 is never retried; it holds calls back for the 30 s it asked,
+    // past the 5 s a 429 naming no window gets.
+    try std.testing.expectError(error.ResourceExhausted, q.page(null));
+    try std.testing.expectEqual(30_000, h.client.readBudget().next_free_ms);
 }
 
 test "retryable: what core retries, but never a 429" {

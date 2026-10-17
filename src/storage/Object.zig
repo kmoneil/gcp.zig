@@ -861,7 +861,7 @@ fn downloadBilled(self: Object, writer: *std.Io.Writer, options: types.DownloadO
                 return err;
             }
         }
-        const delay_ms = rpc.backoffMs(self.client, attempt);
+        const delay_ms = rpc.waitMs(self.client, attempt, self.client.server_delay_ms) orelse return err;
         logging.warn("GET {s} (alt=media) failed with {t}; resuming at byte {d} in {d} ms", .{
             self.name, err, base_offset + counting.count, delay_ms,
         });
@@ -1386,6 +1386,32 @@ test "downloadAlloc resumes after a cut connection and rides out a 503" {
         );
         try testing.expectEqualStrings("bytes=5-", resume_req.header("Range").?);
     }
+}
+
+test "a download waits a 503's delay before asking again, and one past the cap returns at once" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "2" }}, .body = "{}" } },
+        .{ .respond = .{
+            .body = "hello world\n",
+            .headers = &.{
+                .{ .name = "x-goog-generation", .value = "7" },
+                .{ .name = "x-goog-hash", .value = "crc32c=8P9ykg==" },
+            },
+        } },
+        .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "60" }}, .body = "{}" } },
+    }, .{});
+    defer h.deinit();
+    const a = h.client.bucket("b").object("a");
+    var got = try a.downloadAlloc(1024, .{});
+    defer got.deinit();
+    try testing.expectEqualStrings("hello world\n", got.value.data);
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(2_000, h.clock.sleepMs(0));
+    try testing.expectError(error.Unavailable, a.downloadAlloc(1024, .{}));
+    try testing.expectEqual(3, h.fake.stream_requests.items.len);
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(60_000, h.diag.retry_after_ms.?);
 }
 
 test "a resumed download is held to the first response's checksum" {

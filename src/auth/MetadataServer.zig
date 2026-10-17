@@ -360,7 +360,8 @@ fn getRetrying(self: *MetadataServer, io: std.Io, arena: Allocator, url: []const
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {
         const started = std.Io.Clock.awake.now(io);
-        const result = self.get(arena, url);
+        var asked: ?u32 = null;
+        const result = self.get(io, arena, url, &asked);
         const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
         switch (result) {
             .ok => |res| {
@@ -374,7 +375,12 @@ fn getRetrying(self: *MetadataServer, io: std.Io, arena: Allocator, url: []const
             .retry => |err| {
                 logging.debug("GET {s} -> {t} in {d} ms (attempt {d} of {d})", .{ url, err, elapsed_ms, attempt, max_attempts });
                 if (attempt >= max_attempts) return err;
-                const delay_ms = self.retry.backoffMs(attempt, entropy(io));
+                const delay_ms = self.retry.waitMs(attempt, entropy(io), asked) orelse {
+                    logging.warn("the metadata server failed with {t}; not retried: it asked to wait {d} ms, longer than max_backoff_ms ({d} ms)", .{
+                        err, asked.?, self.retry.max_backoff_ms,
+                    });
+                    return err;
+                };
                 logging.warn("the metadata server failed with {t}; retrying in {d} ms (attempt {d} of {d})", .{
                     err, delay_ms, attempt + 1, max_attempts,
                 });
@@ -393,8 +399,9 @@ const Attempt = union(enum) {
 
 /// One GET, and what to make of the answer. The body is never copied into
 /// `Diagnostics`: the metadata server answers in plain text, and whatever
-/// answered may not be the metadata server at all.
-fn get(self: *MetadataServer, arena: Allocator, url: []const u8) Attempt {
+/// answered may not be the metadata server at all. `asked` gets the wait a
+/// refusal from the metadata server asks for.
+fn get(self: *MetadataServer, io: std.Io, arena: Allocator, url: []const u8, asked: *?u32) Attempt {
     const res = self.transport.send(.{
         .method = .GET,
         .url = url,
@@ -409,6 +416,13 @@ fn get(self: *MetadataServer, arena: Allocator, url: []const u8) Attempt {
         return .{ .fail = error.MetadataUnavailable };
     }
     if (res.status == 200) return .{ .ok = res };
+    const outcome = self.describeRefusal(res);
+    asked.* = token_response.askedDelayMs(io, arena, res, self.diagnostics) catch return .{ .fail = error.OutOfMemory };
+    return outcome;
+}
+
+/// What a refusal from the metadata server means, put in `Diagnostics`.
+fn describeRefusal(self: *MetadataServer, res: Response) Attempt {
     if (res.status == 404) {
         if (self.diagnostics) |d| d.set(res.status, "", "no service account is attached to this workload");
         return .{ .fail = error.MetadataUnavailable };
@@ -672,6 +686,29 @@ test "MetadataServer: a busy server is retried, then TokenUnavailable" {
     try testing.expectError(error.TokenUnavailable, gone.get());
     try testing.expectEqual(3, gone.fake.requests.items.len);
     try testing.expectEqualStrings("the metadata server is busy or broken", gone.diag.message());
+}
+
+test "MetadataServer: the metadata server's delay is waited, one past the cap returns at once, and no one else's is read" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 503, .body = "busy", .headers = &.{ .{ .name = "Metadata-Flavor", .value = "Google" }, .{ .name = "Retry-After", .value = "3" } } } },
+        token_ok,
+        .{ .respond = .{ .status = 503, .body = "busy", .headers = &.{ .{ .name = "Metadata-Flavor", .value = "Google" }, .{ .name = "Retry-After", .value = "30" } } } },
+        .{ .respond = .{ .status = 503, .body = "busy", .headers = &.{.{ .name = "Retry-After", .value = "3" }} } },
+    });
+    defer h.deinit();
+    try testing.expectEqualStrings("ya29.SECRET-metadata", try h.get());
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(3_000, h.clock.sleepMs(0));
+    h.metadata.provider().invalidate();
+    try testing.expectError(error.TokenUnavailable, h.get());
+    try testing.expectEqual(3, h.fake.requests.items.len);
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(30_000, h.diag.retry_after_ms.?);
+    // Without Metadata-Flavor the answer is not the metadata server's, and
+    // neither is its delay.
+    try testing.expectError(error.MetadataUnavailable, h.get());
+    try testing.expectEqual(null, h.diag.retry_after_ms);
 }
 
 test "MetadataServer: another refusal is TokenEndpointRejected, not retried" {

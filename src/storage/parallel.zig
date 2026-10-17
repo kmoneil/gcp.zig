@@ -1129,11 +1129,13 @@ const Worker = struct {
                     const sent = mp.sendPart(&w.client, w.arena.allocator(), run.bucket, run.object, run.upload_id, number, .{
                         .stream = .{ .reader = &hashed.reader, .len = len },
                     }) catch |err| {
+                        // Taken before `uploadIsGone`, which may ask the server.
+                        const asked = w.client.server_delay_ms;
                         const again = err != error.Canceled and err != error.ReadFailed and
                             core.isRetryable(err) and attempt < w.client.retry.max_attempts and
                             !mp.uploadIsGone(&w.client, err);
                         if (!again) return w.partFailed(err, number);
-                        const delay_ms = rpc.backoffMs(&w.client, attempt);
+                        const delay_ms = rpc.waitMs(&w.client, attempt, asked) orelse return w.partFailed(err, number);
                         logging.warn("part {d} of {s} failed with {t}; sending it again in {d} ms", .{ number, run.object, err, delay_ms });
                         try run.client.io.sleep(.fromMilliseconds(delay_ms), .awake);
                         continue;
@@ -1452,6 +1454,33 @@ test "uploadParallel: transient failures are sent again, never written twice" {
         // the store, the start's 503 included.
         try testing.expectEqual(5 + 1, s.fake.counts.parts);
         try testing.expectEqual(1, s.fake.counts.starts);
+        try testing.expectEqual(0, s.fake.openUploads());
+    }
+}
+
+test "uploadParallel: a part refused with a delay past the cap fails the upload, not sent again" {
+    var rules = [_]Script.Rule{.{ .kind = .part, .part = 2, .fault = .unavailable }};
+    var script: Script = .{ .rules = &rules };
+    for ([_]bool{ false, true }) |from_file| {
+        var s: Setup = undefined;
+        try s.init(testing.io, .{});
+        defer s.deinit();
+        rules[0].times = 1;
+        // The setup's policy waits at most 2 ms; the server asks for 1 s.
+        s.fake.retry_after = "1";
+        s.fake.faults = script.plan();
+        var data: [40 * 1024]u8 = undefined;
+        fill(&data, 5);
+
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = &data });
+        const file = try tmp.dir.openFile(testing.io, "f", .{});
+        defer file.close(testing.io);
+        const source: types.ParallelSource = if (from_file) .{ .file = file } else .{ .data = &data };
+
+        // Sent again, part 2 would go through: the one 503 is all there is.
+        try testing.expectError(error.Unavailable, s.object("o").uploadParallel(source, .{ .part_size = 8 * 1024, .concurrency = 3 }));
         try testing.expectEqual(0, s.fake.openUploads());
     }
 }

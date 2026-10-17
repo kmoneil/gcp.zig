@@ -1065,7 +1065,8 @@ fn sendBatch(self: *Publisher, client: *Client, diag: *Diagnostics, batch: *Batc
             // have been swallowed (docs/zig-std-workarounds.md): the last
             // failure stands rather than retrying toward the deadline.
             if (self.isHalted()) return err;
-            const delay_ms = self.retry.backoffMs(attempt, core.rpc.entropy(io));
+            // A server's delay past the cap stops here, kept in Diagnostics.
+            const delay_ms = self.retry.waitMs(attempt, core.rpc.entropy(io), client.server_delay_ms) orelse return err;
             // No time for another attempt: the failure stands.
             if (delay_ms >= msUntil(io, batch.deadline)) return err;
             logging.warn("publishing {d} messages failed with {t}; retrying in {d} ms", .{ batch.count, err, delay_ms });
@@ -1185,6 +1186,8 @@ const FakeTopic = struct {
         slow: u32,
         /// Take this long, then answer with this status.
         slow_status: struct { u32, u16, []const u8 },
+        /// Answer with this status and `Retry-After` value.
+        asking: struct { u16, []const u8, []const u8 },
     };
 
     fn deinit(f: *FakeTopic) void {
@@ -1318,6 +1321,14 @@ const FakeTopic = struct {
                 const ms, const code, const status = s;
                 io.sleep(.fromMilliseconds(ms), .awake) catch return error.Canceled;
                 return errorResponse(arena, code, status);
+            },
+            .asking => |s| {
+                const code, const status, const after = s;
+                var res = try errorResponse(arena, code, status);
+                const headers = try arena.alloc(core.transport.Header, 1);
+                headers[0] = .{ .name = "Retry-After", .value = after };
+                res.headers = headers;
+                return res;
             },
             .fail => |err| return err,
             .ok, .short => {},
@@ -1664,6 +1675,36 @@ test "deadlines: transient failures are retried until the deadline, then the las
     s.fake.mutex.lockUncancelable(s.fake.io);
     defer s.fake.mutex.unlock(s.fake.io);
     for (s.fake.requests.items) |seen| try testing.expect(seen.at_ns < 5_000 * std.time.ns_per_ms);
+}
+
+test "deadlines: a server's delay is waited, and one past the cap ends the retries at once" {
+    var s: Solo = undefined;
+    try s.init(.{});
+    defer s.deinit();
+    s.fake.script = &.{
+        .{ .asking = .{ 503, "UNAVAILABLE", "1" } },
+        .ok,
+        .{ .asking = .{ 503, "UNAVAILABLE", "30" } },
+    };
+    const first = try s.publishText("waits");
+    defer first.release();
+    s.advance(10);
+    try s.publisher.sendDue();
+    try testing.expectEqualStrings("1", try idOf(first));
+    {
+        s.fake.mutex.lockUncancelable(s.fake.io);
+        defer s.fake.mutex.unlock(s.fake.io);
+        const gap = s.fake.requests.items[1].at_ns - s.fake.requests.items[0].at_ns;
+        try testing.expect(gap >= 1_000 * std.time.ns_per_ms and gap < 1_100 * std.time.ns_per_ms);
+    }
+    // 30 s is inside the batch's deadline, but past the policy's 1 s cap.
+    const second = try s.publishText("refused");
+    defer second.release();
+    s.advance(10);
+    try s.publisher.sendDue();
+    try testing.expectError(error.Unavailable, idOf(second));
+    try testing.expectEqual(3, s.fake.requestCount());
+    try testing.expectEqual(30_000, second.diagnostics().retry_after_ms.?);
 }
 
 test "deadlines: a failure that clears in time is survived" {

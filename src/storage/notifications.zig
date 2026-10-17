@@ -207,7 +207,7 @@ pub fn create(client: *Client, bucket: []const u8, config: types.NotificationCon
             if (!core.isRetryable(err)) return err;
             // It may have landed with its answer lost. Give it time to,
             // then look for it.
-            const delay_ms = rpc.backoffMs(client, attempt);
+            const delay_ms = rpc.waitMs(client, attempt, client.server_delay_ms) orelse return err;
             logging.warn("creating a notification configuration on {s} failed with {t}; looking for it in {d} ms", .{ bucket, err, delay_ms });
             try client.io.sleep(.fromMilliseconds(delay_ms), .awake);
             var after = list(client, bucket) catch |list_err| {
@@ -788,6 +788,30 @@ test "a create that never lands stops at the retry policy's attempts" {
     // A list, then three attempts, each looked for after: the last too,
     // since it may have landed as well.
     try testing.expectEqual(7, faults.seen);
+}
+
+test "a create refused with a delay waits it before looking, and one past the cap returns at once" {
+    const busy = "{\"error\":{\"code\":503,\"message\":\"Backend Error\"}}";
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = empty_list } },
+        .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "2" }}, .body = busy } },
+        .{ .respond = .{ .body = empty_list } },
+        .{ .respond = .{ .body = minimal_answer } },
+        .{ .respond = .{ .body = empty_list } },
+        .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "60" }}, .body = busy } },
+    }, .{});
+    defer h.deinit();
+    const b = h.client.bucket("zigps-ntf");
+    var made = try b.createNotification(minimal);
+    defer made.deinit();
+    try testing.expectEqualStrings("1", made.value.id);
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(2_000, h.clock.sleepMs(0));
+    try testing.expectError(error.Unavailable, b.createNotification(minimal));
+    try h.expectRequestCount(6);
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(60_000, h.diag.retry_after_ms.?);
 }
 
 test "a create whose answer was lost, and whose look for it fails, says it may exist" {

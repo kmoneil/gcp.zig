@@ -339,6 +339,23 @@ test "IamSigner: busy IAM is retried with backoff, and three busy answers are Si
     try testing.expectEqual(6, h.fake.requests.items.len);
 }
 
+test "IamSigner: IAM's delay is waited, and one past the cap returns at once" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "4" }}, .body = "Service Unavailable" } },
+        signed,
+        .{ .respond = .{ .status = 429, .body = test_util.retryInfoBody(429, "RESOURCE_EXHAUSTED", "45s") } },
+    }, &.{});
+    defer h.deinit();
+    try testing.expectEqualSlices(u8, &test_signature, try h.sign());
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(4_000, h.clock.sleepMs(0));
+    try testing.expectError(error.SigningFailed, h.sign());
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(3, h.fake.requests.items.len);
+    try testing.expectEqual(45_000, h.diag.retry_after_ms.?);
+}
+
 test "IamSigner: a dropped connection is retried; an unknown host is not" {
     var h: Harness = undefined;
     try h.init(&.{ .{ .fail = error.ConnectionResetByPeer }, signed, .{ .fail = error.UnknownHostName } }, &.{});

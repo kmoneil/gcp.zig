@@ -77,7 +77,7 @@ pub fn create(client: *Client, bucket: []const u8, path: []const u8) Error!types
         } else |err| {
             result.deinit();
             if (!core.isRetryable(err)) return err;
-            const delay_ms = rpc.backoffMs(client, attempt);
+            const delay_ms = rpc.waitMs(client, attempt, client.server_delay_ms) orelse return err;
             logging.warn("creating managed folder {s} in {s} failed with {t}; reading it in {d} ms", .{ folder, bucket, err, delay_ms });
             try client.io.sleep(.fromMilliseconds(delay_ms), .awake);
             if (get(client, bucket, folder)) |found| {
@@ -288,6 +288,26 @@ test "a create whose answer was lost is read back, not sent again" {
     try h.expectRequest(1, .GET, "https://storage.googleapis.com/storage/v1/b/zigps-mf/managedFolders/m1%2F", null);
     try h.expectRequestCount(2);
     try testing.expectEqual(0, h.diag.message().len);
+}
+
+test "a create refused with a delay waits it before reading back, and one past the cap returns at once" {
+    const busy = "{\"error\":{\"code\":503,\"message\":\"Backend Error\"}}";
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "2" }}, .body = busy } },
+        .{ .respond = .{ .body = managed_answer } },
+        .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "60" }}, .body = busy } },
+    }, .{});
+    defer h.deinit();
+    const managed = h.client.bucket("zigps-mf").managedFolder("m1/");
+    var made = try managed.create();
+    defer made.deinit();
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(2_000, h.clock.sleepMs(0));
+    try testing.expectError(error.Unavailable, managed.create());
+    try h.expectRequestCount(3);
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(60_000, h.diag.retry_after_ms.?);
 }
 
 test "a lost create whose read-back fails says it may exist, and NotFound tries again" {

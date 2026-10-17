@@ -21,9 +21,30 @@ including the ones that did not change.
   makes a status retryable. `core.retry_after` reads the three forms.
   Measured on 2026-10-17, none of the services these modules call sends
   any of them, so nothing changes against Google today.
-- auth, firestore, logging, pubsub, resource_manager, secret_manager and
-  storage: unchanged so far; their own retry loops follow in the next
-  milestone.
+- auth: the token providers' and IAM Credentials' retry loops honour a
+  server's delay the same way, and a refusal from a token endpoint, the
+  STS, a `credential_source` URL, the metadata server or IAM keeps it in
+  `Diagnostics.retry_after_ms`. The metadata server's is read only from
+  an answer that carries `Metadata-Flavor`.
+- firestore: an aborted transaction runs again after at least the delay
+  its `ABORTED` asked for; one past the cap returns the abort.
+- logging: `entries.list` retries wait at least a server's delay, and a
+  429 holds later reads back for the larger of its quota window and the
+  delay it asked for.
+- pubsub: the Publisher, schema commits, `detach` and the ack loops
+  honour a server's delay. One past the cap ends a batch's retries before
+  its deadline, and leaves ack ids still refused for now `.transient`,
+  the delay kept beside the call's summary in `Diagnostics`. IAM grants
+  that start over wait a refused write's delay.
+- resource_manager: nothing of its own: it never retries a 429, and its
+  refusals keep their delay in `Diagnostics` as every module's do.
+- secret_manager: IAM grants that start over wait a refused write's
+  delay. A version read again after a checksum mismatch follows a 200,
+  which asks for no delay, so it keeps its backoff.
+- storage: ACL and IAM grants that start over, download resumes, folder,
+  managed folder and notification creates, and parallel and resumable
+  uploads' parts and chunks honour a server's delay. A resumable chunk,
+  sent to its session past the engine, reads the delay itself.
 
 ## 0.40.0 (2026-10-17)
 

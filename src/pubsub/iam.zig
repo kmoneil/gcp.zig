@@ -45,6 +45,10 @@ pub const Resource = struct {
         const conditional = if (policy.etag) |etag| etag.len > 0 else false;
         return fetch(r.client, .{ .method = .POST, .path = path, .body = try core.iam.encodeSet(a, policy), .retry = conditional });
     }
+    /// The delay the last refused call asked for, for `core.iam.update`.
+    pub fn serverDelayMs(r: Resource) ?u32 {
+        return r.client.server_delay_ms;
+    }
 };
 
 /// `setIamPolicy`, after the checks: no condition, which Pub/Sub refuses,
@@ -281,6 +285,28 @@ test "IAM: a write under an etag is retried, one without is sent once, and a gra
         try testing.expectEqual(@as(i64, policy.backoffMs(1, std.math.maxInt(u64))), h.clock.sleepMs(0));
         try testing.expect(h.clock.sleepMs(0) > 0);
     }
+}
+
+test "IAM: a refused write's delay is waited before the grant starts over, and one past the cap ends it" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "{\"etag\":\"E1\"}" } },
+        .{ .respond = .{ .status = 409, .headers = &.{.{ .name = "Retry-After", .value = "2" }}, .body = aborted } },
+        .{ .respond = .{ .body = "{\"etag\":\"E2\"}" } },
+        .{ .respond = .{ .body = "{\"version\":1,\"etag\":\"E3\",\"bindings\":[{\"role\":\"roles/pubsub.subscriber\",\"members\":[\"" ++ agent ++ "\"]}]}" } },
+        .{ .respond = .{ .body = "{\"etag\":\"E3\"}" } },
+        .{ .respond = .{ .status = 409, .headers = &.{.{ .name = "Retry-After", .value = "60" }}, .body = aborted } },
+    }, .{});
+    defer h.deinit();
+    const sub = h.client.subscription("sub");
+    var granted = try sub.addIamBinding("roles/pubsub.subscriber", agent);
+    defer granted.deinit();
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(2_000, h.clock.sleepMs(0));
+    try testing.expectError(error.Aborted, sub.addIamBinding("roles/pubsub.viewer", agent));
+    try h.expectRequestCount(6);
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(60_000, h.diag.retry_after_ms.?);
 }
 
 test "IAM: the emulator's 501 is Unimplemented, and a missing resource's test is NotFound" {

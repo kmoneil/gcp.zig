@@ -474,8 +474,11 @@ const Machine = struct {
                         self.maybeCancel(&response, session_uri, err);
                         return err;
                     }
+                    const delay_ms = rpc.waitMs(self.client, attempt - 1, self.client.server_delay_ms) orelse {
+                        self.maybeCancel(&response, session_uri, err);
+                        return err;
+                    };
                     querying = true;
-                    const delay_ms = rpc.backoffMs(self.client, attempt - 1);
                     logging.warn("resumable chunk at byte {d} failed with {t}; querying the session in {d} ms (attempt {d} of {d})", .{
                         self.confirmed, err, delay_ms, attempt, self.client.retry.max_attempts,
                     });
@@ -705,7 +708,8 @@ const Machine = struct {
     }
 
     /// One request to the session URI, which carries no credentials: the
-    /// URI itself is the authorization.
+    /// URI itself is the authorization. It goes past the engine, so it
+    /// keeps the delay a refusal asks for in `client.server_delay_ms` itself.
     fn exchange(
         self: *Machine,
         response: *std.heap.ArenaAllocator,
@@ -714,6 +718,7 @@ const Machine = struct {
         segments: []const []const u8,
         what: []const u8,
     ) Exchange {
+        self.client.server_delay_ms = null;
         const started = std.Io.Clock.awake.now(self.client.io);
         const outcome = self.client.transport.sendStream(.{
             .method = .PUT,
@@ -760,6 +765,10 @@ const Machine = struct {
         var local: core.Diagnostics = .{};
         const d = self.client.diagnostics orelse &local;
         d.set(res.status, status_text, message);
+        const asked = core.retry_after.serverDelayMs(scratch.allocator(), res.headers, res.body, std.Io.Clock.real.now(self.client.io)) catch
+            return .{ .fatal = error.OutOfMemory };
+        d.retry_after_ms = asked;
+        self.client.server_delay_ms = asked;
         const err = core.errors.fromResponse(res.status, status_text);
         // A final chunk over a retained or held object, after every byte.
         if (retention.isRetained(err, d)) return .{ .fatal = error.ObjectRetained };
@@ -974,6 +983,58 @@ test "a 503 mid-chunk leads to a status query, then a resume" {
     // Sending resumed exactly where the query said.
     try testing.expectEqualStrings("bytes 4096-266239/614400", (try h.fake.streamRequest(3)).header("Content-Range").?);
     try testing.expectEqual(1, h.clock.sleep_count);
+}
+
+test "a 503 mid-chunk waits its delay before the status query, and one past the cap ends the upload" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        opened,
+        .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "2" }}, .body = "{}" } },
+        .{ .respond = .{ .status = 308, .body = "", .headers = &.{.{ .name = "Range", .value = "bytes=0-4095" }} } },
+        kept(4096 + chunk_size - 1),
+        kept(4096 + 2 * chunk_size - 1),
+        finished,
+        opened,
+        .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "60" }}, .body = "{}" } },
+        .{ .respond = .{ .status = 499, .body = "" } },
+    }, resumableOptions());
+    defer h.deinit();
+    const data = try testData(testing.allocator, 600 * 1024);
+    defer testing.allocator.free(data);
+    const backup = h.client.bucket("b").object("backup.tar");
+    var info = try backup.upload(data, .{});
+    defer info.deinit();
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(2_000, h.clock.sleepMs(0));
+    // No status query after the second 503: the upload ends there.
+    try testing.expectError(error.Unavailable, backup.upload(data, .{}));
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(60_000, h.diag.retry_after_ms.?);
+    try testing.expect(h.fake.stream_requests.items.len <= 9);
+    for (8..h.fake.stream_requests.items.len) |i| try testing.expectEqual(.DELETE, (try h.fake.streamRequest(i)).method);
+}
+
+test "a delay one chunk asked for is not waited again after a dropped connection" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        opened,
+        .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "2" }}, .body = "{}" } },
+        .{ .respond = .{ .status = 308, .body = "", .headers = &.{.{ .name = "Range", .value = "bytes=0-4095" }} } },
+        .{ .fail = error.ConnectionResetByPeer },
+        .{ .respond = .{ .status = 308, .body = "", .headers = &.{.{ .name = "Range", .value = "bytes=0-4095" }} } },
+        kept(4096 + chunk_size - 1),
+        kept(4096 + 2 * chunk_size - 1),
+        finished,
+    }, resumableOptions());
+    defer h.deinit();
+    const data = try testData(testing.allocator, 600 * 1024);
+    defer testing.allocator.free(data);
+    var info = try h.client.bucket("b").object("backup.tar").upload(data, .{});
+    defer info.deinit();
+    try testing.expectEqual(2, h.clock.sleep_count);
+    try testing.expectEqual(2_000, h.clock.sleepMs(0));
+    // The reset asked for nothing: the policy's 1 ms backoff, not 2 s again.
+    try testing.expect(h.clock.sleepMs(1) <= 1);
 }
 
 test "a status query can reveal the upload already completed" {

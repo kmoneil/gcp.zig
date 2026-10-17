@@ -11,6 +11,7 @@ const TokenProvider = core.TokenProvider;
 const Transport = core.transport.Transport;
 const Cache = @import("Cache.zig");
 const logging = @import("logging.zig");
+const token_response = @import("token_response.zig");
 
 /// Google's endpoint: scheme and host.
 pub const default_endpoint = "https://iamcredentials.googleapis.com";
@@ -49,7 +50,7 @@ pub const Outcome = union(enum) {
 /// Makes the call. The token and everything else that touches it are in
 /// `arena`, which the caller wipes. `refused` is the diagnostics message
 /// for HTTP 403, which should name the missing role: it differs by who is
-/// asking.
+/// asking. `asked` gets the wait a refusal asks for.
 pub fn generateAccessToken(
     transport: Transport,
     io: std.Io,
@@ -57,6 +58,7 @@ pub fn generateAccessToken(
     request: Request,
     diag: ?*core.Diagnostics,
     refused: []const u8,
+    asked: *?u32,
 ) Outcome {
     const body = encodeBody(arena, request) catch return .{ .fail = error.OutOfMemory };
     const res = transport.send(.{
@@ -71,7 +73,7 @@ pub fn generateAccessToken(
         return if (core.isRetryable(err)) .{ .retry = err } else .{ .fail = err };
     };
     if (res.status != 200) {
-        describeFailure(arena, res, diag, refused) catch |err| return .{ .fail = err };
+        describeFailure(io, arena, res, diag, refused, asked) catch |err| return .{ .fail = err };
         if (res.status == 401) return .unauthorized;
         if (res.status == 429 or res.status >= 500) return .{ .retry = error.TokenUnavailable };
         return .{ .fail = error.TokenEndpointRejected };
@@ -80,16 +82,19 @@ pub fn generateAccessToken(
 }
 
 /// Puts a refusal in `diag`: `refused` for a 403, which should name the
-/// missing role, and the server's own words for anything else.
-fn describeFailure(arena: Allocator, res: core.transport.Response, diag: ?*core.Diagnostics, refused: []const u8) Allocator.Error!void {
+/// missing role, and the server's own words for anything else. `asked`
+/// gets the wait it asks for.
+fn describeFailure(io: std.Io, arena: Allocator, res: core.transport.Response, diag: ?*core.Diagnostics, refused: []const u8, asked: *?u32) Allocator.Error!void {
     const error_body = try core.errors.decodeErrorBody(arena, res.body);
-    const d = diag orelse return;
-    const status = if (error_body) |b| b.status else "";
-    if (res.status == 403) {
-        d.set(res.status, status, refused);
-    } else {
-        d.set(res.status, status, if (error_body) |b| b.message else res.body);
+    if (diag) |d| {
+        const status = if (error_body) |b| b.status else "";
+        if (res.status == 403) {
+            d.set(res.status, status, refused);
+        } else {
+            d.set(res.status, status, if (error_body) |b| b.message else res.body);
+        }
     }
+    asked.* = try token_response.askedDelayMs(io, arena, res, diag);
 }
 
 /// `{"delegates":[...],"scope":[...],"lifetime":"3600s"}`, with `delegates`
@@ -186,13 +191,15 @@ pub const SignOutcome = union(enum) {
 /// One `signBlob` call: RSASSA-PKCS1-v1_5 with SHA-256 over `payload`, made
 /// by Google with the account's own key. The signature lands in `arena`.
 /// `refused` is the diagnostics message for HTTP 403, which should name the
-/// missing role.
+/// missing role. `asked` gets the wait a refusal asks for.
 pub fn signBlob(
     transport: Transport,
+    io: std.Io,
     arena: Allocator,
     request: SignBlobRequest,
     diag: ?*core.Diagnostics,
     refused: []const u8,
+    asked: *?u32,
 ) SignOutcome {
     const body = encodeSignBody(arena, request) catch return .{ .fail = error.OutOfMemory };
     const res = transport.send(.{
@@ -207,7 +214,7 @@ pub fn signBlob(
         return if (core.isRetryable(err)) .{ .retry = err } else .{ .fail = err };
     };
     if (res.status != 200) {
-        describeFailure(arena, res, diag, refused) catch |err| return .{ .fail = err };
+        describeFailure(io, arena, res, diag, refused, asked) catch |err| return .{ .fail = err };
         if (res.status == 401) return .unauthorized;
         if (res.status == 429 or res.status >= 500) return .{ .retry = error.SigningFailed };
         return .{ .fail = error.SigningRejected };
@@ -286,13 +293,14 @@ pub fn sign(transport: Transport, io: std.Io, arena: Allocator, signing: Sign) c
         // The provider caches its token and did its own retries.
         const bearer = try signing.provider.getToken(io, arena, &.{scope});
         const started = std.Io.Clock.awake.now(io);
-        const outcome = signBlob(transport, arena, .{
+        var asked: ?u32 = null;
+        const outcome = signBlob(transport, io, arena, .{
             .url = signing.url,
             .bearer = bearer,
             .payload = signing.payload,
             .delegates = signing.delegates,
             .timeout_ms = signing.timeout_ms,
-        }, signing.diagnostics, signing.refused);
+        }, signing.diagnostics, signing.refused, &asked);
         const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
         switch (outcome) {
             .signature => |signature| {
@@ -316,7 +324,12 @@ pub fn sign(transport: Transport, io: std.Io, arena: Allocator, signing: Sign) c
             .retry => |err| {
                 logging.debug("POST {s} -> {t} in {d} ms (attempt {d} of {d})", .{ signing.url, err, elapsed_ms, attempt, max_attempts });
                 if (attempt >= max_attempts) return err;
-                const delay_ms = signing.retry.backoffMs(attempt, entropy(io));
+                const delay_ms = signing.retry.waitMs(attempt, entropy(io), asked) orelse {
+                    logging.warn("signing through IAM failed with {t}; not retried: it asked to wait {d} ms, longer than max_backoff_ms ({d} ms)", .{
+                        err, asked.?, signing.retry.max_backoff_ms,
+                    });
+                    return err;
+                };
                 logging.warn("signing through IAM failed with {t}; retrying in {d} ms (attempt {d} of {d})", .{
                     err, delay_ms, attempt + 1, max_attempts,
                 });
@@ -382,6 +395,7 @@ const target = "sa@p.iam.gserviceaccount.com";
 const target_url = "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/" ++ target ++ ":generateAccessToken";
 
 fn call(fake: *test_util.FakeTransport, arena: Allocator, diag: *core.Diagnostics, delegates: []const []const u8) Outcome {
+    var asked: ?u32 = null;
     return generateAccessToken(fake.transport(), testing.io, arena, .{
         .url = target_url,
         .bearer = "ya29.SOURCE",
@@ -389,7 +403,7 @@ fn call(fake: *test_util.FakeTransport, arena: Allocator, diag: *core.Diagnostic
         .lifetime_s = 3600,
         .delegates = delegates,
         .timeout_ms = 5_000,
-    }, diag, "refused: grant the role");
+    }, diag, "refused: grant the role", &asked);
 }
 
 test "golden: the request, with and without delegates" {
@@ -418,6 +432,31 @@ test "golden: the request, with and without delegates" {
         "{\"delegates\":[\"projects/-/serviceAccounts/middle@p.iam.gserviceaccount.com\"],\"scope\":[\"https://www.googleapis.com/auth/pubsub\",\"https://www.googleapis.com/auth/cloud-platform\"],\"lifetime\":\"3600s\"}",
         (try fake.request(1)).body.?,
     );
+}
+
+test "generateAccessToken and signBlob: a refusal's delay goes to the caller and to Diagnostics" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var diag: core.Diagnostics = .{};
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+        .{ .respond = .{ .status = 403, .headers = &.{.{ .name = "Retry-After", .value = "9" }}, .body = "{\"error\":{\"status\":\"PERMISSION_DENIED\",\"message\":\"denied\"}}" } },
+        .{ .respond = .{ .status = 500, .body = test_util.retryInfoBody(500, "INTERNAL", "1.5s") } },
+        .{ .respond = .{ .status = 503, .body = "unavailable" } },
+    });
+    defer fake.deinit();
+    var asked: ?u32 = null;
+    const request: Request = .{ .url = target_url, .bearer = "ya29.SOURCE", .scopes = scope, .lifetime_s = 3600, .timeout_ms = 5_000 };
+    try testing.expectEqual(.fail, std.meta.activeTag(generateAccessToken(fake.transport(), testing.io, arena.allocator(), request, &diag, "refused", &asked)));
+    try testing.expectEqual(9_000, asked.?);
+    try testing.expectEqual(9_000, diag.retry_after_ms.?);
+    const sign_request: SignBlobRequest = .{ .url = default_endpoint ++ "/v1/projects/-/serviceAccounts/" ++ target ++ ":signBlob", .bearer = "ya29.CALLER", .payload = "x", .timeout_ms = 5_000 };
+    try testing.expectEqual(.retry, std.meta.activeTag(signBlob(fake.transport(), testing.io, arena.allocator(), sign_request, &diag, "refused", &asked)));
+    try testing.expectEqual(1_500, asked.?);
+    try testing.expectEqual(1_500, diag.retry_after_ms.?);
+    // An answer that asks for nothing clears both.
+    try testing.expectEqual(.retry, std.meta.activeTag(signBlob(fake.transport(), testing.io, arena.allocator(), sign_request, &diag, "refused", &asked)));
+    try testing.expectEqual(null, asked);
+    try testing.expectEqual(null, diag.retry_after_ms);
 }
 
 test "outcomes: each status says what to do next" {
@@ -522,12 +561,13 @@ test "fuzz principalFromUrl: only a plain account name ever comes out" {
 const signed_body = "{\"keyId\":\"k1\",\"signedBlob\":\"" ++ test_util.repeat("Wlpa", 85) ++ "Wg==" ++ "\"}";
 
 fn signOnce(fake: *test_util.FakeTransport, arena: Allocator, diag: *core.Diagnostics) SignOutcome {
-    return signBlob(fake.transport(), arena, .{
+    var asked: ?u32 = null;
+    return signBlob(fake.transport(), testing.io, arena, .{
         .url = default_endpoint ++ "/v1/projects/-/serviceAccounts/" ++ target ++ ":signBlob",
         .bearer = "ya29.CALLER",
         .payload = "string to sign",
         .timeout_ms = 5_000,
-    }, diag, "refused: grant the role");
+    }, diag, "refused: grant the role", &asked);
 }
 
 test "signBlob: the request, and the signature from its answer" {

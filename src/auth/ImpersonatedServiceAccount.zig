@@ -365,6 +365,7 @@ fn fetch(ptr: *anyopaque, io: std.Io, arena: Allocator) TokenProvider.Error!Cach
         // The source's provider caches its token and did its own retries.
         const source_token = try self.source.provider().getToken(io, arena, &.{iam_credentials.scope});
         const started = std.Io.Clock.awake.now(io);
+        var asked: ?u32 = null;
         const outcome = iam_credentials.generateAccessToken(self.transport, io, arena, .{
             .url = self.url,
             .bearer = source_token,
@@ -372,7 +373,7 @@ fn fetch(ptr: *anyopaque, io: std.Io, arena: Allocator) TokenProvider.Error!Cach
             .lifetime_s = self.lifetime_s,
             .delegates = self.delegates,
             .timeout_ms = self.request_timeout_ms,
-        }, self.diagnostics, self.refused);
+        }, self.diagnostics, self.refused, &asked);
         const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
         switch (outcome) {
             .token => |fetched| {
@@ -396,7 +397,12 @@ fn fetch(ptr: *anyopaque, io: std.Io, arena: Allocator) TokenProvider.Error!Cach
             .retry => |err| {
                 logging.debug("POST {s} -> {t} in {d} ms (attempt {d} of {d})", .{ self.url, err, elapsed_ms, attempt, max_attempts });
                 if (attempt >= max_attempts) return err;
-                const delay_ms = self.retry.backoffMs(attempt, entropy(io));
+                const delay_ms = self.retry.waitMs(attempt, entropy(io), asked) orelse {
+                    logging.warn("impersonation failed with {t}; not retried: it asked to wait {d} ms, longer than max_backoff_ms ({d} ms)", .{
+                        err, asked.?, self.retry.max_backoff_ms,
+                    });
+                    return err;
+                };
                 logging.warn("impersonation failed with {t}; retrying in {d} ms (attempt {d} of {d})", .{
                     err, delay_ms, attempt + 1, max_attempts,
                 });
@@ -645,6 +651,22 @@ test "ImpersonatedServiceAccount: transient failures are retried" {
     defer gives_up.deinit();
     try testing.expectError(error.TokenUnavailable, gives_up.get());
     try testing.expectEqual(3, gives_up.fake.requests.items.len);
+}
+
+test "ImpersonatedServiceAccount: IAM's RetryInfo is honoured, and one past the cap returns at once" {
+    // The harness caps waits at 5 ms.
+    var h: Harness = undefined;
+    try h.init(&.{ source_ok, .{ .respond = .{ .status = 503, .body = test_util.retryInfoBody(503, "UNAVAILABLE", "0.004s") } }, iam_ok }, user_file);
+    defer h.deinit();
+    try testing.expectEqualStrings("ya29.IMPERSONATED-SECRET", try h.get());
+    try testing.expectEqual(3, h.fake.requests.items.len);
+
+    var refused: Harness = undefined;
+    try refused.init(&.{ source_ok, .{ .respond = .{ .status = 429, .body = test_util.retryInfoBody(429, "RESOURCE_EXHAUSTED", "30s") } }, iam_ok }, user_file);
+    defer refused.deinit();
+    try testing.expectError(error.TokenUnavailable, refused.get());
+    try testing.expectEqual(2, refused.fake.requests.items.len);
+    try testing.expectEqual(30_000, refused.diag.retry_after_ms.?);
 }
 
 test "ImpersonatedServiceAccount: the source's own failure is the caller's" {

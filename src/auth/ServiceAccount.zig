@@ -305,7 +305,8 @@ fn fetch(ptr: *anyopaque, io: std.Io, arena: Allocator) TokenProvider.Error!Cach
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {
         const started = std.Io.Clock.awake.now(io);
-        const result = self.exchange(arena, body);
+        var asked: ?u32 = null;
+        const result = self.exchange(io, arena, body, &asked);
         const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
         switch (result) {
             .token => |fetched| {
@@ -319,7 +320,12 @@ fn fetch(ptr: *anyopaque, io: std.Io, arena: Allocator) TokenProvider.Error!Cach
             .retry => |err| {
                 logging.debug("POST {s} -> {t} in {d} ms (attempt {d} of {d})", .{ self.token_url, err, elapsed_ms, attempt, max_attempts });
                 if (attempt >= max_attempts) return err;
-                const delay_ms = self.retry.backoffMs(attempt, entropy(io));
+                const delay_ms = self.retry.waitMs(attempt, entropy(io), asked) orelse {
+                    logging.warn("the token endpoint failed with {t}; not retried: it asked to wait {d} ms, longer than max_backoff_ms ({d} ms)", .{
+                        err, asked.?, self.retry.max_backoff_ms,
+                    });
+                    return err;
+                };
                 logging.warn("the token endpoint failed with {t}; retrying in {d} ms (attempt {d} of {d})", .{
                     err, delay_ms, attempt + 1, max_attempts,
                 });
@@ -394,7 +400,8 @@ const Result = union(enum) {
 };
 
 /// One request to the token endpoint, and what to make of the answer.
-fn exchange(self: *ServiceAccount, arena: Allocator, body: []const u8) Result {
+/// `asked` gets the wait a refusal asks for.
+fn exchange(self: *ServiceAccount, io: std.Io, arena: Allocator, body: []const u8, asked: *?u32) Result {
     const res = self.transport.send(.{
         .method = .POST,
         .url = self.token_url,
@@ -436,6 +443,7 @@ fn exchange(self: *ServiceAccount, arena: Allocator, body: []const u8) Result {
             d.set(res.status, "", "the token endpoint refused the request");
         }
     }
+    asked.* = token_response.askedDelayMs(io, arena, res, self.diagnostics) catch return .{ .fail = error.OutOfMemory };
     if (res.status == 429 or res.status >= 500) return .{ .retry = error.TokenUnavailable };
     return .{ .fail = error.TokenEndpointRejected };
 }
@@ -669,6 +677,24 @@ test "ServiceAccount: three busy answers are TokenUnavailable" {
     try testing.expectError(error.TokenUnavailable, h.get());
     try testing.expectEqual(3, h.fake.requests.items.len);
     try testing.expectEqual(503, h.diag.http_status);
+}
+
+test "ServiceAccount: a server's delay is waited, and one past the cap returns at once" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 429, .headers = &.{.{ .name = "retry-after-ms", .value = "1500" }}, .body = "{}" } },
+        token_ok,
+        .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "11" }}, .body = "Service Unavailable" } },
+    });
+    defer h.deinit();
+    try testing.expectEqualStrings("ya29.SECRET-at", try h.get());
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(1_500, h.clock.sleepMs(0));
+    h.account.provider().invalidate();
+    try testing.expectError(error.TokenUnavailable, h.get());
+    try testing.expectEqual(3, h.fake.requests.items.len);
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(11_000, h.diag.retry_after_ms.?);
 }
 
 test "ServiceAccount: a dropped connection is retried; a rejected client is not" {

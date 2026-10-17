@@ -42,6 +42,9 @@ retry_add_version: bool,
 send_quota_project: bool,
 request_timeout_ms: u32,
 diagnostics: ?*Diagnostics,
+/// The delay the last failed attempt's response asked for, or null, as
+/// the engine leaves it: this module's own retry loops wait by it.
+server_delay_ms: ?u32 = null,
 transport: Transport,
 /// The built-in transport, when `Options.transport` was null.
 http: ?*HttpTransport,

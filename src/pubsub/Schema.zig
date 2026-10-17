@@ -274,13 +274,15 @@ fn revise(self: Schema, call: rpc.Call, what: Revision) Error!Owned(types.Schema
         attempt += 1;
         return fetch(c, call) catch |err| {
             if (!core.isRetryable(err) or attempt >= c.retry.max_attempts) return err;
+            // Taken before `landed` reads, which makes a call of its own.
+            const asked = c.server_delay_ms;
             // A refusal for quota is an answer: the attempt did not land,
             // and a latest revision that happens to hold the same
             // definition would not make it one that did.
             if (err != error.ResourceExhausted) {
                 if (try self.landed(what, err)) |latest| return latest;
             }
-            const delay_ms = c.retry.backoffMs(attempt, core.rpc.entropy(c.io));
+            const delay_ms = c.retry.waitMs(attempt, core.rpc.entropy(c.io), asked) orelse return err;
             logging.warn("revising schema {s} failed with {t}; trying again in {d} ms", .{ self.id, err, delay_ms });
             try c.io.sleep(.fromMilliseconds(delay_ms), .awake);
             continue;
@@ -880,6 +882,23 @@ test "commit: attempts run out with the last failure, its diagnostics restored a
     try testing.expectEqualStrings("still down", h.diag.message());
     try testing.expectEqual(503, h.diag.http_status);
     try h.expectRequestCount(3);
+}
+
+test "commit: the refused attempt's delay is waited, not the read's after it, and one past the cap returns at once" {
+    const busy: test_util.FakeTransport.Reply = .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "2" }}, .body = "{\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\"}}" } };
+    const full: test_util.FakeTransport.Reply = .{ .respond = .{ .status = 429, .headers = &.{.{ .name = "Retry-After", .value = "40" }}, .body = "{\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\"}}" } };
+    var h: Harness = undefined;
+    try h.init(&.{ busy, .{ .respond = .{ .body = stored } }, .{ .respond = .{ .body = stored_v2 } }, full }, .{});
+    defer h.deinit();
+    const order = h.client.schema("order-v1");
+    var second = try order.commit(avro_v2);
+    defer second.deinit();
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(2_000, h.clock.sleepMs(0));
+    try testing.expectError(error.ResourceExhausted, order.commit(avro_v2));
+    try h.expectRequestCount(4);
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(40_000, h.diag.retry_after_ms.?);
 }
 
 test "commit: a refusal for quota is tried again without a read, and a latest revision that holds the same definition is not taken for the commit" {

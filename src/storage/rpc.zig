@@ -63,6 +63,7 @@ fn engine(client: *Client) Engine {
         .retry = client.retry,
         .request_timeout_ms = client.request_timeout_ms,
         .diagnostics = client.diagnostics,
+        .server_delay_out = &client.server_delay_ms,
     };
 }
 
@@ -333,6 +334,13 @@ pub fn executeXmlBody(
 /// business.
 pub fn backoffMs(client: *Client, attempt: u32) u32 {
     return client.retry.backoffMs(attempt, core.rpc.entropy(client.io));
+}
+
+/// The wait before retrying a refused request: the backoff, or the delay
+/// its response asked for (`server_delay_ms`) when that is longer; null,
+/// to return the failure, when that delay is past the policy's cap.
+pub fn waitMs(client: *Client, attempt: u32, server_delay_ms: ?u32) ?u32 {
+    return client.retry.waitMs(attempt, core.rpc.entropy(client.io), server_delay_ms);
 }
 
 /// Checks a bucket name before any request.

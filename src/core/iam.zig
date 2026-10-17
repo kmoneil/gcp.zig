@@ -235,8 +235,11 @@ pub const Change = union(enum) {
 /// with `resource.writePolicy(policy)`, under the read's etag. A write
 /// refused with `error.Aborted`, another change having come in between,
 /// starts the whole round over after a full-jitter wait from `retry`, up to
-/// `retry.max_attempts` rounds, as IAM asks; any other error ends it. The
-/// answer is the policy as written, or as read when nothing had to change.
+/// `retry.max_attempts` rounds, as IAM asks; any other error ends it. A
+/// resource with `serverDelayMs()` says what delay the refused write asked
+/// for, which `RetryPolicy.waitMs` honours: one past the cap ends it too.
+/// The answer is the policy as written, or as read when nothing had to
+/// change.
 pub fn update(gpa: Allocator, io: std.Io, retry: RetryPolicy, resource: anytype, change: Change) !Owned(Policy) {
     var round: u32 = 0;
     while (true) {
@@ -251,7 +254,8 @@ pub fn update(gpa: Allocator, io: std.Io, retry: RetryPolicy, resource: anytype,
             if (err != error.Aborted or round >= retry.max_attempts) return err;
             var bytes: [8]u8 = undefined;
             io.random(&bytes);
-            const delay_ms = retry.backoffMs(round, std.mem.readInt(u64, &bytes, .little));
+            const asked: ?u32 = if (comptime std.meta.hasMethod(@TypeOf(resource), "serverDelayMs")) resource.serverDelayMs() else null;
+            const delay_ms = retry.waitMs(round, std.mem.readInt(u64, &bytes, .little), asked) orelse return err;
             try io.sleep(.fromMilliseconds(delay_ms), .awake);
             continue;
         };
@@ -611,6 +615,8 @@ const FakeResource = struct {
     fail: ?anyerror = null,
     reads: u32 = 0,
     writes: u32 = 0,
+    /// The delay each refused write asks for.
+    asked: ?u32 = null,
 
     fn init(gpa: Allocator) FakeResource {
         var r: FakeResource = .{ .gpa = gpa, .store = .init(gpa) };
@@ -648,6 +654,10 @@ const FakeResource = struct {
         errdefer result.deinit();
         result.value = try copy(result.arena.allocator(), r.policy);
         return result;
+    }
+
+    pub fn serverDelayMs(r: *const FakeResource) ?u32 {
+        return r.asked;
     }
 
     pub fn readPolicy(r: *FakeResource) !Owned(Policy) {
@@ -735,6 +745,31 @@ test "update: another change in between starts the round over; the retry policy'
         r.fail = error.PermissionDenied;
         try testing.expectError(error.PermissionDenied, update(testing.allocator, testing.io, quick, &r, .{ .grant = .{ .role = "roles/r", .member = "user:a@x.com" } }));
         try testing.expectEqual(1, r.writes);
+    }
+}
+
+test "update: a refused write's delay is waited before the next round, and one past the cap ends it" {
+    var clock: test_util.FakeClock = .{};
+    const grant: Change = .{ .grant = .{ .role = "roles/mine", .member = "user:a@x.com" } };
+    {
+        var r: FakeResource = .init(testing.allocator);
+        defer r.deinit();
+        r.aborts = 1;
+        r.asked = 3_000;
+        var granted = try update(testing.allocator, clock.io(), .{}, &r, grant);
+        defer granted.deinit();
+        try testing.expectEqual(2, r.writes);
+        try testing.expectEqual(1, clock.sleep_count);
+        try testing.expectEqual(3_000, clock.sleepMs(0));
+    }
+    {
+        var r: FakeResource = .init(testing.allocator);
+        defer r.deinit();
+        r.aborts = 1;
+        r.asked = 30_000;
+        try testing.expectError(error.Aborted, update(testing.allocator, clock.io(), .{}, &r, grant));
+        try testing.expectEqual(1, r.writes);
+        try testing.expectEqual(1, clock.sleep_count);
     }
 }
 

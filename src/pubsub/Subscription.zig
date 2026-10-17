@@ -304,7 +304,7 @@ pub fn detach(self: Subscription) Error!void {
         rpc.executeDiscard(c, .{ .method = .POST, .path = path, .retry = false }) catch |err| {
             if (err == error.FailedPrecondition and attempt > 1) return self.settleDetach(err);
             if (!core.isRetryable(err) or attempt >= c.retry.max_attempts) return err;
-            const delay_ms = c.retry.backoffMs(attempt, core.rpc.entropy(c.io));
+            const delay_ms = c.retry.waitMs(attempt, core.rpc.entropy(c.io), c.server_delay_ms) orelse return err;
             logging.warn("detaching subscription {s} failed with {t}; trying again in {d} ms", .{ self.id, err, delay_ms });
             try c.io.sleep(.fromMilliseconds(delay_ms), .awake);
             continue;
@@ -437,7 +437,7 @@ fn sendChunk(
             const refusal = answer orelse {
                 // No answer at all, so whether the ids were taken is unknown.
                 if (!core.isRetryable(err) or attempt >= c.retry.max_attempts) return err;
-                try backoff(c, attempt, err, pending.len);
+                if (!try backoff(c, attempt, err, pending.len)) return err;
                 continue;
             };
             switch (err) {
@@ -475,27 +475,28 @@ fn sendChunk(
             }
             pending = pending[0..kept];
             if (pending.len == 0) return;
-            if (attempt >= c.retry.max_attempts) {
-                for (pending) |i| {
-                    results[i] = .transient;
-                    tally.note(.transient, err, c.diagnostics, transient_reason);
-                }
-                return;
+            if (attempt < c.retry.max_attempts and try backoff(c, attempt, err, pending.len)) continue;
+            // Out of attempts, or the server asked to wait past the cap.
+            for (pending) |i| {
+                results[i] = .transient;
+                tally.note(.transient, err, c.diagnostics, transient_reason);
             }
-            try backoff(c, attempt, err, pending.len);
-            continue;
+            return;
         };
         for (pending) |i| results[i] = .ok;
         return;
     }
 }
 
-fn backoff(c: *Client, attempt: u32, err: Error, count: usize) Error!void {
-    const delay_ms = c.retry.backoffMs(attempt, core.rpc.entropy(c.io));
+/// Waits before sending the refused ids again, by the backoff or the
+/// server's delay; false, without waiting, when that delay is past the cap.
+fn backoff(c: *Client, attempt: u32, err: Error, count: usize) Error!bool {
+    const delay_ms = c.retry.waitMs(attempt, core.rpc.entropy(c.io), c.server_delay_ms) orelse return false;
     logging.warn("{d} ack ids were refused for now with {t}; sending them again in {d} ms (attempt {d} of {d})", .{
         count, err, delay_ms, attempt + 1, c.retry.max_attempts,
     });
     try c.io.sleep(.fromMilliseconds(delay_ms), .awake);
+    return true;
 }
 
 /// Pub/Sub's reason for an exactly-once refusal, whose metadata maps each
@@ -513,8 +514,8 @@ fn exactlyOnceRefusals(arena: Allocator, body: []const u8) Allocator.Error!?std.
     return if (refused.count() > 0) refused else null;
 }
 
-/// What a call's refusals came to: counts, and the first refusal's error
-/// and words, for the caller's error and for `Diagnostics`.
+/// What a call's refusals came to: counts, and the first refusal's error,
+/// words and asked-for delay, for the caller's error and for `Diagnostics`.
 const Tally = struct {
     invalid: usize = 0,
     transient: usize = 0,
@@ -527,6 +528,7 @@ const Tally = struct {
     reason_len: usize = 0,
     message_buf: [320]u8 = undefined,
     message_len: usize = 0,
+    retry_after_ms: ?u32 = null,
 
     fn refused(t: *const Tally) usize {
         return t.invalid + t.transient + t.other;
@@ -553,6 +555,7 @@ const Tally = struct {
         const m = core.errors.truncateUtf8(d.message(), t.message_buf.len);
         @memcpy(t.message_buf[0..m.len], m);
         t.message_len = m.len;
+        t.retry_after_ms = d.retry_after_ms;
     }
 
     /// Replaces the details of the call's last request with the whole
@@ -565,6 +568,7 @@ const Tally = struct {
         if (t.reason_len > 0) w.print(" ({s})", .{t.reason_buf[0..t.reason_len]}) catch {};
         if (t.message_len > 0) w.print(": {s}", .{t.message_buf[0..t.message_len]}) catch {};
         d.set(t.http_status, t.status_buf[0..t.status_len], w.buffered());
+        d.retry_after_ms = t.retry_after_ms;
     }
 };
 
@@ -858,6 +862,28 @@ test "ackWithResults: ids refused for now are sent again, alone, until taken" {
     try h.expectRequestCount(3);
     // Every id was taken in the end, so the call leaves no failure behind.
     try testing.expectEqual(0, h.diag.http_status);
+}
+
+test "ackWithResults: a server's delay is waited before ids go again, and one past the cap leaves them transient" {
+    const refusal = exactlyOnceRefusal(503, "UNAVAILABLE", "TRANSIENT_FAILURE_ACK_ID", &.{"b"});
+    const waits: test_util.FakeTransport.Reply = .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "2" }}, .body = refusal.respond.body } };
+    const too_long: test_util.FakeTransport.Reply = .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "60" }}, .body = refusal.respond.body } };
+    var h: Harness = undefined;
+    try h.init(&.{ waits, empty_ok, too_long, empty_ok }, .{});
+    defer h.deinit();
+    const work = h.client.subscription("work");
+    var results: [2]types.AckResult = undefined;
+    try work.ackWithResults(&.{ "a", "b" }, &results);
+    try testing.expectEqualSlices(types.AckResult, &.{ .ok, .ok }, &results);
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(2_000, h.clock.sleepMs(0));
+    try work.ackWithResults(&.{ "a", "b" }, &results);
+    try testing.expectEqualSlices(types.AckResult, &.{ .ok, .transient }, &results);
+    try h.expectRequestCount(3);
+    try testing.expectEqual(1, h.clock.sleep_count);
+    // The call's summary keeps the delay, for the caller's own retry.
+    try testing.expect(std.mem.startsWith(u8, h.diag.message(), "1 of 2 ack ids were refused (TRANSIENT_FAILURE_ACK_ID)"));
+    try testing.expectEqual(60_000, h.diag.retry_after_ms.?);
 }
 
 test "ackWithResults: ids still refused for now when the retries run out" {
@@ -1696,6 +1722,24 @@ test "detach: a refused retry stands when the subscription reads back attached, 
         h.diag.message(),
     );
     try h.expectRequestCount(6);
+}
+
+test "detach: a server's delay is waited, and one past the cap returns at once" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "3" }}, .body = "{\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\"}}" } },
+        .{ .respond = .{} },
+        .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "15" }}, .body = "{\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\"}}" } },
+    }, .{});
+    defer h.deinit();
+    const worker = h.client.subscription("orders-worker");
+    try worker.detach();
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(3_000, h.clock.sleepMs(0));
+    try testing.expectError(error.Unavailable, worker.detach());
+    try h.expectRequestCount(3);
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(15_000, h.diag.retry_after_ms.?);
 }
 
 test "detach: an outage is retried up to the policy's attempts, and no further" {

@@ -323,7 +323,7 @@ const Pull = struct {
                 else => |e| {
                     if (got > before) attempt = 0;
                     if (!core.isRetryable(e) or attempt >= client.retry.max_attempts) return e;
-                    const delay_ms = rpc.backoffMs(client, attempt);
+                    const delay_ms = rpc.waitMs(client, attempt, client.server_delay_ms) orelse return e;
                     logging.warn("GET {s} (stored gzip bytes) failed with {t}; resuming at byte {d} in {d} ms", .{ self.name, e, self.fetched + got, delay_ms });
                     try client.io.sleep(.fromMilliseconds(delay_ms), .awake);
                 },
@@ -665,6 +665,24 @@ test "gzip: cut connections resume at a stored offset, and the decompressor neve
         try testing.expect(result.checksum_verified);
         try testing.expect(faults.seen > case.faults.len);
     }
+}
+
+test "gzip: a range refused with a delay past the cap ends the download, the delay kept" {
+    const plain = try randomBytes(testing.allocator, 768 * 1024, 3);
+    defer testing.allocator.free(plain);
+    var s: Setup = undefined;
+    try s.init(.{});
+    defer s.deinit();
+    try s.fake.putGzipped("big.bin", plain);
+    // The setup's policy waits at most 2 ms; the server asks for 1 s.
+    s.fake.retry_after = "1";
+    var faults: MediaFaults = .{ .faults = &.{ .none, .unavailable } };
+    s.fake.faults = faults.plan();
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try testing.expectError(error.Unavailable, s.object("big.bin").download(&out.writer, .{}));
+    try testing.expectEqual(2, faults.seen);
+    try testing.expectEqual(1_000, s.diag.retry_after_ms.?);
 }
 
 test "gzip: a stored byte flipped on the way is caught, with checking on or off" {
