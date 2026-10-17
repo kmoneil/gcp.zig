@@ -187,8 +187,8 @@ pub fn poll(self: *Tail) Error!types.Owned(types.TailBatch) {
         calls += 1;
         self.counters.calls += 1;
         var page = q.page(token) catch |err| {
-            if (kept != null and calls == 1 and (err == error.InvalidPageToken or err == error.InvalidArgument)) {
-                // The server will not take the kept token: the next poll
+            if (token != null and (err == error.InvalidPageToken or err == error.InvalidArgument)) {
+                // The server will not take the token: the next poll
                 // begins a window from the cursor.
                 self.dropPending();
                 token = null;
@@ -563,8 +563,11 @@ test "tail: a run at one timestamp longer than a poll's calls is read through, e
     // poll's one call, and never get past them.
     try testing.expect((try r.poll(&tail, &out)).behind);
     try testing.expectEqualStrings("c d", out.items);
+    try testing.expectEqualStrings("d", tail.cursor().insert_id);
+    try testing.expect(tail.pending != null);
     try testing.expect(!(try r.poll(&tail, &out)).behind);
     try testing.expectEqualStrings("e", out.items);
+    try testing.expect(tail.pending == null);
     try testing.expectEqual(at(25).nanoseconds, tail.cursor().timestamp.nanoseconds);
     try testing.expectEqual(3, r.fake.listCalls());
     try testing.expectEqual(0, tail.stats().duplicates);
@@ -640,6 +643,7 @@ test "tail: a kept page token the server refuses stops the poll, and the next be
         .{ .respond = .{ .body = "{\"entries\":[" ++ one ++ "," ++ two ++ "],\"nextPageToken\":\"t2\"}" } },
         .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Request contains an invalid argument.\",\"status\":\"INVALID_ARGUMENT\"}}" } },
         .{ .respond = .{ .body = "{}" } },
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Request contains an invalid argument.\",\"status\":\"INVALID_ARGUMENT\"}}" } },
     }, .{});
     defer h.deinit();
     var tail = try h.client.tail(.{ .from = .{ .timestamp = at(0) }, .max_calls_per_poll = 1 });
@@ -675,6 +679,34 @@ test "tail: a kept page token the server refuses stops the poll, and the next be
             try testing.expectEqualStrings(first_body[0 .. std.mem.indexOf(u8, first_body, "\"pageSize\"") orelse first_body.len], body[0 .. std.mem.indexOf(u8, body, "\"pageSize\"") orelse body.len]);
         } else try testing.expect(std.mem.indexOf(u8, body, "pageToken") == null);
     }
+    // The same refusal of a new window's first call is the error.
+    try testing.expectError(error.InvalidArgument, tail.poll());
+}
+
+test "tail: a page token refused partway through a poll is dropped at once" {
+    const one = "{\"timestamp\":\"2026-10-16T09:00:01Z\",\"insertId\":\"a\",\"logName\":\"projects/extractctl/logs/x\",\"textPayload\":\"1\"}";
+    const two = "{\"timestamp\":\"2026-10-16T09:00:02Z\",\"insertId\":\"b\",\"logName\":\"projects/extractctl/logs/x\",\"textPayload\":\"2\"}";
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "{\"entries\":[" ++ one ++ "],\"nextPageToken\":\"t1\"}" } },
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Invalid page_token\",\"status\":\"INVALID_ARGUMENT\"}}" } },
+        .{ .respond = .{ .body = "{\"entries\":[" ++ one ++ "," ++ two ++ "]}" } },
+    }, .{});
+    defer h.deinit();
+    var tail = try h.client.tail(.{ .from = .{ .timestamp = at(0) }, .max_calls_per_poll = 2 });
+    defer tail.deinit();
+    h.clock.now_ns = at(60).nanoseconds;
+    var first = try tail.poll();
+    defer first.deinit();
+    try testing.expectEqual(1, first.value.entries.len);
+    try testing.expectEqual(error.InvalidPageToken, first.value.stopped.?);
+    try testing.expect(tail.pending == null);
+    var second = try tail.poll();
+    defer second.deinit();
+    try testing.expectEqual(1, second.value.entries.len);
+    try testing.expectEqualStrings("b", second.value.entries[0].insert_id);
+    try testing.expect(std.mem.indexOf(u8, (try h.fake.request(1)).body.?, "\"pageToken\":\"t1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, (try h.fake.request(2)).body.?, "pageToken") == null);
 }
 
 test "tail: resumes from a kept cursor, and stops on a spent budget without losing anything" {
