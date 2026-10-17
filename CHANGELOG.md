@@ -43,8 +43,9 @@ including the ones that did not change.
   them as production did when measured, its refusals in production's
   words: grants on a project or above it, public projects read but not
   searched, the project charged for each call, the search quota, a lag
-  before search sees a change, and an order that differs between
-  searches. `examples/projects_list.zig`, with `--fake` for no network.
+  before search sees a change, and one order for every search, in which
+  a page token is a position, as production's was.
+  `examples/projects_list.zig`, with `--fake` for no network.
 - resource_manager: guides in `docs/resource_manager/` (listing
   projects, the project charged, testing), each fact in them measured in
   production; a production suite,

@@ -70,7 +70,7 @@ everything the credential can see.
 
 Resource Manager has no emulator, so what this module does was measured
 in production on 2026-10-17 before it was built on, and a production
-suite replays 33 scripts against production and the fake. What that
+suite replays 37 scripts against production and the fake. What that
 changed:
 
 - **Two search terms side by side mean AND**, whatever the reference

@@ -51,6 +51,15 @@ token. An empty page with a token is an ordinary answer; only a null
 token ends a search. Tokens "have a limited lifetime", so start a new
 search for each refresh rather than keeping one.
 
+Measured on 2026-10-17 with two visible projects: a token is a position
+in one order, not a bookmark in its search. Sent again it gave the same
+page, and it still worked 65 s later. Sent with another page size it went
+on from its place; sent with another query it applied that query from
+its place, so a project listed before the token was not found. The order
+was the same on every walk and at every page size (project number order,
+which was also id order), but nothing promises it, and the walk sorts by
+project id itself.
+
 <!-- snippet: tests/docs_examples.zig#rm-pages -->
 ```zig
 var search = try client.searchProjects(.{ .query = "labels.team:payments", .page_size = 100 });
