@@ -397,11 +397,13 @@ pub const TailBatch = struct {
     /// Entries not returned before, oldest first.
     entries: []const Entry,
     /// More was waiting than the poll's calls allowed: the tail is behind,
-    /// and the next poll goes on from here.
+    /// and the next poll goes on from the page this one did not reach.
     behind: bool,
     /// Why the poll stopped early, with what it had: the read budget or the
-    /// server's quota (`error.ResourceExhausted`), or a call that failed
-    /// after entries came. The next poll tries again from the cursor.
+    /// server's quota (`error.ResourceExhausted`), a call that failed after
+    /// entries came, or a page token kept from the last poll that the
+    /// server refused. The next poll tries again where this one stopped,
+    /// or, after a refused token, from the cursor.
     stopped: ?anyerror,
 };
 

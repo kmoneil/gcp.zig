@@ -40,7 +40,7 @@ seconds leaves most of them to others.
 
 ## The window
 
-Each poll makes one fresh query, oldest first, with literal bounds:
+Each poll reads a window, oldest first, with literal bounds:
 
 - **From the cursor, less `overlap_ms`** (60 s by default), so entries
   that arrived late are read again;
@@ -61,20 +61,26 @@ edge, which tells you whether to widen it.
 ## Falling behind, and stopping
 
 When a window holds more than `max_calls_per_poll` pages, the poll
-returns what it read with `behind` set, and the cursor stops at its last
-entry. The next poll reads on from there, without the overlap, to catch
-up.
+returns what it read with `behind` set, and keeps the window with its
+next page's token. The next poll asks for that page, so it goes on where
+this one stopped. A fresh query would read again what this one passed,
+and a run of entries at one timestamp that filled a poll's calls would
+hold the tail there for good. A window left for more than an hour is
+begun again from the cursor instead.
 
 When the read budget or the server's quota stops a poll, or a call fails
 after entries came, the poll returns what it had with `stopped` set, and
-the next one tries again from the cursor. Only a first call that fails
-for another reason is an error, and the cursor stays where it was.
+the next one tries again where it stopped. A kept page token the server
+refuses is dropped, and the next poll begins a window from the cursor.
+Only a first call that fails for another reason is an error, and the
+cursor stays where it was.
 
 ## Keeping the cursor
 
-`tail.cursor()` is where the next poll begins. Keep it, and a tail made
-later with `.from = cursor` resumes there, past the entry it names,
-without returning it again.
+`tail.cursor()` is how far the tail has read: the end of the last window
+it finished, or the last entry it returned past that. Keep it, and a
+tail made later with `.from = cursor` resumes there, past the entry it
+names, without returning it again.
 
 ## Memory
 
