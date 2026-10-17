@@ -432,7 +432,7 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
 
         /// The wait before the next attempt, or null, logged, when the
         /// server asked for longer than the policy waits.
-        fn waitMs(self: Self, attempt: u32, server_delay: ?u32, method: transport.Method, log_path: []const u8, err: anyerror) ?u32 {
+        fn waitMs(self: Self, attempt: u32, server_delay: ?u32, method: transport.Method, log_path: []const u8, err: StreamBodyError) ?u32 {
             if (self.retry.waitMs(attempt, entropy(self.io), server_delay)) |ms| return ms;
             log.warn("{t} {s} failed with {t}; not retried: the server asked to wait {d} ms, longer than max_backoff_ms ({d} ms)", .{
                 method, log_path, err, server_delay.?, self.retry.max_backoff_ms,

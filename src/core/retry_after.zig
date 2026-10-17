@@ -229,10 +229,10 @@ pub const Asked = struct {
     pub fn headers(a: Asked, arena: Allocator) Allocator.Error![]const transport.Header {
         var list: std.ArrayList(transport.Header) = .empty;
         if (a.form == .retry_after or a.form == .all) {
-            try list.append(arena, .{ .name = "Retry-After", .value = try std.fmt.allocPrint(arena, "{d}", .{a.seconds()}) });
+            try list.append(arena, .{ .name = "Retry-After", .value = try arena.print("{d}", .{a.seconds()}) });
         }
         if (a.form == .retry_after_ms or a.form == .all) {
-            try list.append(arena, .{ .name = "retry-after-ms", .value = try std.fmt.allocPrint(arena, "{d}", .{a.ms}) });
+            try list.append(arena, .{ .name = "retry-after-ms", .value = try arena.print("{d}", .{a.ms}) });
         }
         return list.items;
     }
@@ -278,8 +278,8 @@ pub const Asked = struct {
     fn retryDelay(a: Asked, arena: Allocator) Allocator.Error![]const u8 {
         const whole = a.ms / std.time.ms_per_s;
         const part = a.ms % std.time.ms_per_s;
-        if (part == 0) return std.fmt.allocPrint(arena, "{d}s", .{whole});
-        return std.fmt.allocPrint(arena, "{d}.{d:0>3}s", .{ whole, part });
+        if (part == 0) return arena.print("{d}s", .{whole});
+        return arena.print("{d}.{d:0>3}s", .{ whole, part });
     }
 };
 
