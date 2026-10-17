@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.39.0 (unreleased)
+## 0.39.0 (2026-10-17)
 
 - logging: new module, **experimental**: the read side of Cloud
   Logging, over REST. `Client.query` builds and fixes one `entries.list`
