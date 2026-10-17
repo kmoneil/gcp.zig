@@ -2,14 +2,17 @@
 //! arrive. Milestone 0 found REST tail unusable over HTTP/1.1, so this is
 //! the tail: `entries.list` again and again, over a window that moves.
 //!
-//! Each `poll` makes one fresh query, oldest first, bounded by literal
-//! times: from the cursor less `overlap_ms`, for entries that arrived late,
-//! to now less `settle_ms`, so the newest have time to come in. It drains
-//! the window's pages up to `max_calls_per_poll`, drops what it returned
-//! before (by log name, timestamp and insertId, the server's own key for
-//! duplicates, which it applies only within one result), and moves the
-//! cursor: to the end of the window when the window was drained, or to the
-//! last entry returned when calls ran out, which `behind` reports.
+//! Each `poll` reads a window, oldest first, bounded by literal times: from
+//! the cursor less `overlap_ms`, for entries that arrived late, to now less
+//! `settle_ms`, so the newest have time to come in. It reads the window's
+//! pages up to `max_calls_per_poll` and drops what it returned before (by
+//! log name, timestamp and insertId, the server's own key for duplicates,
+//! which it applies only within one result). A window drained moves the
+//! cursor to its end. One with more pages than the calls is kept with its
+//! next page's token, which `behind` reports, and the next poll goes on
+//! with it: a fresh query would read again what this one passed, and a run
+//! of entries at one timestamp longer than a poll's calls would hold the
+//! tail there for good.
 //!
 //! An entry that arrives later than the overlap is never returned: every
 //! poller has that trade, gcloud's included. `stats().latest_late_ms` says
@@ -42,9 +45,11 @@ cursor_ns: i96,
 /// The insertId of the last entry returned at `cursor_ns`, when calls ran
 /// out mid-window; "" after a drained window.
 cursor_insert_id: std.ArrayList(u8) = .empty,
-/// The last poll ran out of calls: the next reads on from the cursor
-/// itself, without the overlap, to catch up.
+/// A poll ran out of calls: a new window reads on from the cursor itself,
+/// without the overlap, to catch up.
 was_behind: bool = false,
+/// The window the last poll left partway, which the next goes on with.
+pending: ?Pending = null,
 /// Keys returned within the overlap, so a second sight is dropped; in
 /// `seen_order` oldest first, for pruning.
 seen: std.StringHashMapUnmanaged(i96) = .empty,
@@ -55,6 +60,23 @@ counters: types.TailStats = .{},
 seen_cap: usize = max_seen,
 
 pub const max_seen = 100_000;
+
+/// A window left this long is begun again from the cursor rather than
+/// gone on with: Logging's page tokens last a day, and the rest of an hour
+/// old window is not what a person watching wants first.
+pub const max_pending_ns: i96 = std.time.ns_per_hour;
+
+const Window = struct { lower: i96, upper: i96 };
+
+/// A window a poll ran out of calls in. Its next page is asked for with
+/// the same request, as a page token requires.
+const Pending = struct {
+    window: Window,
+    /// The next page's, in the client's allocator.
+    token: []u8,
+    /// When the window's first page was asked for.
+    begun_ns: i96,
+};
 
 pub fn init(client: *Client, options: types.TailOptions) Error!Tail {
     const diag = client.diagnostics;
@@ -104,11 +126,13 @@ pub fn deinit(self: *Tail) void {
     self.seen_order.deinit(gpa);
     self.seen.deinit(gpa);
     self.cursor_insert_id.deinit(gpa);
+    self.dropPending();
     self.arena.deinit();
     self.* = undefined;
 }
 
-/// Where the next poll begins, to keep and resume from. Valid until the
+/// How far the tail has read, to keep and resume from: the end of the last
+/// window drained, or the last entry returned past it. Valid until the
 /// next poll.
 pub fn cursor(self: *const Tail) types.Cursor {
     return .{ .timestamp = .{ .nanoseconds = self.cursor_ns }, .insert_id = self.cursor_insert_id.items };
@@ -131,9 +155,12 @@ pub fn poll(self: *Tail) Error!types.Owned(types.TailBatch) {
     self.counters.polls += 1;
 
     const now = std.Io.Clock.real.now(client.io).nanoseconds;
-    const upper = now - @as(i96, self.options.settle_ms) * std.time.ns_per_ms;
-    const overlap: i96 = if (self.was_behind) 0 else @as(i96, self.options.overlap_ms) * std.time.ns_per_ms;
-    const lower = @max(self.begin_ns, self.cursor_ns - overlap);
+    if (self.pending) |p| if (now - p.begun_ns > max_pending_ns) self.dropPending();
+    const kept = self.pending;
+    const window: Window = if (kept) |p| p.window else .{
+        .lower = @max(self.begin_ns, self.cursor_ns - if (self.was_behind) 0 else @as(i96, self.options.overlap_ms) * std.time.ns_per_ms),
+        .upper = now - @as(i96, self.options.settle_ms) * std.time.ns_per_ms,
+    };
     const cursor_at_start = self.cursor_ns;
     // Reading on from a cursor that stopped partway through a timestamp:
     // what came at that timestamp up to its entry was returned already,
@@ -143,15 +170,15 @@ pub fn poll(self: *Tail) Error!types.Owned(types.TailBatch) {
         try a.dupe(u8, self.cursor_insert_id.items)
     else
         null;
-    if (upper <= lower) {
+    if (window.upper <= window.lower) {
         result.value = .{ .entries = &.{}, .behind = false, .stopped = null };
         return result;
     }
 
-    var q = try client.query(queryOptions(self.options, lower, upper));
+    var q = try client.query(queryOptions(self.options, window.lower, window.upper));
     defer q.deinit();
     var out: std.ArrayList(types.Entry) = .empty;
-    var token: ?[]const u8 = null;
+    var token: ?[]const u8 = if (kept) |p| try a.dupe(u8, p.token) else null;
     var calls: u32 = 0;
     var last: ?struct { ns: i96, insert_id: []const u8 } = null;
     var stopped: ?anyerror = null;
@@ -160,7 +187,12 @@ pub fn poll(self: *Tail) Error!types.Owned(types.TailBatch) {
         calls += 1;
         self.counters.calls += 1;
         var page = q.page(token) catch |err| {
-            if (out.items.len == 0 and calls == 1 and err != error.ResourceExhausted) return err;
+            if (kept != null and calls == 1 and (err == error.InvalidPageToken or err == error.InvalidArgument)) {
+                // The server will not take the kept token: the next poll
+                // begins a window from the cursor.
+                self.dropPending();
+                token = null;
+            } else if (out.items.len == 0 and calls == 1 and err != error.ResourceExhausted) return err;
             stopped = err;
             break;
         };
@@ -193,22 +225,37 @@ pub fn poll(self: *Tail) Error!types.Owned(types.TailBatch) {
     self.counters.entries += out.items.len;
 
     if (drained) {
-        self.cursor_ns = upper;
+        self.dropPending();
+        self.cursor_ns = window.upper;
         self.cursor_insert_id.clearRetainingCapacity();
         self.was_behind = false;
-    } else if (last) |l| {
-        self.cursor_ns = l.ns;
-        self.cursor_insert_id.clearRetainingCapacity();
-        try self.cursor_insert_id.appendSlice(client.gpa, l.insert_id);
-        self.was_behind = true;
     } else {
-        // Nothing came and calls ran out, or the first was refused: the
-        // next poll tries the same window again.
-        self.was_behind = stopped == null;
+        // Calls ran out, or one was stopped: the next poll asks for the
+        // page this one did not get.
+        if (token) |t| try self.keep(window, t, if (kept) |p| p.begun_ns else now);
+        // The cursor only moves on: what a window read again before it
+        // was returned already.
+        if (last) |l| if (l.ns > self.cursor_ns or (l.ns == self.cursor_ns and std.mem.order(u8, l.insert_id, self.cursor_insert_id.items) == .gt)) {
+            self.cursor_ns = l.ns;
+            self.cursor_insert_id.clearRetainingCapacity();
+            try self.cursor_insert_id.appendSlice(client.gpa, l.insert_id);
+            self.was_behind = true;
+        };
     }
     self.prune(self.cursor_ns - @as(i96, self.options.overlap_ms) * std.time.ns_per_ms);
     result.value = .{ .entries = out.items, .behind = !drained and stopped == null, .stopped = stopped };
     return result;
+}
+
+fn keep(self: *Tail, window: Window, token: []const u8, begun_ns: i96) Allocator.Error!void {
+    const copy = try self.client.gpa.dupe(u8, token);
+    self.dropPending();
+    self.pending = .{ .window = window, .token = copy, .begun_ns = begun_ns };
+}
+
+fn dropPending(self: *Tail) void {
+    if (self.pending) |p| self.client.gpa.free(p.token);
+    self.pending = null;
 }
 
 fn queryOptions(o: types.TailOptions, lower: i96, upper: i96) types.QueryOptions {
@@ -499,6 +546,137 @@ test "tail: behind when calls run out, then on from the cursor without the overl
     try testing.expectEqualStrings("", tail.cursor().insert_id);
 }
 
+test "tail: a run at one timestamp longer than a poll's calls is read through, each entry once" {
+    var r: Rig = undefined;
+    try r.init(0);
+    defer r.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    var tail = try r.client.tail(.{ .page_size = 2, .max_calls_per_poll = 1 });
+    defer tail.deinit();
+    for ([_][]const u8{ "a", "b", "c", "d", "e" }) |id| try r.write(id, 1, 1);
+    r.now(30);
+    try testing.expect((try r.poll(&tail, &out)).behind);
+    try testing.expectEqualStrings("a b", out.items);
+    try testing.expectEqualStrings("b", tail.cursor().insert_id);
+    // A fresh query from the cursor would read a and b again with the
+    // poll's one call, and never get past them.
+    try testing.expect((try r.poll(&tail, &out)).behind);
+    try testing.expectEqualStrings("c d", out.items);
+    try testing.expect(!(try r.poll(&tail, &out)).behind);
+    try testing.expectEqualStrings("e", out.items);
+    try testing.expectEqual(at(25).nanoseconds, tail.cursor().timestamp.nanoseconds);
+    try testing.expectEqual(3, r.fake.listCalls());
+    try testing.expectEqual(0, tail.stats().duplicates);
+}
+
+test "tail: a cursor kept partway through a long run at one timestamp resumes past it" {
+    var r: Rig = undefined;
+    try r.init(0);
+    defer r.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "f" }) |id| try r.write(id, 1, 1);
+    var first = try r.client.tail(.{ .page_size = 2, .max_calls_per_poll = 2 });
+    defer first.deinit();
+    r.now(30);
+    _ = try r.poll(&first, &out);
+    try testing.expectEqualStrings("a b c d", out.items);
+    const kept = first.cursor();
+    try testing.expectEqualStrings("d", kept.insert_id);
+
+    // One entry a call: a, b, c and d take a poll each to pass, none of
+    // them comes again, and the cursor never goes back.
+    var resumed = try r.client.tail(.{ .from = kept, .page_size = 1, .max_calls_per_poll = 1 });
+    defer resumed.deinit();
+    var all: std.ArrayList(u8) = .empty;
+    defer all.deinit(testing.allocator);
+    var polls: usize = 1;
+    while (polls <= 10) : (polls += 1) {
+        const b = try r.poll(&resumed, &out);
+        try all.appendSlice(testing.allocator, out.items);
+        const at_id = resumed.cursor().insert_id;
+        if (at_id.len > 0) try testing.expect(std.mem.order(u8, at_id, "d") != .lt);
+        if (!b.behind) break;
+    }
+    try testing.expectEqualStrings("ef", all.items);
+    try testing.expectEqual(6, polls);
+    try testing.expectEqual(4, resumed.stats().duplicates);
+}
+
+test "tail: a window left over an hour is begun again from the cursor" {
+    var r: Rig = undefined;
+    try r.init(0);
+    defer r.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    var tail = try r.client.tail(.{ .page_size = 1, .max_calls_per_poll = 1 });
+    defer tail.deinit();
+    for ([_][]const u8{ "a", "b", "c" }, 1..) |id, ts| try r.write(id, @intCast(ts), @intCast(ts));
+    r.now(30);
+    _ = try r.poll(&tail, &out);
+    try testing.expectEqualStrings("a", out.items);
+    // An hour after its first page, the window goes on.
+    r.now(30 + 3600);
+    _ = try r.poll(&tail, &out);
+    try testing.expectEqualStrings("b", out.items);
+    // Past the hour, a window begins at the cursor, at b, without the
+    // overlap: its one call reads b again, dropped.
+    r.now(30 + 3601);
+    try testing.expect((try r.poll(&tail, &out)).behind);
+    try testing.expectEqualStrings("", out.items);
+    try testing.expectEqual(1, tail.stats().duplicates);
+    try testing.expect(!(try r.poll(&tail, &out)).behind);
+    try testing.expectEqualStrings("c", out.items);
+}
+
+test "tail: a kept page token the server refuses stops the poll, and the next begins from the cursor" {
+    const one = "{\"timestamp\":\"2026-10-16T09:00:01Z\",\"insertId\":\"a\",\"logName\":\"projects/extractctl/logs/x\",\"textPayload\":\"1\"}";
+    const two = "{\"timestamp\":\"2026-10-16T09:00:02Z\",\"insertId\":\"b\",\"logName\":\"projects/extractctl/logs/x\",\"textPayload\":\"2\"}";
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "{\"entries\":[" ++ one ++ "],\"nextPageToken\":\"t1\"}" } },
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Invalid page_token\",\"status\":\"INVALID_ARGUMENT\"}}" } },
+        .{ .respond = .{ .body = "{\"entries\":[" ++ one ++ "," ++ two ++ "],\"nextPageToken\":\"t2\"}" } },
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Request contains an invalid argument.\",\"status\":\"INVALID_ARGUMENT\"}}" } },
+        .{ .respond = .{ .body = "{}" } },
+    }, .{});
+    defer h.deinit();
+    var tail = try h.client.tail(.{ .from = .{ .timestamp = at(0) }, .max_calls_per_poll = 1 });
+    defer tail.deinit();
+    h.clock.now_ns = at(60).nanoseconds;
+    const Poll = struct { ids: []const u8, behind: bool, stopped: ?anyerror };
+    const expected = [_]Poll{
+        .{ .ids = "a", .behind = true, .stopped = null },
+        .{ .ids = "", .behind = false, .stopped = error.InvalidPageToken },
+        // From the cursor at a, which comes again and is dropped.
+        .{ .ids = "b", .behind = true, .stopped = null },
+        .{ .ids = "", .behind = false, .stopped = error.InvalidArgument },
+        .{ .ids = "", .behind = false, .stopped = null },
+    };
+    for (expected) |want| {
+        var batch = try tail.poll();
+        defer batch.deinit();
+        var ids: std.ArrayList(u8) = .empty;
+        defer ids.deinit(testing.allocator);
+        for (batch.value.entries) |e| try ids.appendSlice(testing.allocator, e.insert_id);
+        try testing.expectEqualStrings(want.ids, ids.items);
+        try testing.expectEqual(want.behind, batch.value.behind);
+        try testing.expectEqual(want.stopped, batch.value.stopped);
+    }
+    // The kept tokens went with the request that made them, and a refused
+    // one was not sent again.
+    const tokens = [_]?[]const u8{ null, "\"pageToken\":\"t1\"", null, "\"pageToken\":\"t2\"", null };
+    for (tokens, 0..) |want, i| {
+        const body = (try h.fake.request(i)).body.?;
+        if (want) |t| {
+            try testing.expect(std.mem.indexOf(u8, body, t) != null);
+            const first_body = (try h.fake.request(i - 1)).body.?;
+            try testing.expectEqualStrings(first_body[0 .. std.mem.indexOf(u8, first_body, "\"pageSize\"") orelse first_body.len], body[0 .. std.mem.indexOf(u8, body, "\"pageSize\"") orelse body.len]);
+        } else try testing.expect(std.mem.indexOf(u8, body, "pageToken") == null);
+    }
+}
+
 test "tail: resumes from a kept cursor, and stops on a spent budget without losing anything" {
     var r: Rig = undefined;
     try r.init(1);
@@ -670,11 +848,16 @@ fn tailProperty(_: void, input: []const u8) !void {
     var returned: [40]bool = @splat(false);
     var clean = true;
     var now_ms: i64 = 0;
-    while (now_ms < 400_000) : (now_ms += @as(i64, g.intRange(u32, 500, 10_000))) {
+    var polls: usize = 0;
+    // Polls at random gaps for 400 s, then every 5 s until one drains its
+    // window: a tail that fell behind must still catch up.
+    while (true) : (polls += 1) {
+        const catching_up = now_ms >= 400_000;
+        if (polls == 2000) return error.TestTailStalled;
         r.clock.now_ns = (base_s * 1000 + now_ms) * std.time.ns_per_ms;
         var batch = try tail.poll();
         defer batch.deinit();
-        if (batch.value.behind or batch.value.stopped != null) clean = false;
+        if (!catching_up and (batch.value.behind or batch.value.stopped != null)) clean = false;
         for (batch.value.entries) |e| {
             const i = (e.insert_id[1] - '0') * 10 + (e.insert_id[2] - '0');
             const a = arrivals[i];
@@ -686,21 +869,22 @@ fn tailProperty(_: void, input: []const u8) !void {
             try testing.expect(a.visible_ms <= now_ms);
             try testing.expect(a.ts_ms < now_ms - settle_s * 1000);
         }
+        if (catching_up and !batch.value.behind and batch.value.stopped == null) break;
+        now_ms += if (catching_up) 5_000 else @as(i64, g.intRange(u32, 500, 10_000));
     }
-    // Every entry from the tail's start that arrived within the overlap
-    // and the settle time came, when no poll fell behind or stopped.
-    if (!clean) return;
+    // Every entry from the tail's start that had settled when it arrived
+    // came, behind or not; and, when no poll fell behind or stopped, every
+    // one that arrived within the overlap and the settle time.
     for (arrivals[0..n], returned[0..n]) |a, got| {
-        if (a.ts_ms < begin_ms) continue;
-        if (a.visible_ms - a.ts_ms > (overlap_s + settle_s) * 1000) continue;
-        if (!got) {
-            std.debug.print("missed {s}: stamped {d} ms, visible {d} ms, settle {d} s, overlap {d} s\n", .{ a.id[0..3], a.ts_ms, a.visible_ms, settle_s, overlap_s });
-            return error.TestEntryMissed;
-        }
+        if (a.ts_ms < begin_ms or got) continue;
+        const delay_ms = a.visible_ms - a.ts_ms;
+        if (delay_ms > settle_s * 1000 and !(clean and delay_ms <= (overlap_s + settle_s) * 1000)) continue;
+        std.debug.print("missed {s}: stamped {d} ms, visible {d} ms, settle {d} s, overlap {d} s, clean {}\n", .{ a.id[0..3], a.ts_ms, a.visible_ms, settle_s, overlap_s, clean });
+        return error.TestEntryMissed;
     }
 }
 
-test "slow property Tail: each entry once, never early, none missed within the overlap" {
+test "slow property Tail: each entry once, never early, none missed within the overlap, and caught up" {
     try test_util.fuzzBytes({}, tailProperty, .{
         .corpus = &.{ "", "\x00\x00\x03\x03\x28", "\x02\x02\x01\x01\x10\xff\xff\x00\x00\x40" },
         // Each run polls through some 400 s of entries; the nightly

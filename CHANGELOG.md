@@ -41,9 +41,10 @@ including the ones that did not change.
   oldest first, from the cursor less `overlap_ms` (60 s) for entries
   that arrived late, to now less `settle_ms` (5 s), up to
   `max_calls_per_poll` calls, and returns each entry once. A poll that
-  runs out of calls says `behind` and the next reads on without the
-  overlap; one stopped by the read quota returns what it had. The
-  cursor can be kept and a tail resumed from it. `Tail.stats` counts
+  runs out of calls says `behind`, and the next goes on with the same
+  window from its next page, however many entries share a timestamp;
+  one stopped by the read quota returns what it had. The cursor can be
+  kept and a tail resumed from it. `Tail.stats` counts
   entries seen again and late ones, and how close the latest late one
   came to the overlap. `examples/logs_tail.zig`, with `--fake`.
 - logging: guides in `docs/logging/` (listing, filters, tailing, logs,
