@@ -157,7 +157,7 @@ pub fn provider(self: Credentials) TokenProvider {
 /// to sign with. Points into the heap, like `provider()`.
 pub fn signer(self: Credentials) ?core.Signer {
     return switch (self.held.impl) {
-        .service_account => |*account| account.signer(),
+        .service_account => |*key| key.signer(),
         .impersonated => |*impersonated| impersonated.signer(),
         .metadata => |*metadata| metadata.signer(),
         .user, .external_account => null,
@@ -177,8 +177,36 @@ pub fn quotaProjectId(self: Credentials) ?[]const u8 {
 pub fn projectId(self: Credentials, io: std.Io, arena: Allocator) MetadataServer.ProjectIdError!?[]const u8 {
     return switch (self.held.impl) {
         .user, .external_account, .impersonated => null,
-        .service_account => |*account| if (account.projectId()) |p| try arena.dupe(u8, p) else null,
+        .service_account => |*key| if (key.projectId()) |p| try arena.dupe(u8, p) else null,
         .metadata => |*metadata| try metadata.projectId(io, arena),
+    };
+}
+
+/// What `account` can fail with: a user's login may fetch a token first,
+/// and the metadata server is asked.
+pub const AccountError = TokenProvider.Error || MetadataServer.EmailError;
+
+/// The account these credentials act as, copied into `arena`, or null when
+/// it cannot be known, with the reason in Diagnostics:
+///
+/// - a service account key: its `client_email`;
+/// - a login that impersonates a service account, or a workload identity
+///   federation file that does: the target as its URL names it, an email
+///   or a numeric unique id;
+/// - the metadata server: the attached account's email, or on GKE under
+///   Workload Identity, `PROJECT.svc.id.goog`; asked once and kept;
+/// - a user's login: the email in the id_token Google's token endpoint
+///   sends with each token, else the file's `account`; a token is fetched
+///   first when none was. Google warns that a person's email may change;
+/// - workload identity federation without impersonation: null, since
+///   Google gives no way to name a federated principal.
+pub fn account(self: Credentials, io: std.Io, arena: Allocator) AccountError!?[]const u8 {
+    return switch (self.held.impl) {
+        .service_account => |*key| try arena.dupe(u8, key.clientEmail()),
+        .impersonated => |*impersonated| try arena.dupe(u8, impersonated.targetPrincipal()),
+        .metadata => |*metadata| try metadata.account(io, arena),
+        .user => |*user| try user.account(io, arena),
+        .external_account => |*external| try external.account(arena),
     };
 }
 
@@ -649,6 +677,79 @@ test "Credentials.signer: a key file signs here, impersonation and the metadata 
     const metadata_signer = metadata.signer().?;
     try testing.expectEqualStrings("worker@my-project.iam.gserviceaccount.com", try metadata_signer.email(testing.io, a));
     try testing.expectEqual(43_200, metadata_signer.lifetimeS());
+}
+
+test "Credentials.account: each kind of credentials names its account as it can" {
+    var config: TmpConfig = undefined;
+    try config.init();
+    defer config.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var none: test_util.FakeTransport = .init(testing.allocator, &.{});
+    defer none.deinit();
+
+    // A key file: its client_email, with no request.
+    var sa_buf: [160]u8 = undefined;
+    var key = try find(testing.allocator, testing.io, .{ .credentials_path = try config.write(&sa_buf, "sa.json", try serviceAccountJson(a)) }, .{ .transport = none.transport() });
+    defer key.deinit();
+    try testing.expectEqualStrings("robot@sa-project.iam.gserviceaccount.com", (try key.account(testing.io, a)).?);
+
+    // A login that impersonates an account: the target as its URL names
+    // it, a unique id as written.
+    var impersonated_buf: [160]u8 = undefined;
+    var impersonated = try find(testing.allocator, testing.io, .{ .credentials_path = try config.write(&impersonated_buf, "impersonated.json",
+        \\{"type": "impersonated_service_account",
+        \\ "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/104223497553108012345:generateAccessToken",
+        \\ "source_credentials": {"type": "authorized_user", "client_id": "c", "client_secret": "SECRET", "refresh_token": "SECRET-refresh"}}
+    ) }, .{ .transport = none.transport() });
+    defer impersonated.deinit();
+    try testing.expectEqualStrings("104223497553108012345", (try impersonated.account(testing.io, a)).?);
+
+    // Workload identity federation without impersonation: no name.
+    var subject_buf: [160]u8 = undefined;
+    _ = try config.write(&subject_buf, "subject", "external-subject-token");
+    var external_buf: [160]u8 = undefined;
+    var diag: Diagnostics = .{};
+    var external = try find(testing.allocator, testing.io, .{ .credentials_path = try config.write(&external_buf, "external.json", try a.print(
+        \\{{"type": "external_account",
+        \\ "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/x",
+        \\ "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+        \\ "token_url": "https://sts.googleapis.com/v1/token",
+        \\ "credential_source": {{"file": "{s}/subject"}}}}
+    , .{config.dir})), .diagnostics = &diag }, .{ .transport = none.transport() });
+    defer external.deinit();
+    try testing.expectEqual(null, try external.account(testing.io, a));
+    try testing.expect(std.mem.startsWith(u8, diag.message(), "no account to name: workload identity federation without impersonation"));
+    try testing.expectEqual(0, none.requests.items.len);
+
+    // gcloud's login: the email in the id_token of the token it fetches.
+    var gcloud_buf: [160]u8 = undefined;
+    _ = try config.write(&gcloud_buf, Lookup.adc_file_name, gcloud_json);
+    var tokens: test_util.FakeTransport = .init(testing.allocator, &.{.{ .respond = .{
+        .body = "{\"access_token\":\"ya29.from-file\",\"expires_in\":3599,\"token_type\":\"Bearer\",\"id_token\":\"eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIiwidHlwIjoiSldUIn0.eyJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJhdWQiOiJnY2xvdWQuYXBwcy5nb29nbGV1c2VyY29udGVudC5jb20iLCJhenAiOiJnY2xvdWQuYXBwcy5nb29nbGV1c2VyY29udGVudC5jb20iLCJzdWIiOiIxMDQyMjM0OTc1NTMxMDgwMTExMTEiLCJlbWFpbCI6InBlcnNvbkBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlfQ.c2lnbmF0dXJl\"}",
+    } }});
+    defer tokens.deinit();
+    var user = try find(testing.allocator, testing.io, .{ .gcloud_config_dir = config.dir }, .{ .transport = tokens.transport() });
+    defer user.deinit();
+    try testing.expectEqual(.gcloud_file, user.source);
+    try testing.expectEqualStrings("person@example.com", (try user.account(testing.io, a)).?);
+    try testing.expectEqualStrings("ya29.from-file", try user.provider().getToken(testing.io, a, test_scopes));
+    try testing.expectEqual(1, tokens.requests.items.len);
+
+    // A workload on Google Cloud: what the metadata server names.
+    var empty: TmpConfig = undefined;
+    try empty.init();
+    defer empty.deinit();
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+        metadata_listing,
+        .{ .respond = .{ .body = "my-project.svc.id.goog\n", .headers = flavor } },
+    });
+    defer fake.deinit();
+    var metadata = try find(testing.allocator, testing.io, .{ .gcloud_config_dir = empty.dir }, .{ .transport = fake.transport() });
+    defer metadata.deinit();
+    try testing.expectEqual(.metadata_server, metadata.source);
+    try testing.expectEqualStrings("my-project.svc.id.goog", (try metadata.account(testing.io, a)).?);
 }
 
 test "findDefault: gcloud's login file is next, and its token comes from it" {

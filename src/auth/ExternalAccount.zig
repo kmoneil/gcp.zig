@@ -153,7 +153,7 @@ pub fn initFromJson(gpa: Allocator, io: std.Io, json: []const u8, options: Optio
     var scratch: std.heap.ArenaAllocator = .init(wiping.allocator());
     defer scratch.deinit();
     const file = switch (try adc_file.parse(scratch.allocator(), json, diag)) {
-        .external_account => |account| account,
+        .external_account => |parsed| parsed,
         .authorized_user => {
             if (diag) |d| d.print("the credentials file is an OAuth user login; use AuthorizedUser, or findDefault", .{});
             return error.UnsupportedCredentialType;
@@ -310,6 +310,22 @@ pub fn provider(self: *ExternalAccount) TokenProvider {
 /// The project the file names for quota, if any.
 pub fn quotaProjectId(self: *const ExternalAccount) ?[]const u8 {
     return self.quota_project_id;
+}
+
+/// The service account these credentials impersonate, as the
+/// impersonation URL names it, an email or a numeric unique id, copied into
+/// `arena`. Without impersonation they act as a federated principal, which
+/// Google gives no way to name: null, said in Diagnostics.
+pub fn account(self: *const ExternalAccount, arena: Allocator) Allocator.Error!?[]const u8 {
+    const url = self.impersonation_url orelse {
+        if (self.diagnostics) |d| d.print("no account to name: workload identity federation without impersonation acts as a federated principal, which Google gives no way to name", .{});
+        return null;
+    };
+    const target = iam_credentials.principalFromUrl(url) orelse {
+        if (self.diagnostics) |d| d.print("no account to name: the impersonation URL does not end in serviceAccounts/ACCOUNT:generateAccessToken", .{});
+        return null;
+    };
+    return try arena.dupe(u8, target);
 }
 
 fn fromPtr(ptr: *anyopaque) *ExternalAccount {
@@ -676,6 +692,42 @@ test "ExternalAccount: a url source sends its headers and reads the json field" 
     try testing.expect(std.mem.endsWith(u8, (try h.fake.request(1)).body.?, "&subject_token=url-subject-token"));
 }
 
+test "ExternalAccount.account: the impersonated service account, or null for a federated principal" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    {
+        var h: Harness = undefined;
+        try h.init(&.{}, .{ .impersonate = true });
+        defer h.deinit();
+        try testing.expectEqualStrings("sa@p.iam.gserviceaccount.com", (try h.account.account(arena.allocator())).?);
+        try testing.expectEqual(0, h.fake.requests.items.len);
+    }
+    {
+        var h: Harness = undefined;
+        try h.init(&.{}, .{});
+        defer h.deinit();
+        try testing.expectEqual(null, try h.account.account(arena.allocator()));
+        try testing.expectEqualStrings(
+            "no account to name: workload identity federation without impersonation acts as a federated principal, which Google gives no way to name",
+            h.diag.message(),
+        );
+    }
+    {
+        // An impersonation URL in a shape Google does not use names nobody.
+        var diag: Diagnostics = .{};
+        const json = try arena.allocator().print(
+            \\{{"type": "external_account", "audience": "{s}",
+            \\ "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+            \\ "credential_source": {{"file": "/nonexistent"}},
+            \\ "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com"}}
+        , .{test_audience});
+        var external: ExternalAccount = try .initFromJson(testing.allocator, testing.io, json, .{ .diagnostics = &diag });
+        defer external.deinit();
+        try testing.expectEqual(null, try external.account(arena.allocator()));
+        try testing.expectEqualStrings("no account to name: the impersonation URL does not end in serviceAccounts/ACCOUNT:generateAccessToken", diag.message());
+    }
+}
+
 test "ExternalAccount: impersonation trades the STS token once more, scoped down" {
     var h: Harness = undefined;
     try h.init(&.{
@@ -908,9 +960,9 @@ test "ExternalAccount: the provider hands over the file's quota project, or null
     );
     var fake: test_util.FakeTransport = .init(testing.allocator, &.{});
     defer fake.deinit();
-    var account: ExternalAccount = try .initFromJson(testing.allocator, testing.io, with_quota, .{ .transport = fake.transport() });
-    defer account.deinit();
-    try testing.expectEqualStrings("quota-p", account.provider().quotaProject().?);
+    var external: ExternalAccount = try .initFromJson(testing.allocator, testing.io, with_quota, .{ .transport = fake.transport() });
+    defer external.deinit();
+    try testing.expectEqualStrings("quota-p", external.provider().quotaProject().?);
 }
 
 test "ExternalAccount: a credential_source url out of reach retries, then keeps its error" {
@@ -1002,11 +1054,11 @@ test "ExternalAccount: every block it frees is wiped first" {
         sts_ok,
     });
     defer fake.deinit();
-    var account: ExternalAccount = try .initFromJson(checker.allocator(), testing.io, try credJson(arena.allocator(), with_headers, false), .{
+    var external: ExternalAccount = try .initFromJson(checker.allocator(), testing.io, try credJson(arena.allocator(), with_headers, false), .{
         .transport = fake.transport(),
     });
-    _ = try account.provider().getToken(testing.io, arena.allocator(), test_scopes);
-    account.deinit();
+    _ = try external.provider().getToken(testing.io, arena.allocator(), test_scopes);
+    external.deinit();
     try testing.expect(checker.frees >= 8);
     try testing.expectEqual(0, checker.unwiped);
 }
@@ -1025,9 +1077,9 @@ test "ExternalAccount: every allocation failure is OutOfMemory without leaks" {
             defer fake.deinit();
             var scratch: std.heap.ArenaAllocator = .init(gpa);
             defer scratch.deinit();
-            var account: ExternalAccount = try .initFromJson(gpa, testing.io, cred, .{ .transport = fake.transport() });
-            defer account.deinit();
-            _ = try account.provider().getToken(testing.io, scratch.allocator(), test_scopes);
+            var external: ExternalAccount = try .initFromJson(gpa, testing.io, cred, .{ .transport = fake.transport() });
+            defer external.deinit();
+            _ = try external.provider().getToken(testing.io, scratch.allocator(), test_scopes);
         }
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.get, .{json});
@@ -1048,8 +1100,8 @@ test "ExternalAccount: a url source with headers survives every allocation failu
     const json = try credJson(arena.allocator(), source, false);
     const Run = struct {
         fn init(gpa: Allocator, cred: []const u8) !void {
-            var account: ExternalAccount = try .initFromJson(gpa, testing.io, cred, .{});
-            account.deinit();
+            var external: ExternalAccount = try .initFromJson(gpa, testing.io, cred, .{});
+            external.deinit();
         }
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.init, .{json});
@@ -1071,11 +1123,11 @@ test "ExternalAccount: against an STS on loopback" {
     defer arena.deinit();
     const source = try arena.allocator().print("{{\"file\": \".zig-cache/tmp/{s}/subject\"}}", .{&tmp.sub_path});
     var url_buf: [64]u8 = undefined;
-    var account: ExternalAccount = try .initFromJson(testing.allocator, io, try credJson(arena.allocator(), source, false), .{
+    var external: ExternalAccount = try .initFromJson(testing.allocator, io, try credJson(arena.allocator(), source, false), .{
         .token_url = server.url(&url_buf, "/v1/token"),
     });
-    defer account.deinit();
-    try testing.expectEqualStrings("ya29.loopback", try account.provider().getToken(io, arena.allocator(), test_scopes));
+    defer external.deinit();
+    try testing.expectEqualStrings("ya29.loopback", try external.provider().getToken(io, arena.allocator(), test_scopes));
     try serving.await(io);
 
     const post = server.request(0);

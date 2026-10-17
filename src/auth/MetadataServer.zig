@@ -46,6 +46,9 @@ http: ?*HttpTransport,
 /// The attached account's email, which the signer asks for once and keeps.
 /// Owned.
 signer_email: ?[]u8 = null,
+/// What `account` asked for and keeps, which may be no email. Owned, and
+/// guarded by `signer_mutex` too.
+account_name: ?[]u8 = null,
 signer_mutex: std.Io.Mutex = .init,
 
 pub const Options = struct {
@@ -189,6 +192,7 @@ pub fn deinit(self: *MetadataServer) void {
     wipeFree(self.gpa, self.email_url);
     wipeFree(self.gpa, self.root_url);
     if (self.signer_email) |address| wipeFree(self.gpa, address);
+    if (self.account_name) |name| wipeFree(self.gpa, name);
     wipeFree(self.gpa, self.user_agent);
     self.* = undefined;
 }
@@ -260,18 +264,45 @@ pub const EmailError = ProjectIdError;
 /// `Options.service_account` names, `default` unless set. Copied into
 /// `arena`.
 pub fn email(self: *MetadataServer, io: std.Io, arena: Allocator) EmailError![]const u8 {
-    const res = self.getRetrying(io, arena, self.email_url) catch |err| switch (err) {
-        // Any refusal means no metadata server this code can use.
-        error.TokenUnavailable, error.TokenEndpointRejected => return error.MetadataUnavailable,
-        else => |e| return e,
-    };
-    const address = std.mem.trim(u8, res.body, " \t\r\n");
+    const res, const address = try self.askEmail(io, arena);
     if (!iam_credentials.isEmail(address)) {
         if (self.diagnostics) |d| d.set(res.status, "", "the metadata server's service account email is not one");
         return error.MetadataUnavailable;
     }
     logging.debug("metadata server: service account {s}", .{address});
     return arena.dupe(u8, address);
+}
+
+/// The identity this workload runs as, as the metadata server names it,
+/// asked once and kept, copied into `arena`: the attached service account's
+/// email, or on GKE, under Workload Identity with no service account bound,
+/// the workload pool, `PROJECT.svc.id.goog`, which `email` and the signer
+/// refuse since IAM cannot sign as it.
+pub fn account(self: *MetadataServer, io: std.Io, arena: Allocator) EmailError![]const u8 {
+    try self.signer_mutex.lock(io);
+    defer self.signer_mutex.unlock(io);
+    if (self.account_name == null) {
+        var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+        defer scratch.deinit();
+        const res, const name = try self.askEmail(io, scratch.allocator());
+        const pool = iam_credentials.isPrincipal(name) and std.mem.endsWith(u8, name, ".svc.id.goog") and name.len > ".svc.id.goog".len;
+        if (!iam_credentials.isEmail(name) and !pool) {
+            if (self.diagnostics) |d| d.set(res.status, "", "the metadata server's service account is neither an email nor a workload pool");
+            return error.MetadataUnavailable;
+        }
+        self.account_name = try self.gpa.dupe(u8, name);
+    }
+    return arena.dupe(u8, self.account_name.?);
+}
+
+/// The answer to the email URL, trimmed. A refusal means no metadata
+/// server this code can use.
+fn askEmail(self: *MetadataServer, io: std.Io, arena: Allocator) EmailError!struct { Response, []const u8 } {
+    const res = self.getRetrying(io, arena, self.email_url) catch |err| switch (err) {
+        error.TokenUnavailable, error.TokenEndpointRejected => return error.MetadataUnavailable,
+        else => |e| return e,
+    };
+    return .{ res, std.mem.trim(u8, res.body, " \t\r\n") };
 }
 
 /// Signs as the attached account through IAM `signBlob`, with this
@@ -307,15 +338,15 @@ fn signerEmail(ptr: *anyopaque, io: std.Io, arena: Allocator) core.Signer.Error!
 
 fn sign(ptr: *anyopaque, io: std.Io, arena: Allocator, message: []const u8) core.Signer.Error![]const u8 {
     const self = fromPtr(ptr);
-    const account = try signerEmail(ptr, io, arena);
+    const signing_as = try signerEmail(ptr, io, arena);
     return iam_credentials.sign(self.transport, io, arena, .{
         .provider = self.provider(),
-        .url = try iam_credentials.signBlobUrl(arena, iam_credentials.default_endpoint, account),
+        .url = try iam_credentials.signBlobUrl(arena, iam_credentials.default_endpoint, signing_as),
         .payload = message,
         .retry = self.retry,
         .timeout_ms = self.request_timeout_ms,
         .diagnostics = self.diagnostics,
-        .refused = try arena.print("signing was refused: {s} needs roles/iam.serviceAccountTokenCreator on itself, the IAM Service Account Credentials API must be enabled, and on Compute Engine the VM's access scopes must include cloud-platform", .{account}),
+        .refused = try arena.print("signing was refused: {s} needs roles/iam.serviceAccountTokenCreator on itself, the IAM Service Account Credentials API must be enabled, and on Compute Engine the VM's access scopes must include cloud-platform", .{signing_as}),
     });
 }
 
@@ -795,6 +826,46 @@ test "MetadataServer: email reads the attached account, and refuses what is not 
     // Even a refusal is only ever "no metadata server to read this from".
     try testing.expectError(error.MetadataUnavailable, h.metadata.email(h.clock.io(), h.arena.allocator()));
     try testing.expectError(error.MetadataUnavailable, h.metadata.email(h.clock.io(), h.arena.allocator()));
+}
+
+test "MetadataServer.account: the attached account or GKE's workload pool, asked once and kept" {
+    const pool: Reply = .{ .respond = .{ .body = "my-project.svc.id.goog\n", .headers = flavor } };
+    {
+        var h: Harness = undefined;
+        try h.init(&.{email_ok});
+        defer h.deinit();
+        try testing.expectEqualStrings("worker@my-project.iam.gserviceaccount.com", try h.metadata.account(h.clock.io(), h.arena.allocator()));
+        try testing.expectEqualStrings("worker@my-project.iam.gserviceaccount.com", try h.metadata.account(h.clock.io(), h.arena.allocator()));
+        try testing.expectEqual(1, h.fake.requests.items.len);
+    }
+    {
+        // Under Workload Identity with no service account bound, the
+        // identity is the pool: `account` names it, `email` refuses it.
+        var h: Harness = undefined;
+        try h.init(&.{ pool, pool });
+        defer h.deinit();
+        try testing.expectEqualStrings("my-project.svc.id.goog", try h.metadata.account(h.clock.io(), h.arena.allocator()));
+        try testing.expectError(error.MetadataUnavailable, h.metadata.email(h.clock.io(), h.arena.allocator()));
+    }
+    {
+        var h: Harness = undefined;
+        try h.init(&.{
+            .{ .respond = .{ .body = "not an email", .headers = flavor } },
+            .{ .respond = .{ .body = ".svc.id.goog", .headers = flavor } },
+            .{ .respond = .{ .body = "a b.svc.id.goog", .headers = flavor } },
+            .{ .respond = .{ .status = 404, .body = "Not Found", .headers = flavor } },
+            email_ok,
+        });
+        defer h.deinit();
+        try testing.expectError(error.MetadataUnavailable, h.metadata.account(h.clock.io(), h.arena.allocator()));
+        try testing.expectEqualStrings("the metadata server's service account is neither an email nor a workload pool", h.diag.message());
+        // Nor a bare suffix, nor a name that could not be one; a 404 says
+        // no account is attached.
+        for (0..3) |_| try testing.expectError(error.MetadataUnavailable, h.metadata.account(h.clock.io(), h.arena.allocator()));
+        try testing.expectEqualStrings("no service account is attached to this workload", h.diag.message());
+        // A refusal is not kept: the next call asks again.
+        try testing.expectEqualStrings("worker@my-project.iam.gserviceaccount.com", try h.metadata.account(h.clock.io(), h.arena.allocator()));
+    }
 }
 
 test "MetadataServer: the signer asks for its email once, then signs through IAM with the server's token" {

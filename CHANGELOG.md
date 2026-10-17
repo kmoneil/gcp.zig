@@ -4,6 +4,35 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.42.0 (unreleased)
+
+- auth: `Credentials.account` names the account any credentials act as
+  (issue #217), for an app that says who is signed in and keeps state per
+  identity. A service account key answers with its `client_email`; a
+  login that impersonates an account, and a workload identity federation
+  file that does, with the target as its URL names it, an email or a
+  numeric unique id; the metadata server with the attached account, or on
+  GKE under Workload Identity with no service account bound, the workload
+  pool `PROJECT.svc.id.goog`, asked once and kept. A user's own login, the
+  `authorized_user` file gcloud's `application-default login` writes,
+  answers with the email in the `id_token` Google's token endpoint sends
+  with every token. That token is taken as OpenID Connect allows for one
+  straight from the token endpoint: its signature is not checked, but its
+  issuer must be Google's, its audience this login's client, and its
+  email verified. Failing that, the file's `account` answers, which gcloud
+  leaves empty unless the login named one. The first call fetches a token
+  when none was fetched yet. Workload identity federation without
+  impersonation is null, since Google gives no way to name a federated
+  principal, and every null comes with its reason in `Diagnostics`. Each
+  provider answers on its own as well: `AuthorizedUser.account`,
+  `MetadataServer.account`, `ExternalAccount.account`,
+  `ServiceAccount.clientEmail`, and `ImpersonatedServiceAccount.targetPrincipal`
+  as before. Measured on 2026-10-17, a refresh of a gcloud login returned
+  an `id_token` naming its verified email, and the file's `account` was
+  empty.
+- core, firestore, logging, pubsub, resource_manager, secret_manager and
+  storage: unchanged.
+
 ## 0.41.0 (2026-10-17)
 
 - core: a server's retry delay is read and honoured. When a refused
