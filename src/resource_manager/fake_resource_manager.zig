@@ -27,20 +27,25 @@
 //!   enforced: production served ten in 205 ms. The 429 follows the shape
 //!   of a 2024 Resource Manager 429; its metric and limit names come from
 //!   the limits page, since production's for v3 search were not seen.
-//! - Order: a seeded shuffle that differs between searches, as production
-//!   promises none.
-//! - Paging: the default and largest page sizes are options, since one
-//!   visible project could not show production's. A token goes on with
-//!   the search that issued it; one it did not issue is production's 400.
+//! - Order: one order for every search, as production listed two projects
+//!   the same way on every walk and at every page size. By default a hash
+//!   of each number, which nothing can sort by; `.by_number` lists as
+//!   production did.
+//! - Paging: the default and largest page sizes are options, since two
+//!   visible projects could not show production's. A token is a position
+//!   in the order, as production's was: it goes on from there with another
+//!   page size, and with another query, applied from there, and gives the
+//!   same page each time it is sent. One it did not issue is production's
+//!   400.
 //! - Eventual consistency: a change shows in `projects.get` at once and in
 //!   search after `search_lag_ns`.
 //! - The query language, by `fake_query.zig`'s reading of it.
 //! - Faults on searches: refusals with any status, dropped connections,
 //!   empty pages that go on, and short pages.
 //!
-//! Not modelled, each answered 501 with the reason: a token sent with
-//! another query, page size or caller, or past its lifetime (none of which
-//! production was asked), what `fake_query.zig` does not read, the quota of
+//! Not modelled, each answered 501 with the reason: a token past its
+//! lifetime (production's still worked after 65 s), or from another kind
+//! of search, what `fake_query.zig` does not read, the quota of
 //! `projects.get`, and every other call.
 
 const std = @import("std");
@@ -68,10 +73,8 @@ pub const FakeResourceManager = struct {
     organizations: std.StringArrayHashMapUnmanaged(*StoredOrganization) = .empty,
     /// By bearer token. In `store`.
     principals: std.StringHashMapUnmanaged(*Principal) = .empty,
-    listings: std.ArrayList(Listing) = .empty,
     /// Searches by charged project, in the current minute.
     quota: std.StringHashMapUnmanaged(Window) = .empty,
-    prng: std.Random.DefaultPrng,
     faults: [4]Fault = @splat(.{}),
     search_calls: usize = 0,
     get_calls: usize = 0,
@@ -86,13 +89,27 @@ pub const FakeResourceManager = struct {
         max_page_size: u32 = 1000,
         /// How long after a change search shows it.
         search_lag_ns: i96 = 0,
-        /// How long a token goes on with its search.
+        /// How long a token stays good. Production's still worked after 65
+        /// s; how much longer was not measured.
         token_lifetime_ns: i96 = std.time.ns_per_hour,
         /// Searches a minute per charged project, shared by every caller
         /// charged to it. 0 counts none.
         searches_per_minute: u32 = 240,
-        /// The order's seed.
+        /// The one order every search lists in.
+        order: Order = .seeded,
+        /// The seeded order's seed.
         seed: u64 = 0x5eed,
+    };
+
+    /// The order searches list in. Production promises none, and listed
+    /// two projects in the same order on every walk and at every page
+    /// size, which was project number order (and project id order too).
+    pub const Order = enum {
+        /// Stable, but no order an app could sort by: a hash of each
+        /// number, so that nothing comes to depend on one.
+        seeded,
+        /// By number, as production listed two projects.
+        by_number,
     };
 
     /// A project as a test adds it.
@@ -187,15 +204,8 @@ pub const FakeResourceManager = struct {
         create_ns: i96,
     };
 
-    const Listing = struct {
-        kind: Kind,
-        principal: *const Principal,
-        query: []const u8,
-        page_size: []const u8,
-        created_ns: i96,
-        /// Each item's JSON, in the listing's order.
-        items: []const []const u8,
-    };
+    /// One item a search found: its place in the order, and its JSON.
+    const Item = struct { rank: u128, json: []const u8 };
 
     const Window = struct { minute: i96, count: u32 };
 
@@ -210,12 +220,11 @@ pub const FakeResourceManager = struct {
     pub const WriteError = error{ OutOfMemory, InvalidEntry };
 
     pub fn init(gpa: Allocator, io: std.Io, options: Options) FakeResourceManager {
-        return .{ .gpa = gpa, .io = io, .options = options, .store = .init(gpa), .prng = .init(options.seed) };
+        return .{ .gpa = gpa, .io = io, .options = options, .store = .init(gpa) };
     }
 
     pub fn deinit(f: *FakeResourceManager) void {
         f.projects.deinit(f.gpa);
-        f.listings.deinit(f.gpa);
         f.store.deinit();
         f.* = undefined;
     }
@@ -629,118 +638,113 @@ pub const FakeResourceManager = struct {
         const query_text = paramOf(params, "query") orelse "";
 
         const token = paramOf(params, "pageToken") orelse "";
-        var listing_index: usize = undefined;
-        var offset: usize = 0;
-        if (token.len == 0) {
-            listing_index = try f.newListing(arena, kind, principal, query_text, size_text) orelse
-                return f.queryRefusal(arena, kind, query_text);
-        } else {
+        // A token is a position in the one order, measured on 2026-10-17:
+        // it went on from there with another page size, and with another
+        // query, which it applied from there.
+        var after: ?u128 = null;
+        if (token.len > 0) {
             const at = decodeToken(token) orelse return fail(arena, 400, "INVALID_ARGUMENT", "Request contains an invalid argument.");
-            if (at.listing >= f.listings.items.len) return fail(arena, 400, "INVALID_ARGUMENT", "Request contains an invalid argument.");
-            const l = f.listings.items[at.listing];
-            if (at.offset > l.items.len) return fail(arena, 400, "INVALID_ARGUMENT", "Request contains an invalid argument.");
-            if (l.kind != kind) return notModelled(arena, "a token from another kind of search");
-            if (l.principal != principal) return notModelled(arena, "a token sent by another caller");
-            if (!std.mem.eql(u8, l.query, query_text)) return notModelled(arena, "a token sent with another query");
-            if (!std.mem.eql(u8, l.page_size, size_text)) return notModelled(arena, "a token sent with another page size");
-            if (f.now() - l.created_ns > f.options.token_lifetime_ns) return notModelled(arena, "a token past its lifetime");
-            listing_index = at.listing;
-            offset = at.offset;
+            if (at.kind != kind) return notModelled(arena, "a token from another kind of search");
+            if (f.now() - at.issued_ns > f.options.token_lifetime_ns) return notModelled(arena, "a token past its lifetime");
+            after = at.after;
         }
-        const l = f.listings.items[listing_index];
-        var count = @min(page_size, l.items.len - offset);
+        const found = try f.items(arena, kind, principal, query_text) orelse return f.queryRefusal(arena, kind, query_text);
+        var first: usize = 0;
+        if (after) |position| {
+            while (first < found.len and found[first].rank <= position) first += 1;
+        }
+        const left = found[first..];
+        var count = @min(page_size, left.len);
         if (f.takeFault(empty) != null) count = 0;
         if (f.takeFault(short)) |fault| count = @min(count, fault.max);
-        const end = offset + count;
         // An empty page that goes on is only ever a fault's: production
         // never answered one.
-        const more = end < l.items.len or (count == 0 and l.items.len > offset);
-        var out: std.Io.Writer.Allocating = .init(arena);
+        const more = count < left.len;
         const next = if (more) next: {
             f.tokens_issued += 1;
-            break :next try encodeToken(arena, listing_index, end, f.tokens_issued);
+            const position: ?u128 = if (count > 0) left[count - 1].rank else after;
+            break :next try encodeToken(arena, kind, position, f.now(), f.tokens_issued);
         } else null;
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jsons = try arena.alloc([]const u8, count);
+        for (left[0..count], 0..) |item, i| jsons[i] = item.json;
         writePage(&out.writer, switch (kind) {
             .project => "projects",
             .folder => "folders",
             .organization => "organizations",
-        }, l.items[offset..end], next) catch return error.OutOfMemory;
+        }, jsons, next) catch return error.OutOfMemory;
         return ok(try out.toOwnedSlice());
     }
 
-    /// Reads `query_text`, and lists what it finds for `principal` in a
-    /// new order: the listing's index, or null when the query is refused.
-    fn newListing(f: *FakeResourceManager, arena: Allocator, kind: Kind, principal: *const Principal, query_text: []const u8, size_text: []const u8) Allocator.Error!?usize {
-        const a = f.store.allocator();
-        const items = switch (kind) {
+    /// A project's, folder's or organization's place in the one order.
+    fn rank(f: *const FakeResourceManager, number: u64) u128 {
+        return switch (f.options.order) {
+            .by_number => number,
+            .seeded => (@as(u128, std.hash.Wyhash.hash(f.options.seed, std.mem.asBytes(&number))) << 64) | number,
+        };
+    }
+
+    fn byRank(_: void, a: Item, b: Item) bool {
+        return a.rank < b.rank;
+    }
+
+    /// What a search of `kind` finds for `principal` now, in the one order,
+    /// or null when the query is refused.
+    fn items(f: *FakeResourceManager, arena: Allocator, kind: Kind, principal: *const Principal, query_text: []const u8) Allocator.Error!?[]Item {
+        const found = switch (kind) {
             .project => try f.projectItems(arena, principal, query_text) orelse return null,
             .folder => try f.folderItems(arena, principal, query_text) orelse return null,
             .organization => try f.organizationItems(arena, principal, query_text) orelse return null,
         };
-        try f.listings.append(f.gpa, .{
-            .kind = kind,
-            .principal = principal,
-            .query = try a.dupe(u8, query_text),
-            .page_size = try a.dupe(u8, size_text),
-            .created_ns = f.now(),
-            .items = items,
-        });
-        return f.listings.items.len - 1;
+        std.mem.sort(Item, found, {}, byRank);
+        return found;
     }
 
-    /// The JSON of every project `principal` sees that `query_text` finds,
-    /// in a new order, or null when the query is refused.
-    fn projectItems(f: *FakeResourceManager, arena: Allocator, principal: *const Principal, query_text: []const u8) Allocator.Error!?[]const []const u8 {
-        const a = f.store.allocator();
+    /// Every project `principal` sees that `query_text` finds, or null when
+    /// the query is refused.
+    fn projectItems(f: *FakeResourceManager, arena: Allocator, principal: *const Principal, query_text: []const u8) Allocator.Error!?[]Item {
         const parsed = try fake_query.parse(arena, query_text);
         const q = switch (parsed) {
             .query => |q| q,
             .refused => return null,
         };
-        var found: std.ArrayList(*Stored) = .empty;
+        var found: std.ArrayList(Item) = .empty;
         for (f.projects.items) |s| {
             f.promote(s);
             const v = s.searched orelse continue;
             if (v.purged or !f.sees(principal, s, v.parent)) continue;
             switch (q.matches(.{ .project_id = s.project_id, .display_name = v.display_name, .number = s.number, .state = v.state, .labels = v.labels })) {
-                .yes => try found.append(arena, s),
+                .yes => try found.append(arena, .{ .rank = f.rank(s.number), .json = try render(arena, s, v, false) }),
                 .no => {},
                 .unknown => return null,
             }
         }
-        f.prng.random().shuffle(*Stored, found.items);
-        const items = try a.alloc([]const u8, found.items.len);
-        for (found.items, items) |s, *item| item.* = try render(a, s, s.searched.?, false);
-        return items;
+        return found.items;
     }
 
     /// The folders `principal` reads: granted on them or above them. Only
     /// the empty query was measured, so any other is refused.
-    fn folderItems(f: *FakeResourceManager, arena: Allocator, principal: *const Principal, query_text: []const u8) Allocator.Error!?[]const []const u8 {
+    fn folderItems(f: *FakeResourceManager, arena: Allocator, principal: *const Principal, query_text: []const u8) Allocator.Error!?[]Item {
         if (query_text.len > 0) return null;
-        const a = f.store.allocator();
-        var found: std.ArrayList(*StoredFolder) = .empty;
-        for (f.folders.values()) |folder| if (f.seesFrom(principal, folder.name)) try found.append(arena, folder);
-        f.prng.random().shuffle(*StoredFolder, found.items);
-        const items = try a.alloc([]const u8, found.items.len);
-        for (found.items, items) |folder, *item| item.* = try renderFolder(a, folder);
-        return items;
+        var found: std.ArrayList(Item) = .empty;
+        for (f.folders.values()) |folder| if (f.seesFrom(principal, folder.name)) {
+            try found.append(arena, .{ .rank = f.rank(idNumber(folder.name)), .json = try renderFolder(arena, folder) });
+        };
+        return found.items;
     }
 
     /// The organizations `principal` is granted on. Only the empty query
     /// was measured, so any other is refused.
-    fn organizationItems(f: *FakeResourceManager, arena: Allocator, principal: *const Principal, query_text: []const u8) Allocator.Error!?[]const []const u8 {
+    fn organizationItems(f: *FakeResourceManager, arena: Allocator, principal: *const Principal, query_text: []const u8) Allocator.Error!?[]Item {
         if (query_text.len > 0) return null;
-        const a = f.store.allocator();
-        var found: std.ArrayList(*StoredOrganization) = .empty;
-        for (f.organizations.values()) |org| if (principal.grants.contains(org.name)) try found.append(arena, org);
-        f.prng.random().shuffle(*StoredOrganization, found.items);
-        const items = try a.alloc([]const u8, found.items.len);
-        for (found.items, items) |org, *item| item.* = try renderOrganization(a, org);
-        return items;
+        var found: std.ArrayList(Item) = .empty;
+        for (f.organizations.values()) |org| if (principal.grants.contains(org.name)) {
+            try found.append(arena, .{ .rank = f.rank(idNumber(org.name)), .json = try renderOrganization(arena, org) });
+        };
+        return found.items;
     }
 
-    /// Why `newListing` refused `query_text`, in production's words or as
+    /// Why `items` refused `query_text`, in production's words or as
     /// not modelled.
     fn queryRefusal(f: *FakeResourceManager, arena: Allocator, kind: Kind, query_text: []const u8) Allocator.Error!Reply {
         _ = f;
@@ -910,20 +914,39 @@ fn writePage(w: *std.Io.Writer, field: []const u8, items: []const []const u8, to
     try w.writeByte('}');
 }
 
-const TokenAt = struct { listing: usize, offset: usize };
+const TokenAt = struct { kind: FakeResourceManager.Kind, after: ?u128, issued_ns: i96 };
 
-fn encodeToken(arena: Allocator, listing: usize, offset: usize, serial: u64) Allocator.Error![]const u8 {
-    return std.fmt.allocPrint(arena, "fake.{d}.{d}.{d}", .{ listing, offset, serial });
+/// "fake.p.<rank or s>.<issued>.<serial>": the kind of search, the last
+/// place listed (s for none yet), when it was issued, and a serial that
+/// makes each token its own.
+fn encodeToken(arena: Allocator, kind: FakeResourceManager.Kind, after: ?u128, issued_ns: i96, serial: u64) Allocator.Error![]const u8 {
+    const k: u8 = switch (kind) {
+        .project => 'p',
+        .folder => 'f',
+        .organization => 'o',
+    };
+    if (after) |position| return std.fmt.allocPrint(arena, "fake.{c}.{d}.{d}.{d}", .{ k, position, issued_ns, serial });
+    return std.fmt.allocPrint(arena, "fake.{c}.s.{d}.{d}", .{ k, issued_ns, serial });
 }
 
 fn decodeToken(token: []const u8) ?TokenAt {
     var it = std.mem.splitScalar(u8, token, '.');
     if (!std.mem.eql(u8, it.next() orelse return null, "fake")) return null;
-    const listing = std.fmt.parseInt(usize, it.next() orelse return null, 10) catch return null;
-    const offset = std.fmt.parseInt(usize, it.next() orelse return null, 10) catch return null;
+    const k = it.next() orelse return null;
+    const kind: FakeResourceManager.Kind = if (std.mem.eql(u8, k, "p")) .project else if (std.mem.eql(u8, k, "f")) .folder else if (std.mem.eql(u8, k, "o")) .organization else return null;
+    const position = it.next() orelse return null;
+    const after: ?u128 = if (std.mem.eql(u8, position, "s")) null else std.fmt.parseInt(u128, position, 10) catch return null;
+    const issued_ns = std.fmt.parseInt(i96, it.next() orelse return null, 10) catch return null;
     _ = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
     if (it.next() != null) return null;
-    return .{ .listing = listing, .offset = offset };
+    return .{ .kind = kind, .after = after, .issued_ns = issued_ns };
+}
+
+/// The number in "folders/876" or "organizations/123", which the fake
+/// checked when they were added.
+fn idNumber(name: []const u8) u64 {
+    const slash = std.mem.indexOfScalar(u8, name, '/').?;
+    return std.fmt.parseInt(u64, name[slash + 1 ..], 10) catch unreachable;
 }
 
 /// Whether production reads `ref` as a project before it checks the
@@ -1395,7 +1418,7 @@ test "the charged project: the caller's own, or the one named; production's refu
     again.deinit();
 }
 
-test "paging: a new order each search, every page of it, tokens kept to it" {
+test "paging: one stable order, every page of it, and a token a position in it" {
     var r: Rig = undefined;
     try r.init(.{ .default_page_size = 4, .max_page_size = 6 }, .none);
     defer r.deinit();
@@ -1404,52 +1427,106 @@ test "paging: a new order each search, every page of it, tokens kept to it" {
     var id_buf: [23][8]u8 = undefined;
     for (0..23) |i| {
         const id = std.fmt.bufPrint(&id_buf[i], "proj-{d:0>2}", .{i}) catch unreachable;
-        try f.addProject(.{ .number = 100 + i, .project_id = id });
+        try f.addProject(.{ .number = 100 + i, .project_id = id, .state = if (i % 2 == 0) .active else .delete_requested });
         try f.grant("person-token", id);
     }
-    var first = try r.client.allProjects(.{ .page_size = 0 });
+    var first = try r.client.allProjects(.{ .page_size = 0, .include_pending_deletion = true });
     defer first.deinit();
     try testing.expectEqual(23, first.value.projects.len);
     try testing.expectEqual(6, first.value.pages);
     try testing.expectEqualStrings("proj-00", first.value.projects[0].project_id);
 
-    // The server's order differs between two searches.
+    // The same order on every search and at every page size, and not one
+    // an app could sort by.
     var s1 = try r.client.searchProjects(.{ .page_size = 100 });
     defer s1.deinit();
     var p1 = try s1.page(null);
     defer p1.deinit();
     try testing.expectEqual(6, p1.value.items.len);
-    var s2 = try r.client.searchProjects(.{ .page_size = 100 });
+    var s2 = try r.client.searchProjects(.{ .page_size = 1 });
     defer s2.deinit();
     var p2 = try s2.page(null);
     defer p2.deinit();
-    var same = true;
-    for (p1.value.items, p2.value.items) |a, b| same = same and a.number == b.number;
-    try testing.expect(!same);
+    try testing.expectEqual(p1.value.items[0].number, p2.value.items[0].number);
+    var sorted = true;
+    for (p1.value.items[1..], p1.value.items[0 .. p1.value.items.len - 1]) |b, a| sorted = sorted and a.number < b.number;
+    try testing.expect(!sorted);
+
+    // A token goes on from its place with another page size, and with
+    // another query, applied from there, as production's did.
+    var bigger = try r.client.searchProjects(.{ .page_size = 3 });
+    defer bigger.deinit();
+    var after_one = try bigger.page(p2.value.next_page_token);
+    defer after_one.deinit();
+    for (after_one.value.items, p1.value.items[1..4]) |a, b| try testing.expectEqual(b.number, a.number);
+    var first_id_buf: [32]u8 = undefined;
+    const first_id = try std.fmt.bufPrint(&first_id_buf, "projectId:{s}", .{p2.value.items[0].project_id});
+    var behind = try r.client.searchProjects(.{ .query = first_id, .page_size = 1 });
+    defer behind.deinit();
+    var none = try behind.page(p2.value.next_page_token);
+    defer none.deinit();
+    try testing.expectEqual(0, none.value.items.len);
+    try testing.expectEqual(null, none.value.next_page_token);
+    var active = try r.client.searchProjects(.{ .query = "state:ACTIVE", .page_size = 100 });
+    defer active.deinit();
+    var rest = try active.page(p2.value.next_page_token);
+    defer rest.deinit();
+    for (rest.value.items) |p| try testing.expectEqual(.active, p.state);
+    // The same token twice gives the same page.
+    var again = try bigger.page(p2.value.next_page_token);
+    defer again.deinit();
+    for (after_one.value.items, again.value.items) |a, b| try testing.expectEqual(a.number, b.number);
+
+    // An empty page partway keeps its place.
+    var fives = try r.client.searchProjects(.{ .page_size = 5 });
+    defer fives.deinit();
+    var five1 = try fives.page(null);
+    defer five1.deinit();
+    f.emptyNext(1);
+    var gap = try fives.page(five1.value.next_page_token);
+    defer gap.deinit();
+    try testing.expectEqual(0, gap.value.items.len);
+    var five2 = try fives.page(gap.value.next_page_token);
+    defer five2.deinit();
+    try testing.expectEqual(p1.value.items[5].number, five2.value.items[0].number);
 
     // Empty and short pages go on.
     f.emptyNext(1);
-    var emptied = try r.client.allProjects(.{ .page_size = 5 });
+    var emptied = try r.client.allProjects(.{ .page_size = 5, .include_pending_deletion = true });
     defer emptied.deinit();
     try testing.expectEqual(23, emptied.value.projects.len);
     try testing.expectEqual(1 + 5, emptied.value.pages);
     f.shortenNext(1, 1);
-    var shortened = try r.client.allProjects(.{ .page_size = 5 });
+    var shortened = try r.client.allProjects(.{ .page_size = 5, .include_pending_deletion = true });
     defer shortened.deinit();
     try testing.expectEqual(23, shortened.value.projects.len);
     // One, then 22 in fives.
     try testing.expectEqual(1 + 5, shortened.value.pages);
 
-    // A token it did not issue is production's 400; one sent with another
-    // query is not modelled.
+    // A token it did not issue is production's 400; one past its lifetime
+    // is not modelled.
     try testing.expectError(error.InvalidPageToken, s1.page("garbage"));
-    var other = try r.client.searchProjects(.{ .query = "state:ACTIVE", .page_size = 100 });
-    defer other.deinit();
-    try testing.expectError(error.Unimplemented, other.page(p1.value.next_page_token));
-    try testing.expect(std.mem.indexOf(u8, r.diag.message(), "another query") != null);
+    try testing.expectError(error.InvalidPageToken, s1.page("fake.x.s.0.1"));
     r.clock.now_ns += 2 * std.time.ns_per_hour;
     try testing.expectError(error.Unimplemented, s1.page(p1.value.next_page_token));
     try testing.expect(std.mem.indexOf(u8, r.diag.message(), "past its lifetime") != null);
+}
+
+test "paging: by number, as production listed two projects" {
+    var r: Rig = undefined;
+    try r.init(.{ .order = .by_number }, .none);
+    defer r.deinit();
+    const f = &r.fake;
+    try f.addPrincipal("person-token", "home");
+    for ([_]u64{ 900000000002, 82150720798, 5 }, [_][]const u8{ "second-proj", "extractctl", "zzz-first" }) |n, id| {
+        try f.addProject(.{ .number = n, .project_id = id });
+        try f.grant("person-token", id);
+    }
+    var s = try r.client.searchProjects(.{});
+    defer s.deinit();
+    var page = try s.page(null);
+    defer page.deinit();
+    for ([_]u64{ 5, 82150720798, 900000000002 }, page.value.items) |n, p| try testing.expectEqual(n, p.number);
 }
 
 test "eventual consistency: get sees a change at once, search after the lag" {
@@ -1687,29 +1764,42 @@ fn walkProperty(_: void, input: []const u8) !void {
     const v = list.value;
 
     // What the plain model says the person sees.
-    var expected: std.ArrayList([]const u8) = .empty;
-    defer expected.deinit(gpa);
-    var pending: u32 = 0;
+    // Each page reads the index as it is then, as production's did, so a
+    // project search shows partway through the walk may be listed too:
+    // every one searchable when the walk started must be, and none that
+    // was not searchable by its end may be.
+    const ended = clock.now_ns;
+    var must: usize = 0;
+    var pending_min: u32 = 0;
+    var pending_max: u32 = 0;
     for (wants[0..n]) |*w| {
         const s = fake.byId(&w.id).?;
         const inherited = if (s.current.parent) |p| !std.mem.eql(u8, p, "organizations/2") else false;
-        if (!(w.visible or inherited) or started < w.searchable_at) continue;
+        const seen = w.visible or inherited;
+        const at_start = seen and started >= w.searchable_at;
+        const by_end = seen and ended >= w.searchable_at;
+        const listed = for (v.projects) |p| {
+            if (std.mem.eql(u8, p.project_id, &w.id)) break true;
+        } else false;
         if (!w.active and !include) {
-            pending += 1;
+            if (at_start) pending_min += 1;
+            if (by_end) pending_max += 1;
+            try testing.expect(!listed);
             continue;
         }
-        try expected.append(gpa, &w.id);
-    }
-    std.mem.sort([]const u8, expected.items, {}, struct {
-        fn less(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
+        if (at_start) {
+            must += 1;
+            try testing.expect(listed);
         }
-    }.less);
+        if (listed) try testing.expect(by_end);
+    }
     try testing.expect(v.complete);
     try testing.expectEqual(0, v.duplicates);
-    try testing.expectEqual(pending, v.pending_deletion);
-    try testing.expectEqual(expected.items.len, v.projects.len);
-    for (expected.items, v.projects) |id, p| try testing.expectEqualStrings(id, p.project_id);
+    try testing.expect(v.pending_deletion >= pending_min and v.pending_deletion <= pending_max);
+    try testing.expect(v.projects.len >= must);
+    if (v.projects.len > 1) for (v.projects[1..], v.projects[0 .. v.projects.len - 1]) |b, a| {
+        try testing.expect(std.mem.order(u8, a.project_id, b.project_id) == .lt);
+    };
     // A pause before each page after the first, and none faster: never
     // more than 4 pages a second.
     if (interval > 0) {

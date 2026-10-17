@@ -53,10 +53,13 @@ test "the switcher finds a project by a few letters, from a fake" {
 - **The search quota**: 240 searches a minute per charged project, in
   fixed minutes. Production served ten in 205 ms, so 4 a second is not
   enforced.
-- **Order and pages.** A seeded shuffle that differs between searches;
-  `default_page_size` and `max_page_size` as options, since one visible
-  project could not show production's; tokens that go on with their own
-  search.
+- **Order and pages.** One order for every search, as production's
+  was: by default a hash of each number, which no app can sort by, or
+  `.order = .by_number`, as production listed two projects. A token is a
+  position in that order: it goes on from there with another page size,
+  and with another query, applied from there. `default_page_size` and
+  `max_page_size` are options, since two visible projects could not show
+  production's.
 - **Eventual consistency.** `change` renames, moves, deletes or purges a
   project; `getProject` sees it at once, search after `search_lag_ns`.
 - **The query language**, as the table in [Listing
@@ -77,8 +80,8 @@ Each is answered 501 with the reason, never guessed at:
   an id into words (measured only on one-word names);
 - AND and OR mixed without parentheses;
 - folder and organization queries other than the empty one;
-- a token sent with another query, page size, caller or kind of search,
-  or past `token_lifetime_ns`.
+- a token from another kind of search, or past `token_lifetime_ns`
+  (production's still worked after 65 s).
 
 Its 403 for a project the caller cannot see leaves out production's
 Troubleshooter link; its 429 uses the documented limit's names, since
@@ -87,10 +90,12 @@ production's for v3 search were not seen.
 ## Held to production
 
 A production suite, `tests/resource_manager_gcp_integration.zig`, sets
-the fake up as production answered and runs 33 scripts against both:
-queries, refusals, gets and quota projects. On 2026-10-17 they agreed on
-all 33, after one fix to the fake (production refuses a malformed project
-id such as `a..b` before it checks the caller's permission). The
+the fake up as production answered and runs 37 scripts against both:
+queries, refusals, gets, quota projects, and tokens sent with another
+query or page size. On 2026-10-17 they agreed on all of them, after two
+fixes to the fake: production refuses a malformed project id such as
+`a..b` before it checks the caller's permission, and a production token
+is a position in one order, where the fake had kept each search's own. The
 refusals the probe recorded are kept verbatim in
 `src/resource_manager/production_bodies.zig`, and the fake's are held to
 them word for word.

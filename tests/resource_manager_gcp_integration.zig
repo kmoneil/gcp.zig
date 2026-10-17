@@ -152,7 +152,11 @@ test "resource_manager: parent names, and the searches they read" {
 /// One script of the replay: what is asked, of whom.
 const Script = struct {
     name: []const u8,
-    kind: enum { search, get } = .search,
+    /// `after_first`: the first page of a search with no query, one
+    /// project a page, then its token sent with `arg` as the query and
+    /// `size` projects a page. It needs two visible projects.
+    kind: enum { search, get, after_first } = .search,
+    size: u31 = 1,
     /// The query, or the project a get names. `@id@`, `@ID@`, `@pre@` and
     /// `@number@` become the test project's id, its id in capitals, its
     /// first three letters and its number.
@@ -186,6 +190,10 @@ const scripts = [_]Script{
     .{ .name = "one space", .arg = " " },
     .{ .name = "a value past ASCII", .arg = "name:\u{e9}t\u{e9}" },
     .{ .name = "a number star", .arg = "projectNumber:1*" },
+    .{ .name = "a token, the same request", .kind = .after_first },
+    .{ .name = "a token, another page size", .kind = .after_first, .size = 5 },
+    .{ .name = "a token, a query for the first project", .kind = .after_first, .arg = "projectId:@first@" },
+    .{ .name = "a token, another query", .kind = .after_first, .arg = "state:ACTIVE" },
     .{ .name = "get by id", .kind = .get, .arg = "@id@" },
     .{ .name = "get by number", .kind = .get, .arg = "@number@" },
     .{ .name = "get a public project", .kind = .get, .arg = public_project },
@@ -196,8 +204,8 @@ const scripts = [_]Script{
     .{ .name = "charged to a project that does not exist", .quota = .missing },
 };
 
-fn expand(a: std.mem.Allocator, text: []const u8, project: rm.Project) ![]const u8 {
-    var out = try a.dupe(u8, text);
+fn expand(a: std.mem.Allocator, text: []const u8, project: rm.Project, first: []const u8) ![]const u8 {
+    var out = try std.mem.replaceOwned(u8, a, text, "@first@", first);
     const upper = try std.ascii.allocUpperString(a, project.project_id);
     const number = try std.fmt.allocPrint(a, "{d}", .{project.number});
     inline for (.{ .{ "@id@", project.project_id }, .{ "@ID@", upper }, .{ "@pre@", project.project_id[0..@min(3, project.project_id.len)] }, .{ "@number@", number } }) |r| {
@@ -209,7 +217,7 @@ fn expand(a: std.mem.Allocator, text: []const u8, project: rm.Project) ![]const 
 /// What a script got: project ids in order, or the error, its message cut
 /// before any Troubleshooter link (which the fake does not make), and the
 /// consumer of a refusal.
-fn runScript(a: std.mem.Allocator, f: *Fixture, transport: ?core.transport.Transport, io: std.Io, token: rm.TokenProvider, project: rm.Project, s: Script) ![]const u8 {
+fn runScript(a: std.mem.Allocator, f: *Fixture, transport: ?core.transport.Transport, io: std.Io, token: rm.TokenProvider, project: rm.Project, first: []const u8, s: Script) ![]const u8 {
     var diag: rm.Diagnostics = .{};
     var client = try rm.Client.init(testing.allocator, io, .{
         .token_provider = token,
@@ -224,7 +232,7 @@ fn runScript(a: std.mem.Allocator, f: *Fixture, transport: ?core.transport.Trans
         .user_agent = "zig-gcp-resource_manager-gcp-integration/0.1",
     });
     defer client.deinit();
-    const arg = try expand(a, s.arg, project);
+    const arg = try expand(a, s.arg, project, first);
     var out: std.ArrayList(u8) = .empty;
     switch (s.kind) {
         .search => {
@@ -239,6 +247,22 @@ fn runScript(a: std.mem.Allocator, f: *Fixture, transport: ?core.transport.Trans
             var got = client.getProject(arg) catch |err| return failed(a, err, &diag, &client);
             defer got.deinit();
             try out.appendSlice(a, got.value.project_id);
+        },
+        .after_first => {
+            var plain = try client.searchProjects(.{ .page_size = 1 });
+            defer plain.deinit();
+            var one = plain.page(null) catch |err| return failed(a, err, &diag, &client);
+            defer one.deinit();
+            const next = one.value.next_page_token orelse return "one page only";
+            var other = try client.searchProjects(.{ .query = if (arg.len == 0) null else arg, .page_size = s.size });
+            defer other.deinit();
+            var two = other.page(next) catch |err| return failed(a, err, &diag, &client);
+            defer two.deinit();
+            for (two.value.items) |p| {
+                if (out.items.len > 0) try out.append(a, ' ');
+                try out.appendSlice(a, p.project_id);
+            }
+            try out.appendSlice(a, if (two.value.next_page_token == null) " (end)" else " (more)");
         },
     }
     return out.items;
@@ -259,16 +283,25 @@ test "resource_manager: the fake against production, script by script" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // The fake as production answered: the test project and the public
-    // one, as get read them, and the principal granted on the first.
+    // The fake as production answered: every project the principal sees,
+    // granted to it, and the public one, as get read them, listed in
+    // production's order.
     var mine = try f.client.getProject(f.project);
     defer mine.deinit();
-    var public = try f.client.getProject(public_project);
-    defer public.deinit();
     var clock: core.testing.FakeClock = .{ .now_ns = 1_792_141_200 * std.time.ns_per_s };
-    var fake: rm.testing.FakeResourceManager = .init(testing.allocator, clock.io(), .{});
+    var fake: rm.testing.FakeResourceManager = .init(testing.allocator, clock.io(), .{ .order = .by_number });
     defer fake.deinit();
-    for ([_]rm.Project{ mine.value, public.value }, 0..) |p, i| {
+    try fake.addPrincipal("principal", f.project);
+    var visible = try f.client.allProjects(.{ .include_pending_deletion = true });
+    defer visible.deinit();
+    var refs: std.ArrayList([]const u8) = .empty;
+    for (visible.value.projects) |p| try refs.append(a, p.project_id);
+    try refs.append(a, public_project);
+    for (refs.items, 0..) |ref, i| {
+        var got = try f.client.getProject(ref);
+        defer got.deinit();
+        const p = got.value;
+        const public = i == refs.items.len - 1;
         try fake.addProject(.{
             .number = p.number,
             .project_id = p.project_id,
@@ -276,17 +309,23 @@ test "resource_manager: the fake against production, script by script" {
             .parent = if (p.parent) |x| x.name else null,
             .state = p.state,
             .labels = p.labels,
-            .public = i == 1,
+            .public = public,
         });
+        if (!public) try fake.grant("principal", p.project_id);
     }
-    try fake.addPrincipal("principal", f.project);
-    try fake.grant("principal", f.project);
+    // The first project of an unqueried search, in production's order.
+    var plain = try f.client.searchProjects(.{ .page_size = 1 });
+    defer plain.deinit();
+    var head = try plain.page(null);
+    defer head.deinit();
+    const first = try a.dupe(u8, head.value.items[0].project_id);
+    fact("{d} projects visible; production lists {s} first", .{ visible.value.projects.len, first });
     var fake_token: core.StaticToken = .{ .token = "principal" };
 
     var differences: usize = 0;
     for (scripts) |s| {
-        const theirs = try runScript(a, &f, null, testing.io, f.token.provider(), mine.value, s);
-        const ours = try runScript(a, &f, fake.transport(), clock.io(), fake_token.provider(), mine.value, s);
+        const theirs = try runScript(a, &f, null, testing.io, f.token.provider(), mine.value, first, s);
+        const ours = try runScript(a, &f, fake.transport(), clock.io(), fake_token.provider(), mine.value, first, s);
         if (std.mem.eql(u8, theirs, ours)) {
             fact("replay {s}: {s}", .{ s.name, theirs });
         } else {
