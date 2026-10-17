@@ -170,6 +170,26 @@ pub fn deinit(self: *Client) void {
 /// and fixed: every page sends it unchanged. Nothing is sent. The search
 /// borrows the client and must not outlive it.
 pub fn searchProjects(self: *Client, options: types.SearchOptions) Error!search_mod.Search(types.Project) {
+    return self.search(types.Project, options);
+}
+
+/// A folder search, page by page: the folders the caller holds
+/// `resourcemanager.folders.get` on. The query reads `displayName`,
+/// `parent` and `state` (only its empty form was measured). Nothing is
+/// sent until the first page.
+pub fn searchFolders(self: *Client, options: types.SearchOptions) Error!search_mod.Search(types.Folder) {
+    return self.search(types.Folder, options);
+}
+
+/// An organization search, page by page: the organizations the caller
+/// holds `resourcemanager.organizations.get` on. The query reads
+/// `directoryCustomerId` and `domain` (only its empty form was measured).
+/// Nothing is sent until the first page.
+pub fn searchOrganizations(self: *Client, options: types.SearchOptions) Error!search_mod.Search(types.Organization) {
+    return self.search(types.Organization, options);
+}
+
+fn search(self: *Client, comptime T: type, options: types.SearchOptions) Error!search_mod.Search(T) {
     rpc.begin(self);
     if (options.query) |q| if (validate.queryProblem(q)) |problem| {
         if (self.diagnostics) |d| d.print("{s}", .{problem});
@@ -178,7 +198,7 @@ pub fn searchProjects(self: *Client, options: types.SearchOptions) Error!search_
     var arena: std.heap.ArenaAllocator = .init(self.gpa);
     errdefer arena.deinit();
     var w: std.Io.Writer.Allocating = .init(arena.allocator());
-    writeSearchPath(&w.writer, "/v3/projects:search", options) catch return error.OutOfMemory;
+    writeSearchPath(&w.writer, search_mod.Search(T).route, options) catch return error.OutOfMemory;
     return .{ .client = self, .arena = arena, .path = w.written() };
 }
 
@@ -198,6 +218,16 @@ fn writeSearchPath(w: *std.Io.Writer, route: []const u8, options: types.SearchOp
 /// shares. A failure on any page fails the walk.
 pub fn allProjects(self: *Client, options: types.WalkOptions) Error!types.Owned(types.ProjectList) {
     return walk.projects(self, options);
+}
+
+/// Display text for the parents a caller can read: one walk of
+/// `folders.search` and one of `organizations.search`, both with no query,
+/// every page of each. They share the project search's quota, and for most
+/// people are a page each. A parent the caller cannot read is not in them,
+/// and `ParentNames.label` gives its name instead. Meant to be cached with
+/// the project list.
+pub fn parentNames(self: *Client, options: types.ParentOptions) Error!types.Owned(types.ParentNames) {
+    return walk.parents(self, options);
 }
 
 /// One project by id or number, from `projects.get`, which is strongly

@@ -172,3 +172,117 @@ pub const ConsumerRefusal = struct {
         quota_project_denied,
     };
 };
+
+/// A folder, as `folders.search` sends it.
+pub const Folder = struct {
+    /// "folders/876".
+    name: []const u8,
+    /// The digits of `name`.
+    id: []const u8,
+    /// A folder or an organization. Null only if the server sent none.
+    parent: ?Parent = null,
+    /// Unique among a folder's siblings.
+    display_name: ?[]const u8 = null,
+    state: State = .unspecified,
+    create_time: ?std.Io.Timestamp = null,
+    update_time: ?std.Io.Timestamp = null,
+    delete_time: ?std.Io.Timestamp = null,
+    etag: ?[]const u8 = null,
+};
+
+/// An organization, as `organizations.search` sends it.
+pub const Organization = struct {
+    /// "organizations/123".
+    name: []const u8,
+    /// The digits of `name`.
+    id: []const u8,
+    /// Set by the server: the primary domain of the Workspace customer
+    /// that owns it, such as "example.com".
+    display_name: ?[]const u8 = null,
+    directory_customer_id: ?[]const u8 = null,
+    state: State = .unspecified,
+    create_time: ?std.Io.Timestamp = null,
+    update_time: ?std.Io.Timestamp = null,
+    delete_time: ?std.Io.Timestamp = null,
+    etag: ?[]const u8 = null,
+};
+
+pub const FolderPage = Page(Folder);
+pub const OrganizationPage = Page(Organization);
+
+/// How `Client.parentNames` reads its two searches.
+pub const ParentOptions = struct {
+    /// Folders or organizations a page; 0 lets the server choose.
+    page_size: u31 = 500,
+    /// Each search stops after this many pages, and the names say
+    /// `complete = false`.
+    max_pages: u32 = 100,
+    /// The pause before each page after the first, across both searches,
+    /// which share the project search's quota.
+    page_interval_ms: u32 = 250,
+};
+
+/// Display text for the parents a caller can read: every folder and
+/// organization its searches returned. A parent it cannot read stays its
+/// name, as the console's "Inaccessible parent" does.
+pub const ParentNames = struct {
+    /// Sorted by name; each once.
+    folders: []const Folder,
+    /// Sorted by name; each once.
+    organizations: []const Organization,
+    /// False when `max_pages` stopped either search with pages left.
+    complete: bool,
+    pages: u32,
+
+    /// The folder named `name`, if the caller can read it.
+    pub fn folder(self: *const ParentNames, name: []const u8) ?*const Folder {
+        return find(Folder, self.folders, name);
+    }
+
+    /// The organization named `name`, if the caller can read it.
+    pub fn organization(self: *const ParentNames, name: []const u8) ?*const Organization {
+        return find(Organization, self.organizations, name);
+    }
+
+    /// What to show for `parent`: its display name when the caller can read
+    /// it, else its name as sent ("folders/876").
+    pub fn label(self: *const ParentNames, parent: Parent) []const u8 {
+        switch (parent.kind) {
+            .folder => if (self.folder(parent.name)) |f| if (f.display_name) |d| return d,
+            .organization => if (self.organization(parent.name)) |o| if (o.display_name) |d| return d,
+            .other => {},
+        }
+        return parent.name;
+    }
+
+    /// The labels from `parent` up to its organization, nearest first, as
+    /// far as the caller can read: the first parent it cannot read ends the
+    /// path with its name. At most 16, as folders nest at most ten deep.
+    pub fn path(self: *const ParentNames, gpa: std.mem.Allocator, parent: Parent) std.mem.Allocator.Error![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        errdefer out.deinit(gpa);
+        var at: ?Parent = parent;
+        while (at) |p| {
+            if (out.items.len == max_path) break;
+            try out.append(gpa, self.label(p));
+            at = if (p.kind == .folder) if (self.folder(p.name)) |f| f.parent else null else null;
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    pub const max_path = 16;
+
+    fn find(comptime T: type, items: []const T, name: []const u8) ?*const T {
+        var lo: usize = 0;
+        var hi: usize = items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            switch (std.mem.order(u8, items[mid].name, name)) {
+                .eq => return &items[mid],
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
+            }
+        }
+        return null;
+    }
+};

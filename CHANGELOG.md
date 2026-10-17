@@ -30,6 +30,14 @@ including the ones that did not change.
   and one for a quota project the caller may not use is
   `error.QuotaProjectDenied`; `Client.lastConsumerRefusal` names the
   project charged and the link that fixes it. A 429 is never retried.
+- resource_manager: parent names. `Client.parentNames` reads every
+  folder and organization the caller can read, from one `folders.search`
+  and one `organizations.search` with no query, and
+  `ParentNames.label` and `ParentNames.path` give display text for a
+  project's parent and the chain above it ("Prod / Payments /
+  example.com"), a parent the caller cannot read shown by its name, as
+  the console's "Inaccessible parent" is. `Client.searchFolders` and
+  `Client.searchOrganizations` page through either search.
 - resource_manager: `resource_manager.testing.FakeResourceManager` keeps
   projects, folders and callers in memory and searches, pages and reads
   them as production did when measured, its refusals in production's
