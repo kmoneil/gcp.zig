@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.42.0 (unreleased)
+## 0.42.0 (2026-10-17)
 
 - auth: `Credentials.account` names the account any credentials act as
   (issue #217), for an app that says who is signed in and keeps state per
