@@ -5,6 +5,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const test_util = @import("testing.zig");
+const retry_after = @import("retry_after.zig");
 
 /// One error per canonical Google API status, except OK. Client-side
 /// argument checks also return `InvalidArgument`, as the server would.
@@ -245,6 +246,34 @@ pub fn decodeErrorInfos(arena: Allocator, body: []const u8) Allocator.Error![]co
     return infos.items;
 }
 
+const retry_info_type = "type.googleapis.com/google.rpc.RetryInfo";
+
+/// The delay a `google.rpc.RetryInfo` in an error body's `details` asks
+/// for, in milliseconds, rounded up and saturating at `maxInt(u32)`; the
+/// largest when there are several, though AIP-193 allows one. `retryDelay`
+/// and the proto name `retry_delay` are both read, as ProtoJSON parsers
+/// accept both. Null when there is none, when its Duration is negative or
+/// malformed, or when `body` is not Google's JSON error shape. Every other
+/// detail is skipped, so a body with extra or unknown details loses nothing.
+pub fn decodeRetryDelayMs(arena: Allocator, body: []const u8) Allocator.Error!?u32 {
+    const wire = (try parseMaybeStreamed(WireDetails, arena, body)) orelse return null;
+    const e = wire.@"error" orelse return null;
+    const details = e.details orelse return null;
+    var best: ?u32 = null;
+    for (details) |detail| {
+        const fields = switch (detail) {
+            .object => |o| o,
+            else => continue,
+        };
+        const type_url = stringOf(fields.get("@type")) orelse continue;
+        if (!std.mem.eql(u8, type_url, retry_info_type)) continue;
+        const text = stringOf(fields.get("retryDelay")) orelse stringOf(fields.get("retry_delay")) orelse continue;
+        const ms = retry_after.durationMs(text) orelse continue;
+        best = if (best) |b| @max(b, ms) else ms;
+    }
+    return best;
+}
+
 fn stringOf(value: ?std.json.Value) ?[]const u8 {
     return switch (value orelse return null) {
         .string => |text| text,
@@ -260,6 +289,14 @@ pub const Diagnostics = struct {
     /// HTTP status of the failed response, or 0 when the call failed without
     /// one: client-side validation, a connection error, cancellation.
     http_status: u16 = 0,
+    /// How long the failed response asked its client to wait before trying
+    /// again, in milliseconds, from `Retry-After`, `retry-after-ms` or a
+    /// `google.rpc.RetryInfo`, the largest of them, saturating at
+    /// `maxInt(u32)`; null when it asked for nothing, or the call failed
+    /// without a response. Kept whether or not the call was retried, for a
+    /// caller that schedules its own next try. None of the services this
+    /// library covers sent one when measured on 2026-10-17.
+    retry_after_ms: ?u32 = null,
     status_len: u8 = 0,
     message_len: u16 = 0,
     buffer: [512]u8 = undefined,
@@ -286,6 +323,7 @@ pub const Diagnostics = struct {
     /// not point into `d.buffer`.
     pub fn set(d: *Diagnostics, http_status: u16, status_text: []const u8, message_text: []const u8) void {
         d.http_status = http_status;
+        d.retry_after_ms = null;
         const s = truncateUtf8(status_text, max_status_len);
         @memcpy(d.buffer[0..s.len], s);
         d.status_len = @intCast(s.len);
@@ -297,6 +335,7 @@ pub const Diagnostics = struct {
     /// Records a failure that has no HTTP response, with a formatted message.
     pub fn print(d: *Diagnostics, comptime format: []const u8, args: anytype) void {
         d.http_status = 0;
+        d.retry_after_ms = null;
         d.status_len = 0;
         var w: std.Io.Writer = .fixed(&d.buffer);
         w.print(format, args) catch {}; // Keeps whatever fit.
@@ -316,6 +355,33 @@ pub fn truncateUtf8(text: []const u8, max: usize) []const u8 {
 }
 
 const testing = std.testing;
+
+test "decodeRetryDelayMs: RetryInfo among other details, either field name, the largest, nothing else" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]struct { []const u8, ?u32 }{
+        .{ "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"30s\"}]}}", 30_000 },
+        // The proto field name, which ProtoJSON parsers accept too.
+        .{ "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retry_delay\":\"2s\"}]}}", 2_000 },
+        // Several, though AIP-193 allows one: the largest, wherever it is.
+        .{ "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"9s\"},{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"1s\"}]}}", 9_000 },
+        .{ "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"1s\"},{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"9s\"}]}}", 9_000 },
+        // A field of that name in another detail is not a delay.
+        .{ "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfo\",\"retryDelay\":\"9s\"},{\"@type\":\"type.googleapis.com/google.rpc.QuotaInfo\",\"retryDelay\":\"9s\"}]}}", null },
+        // Beside the legacy errors array, and in a streamed answer.
+        .{ "{\"error\":{\"code\":503,\"errors\":[{\"reason\":\"backendError\"}],\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"0.5s\"}]}}", 500 },
+        .{ "[{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"4s\"}]}}]", 4_000 },
+        // What is no delay: negative, not a string, malformed, none at all.
+        .{ "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"-1s\"}]}}", null },
+        .{ "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":30}]}}", null },
+        .{ "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"soon\"}]}}", null },
+        .{ "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\"}]}}", null },
+        .{ "{\"error\":{\"code\":429}}", null },
+        .{ "<Error><Code>SlowDown</Code></Error>", null },
+        .{ "", null },
+    }) |case| try testing.expectEqual(case[1], try decodeRetryDelayMs(a, case[0]));
+}
 
 test "error table: each API status maps to its error" {
     // One case per row of the spec's error table.

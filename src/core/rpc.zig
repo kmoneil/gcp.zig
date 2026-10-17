@@ -14,6 +14,7 @@ const errors = @import("errors.zig");
 const logging = @import("logging.zig");
 const names = @import("names.zig");
 const retry = @import("retry.zig");
+const retry_after = @import("retry_after.zig");
 const transport = @import("transport.zig");
 const Diagnostics = errors.Diagnostics;
 const Response = transport.Response;
@@ -211,6 +212,7 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
                 const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds();
 
                 var http_status: u16 = 0;
+                var server_delay: ?u32 = null;
                 const err: Error = if (outcome) |res| e: {
                     http_status = res.status;
                     log.debug("{t} {s} -> {d} in {d} ms (attempt {d} of {d})", .{
@@ -221,7 +223,9 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
                         return res.body;
                     }
                     if (call.error_body_out) |out| out.* = res.body;
-                    break :e self.failure(scratch.allocator(), res, null);
+                    const failed = self.failure(scratch.allocator(), res, null);
+                    server_delay = try self.serverDelay(scratch.allocator(), res);
+                    break :e failed;
                 } else |err| e: {
                     log.debug("{t} {s} -> {t} in {d} ms (attempt {d} of {d})", .{
                         call.method, log_path, err, elapsed_ms, attempt, max_attempts,
@@ -243,7 +247,7 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
                 }
 
                 if (attempt >= max_attempts or !call.retryable(err, http_status)) return err;
-                const delay_ms = self.retry.backoffMs(attempt, entropy(self.io));
+                const delay_ms = self.waitMs(attempt, server_delay, call.method, log_path, err) orelse return err;
                 if (self.pastWindow(call.retry_window_ms, first_started, delay_ms, call.method, log_path, err)) return err;
                 log.warn("{t} {s} failed with {t}; retrying in {d} ms (attempt {d} of {d})", .{
                     call.method, log_path, err, delay_ms, attempt + 1, max_attempts,
@@ -333,6 +337,7 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
                 const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds();
 
                 var http_status: u16 = 0;
+                var server_delay: ?u32 = null;
                 var mid_body = false;
                 const err: StreamBodyError = if (outcome) |res| e: {
                     http_status = res.status;
@@ -343,11 +348,10 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
                         if (self.diagnostics) |d| d.clear();
                         return res;
                     }
-                    break :e self.failure(scratch.allocator(), .{
-                        .status = res.status,
-                        .body = res.body,
-                        .headers = res.headers,
-                    }, call.decode_error);
+                    const buffered: Response = .{ .status = res.status, .body = res.body, .headers = res.headers };
+                    const failed = self.failure(scratch.allocator(), buffered, call.decode_error);
+                    server_delay = try self.serverDelay(scratch.allocator(), buffered);
+                    break :e failed;
                 } else |err| e: {
                     log.debug("{t} {s} -> {t} in {d} ms (attempt {d} of {d})", .{
                         call.method, log_path, err, elapsed_ms, attempt, max_attempts,
@@ -388,7 +392,7 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
                 }
 
                 if (mid_body or attempt >= max_attempts or !call.retryable(err, http_status)) return err;
-                const delay_ms = self.retry.backoffMs(attempt, entropy(self.io));
+                const delay_ms = self.waitMs(attempt, server_delay, call.method, log_path, err) orelse return err;
                 if (self.pastWindow(call.retry_window_ms, first_started, delay_ms, call.method, log_path, err)) return err;
                 log.warn("{t} {s} failed with {t}; retrying in {d} ms (attempt {d} of {d})", .{
                     call.method, log_path, err, delay_ms, attempt + 1, max_attempts,
@@ -408,6 +412,24 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
             if (discarding.error_body_out) |out| out.* = null;
             discarding.error_body_out = null;
             _ = try self.execute(&response, discarding);
+        }
+
+        /// The delay a refused response asked for, kept in `Diagnostics`
+        /// whether or not the call is retried.
+        fn serverDelay(self: Self, scratch: Allocator, res: Response) Error!?u32 {
+            const ms = try retry_after.serverDelayMs(scratch, res.headers, res.body, std.Io.Clock.real.now(self.io));
+            if (self.diagnostics) |d| d.retry_after_ms = ms;
+            return ms;
+        }
+
+        /// The wait before the next attempt, or null, logged, when the
+        /// server asked for longer than the policy waits.
+        fn waitMs(self: Self, attempt: u32, server_delay: ?u32, method: transport.Method, log_path: []const u8, err: anyerror) ?u32 {
+            if (self.retry.waitMs(attempt, entropy(self.io), server_delay)) |ms| return ms;
+            log.warn("{t} {s} failed with {t}; not retried: the server asked to wait {d} ms, longer than max_backoff_ms ({d} ms)", .{
+                method, log_path, err, server_delay.?, self.retry.max_backoff_ms,
+            });
+            return null;
         }
 
         /// Whether a retry `delay_ms` from now would begin past the call's
@@ -728,6 +750,152 @@ test "retry: a call can widen what is retried, and sees the HTTP status it decid
     try testing.expectEqual(4, h.fake.requests.items.len);
 }
 
+const too_many_wait_2: Reply = .{ .respond = .{
+    .status = 429,
+    .headers = &.{.{ .name = "Retry-After", .value = "2" }},
+    .body = "{\"error\":{\"code\":429,\"message\":\"Quota exceeded.\",\"status\":\"RESOURCE_EXHAUSTED\"}}",
+} };
+
+test "server delay: Retry-After is waited in full, kept in Diagnostics, and cleared by the success" {
+    var h: Harness = undefined;
+    h.init(&.{ too_many_wait_2, ok });
+    defer h.deinit();
+    _ = try h.get();
+    try testing.expectEqual(2, h.fake.requests.items.len);
+    try testing.expectEqual(1, h.clock.sleep_count);
+    // At least the two seconds asked for, past the 100 ms backoff.
+    try testing.expectEqual(2_000, h.clock.sleepMs(0));
+    try testing.expectEqual(null, h.diag.retry_after_ms);
+}
+
+test "server delay: longer than max_backoff_ms, the call returns at once with the delay, as #208 asks" {
+    // The issue's own repro: a policy with no backoff, and a 429 asking
+    // for 30 s. It used to make all four attempts at once.
+    var h: Harness = undefined;
+    const wait_30: Reply = .{ .respond = .{
+        .status = 429,
+        .headers = &.{.{ .name = "retry-after", .value = "30" }},
+        .body = "{\"error\":{\"code\":429,\"message\":\"Quota exceeded ...\",\"status\":\"RESOURCE_EXHAUSTED\"}}",
+    } };
+    h.init(&.{ wait_30, wait_30, wait_30, wait_30 });
+    defer h.deinit();
+    var e = h.engine();
+    e.retry = .{ .max_attempts = 4, .initial_backoff_ms = 0, .max_backoff_ms = 0 };
+    e.begin();
+    try testing.expectError(error.ResourceExhausted, e.execute(&h.arena, .{ .method = .GET, .path = "/v1/things" }));
+    try testing.expectEqual(1, h.fake.requests.items.len);
+    try testing.expectEqual(0, h.clock.sleep_count);
+    try testing.expectEqual(429, h.diag.http_status);
+    try testing.expectEqualStrings("RESOURCE_EXHAUSTED", h.diag.status());
+    try testing.expectEqual(30_000, h.diag.retry_after_ms.?);
+
+    // With the default policy, 30 s is past its 10 s cap too.
+    var d: Harness = undefined;
+    d.init(&.{ wait_30, ok });
+    defer d.deinit();
+    try testing.expectError(error.ResourceExhausted, d.get());
+    try testing.expectEqual(1, d.fake.requests.items.len);
+    try testing.expectEqual(30_000, d.diag.retry_after_ms.?);
+}
+
+test "server delay: RetryInfo in the body, and the largest of all three forms" {
+    var h: Harness = undefined;
+    h.init(&.{
+        .{ .respond = .{ .status = 503, .body =
+        \\{"error":{"code":503,"message":"try later","status":"UNAVAILABLE","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1.250s"}]}}
+        } },
+        .{ .respond = .{ .status = 503, .headers = &.{ .{ .name = "Retry-After", .value = "1" }, .{ .name = "retry-after-ms", .value = "3500" } }, .body =
+        \\{"error":{"code":503,"message":"try later","status":"UNAVAILABLE","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2s"}]}}
+        } },
+        ok,
+    });
+    defer h.deinit();
+    _ = try h.get();
+    try testing.expectEqual(3, h.fake.requests.items.len);
+    try testing.expectEqual(1_250, h.clock.sleepMs(0));
+    try testing.expectEqual(3_500, h.clock.sleepMs(1));
+}
+
+test "server delay: a status not retried keeps its delay, and is still not retried" {
+    var h: Harness = undefined;
+    h.init(&.{ .{ .respond = .{
+        .status = 400,
+        .headers = &.{.{ .name = "Retry-After", .value = "5" }},
+        .body = "{\"error\":{\"code\":400,\"message\":\"bad\",\"status\":\"INVALID_ARGUMENT\"}}",
+    } }, ok });
+    defer h.deinit();
+    try testing.expectError(error.InvalidArgument, h.get());
+    try testing.expectEqual(1, h.fake.requests.items.len);
+    try testing.expectEqual(5_000, h.diag.retry_after_ms.?);
+}
+
+test "server delay: a 2xx carrying one leaves nothing; a transport failure has none" {
+    var h: Harness = undefined;
+    h.init(&.{
+        .{ .respond = .{ .headers = &.{.{ .name = "Retry-After", .value = "5" }}, .body = "{}" } },
+        .{ .fail = error.ConnectionResetByPeer },
+        ok,
+    });
+    defer h.deinit();
+    _ = try h.get();
+    try testing.expectEqual(null, h.diag.retry_after_ms);
+    _ = try h.get();
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(null, h.diag.retry_after_ms);
+}
+
+test "server delay: each attempt reads its own; one without a delay goes back to the backoff" {
+    var h: Harness = undefined;
+    h.init(&.{ too_many_wait_2, unavailable, ok });
+    defer h.deinit();
+    h.clock.random_byte = 0;
+    _ = try h.get();
+    try testing.expectEqual(2_000, h.clock.sleepMs(0));
+    try testing.expectEqual(0, h.clock.sleepMs(1));
+}
+
+test "server delay: the retry window still holds against a delay within the cap" {
+    var h: Harness = undefined;
+    h.init(&.{ too_many_wait_2, ok });
+    defer h.deinit();
+    const e = h.engine();
+    e.begin();
+    try testing.expectError(error.ResourceExhausted, e.execute(&h.arena, .{ .method = .GET, .path = "/v1/things", .retry_window_ms = 1_000 }));
+    try testing.expectEqual(1, h.fake.requests.items.len);
+    try testing.expectEqual(2_000, h.diag.retry_after_ms.?);
+}
+
+test "server delay: executeStream honours it, and stops past the cap, the delay kept" {
+    var h: Harness = undefined;
+    h.init(&.{ too_many_wait_2, ok });
+    defer h.deinit();
+    const res = try h.engine().executeStream(&h.arena, .{ .method = .GET, .path = "/v1/things" });
+    try testing.expectEqual(200, res.status);
+    try testing.expectEqual(2_000, h.clock.sleepMs(0));
+
+    var long: Harness = undefined;
+    long.init(&.{ .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "60" }}, .body = "{}" } }, ok });
+    defer long.deinit();
+    const e = long.engine();
+    e.begin();
+    try testing.expectError(error.Unavailable, e.executeStream(&long.arena, .{ .method = .GET, .path = "/v1/things" }));
+    try testing.expectEqual(1, long.fake.stream_requests.items.len);
+    try testing.expectEqual(60_000, long.diag.retry_after_ms.?);
+}
+
+test "server delay: Diagnostics' set and print clear an earlier one" {
+    var d: Diagnostics = .{};
+    d.retry_after_ms = 7;
+    d.set(500, "INTERNAL", "x");
+    try testing.expectEqual(null, d.retry_after_ms);
+    d.retry_after_ms = 7;
+    d.print("y", .{});
+    try testing.expectEqual(null, d.retry_after_ms);
+    d.retry_after_ms = 7;
+    d.clear();
+    try testing.expectEqual(null, d.retry_after_ms);
+}
+
 test "a body that is not the standard error shape maps by HTTP status and keeps its text" {
     var h: Harness = undefined;
     h.init(&.{.{ .respond = .{ .status = 502, .body = "<html>Bad Gateway</html>" } }});
@@ -990,10 +1158,20 @@ fn retryPolicyProperty(_: void, input: []const u8) !void {
         .max_backoff_ms = g.intRange(u32, 0, 10_000),
     };
     var script: [8]Reply = undefined;
-    for (&script) |*reply| reply.* = switch (g.intRange(u8, 0, 3)) {
+    // The delay each reply asks for, as `Retry-After` seconds.
+    var delays: [8]?u32 = @splat(null);
+    var texts: [8][4]u8 = undefined;
+    var headers: [8][1]transport.Header = undefined;
+    for (&script, 0..) |*reply, i| reply.* = switch (g.intRange(u8, 0, 4)) {
         0 => ok,
         1 => unavailable,
         2 => .{ .respond = .{ .status = 404, .body = "{}" } },
+        3 => r: {
+            const seconds = g.intRange(u8, 0, 12);
+            delays[i] = @as(u32, seconds) * 1000;
+            headers[i] = .{.{ .name = "Retry-After", .value = std.fmt.bufPrint(&texts[i], "{d}", .{seconds}) catch unreachable }};
+            break :r .{ .respond = .{ .status = g.pick(u16, &.{ 429, 503 }), .headers = &headers[i], .body = "{}" } };
+        },
         else => .{ .fail = error.ConnectionResetByPeer },
     };
 
@@ -1009,15 +1187,28 @@ fn retryPolicyProperty(_: void, input: []const u8) !void {
     // One wait between attempts, none before the first or after the last.
     try testing.expectEqual(requests - 1, h.clock.sleep_count);
     for (0..h.clock.sleep_count) |i| {
-        try testing.expect(h.clock.sleepMs(i) <= policy.backoffCapMs(@intCast(i + 1)));
+        const slept: u32 = @intCast(h.clock.sleepMs(i));
+        if (delays[i]) |d| {
+            // Never shorter than the server asked, and only ever within
+            // the cap, since a longer delay is never waited.
+            try testing.expect(slept >= d);
+            try testing.expect(d <= policy.max_backoff_ms);
+            try testing.expect(slept <= @max(policy.backoffCapMs(@intCast(i + 1)), d));
+        } else {
+            try testing.expect(slept <= policy.backoffCapMs(@intCast(i + 1)));
+        }
     }
-    // A run stops at the first reply that is not retryable, and a success is
-    // always the last thing that happened.
+    // A run stops at the first reply that is not retryable, or that asks
+    // for longer than the cap, and a success is always the last thing that
+    // happened.
+    const last = requests - 1;
     if (outcome) |_| {
-        try testing.expectEqual(Reply.respond, std.meta.activeTag(script[requests - 1]));
-        try testing.expectEqual(200, script[requests - 1].respond.status);
+        try testing.expectEqual(Reply.respond, std.meta.activeTag(script[last]));
+        try testing.expectEqual(200, script[last].respond.status);
     } else |err| {
-        if (requests < policy.max_attempts) try testing.expect(!isRetryable(err));
+        const too_long = if (delays[last]) |d| d > policy.max_backoff_ms else false;
+        if (requests < policy.max_attempts) try testing.expect(!isRetryable(err) or too_long);
+        try testing.expectEqual(delays[last], h.diag.retry_after_ms);
     }
 }
 

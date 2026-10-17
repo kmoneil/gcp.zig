@@ -34,6 +34,20 @@ pub const RetryPolicy = struct {
         const cap = p.backoffCapMs(retry);
         return @intCast(entropy % (@as(u64, cap) + 1));
     }
+
+    /// The wait before retry number `retry`, given the delay the refused
+    /// response asked for (`core.retry_after.serverDelayMs`), or null to
+    /// stop retrying. With no delay, `backoffMs`. With one, the larger of
+    /// the two, since a server's delay is a floor and nothing is taken off
+    /// it; and when it is longer than `max_backoff_ms`, null: the failure
+    /// goes back to the caller at once, its delay in `Diagnostics`, rather
+    /// than holding the task asleep for it.
+    pub fn waitMs(p: RetryPolicy, retry: u32, entropy: u64, server_delay_ms: ?u32) ?u32 {
+        const backoff = p.backoffMs(retry, entropy);
+        const server = server_delay_ms orelse return backoff;
+        if (server > p.max_backoff_ms) return null;
+        return @max(backoff, server);
+    }
 };
 
 /// Whether a failed attempt may be retried: the retryable API statuses
@@ -103,6 +117,54 @@ test "odd policies stay total" {
     // Regression: 0 * inf is NaN, which once made the cap jump to the maximum.
     const zero_huge: RetryPolicy = .{ .initial_backoff_ms = 0, .multiplier = std.math.floatMax(f32) };
     try testing.expectEqual(0, zero_huge.backoffCapMs(1000));
+}
+
+test "waitMs: the backoff, or the server's delay when longer, or stop past the cap" {
+    const p: RetryPolicy = .{};
+    // No delay: the backoff, unchanged.
+    try testing.expectEqual(p.backoffMs(3, 12345), p.waitMs(3, 12345, null).?);
+    // A delay longer than the backoff is waited in full; a shorter one
+    // leaves the backoff as it was.
+    try testing.expectEqual(5_000, p.waitMs(1, 0, 5_000).?);
+    try testing.expectEqual(400, p.waitMs(3, 400, 1).?);
+    try testing.expectEqual(0, p.waitMs(1, 0, 0).?);
+    // At the cap it waits; one millisecond past it, it stops.
+    try testing.expectEqual(10_000, p.waitMs(1, 0, 10_000).?);
+    try testing.expectEqual(null, p.waitMs(1, 0, 10_001));
+    try testing.expectEqual(null, p.waitMs(8, std.math.maxInt(u64), std.math.maxInt(u32)));
+    // A policy that never backs off stops at any delay but zero.
+    const none: RetryPolicy = .{ .initial_backoff_ms = 0, .max_backoff_ms = 0 };
+    try testing.expectEqual(0, none.waitMs(1, 99, 0).?);
+    try testing.expectEqual(null, none.waitMs(1, 99, 1));
+}
+
+fn waitProperty(_: void, input: []const u8) !void {
+    var g: test_util.ByteGen = .init(input);
+    const p: RetryPolicy = .{
+        .initial_backoff_ms = g.intRange(u32, 0, 5_000),
+        .max_backoff_ms = g.intRange(u32, 0, 60_000),
+        .multiplier = g.pick(f32, &.{ 1.0, 1.3, 2.0, 10.0 }),
+    };
+    const retry = g.intRange(u32, 1, 20);
+    const entropy = g.int(u64);
+    const delay: ?u32 = if (g.boolean()) g.intRange(u32, 0, 120_000) else null;
+    const got = p.waitMs(retry, entropy, delay);
+    if (delay) |d| {
+        if (d > p.max_backoff_ms) {
+            try testing.expectEqual(null, got);
+        } else {
+            // Never shorter than the server asked, never past the cap.
+            try testing.expect(got.? >= d);
+            try testing.expect(got.? <= p.max_backoff_ms);
+            try testing.expectEqual(@max(d, p.backoffMs(retry, entropy)), got.?);
+        }
+    } else {
+        try testing.expectEqual(p.backoffMs(retry, entropy), got.?);
+    }
+}
+
+test "fuzz waitMs: never shorter than the server's delay, never past the cap, stopped beyond it" {
+    try test_util.fuzzBytes({}, waitProperty, .{ .corpus = &.{ "", "\x00\x00\x00\x00\x00\x00\x00\x00\x01" } });
 }
 
 test "retryable errors are exactly the transient ones" {

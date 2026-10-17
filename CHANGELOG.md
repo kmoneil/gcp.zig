@@ -4,6 +4,27 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.41.0 (unreleased)
+
+- core: a server's retry delay is read and honoured. When a refused
+  response asks its client to wait, by `Retry-After` (seconds, or an
+  HTTP-date in any of the three formats RFC 9110 requires, read against
+  the response's own `Date`), by `retry-after-ms`, or by a
+  `google.rpc.RetryInfo` in the error body, `Diagnostics.retry_after_ms`
+  keeps the largest of them, saturating at `maxInt(u32)`, whether or not
+  the call is retried, for a caller that schedules its own next try. The
+  engine's retries wait at least that long: `RetryPolicy.waitMs` is the
+  larger of the backoff and the server's delay. A delay longer than
+  `max_backoff_ms` stops the retries and returns the failure at once,
+  rather than holding the task asleep for it: **a change in behaviour**
+  for a server that asks for more than 10 s by default. A delay never
+  makes a status retryable. `core.retry_after` reads the three forms.
+  Measured on 2026-10-17, none of the services these modules call sends
+  any of them, so nothing changes against Google today.
+- auth, firestore, logging, pubsub, resource_manager, secret_manager and
+  storage: unchanged so far; their own retry loops follow in the next
+  milestone.
+
 ## 0.40.0 (2026-10-17)
 
 - resource_manager: new module, **experimental**: the projects a

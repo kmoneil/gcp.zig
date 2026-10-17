@@ -25,6 +25,10 @@ pub const base64 = @import("base64.zig");
 pub const RetryPolicy = @import("retry.zig").RetryPolicy;
 pub const isRetryable = @import("retry.zig").isRetryable;
 
+/// A refused response's own retry delay: `Retry-After`, `retry-after-ms`
+/// and `google.rpc.RetryInfo`, read into milliseconds.
+pub const retry_after = @import("retry_after.zig");
+
 /// The Google API error body, status mapping and `Diagnostics`.
 pub const errors = @import("errors.zig");
 pub const ApiError = errors.ApiError;
@@ -99,6 +103,7 @@ test {
     _ = @import("query.zig");
     _ = @import("rpc.zig");
     _ = @import("retry.zig");
+    _ = @import("retry_after.zig");
     _ = @import("testing.zig");
     _ = @import("timestamp.zig");
     _ = @import("duration.zig");
