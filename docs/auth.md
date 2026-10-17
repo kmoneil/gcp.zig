@@ -33,6 +33,7 @@ account key file names the project it belongs to; a user login does not.
 On Google Cloud that means a program needs no configuration at all.
 
 **On this page:** [Where `findDefault` looks](#where-finddefault-looks) ·
+[Which account](#which-account) ·
 [Choosing a source yourself](#choosing-a-source-yourself) ·
 [Service account keys](#service-account-keys) ·
 [Workload identity federation](#workload-identity-federation) ·
@@ -69,6 +70,45 @@ there but unusable is an error, never a reason to try the next place:
 running as somebody else, quietly, would be worse. With nothing
 anywhere, the error is `NoCredentialsFound` and `Diagnostics` lists what
 was tried.
+
+## Which account
+
+`creds.account(io, arena)` names the account the credentials act as: for
+a status bar that says who is signed in, or for state an app keeps per
+identity. It answers null when the credentials cannot say, and
+`Diagnostics` then says why.
+
+<!-- snippet: tests/docs_examples.zig#auth-account -->
+```zig
+/// Who the app is signed in as, for its status bar. When the credentials
+/// cannot name an account, Diagnostics say why.
+fn signedInAs(creds: auth.Credentials, io: std.Io, arena: std.mem.Allocator) ![]const u8 {
+    return try creds.account(io, arena) orelse "an account the credentials cannot name";
+}
+```
+
+| Credentials | The account |
+| --- | --- |
+| A service account key | its `client_email` |
+| A login that acts as a service account, or workload identity federation that impersonates one | the account as its URL names it: an email, or a numeric unique id as written |
+| The metadata server | the attached service account; on GKE under Workload Identity with no service account bound, the pool, `PROJECT.svc.id.goog` |
+| A person's own login | the email Google's token endpoint names with each token |
+| Workload identity federation without impersonation | null: Google gives no way to name a federated principal |
+
+A person's login names its account in the `id_token` that Google's token
+endpoint sends with each access token, when the login granted `openid`
+and `userinfo.email`. `gcloud auth application-default login` grants both
+by default. The library reads that token as OpenID Connect allows for one
+received straight from the token endpoint over TLS. It does not check the
+signature, but the issuer must be Google's, the audience must be this
+login's client, and the email must be verified. Failing that, the
+credentials file's `account` answers, which gcloud fills in only for
+`gcloud auth application-default login ACCOUNT`.
+
+The first call fetches a token if none was fetched yet; after that it
+answers without a request, and it never refreshes a token just to name
+the account. The email is never logged. Google warns that a person's
+email can change over time; a service account's cannot.
 
 ## Choosing a source yourself
 

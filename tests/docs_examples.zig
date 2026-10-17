@@ -1483,3 +1483,36 @@ test "the switcher finds a project by a few letters, from a fake" {
     try std.testing.expect(matches(list.value.projects[0], "pay"));
 }
 // end snippet
+
+const auth = @import("auth");
+
+// snippet: auth-account
+/// Who the app is signed in as, for its status bar. When the credentials
+/// cannot name an account, Diagnostics say why.
+fn signedInAs(creds: auth.Credentials, io: std.Io, arena: std.mem.Allocator) ![]const u8 {
+    return try creds.account(io, arena) orelse "an account the credentials cannot name";
+}
+// end snippet
+
+test "the auth guide's code: the account a gcloud login names" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = auth.Lookup.adc_file_name, .data =
+        \\{"type": "authorized_user", "account": "", "client_id": "gcloud.apps.googleusercontent.com",
+        \\ "client_secret": "s", "refresh_token": "r"}
+    });
+    var dir_buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    // The token endpoint's answer to a refresh, its id_token naming the
+    // login's account for gcloud's client.
+    var fake: core.testing.FakeTransport = .init(std.testing.allocator, &.{.{ .respond = .{
+        .body = "{\"access_token\":\"ya29.x\",\"expires_in\":3599,\"token_type\":\"Bearer\",\"id_token\":\"eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIiwidHlwIjoiSldUIn0.eyJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJhdWQiOiJnY2xvdWQuYXBwcy5nb29nbGV1c2VyY29udGVudC5jb20iLCJhenAiOiJnY2xvdWQuYXBwcy5nb29nbGV1c2VyY29udGVudC5jb20iLCJzdWIiOiIxMDQyMjM0OTc1NTMxMDgwMTExMTEiLCJlbWFpbCI6InBlcnNvbkBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlfQ.c2lnbmF0dXJl\"}",
+    } }});
+    defer fake.deinit();
+    var creds = try auth.findDefault(std.testing.allocator, std.testing.io, .{ .gcloud_config_dir = dir }, .{ .transport = fake.transport() });
+    defer creds.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings("person@example.com", try signedInAs(creds, std.testing.io, arena.allocator()));
+    try std.testing.expectEqual(1, fake.requests.items.len);
+}
