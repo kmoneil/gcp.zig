@@ -29,7 +29,8 @@ including the ones that did not change.
   `ServiceAccount.clientEmail`, and `ImpersonatedServiceAccount.targetPrincipal`
   as before. Measured on 2026-10-17, a refresh of a gcloud login returned
   an `id_token` naming its verified email, and the file's `account` was
-  empty.
+  empty. The credentials guide has a "Which account" section, and
+  `examples/whoami.zig` prints the account.
 - core, firestore, logging, pubsub, resource_manager, secret_manager and
   storage: unchanged.
 

@@ -1,5 +1,6 @@
-//! Prints which credentials this machine offers, then lists the project's
-//! topics with them. No token is pasted anywhere.
+//! Prints which credentials this machine offers and the account they act
+//! as, then lists the project's topics with them. No token is pasted
+//! anywhere.
 //!
 //!     GOOGLE_CLOUD_PROJECT=my-project zig build example-whoami
 //!
@@ -33,6 +34,11 @@ pub fn main(init: std.process.Init) !void {
     var creds = auth.findDefault(init.gpa, init.io, lookup, .{}) catch |err| return fail(err, &diag);
     defer creds.deinit();
     try out.print("credentials: {t}\n", .{creds.source});
+    // Who they act as: for a person's login, the email Google's token
+    // endpoint names; null when the credentials cannot say, and why.
+    if (creds.account(init.io, arena) catch |err| return fail(err, &diag)) |name| {
+        try out.print("account: {s}\n", .{name});
+    } else try out.print("account: unknown, {s}\n", .{diag.message()});
     if (creds.quotaProjectId()) |project| try out.print("quota project: {s}\n", .{project});
 
     // On Google Cloud the credentials know which project this runs in.
