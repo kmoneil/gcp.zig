@@ -2,9 +2,11 @@
 //! `{"access_token", "expires_in", "token_type"}` with a token, and
 //! `{"error", "error_description"}` when the token endpoint refuses. The
 //! error shape differs from the Google API one: `error` is a string here.
+//! A refusal may also ask for a wait before the next attempt.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const core = @import("core");
 const Cache = @import("Cache.zig");
 
 pub const ParseError = error{ InvalidTokenResponse, OutOfMemory };
@@ -54,6 +56,15 @@ pub const OAuthError = struct {
     /// "" when the server sent none.
     description: []const u8,
 };
+
+/// The wait a refused answer asked for, from `Retry-After`,
+/// `retry-after-ms` or a RetryInfo detail; null when it asked for none.
+/// It is kept in `diag` too, so call this after `diag.set`, which clears it.
+pub fn askedDelayMs(io: std.Io, arena: Allocator, res: core.transport.Response, diag: ?*core.Diagnostics) Allocator.Error!?u32 {
+    const ms = try core.retry_after.serverDelayMs(arena, res.headers, res.body, std.Io.Clock.real.now(io));
+    if (diag) |d| d.retry_after_ms = ms;
+    return ms;
+}
 
 /// The OAuth error in `body`, or null when the body is not one.
 pub fn parseError(arena: Allocator, body: []const u8) Allocator.Error!?OAuthError {

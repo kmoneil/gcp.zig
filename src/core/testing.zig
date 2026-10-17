@@ -1259,6 +1259,21 @@ pub inline fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * 
     };
 }
 
+/// A Google API error body whose RetryInfo detail asks for `delay`, a
+/// protobuf Duration such as "2s" or "0.004s".
+pub fn retryInfoBody(comptime code: u16, comptime status: []const u8, comptime delay: []const u8) []const u8 {
+    return std.fmt.comptimePrint(
+        \\{{"error":{{"code":{d},"message":"try later","status":"{s}","details":[{{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"{s}"}}]}}}}
+    , .{ code, status, delay });
+}
+
+test "retryInfoBody: a delay core reads" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const errors = @import("errors.zig");
+    try std.testing.expectEqual(2_500, try errors.decodeRetryDelayMs(arena.allocator(), retryInfoBody(503, "UNAVAILABLE", "2.5s")));
+}
+
 /// The longest input a property sees under the coverage-guided fuzzer.
 pub const max_fuzz_input = 4096;
 

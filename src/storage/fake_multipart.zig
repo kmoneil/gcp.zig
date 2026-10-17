@@ -146,6 +146,8 @@ pub const FakeMultipart = struct {
     gate: std.Io.Event = .unset,
     /// How long a `stall` holds its request.
     stall_ms: u32 = 500,
+    /// The `Retry-After` value an `unavailable` fault's 503 carries, if any.
+    retry_after: ?[]const u8 = null,
     /// A move checks its destination's conditions before its source, so a
     /// move repeated after one that landed answers 412, not 404. Which
     /// Cloud Storage does, no documentation says.
@@ -643,8 +645,12 @@ pub const FakeMultipart = struct {
                 self.mutex.lockUncancelable(self.io);
             },
             .unavailable => {
-                self.mutex.unlock(self.io);
-                return .{ .status = 503, .body = "<Error><Code>ServiceUnavailable</Code><Message>try again</Message></Error>" };
+                defer self.mutex.unlock(self.io);
+                const busy: Reply = .{ .status = 503, .body = "<Error><Code>ServiceUnavailable</Code><Message>try again</Message></Error>" };
+                const after = self.retry_after orelse return busy;
+                const asking = try arena.alloc(Header, 1);
+                asking[0] = .{ .name = "Retry-After", .value = after };
+                return .{ .status = busy.status, .headers = asking, .body = busy.body };
             },
             .reset => {
                 self.mutex.unlock(self.io);

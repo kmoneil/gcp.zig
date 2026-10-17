@@ -341,7 +341,8 @@ fn fetch(ptr: *anyopaque, io: std.Io, arena: Allocator) TokenProvider.Error!Cach
         const started = std.Io.Clock.awake.now(io);
         // The subject token is read anew each attempt: they rotate, and a
         // stale one is the likeliest thing a retry fixes.
-        const result = self.exchange(io, arena);
+        var asked: ?u32 = null;
+        const result = self.exchange(io, arena, &asked);
         const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
         switch (result) {
             .token => |fetched| {
@@ -355,7 +356,12 @@ fn fetch(ptr: *anyopaque, io: std.Io, arena: Allocator) TokenProvider.Error!Cach
             .retry => |err| {
                 logging.debug("POST {s} -> {t} in {d} ms (attempt {d} of {d})", .{ self.token_url, err, elapsed_ms, attempt, max_attempts });
                 if (attempt >= max_attempts) return err;
-                const delay_ms = self.retry.backoffMs(attempt, entropy(io));
+                const delay_ms = self.retry.waitMs(attempt, entropy(io), asked) orelse {
+                    logging.warn("the token exchange failed with {t}; not retried: it asked to wait {d} ms, longer than max_backoff_ms ({d} ms)", .{
+                        err, asked.?, self.retry.max_backoff_ms,
+                    });
+                    return err;
+                };
                 logging.warn("the token exchange failed with {t}; retrying in {d} ms (attempt {d} of {d})", .{
                     err, delay_ms, attempt + 1, max_attempts,
                 });
@@ -372,20 +378,21 @@ const Result = union(enum) {
     fail: TokenProvider.Error,
 };
 
-/// One whole attempt, each step feeding the next.
-fn exchange(self: *ExternalAccount, io: std.Io, arena: Allocator) Result {
-    const subject = switch (self.subjectToken(io, arena)) {
+/// One whole attempt, each step feeding the next. `asked` gets the wait
+/// the step that was refused asks for.
+fn exchange(self: *ExternalAccount, io: std.Io, arena: Allocator, asked: *?u32) Result {
+    const subject = switch (self.subjectToken(io, arena, asked)) {
         .ok => |token| token,
         .retry => |err| return .{ .retry = err },
         .fail => |err| return .{ .fail = err },
     };
-    const sts = switch (self.stsExchange(arena, subject)) {
+    const sts = switch (self.stsExchange(io, arena, subject, asked)) {
         .token => |fetched| fetched,
         .retry => |err| return .{ .retry = err },
         .fail => |err| return .{ .fail = err },
     };
     if (self.impersonation_url == null) return .{ .token = sts };
-    return self.impersonate(io, arena, sts.token);
+    return self.impersonate(io, arena, sts.token, asked);
 }
 
 const SubjectResult = union(enum) {
@@ -395,7 +402,7 @@ const SubjectResult = union(enum) {
 };
 
 /// The third-party token, from the file or the URL the credentials name.
-fn subjectToken(self: *ExternalAccount, io: std.Io, arena: Allocator) SubjectResult {
+fn subjectToken(self: *ExternalAccount, io: std.Io, arena: Allocator, asked: *?u32) SubjectResult {
     const document: []const u8 = switch (self.source.kind) {
         .file => std.Io.Dir.cwd().readFileAlloc(io, self.source.where, arena, .limited(adc_file.max_file_bytes)) catch |err| {
             if (err == error.Canceled) return .{ .fail = error.Canceled };
@@ -416,6 +423,7 @@ fn subjectToken(self: *ExternalAccount, io: std.Io, arena: Allocator) SubjectRes
             };
             if (res.status != 200) {
                 if (self.diagnostics) |d| d.print("the credential_source url answered HTTP {d}", .{res.status});
+                asked.* = token_response.askedDelayMs(io, arena, res, self.diagnostics) catch return .{ .fail = error.OutOfMemory };
                 const err: TokenProvider.Error = error.TokenUnavailable;
                 return if (res.status == 429 or res.status >= 500) .{ .retry = err } else .{ .fail = err };
             }
@@ -446,7 +454,7 @@ fn subjectToken(self: *ExternalAccount, io: std.Io, arena: Allocator) SubjectRes
 }
 
 /// Trades the subject token at the STS for a Google access token.
-fn stsExchange(self: *ExternalAccount, arena: Allocator, subject: []const u8) Result {
+fn stsExchange(self: *ExternalAccount, io: std.Io, arena: Allocator, subject: []const u8, asked: *?u32) Result {
     // With impersonation, the STS token exists only to reach the IAM
     // Credentials API; without it, it is the token the caller gets.
     const scope = if (self.impersonation_url != null) impersonation_scope else self.scopes.joined.?;
@@ -497,19 +505,20 @@ fn stsExchange(self: *ExternalAccount, arena: Allocator, subject: []const u8) Re
             d.set(res.status, "", "the STS endpoint refused the request");
         }
     }
+    asked.* = token_response.askedDelayMs(io, arena, res, self.diagnostics) catch return .{ .fail = error.OutOfMemory };
     if (res.status == 429 or res.status >= 500) return .{ .retry = error.TokenUnavailable };
     return .{ .fail = error.TokenEndpointRejected };
 }
 
 /// Trades the STS token for one that acts as the service account.
-fn impersonate(self: *ExternalAccount, io: std.Io, arena: Allocator, sts_token: []const u8) Result {
+fn impersonate(self: *ExternalAccount, io: std.Io, arena: Allocator, sts_token: []const u8, asked: *?u32) Result {
     const outcome = iam_credentials.generateAccessToken(self.transport, io, arena, .{
         .url = self.impersonation_url.?,
         .bearer = sts_token,
         .scopes = self.scopes.joined.?,
         .lifetime_s = self.impersonation_lifetime_s,
         .timeout_ms = self.request_timeout_ms,
-    }, self.diagnostics, "impersonation was refused: grant roles/iam.workloadIdentityUser on the service account to the pool identity");
+    }, self.diagnostics, "impersonation was refused: grant roles/iam.workloadIdentityUser on the service account to the pool identity", asked);
     return switch (outcome) {
         .token => |fetched| .{ .token = fetched },
         .retry => |err| .{ .retry = err },
@@ -732,6 +741,52 @@ test "ExternalAccount: a busy STS is retried with a fresh subject read" {
     defer h.deinit();
     try testing.expectEqualStrings("ya29.STS-SECRET", try h.get());
     try testing.expectEqual(2, h.fake.requests.items.len);
+}
+
+test "ExternalAccount: each step's delay is honoured, and one past the cap returns at once" {
+    // The harness caps waits at 5 ms.
+    var sts: Harness = undefined;
+    try sts.init(&.{
+        .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "retry-after-ms", .value = "2" }}, .body = "Service Unavailable" } },
+        sts_ok,
+    }, .{});
+    defer sts.deinit();
+    try testing.expectEqualStrings("ya29.STS-SECRET", try sts.get());
+    try testing.expectEqual(2, sts.fake.requests.items.len);
+
+    var refused: Harness = undefined;
+    try refused.init(&.{
+        .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "120" }}, .body = "Service Unavailable" } },
+        sts_ok,
+    }, .{});
+    defer refused.deinit();
+    try testing.expectError(error.TokenUnavailable, refused.get());
+    try testing.expectEqual(1, refused.fake.requests.items.len);
+    try testing.expectEqual(120_000, refused.diag.retry_after_ms.?);
+
+    var subject: Harness = undefined;
+    try subject.init(&.{
+        .{ .respond = .{ .status = 429, .headers = &.{.{ .name = "Retry-After", .value = "60" }}, .body = "slow down" } },
+        .{ .respond = .{ .body = "subject-doc-token" } },
+        sts_ok,
+    }, .{ .source =
+        \\{"url": "http://127.0.0.1:1/t"}
+    });
+    defer subject.deinit();
+    try testing.expectError(error.TokenUnavailable, subject.get());
+    try testing.expectEqual(1, subject.fake.requests.items.len);
+    try testing.expectEqual(60_000, subject.diag.retry_after_ms.?);
+
+    var iam: Harness = undefined;
+    try iam.init(&.{
+        sts_ok,
+        .{ .respond = .{ .status = 503, .body = test_util.retryInfoBody(503, "UNAVAILABLE", "60s") } },
+        sts_ok,
+    }, .{ .impersonate = true });
+    defer iam.deinit();
+    try testing.expectError(error.TokenUnavailable, iam.get());
+    try testing.expectEqual(2, iam.fake.requests.items.len);
+    try testing.expectEqual(60_000, iam.diag.retry_after_ms.?);
 }
 
 test "ExternalAccount: a missing subject file is retried, then TokenUnavailable" {

@@ -41,6 +41,7 @@ fn engine(client: *Client) Engine {
         .retry = client.retry,
         .request_timeout_ms = client.request_timeout_ms,
         .diagnostics = client.diagnostics,
+        .server_delay_out = &client.server_delay_ms,
     };
 }
 

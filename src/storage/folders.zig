@@ -106,7 +106,7 @@ pub fn create(client: *Client, bucket: []const u8, path: []const u8, recursive: 
             // It may have landed with its answer lost. Give it time to,
             // then read it: a folder that is there is this create's, since
             // an identical concurrent create leaves the same thing.
-            const delay_ms = rpc.backoffMs(client, attempt);
+            const delay_ms = rpc.waitMs(client, attempt, client.server_delay_ms) orelse return err;
             logging.warn("creating folder {s} in {s} failed with {t}; reading it in {d} ms", .{ folder, bucket, err, delay_ms });
             try client.io.sleep(.fromMilliseconds(delay_ms), .awake);
             if (get(client, bucket, folder)) |found| {
@@ -719,6 +719,26 @@ test "a create that did not land is sent again, up to the retry policy's attempt
         h.client.bucket("zigps-h").folder("a/b/").create(.{}),
     );
     try h.expectRequestCount(4);
+}
+
+test "a create refused with a delay waits it before reading back, and one past the cap returns at once" {
+    const busy = "{\"error\":{\"code\":503,\"message\":\"Backend Error\"}}";
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "2" }}, .body = busy } },
+        .{ .respond = .{ .body = folder_answer } },
+        .{ .respond = .{ .status = 503, .headers = &.{.{ .name = "Retry-After", .value = "60" }}, .body = busy } },
+    }, .{});
+    defer h.deinit();
+    const folder = h.client.bucket("zigps-h").folder("a/b/");
+    var made = try folder.create(.{});
+    defer made.deinit();
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(2_000, h.clock.sleepMs(0));
+    try testing.expectError(error.Unavailable, folder.create(.{}));
+    try h.expectRequestCount(3);
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(60_000, h.diag.retry_after_ms.?);
 }
 
 test "a create whose answer was lost, and whose read fails, says it may exist" {

@@ -204,12 +204,17 @@ pub fn run(client: *Client, handler: Handler, options: types.RunTransactionOptio
             return;
         };
         const err = if (outcome) |_| unreachable else |e| e;
+        // Taken before the rollback, which makes a call of its own.
+        const asked = client.server_delay_ms;
         rollbackQuietly(client, txn.id);
         if (err != error.Aborted or options.read_only or attempt >= options.max_attempts) return err;
+        // An ABORTED can carry a RetryInfo, as Spanner's does; one past the
+        // cap returns the abort rather than waiting for it.
+        const delay_ms = client.retry.waitMs(attempt, core.rpc.entropy(client.io), asked) orelse return err;
         logging.debug("transaction aborted on attempt {d} of {d}; running it again", .{ attempt, options.max_attempts });
         if (previous) |p| client.gpa.free(p);
         previous = try client.gpa.dupe(u8, txn.id);
-        try client.io.sleep(.fromMilliseconds(client.retry.backoffMs(attempt, core.rpc.entropy(client.io))), .awake);
+        try client.io.sleep(.fromMilliseconds(delay_ms), .awake);
     }
 }
 
@@ -276,6 +281,26 @@ test "golden: ABORTED rolls back, waits, and runs again naming the last transact
     try testing.expect(std.mem.indexOf(u8, (try h.fake.request(6)).body.?, "\"transaction\":\"" ++ id2 ++ "\"") != null);
     try h.expectRequestCount(7);
     try testing.expectEqual(1, h.clock.sleep_count);
+}
+
+test "runTransaction: an ABORTED's delay is waited, and one past the cap returns the abort" {
+    const waits: test_util.FakeTransport.Reply = .{ .respond = .{ .status = 409, .headers = &.{.{ .name = "Retry-After", .value = "2" }}, .body = aborted.respond.body } };
+    const too_long: test_util.FakeTransport.Reply = .{ .respond = .{ .status = 409, .body = core.testing.retryInfoBody(409, "ABORTED", "60s") } };
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        begun1, read_a, waits,    empty_ok, begun2, read_a, .{ .respond = .{ .body = test_util.commit_body } },
+        begun1, read_a, too_long, empty_ok,
+    }, .{});
+    defer h.deinit();
+    var inc: Increment = .{};
+    try h.client.runTransaction(inc.handler(), .{});
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(2_000, h.clock.sleepMs(0));
+    try testing.expectError(error.Aborted, h.client.runTransaction(inc.handler(), .{}));
+    try h.expectRequestCount(11);
+    try testing.expectEqual(1, h.clock.sleep_count);
+    // The rollback after it kept the abort's delay.
+    try testing.expectEqual(60_000, h.diag.retry_after_ms.?);
 }
 
 test "runTransaction: at most max_attempts runs, then the ABORTED stands, said in the diagnostics" {

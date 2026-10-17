@@ -162,6 +162,11 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
         retry: RetryPolicy = .{},
         request_timeout_ms: u32 = 0,
         diagnostics: ?*Diagnostics = null,
+        /// Set before each attempt to the delay its response asked for,
+        /// or null: for a module's own retry loop, which makes its calls
+        /// with `retry` off and waits with `RetryPolicy.waitMs`. A module
+        /// points it at its client, which one task uses at a time.
+        server_delay_out: ?*?u32 = null,
 
         const Self = @This();
         const log = logging.Scoped(log_scope);
@@ -199,6 +204,7 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
                 // Each attempt starts over: a reset arena no longer holds
                 // the previous attempt's body.
                 if (call.error_body_out) |out| out.* = null;
+                if (self.server_delay_out) |out| out.* = null;
                 const bearer = try self.bearerToken(scratch.allocator());
                 const started = std.Io.Clock.awake.now(self.io);
                 const outcome = self.transport.send(.{
@@ -317,6 +323,7 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
             const first_started = std.Io.Clock.awake.now(self.io);
             var attempt: u32 = 1;
             while (true) : (attempt += 1) {
+                if (self.server_delay_out) |out| out.* = null;
                 const bearer = try self.bearerToken(scratch.allocator());
                 const started = std.Io.Clock.awake.now(self.io);
                 const outcome = self.transport.sendStream(.{
@@ -419,6 +426,7 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
         fn serverDelay(self: Self, scratch: Allocator, res: Response) Error!?u32 {
             const ms = try retry_after.serverDelayMs(scratch, res.headers, res.body, std.Io.Clock.real.now(self.io));
             if (self.diagnostics) |d| d.retry_after_ms = ms;
+            if (self.server_delay_out) |out| out.* = ms;
             return ms;
         }
 
@@ -881,6 +889,31 @@ test "server delay: executeStream honours it, and stops past the cap, the delay 
     try testing.expectError(error.Unavailable, e.executeStream(&long.arena, .{ .method = .GET, .path = "/v1/things" }));
     try testing.expectEqual(1, long.fake.stream_requests.items.len);
     try testing.expectEqual(60_000, long.diag.retry_after_ms.?);
+}
+
+test "server delay: server_delay_out holds each attempt's own, for a module's loop" {
+    var h: Harness = undefined;
+    h.init(&.{ too_many_wait_2, unavailable, too_many_wait_2, ok, too_many_wait_2, ok });
+    defer h.deinit();
+    var delay: ?u32 = 12345;
+    var e = h.engine();
+    e.server_delay_out = &delay;
+    const call: Call = .{ .method = .GET, .path = "/v1/things", .retry = false };
+    try testing.expectError(error.ResourceExhausted, e.execute(&h.arena, call));
+    try testing.expectEqual(2_000, delay.?);
+    try testing.expectError(error.Unavailable, e.execute(&h.arena, call));
+    try testing.expectEqual(null, delay);
+    const stream: StreamCall = .{ .method = .GET, .path = "/v1/things", .retry = false };
+    try testing.expectError(error.ResourceExhausted, e.executeStream(&h.arena, stream));
+    try testing.expectEqual(2_000, delay.?);
+    _ = try e.execute(&h.arena, call);
+    try testing.expectEqual(null, delay);
+    // The same, the other way round: a stream's answer clears an earlier
+    // call's delay.
+    try testing.expectError(error.ResourceExhausted, e.execute(&h.arena, call));
+    try testing.expectEqual(2_000, delay.?);
+    _ = try e.executeStream(&h.arena, stream);
+    try testing.expectEqual(null, delay);
 }
 
 test "server delay: Diagnostics' set and print clear an earlier one" {

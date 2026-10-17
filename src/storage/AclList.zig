@@ -189,7 +189,7 @@ fn update(self: AclList, change: Change) Error!types.Owned(types.Acl) {
             .if_generation_match = read.value.generation,
         }) catch |err| {
             if (err != error.Aborted or round >= self.client.retry.max_attempts) return err;
-            const delay_ms = rpc.backoffMs(self.client, round);
+            const delay_ms = rpc.waitMs(self.client, round, self.client.server_delay_ms) orelse return err;
             try self.client.io.sleep(.fromMilliseconds(delay_ms), .awake);
             continue;
         };
@@ -509,6 +509,20 @@ test "grant starts over when another change came in between, and stops at a refu
         try testing.expectError(error.Aborted, h.client.bucket("b").acl().grant(.all_authenticated_users, .reader));
         try h.expectRequestCount(4);
     }
+}
+
+test "grant waits a stale write's delay before starting over, and one past the cap ends it" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        ok(bucket_read), .{ .respond = .{ .status = 412, .headers = &.{.{ .name = "Retry-After", .value = "2" }}, .body = stale_body } },
+        ok(bucket_read), .{ .respond = .{ .status = 412, .headers = &.{.{ .name = "Retry-After", .value = "60" }}, .body = stale_body } },
+    }, .{});
+    defer h.deinit();
+    try testing.expectError(error.Aborted, h.client.bucket("b").acl().grant(.all_authenticated_users, .reader));
+    try h.expectRequestCount(4);
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(2_000, h.clock.sleepMs(0));
+    try testing.expectEqual(60_000, h.diag.retry_after_ms.?);
 }
 
 test "golden: set, an empty list as the owner alone, and an object's list held to its generation" {

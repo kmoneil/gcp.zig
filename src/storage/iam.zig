@@ -99,6 +99,11 @@ pub const Resource = struct {
         });
         return decoded(r.client, &result, body);
     }
+
+    /// The delay the last refused call asked for, for `core.iam.update`.
+    pub fn serverDelayMs(r: Resource) ?u32 {
+        return r.client.server_delay_ms;
+    }
 };
 
 fn decoded(client: *Client, result: *types.Owned(Policy), body: []const u8) Error!types.Owned(Policy) {
@@ -254,6 +259,28 @@ test "bucket IAM: refused before sending: a role or member of no known form, a p
     try testing.expectError(error.InvalidArgument, b.testIamPermissions(&.{}));
     try testing.expectError(error.InvalidBucketName, h.client.bucket("").iamPolicy());
     try h.expectRequestCount(0);
+}
+
+test "bucket IAM: a stale write's delay is waited before the grant starts over, and one past the cap ends it" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = fresh } },
+        .{ .respond = .{ .status = 412, .headers = &.{.{ .name = "Retry-After", .value = "2" }}, .body = stale_body } },
+        .{ .respond = .{ .body = fresh } },
+        .{ .respond = .{ .body = "{\"version\":1,\"etag\":\"CAM=\",\"bindings\":[{\"role\":\"roles/storage.objectViewer\",\"members\":[\"" ++ agent ++ "\"]}]}" } },
+        .{ .respond = .{ .body = fresh } },
+        .{ .respond = .{ .status = 412, .headers = &.{.{ .name = "Retry-After", .value = "60" }}, .body = stale_body } },
+    }, .{});
+    defer h.deinit();
+    const b = h.client.bucket("b");
+    var granted = try b.addIamBinding("roles/storage.objectViewer", agent);
+    defer granted.deinit();
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(2_000, h.clock.sleepMs(0));
+    try testing.expectError(error.Aborted, b.addIamBinding("roles/storage.objectAdmin", agent));
+    try h.expectRequestCount(6);
+    try testing.expectEqual(1, h.clock.sleep_count);
+    try testing.expectEqual(60_000, h.diag.retry_after_ms.?);
 }
 
 test "bucket IAM: the stale etag's 412 is Aborted, and a grant starts over on it; the other two 412s are not" {
