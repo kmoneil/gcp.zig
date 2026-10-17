@@ -4,6 +4,42 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.40.0 (unreleased)
+
+- resource_manager: new module, **experimental**: the projects a
+  credential can see, from Cloud Resource Manager's v3
+  `projects.search`. `Client.allProjects` reads every page of one search
+  and returns one list for a switcher to cache and filter locally: each
+  project number once, projects pending deletion left out (and counted)
+  unless asked for, sorted by project id, since search promises no
+  order. It waits 250 ms between pages, as the searches share 4 calls a
+  second and 240 a minute per charged project with every other caller
+  charged to it, and stops at `max_pages`, saying so. A page token sent
+  back again fails the walk rather than paging for ever.
+  `Client.searchProjects` fixes one search for a caller with its own
+  loop, and `Client.getProject` reads one project by id or number,
+  strongly consistent where search is not. The query language passes
+  through as written; measured, two terms side by side mean AND. A
+  project's number comes from its `name`, which is the only place v3
+  carries it.
+- resource_manager: no quota project is sent unless asked for, as
+  gcloud sends none for its project commands: a quota project with the
+  API off breaks a search that works without one, the commonest failure
+  reported. `Client.Options.quota_project` sends the credentials' or a
+  named one. A refusal for a disabled API is `error.ServiceDisabled`,
+  and one for a quota project the caller may not use is
+  `error.QuotaProjectDenied`; `Client.lastConsumerRefusal` names the
+  project charged and the link that fixes it. A 429 is never retried.
+- resource_manager: `resource_manager.testing.FakeResourceManager` keeps
+  projects, folders and callers in memory and searches, pages and reads
+  them as production did when measured, its refusals in production's
+  words: grants on a project or above it, public projects read but not
+  searched, the project charged for each call, the search quota, a lag
+  before search sees a change, and an order that differs between
+  searches. `examples/projects_list.zig`, with `--fake` for no network.
+- auth, core, firestore, logging, pubsub, secret_manager and storage:
+  unchanged.
+
 ## 0.39.0 (2026-10-17)
 
 - logging: new module, **experimental**: the read side of Cloud
