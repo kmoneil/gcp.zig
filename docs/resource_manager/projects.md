@@ -143,4 +143,6 @@ page each, on the same quota as the project search. Then:
 | `InvalidResponse` | An answer that does not decode, or a page token sent again |
 
 500, 502, 503, 504 and dropped connections are retried with the client's
-`RetryPolicy`: every call here is a GET with no side effect.
+`RetryPolicy`: every call here is a GET with no side effect. A delay a
+refusal asks for is kept in `Diagnostics.retry_after_ms`, a 429's too,
+and a retry waits at least that long; production's 429 asks for none.

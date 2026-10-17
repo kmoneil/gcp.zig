@@ -174,13 +174,13 @@ pub const FakeLogging = struct {
         restricted_fields: []const []const u8 = &.{},
     };
 
-    const Fault = struct { n: usize = 0, status: u16 = 0, max: usize = 0 };
+    const Fault = struct { n: usize = 0, status: u16 = 0, max: usize = 0, delay: ?core.retry_after.Asked = null };
     const refuse = 0;
     const drop = 1;
     const searching = 2;
     const short = 3;
 
-    pub const Reply = struct { status: u16, body: []const u8 };
+    pub const Reply = struct { status: u16, headers: []const tp.Header = &.{}, body: []const u8 };
 
     pub const WriteError = error{ OutOfMemory, InvalidEntry };
 
@@ -397,6 +397,13 @@ pub const FakeLogging = struct {
         f.setFault(refuse, .{ .n = n, .status = status });
     }
 
+    /// Answers them as `refuseNext` does, and asks the client to wait
+    /// `delay.ms` before trying again, in `delay.form`: for a test of how
+    /// an app schedules its next read. Logging's own 429 sends none.
+    pub fn refuseNextWithDelay(f: *FakeLogging, n: usize, status: u16, delay: core.retry_after.Asked) void {
+        f.setFault(refuse, .{ .n = n, .status = status, .delay = delay });
+    }
+
     /// Closes their connection before any answer.
     pub fn dropNext(f: *FakeLogging, n: usize) void {
         f.setFault(drop, .{ .n = n });
@@ -438,7 +445,7 @@ pub const FakeLogging = struct {
     fn send(ptr: *anyopaque, req: tp.Request, arena: Allocator) tp.Error!tp.Response {
         const f: *FakeLogging = @ptrCast(@alignCast(ptr));
         const reply = try f.serve(req.method, req.url, req.body orelse "", arena);
-        return .{ .status = reply.status, .body = reply.body };
+        return .{ .status = reply.status, .headers = reply.headers, .body = reply.body };
     }
 
     /// One request, as `send` serves it: for a test that wants to send
@@ -451,7 +458,7 @@ pub const FakeLogging = struct {
         if (method == .POST and std.mem.eql(u8, route, "/v2/entries:list")) {
             f.list_calls += 1;
             if (f.takeFault(drop) != null) return error.ConnectionResetByPeer;
-            if (f.takeFault(refuse)) |fault| return refusal(arena, fault.status, @intCast(@divFloor(f.now(), std.time.ns_per_s)));
+            if (f.takeFault(refuse)) |fault| return asking(arena, try refusal(arena, fault.status, @intCast(@divFloor(f.now(), std.time.ns_per_s))), fault.delay);
             return f.list(arena, body);
         }
         if (method == .GET and std.mem.startsWith(u8, route, "/v2/")) {
@@ -1085,6 +1092,12 @@ fn refusal(arena: Allocator, status: u16, now_s: i64) Allocator.Error!FakeLoggin
     };
 }
 
+/// `reply`, asking for the delay a scripted refusal carries, if any.
+fn asking(arena: Allocator, reply: FakeLogging.Reply, delay: ?core.retry_after.Asked) Allocator.Error!FakeLogging.Reply {
+    const d = delay orelse return reply;
+    return .{ .status = reply.status, .headers = try d.headers(arena), .body = try d.intoBody(arena, reply.body) };
+}
+
 /// What this fake has no answer for: said, never guessed at.
 fn notModelled(arena: Allocator, what: []const u8) Allocator.Error!FakeLogging.Reply {
     return fail(arena, 501, "UNIMPLEMENTED", try std.fmt.allocPrint(arena, "fake: {s} is not modelled yet", .{what}));
@@ -1361,6 +1374,30 @@ test "fake: refusals, a 429 in the quota's words, dropped connections" {
     try testing.expectEqual(4, r.fake.listCalls());
     r.fake.refuseNext(1, 403);
     try testing.expectError(error.PermissionDenied, r.listAll(a, .{}));
+}
+
+test "fake: a refusal can ask for a delay, which the client waits, or stops at past its cap" {
+    var r: Rig = undefined;
+    try r.init();
+    defer r.deinit();
+    try r.writeAt("a", 1, "a");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    r.fake.refuseNextWithDelay(1, 503, .{ .ms = 2_000, .form = .retry_info });
+    try testing.expectEqualStrings("a", try r.listAll(a, .{}));
+    try testing.expectEqual(2, r.fake.listCalls());
+    try testing.expectEqual(1, r.clock.sleep_count);
+    try testing.expectEqual(2_000, r.clock.sleepMs(0));
+    r.fake.refuseNextWithDelay(1, 503, .{ .ms = 30_000, .form = .retry_after });
+    try testing.expectError(error.Unavailable, r.listAll(a, .{}));
+    try testing.expectEqual(3, r.fake.listCalls());
+    try testing.expectEqual(30_000, r.diag.retry_after_ms.?);
+    // A 429 is not retried, whatever it asks; the delay is kept.
+    r.fake.refuseNextWithDelay(1, 429, .{ .ms = 45_000 });
+    try testing.expectError(error.ResourceExhausted, r.listAll(a, .{}));
+    try testing.expect(std.mem.indexOf(u8, r.diag.message(), "Read requests per minute") != null);
+    try testing.expectEqual(45_000, r.diag.retry_after_ms.?);
 }
 
 test "fake: requests no client sends" {

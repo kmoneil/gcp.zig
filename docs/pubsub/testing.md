@@ -104,6 +104,7 @@ one kind (`.publish`, `.pull`, `.acknowledge`, `.modify_ack_deadline`,
 | Call | What the next `n` requests meet |
 | --- | --- |
 | `refuseNext(n, status, which)` | answered with that status; nothing changes |
+| `refuseNextWithDelay(n, status, which, delay)` | the same, asking the client to wait `delay.ms` in `delay.form`: `.retry_after` (whole seconds), `.retry_after_ms`, `.retry_info`, or `.all`, the default |
 | `loseAnswers(n, which)` | carried out, then answered 503: the answer was lost on the way back |
 | `dropNext(n, which)` | a broken connection; nothing changes |
 
@@ -128,7 +129,20 @@ fn publishTwice(fake: *pubsub.testing.FakePubSub, client: *pubsub.Client) !void 
     defer sent.deinit();
     try std.testing.expectEqual(before + 2, fake.publishedCount("my-project", "orders"));
 }
+
+/// A refusal that asks for longer than the client waits: not retried, and
+/// the delay is there for the app to schedule its next try by.
+fn askedToWait(fake: *pubsub.testing.FakePubSub, client: *pubsub.Client, diag: *const pubsub.Diagnostics) !void {
+    const sent = fake.requestCount(.publish);
+    fake.refuseNextWithDelay(1, 503, .publish, .{ .ms = 30_000 });
+    try std.testing.expectError(error.Unavailable, client.topic("orders").publish(&.{.{ .data = "later" }}, .{}));
+    try std.testing.expectEqual(sent + 1, fake.requestCount(.publish));
+    try std.testing.expectEqual(30_000, diag.retry_after_ms.?);
+}
 ```
+
+No Google service measured on 2026-10-17 asks for a delay, so a scripted
+one is the way to see what an app does with it before production does.
 
 A pull whose answer is lost has leased its messages to nobody: they come
 again when those leases lapse, as they would in production.

@@ -158,7 +158,10 @@ them twice: a write without transforms always, one with transforms only
 under a precondition a repeat fails. [Retries](writing.md#retries) has
 the rule, and `Client.Options.retry_unconditional_writes` to retry
 regardless, as Google's own clients do. A transaction's commit is never
-sent twice; see [Transactions](transactions.md).
+sent twice; see [Transactions](transactions.md). A transaction that
+aborted runs again after at least the delay its ABORTED asked for, if
+any, as Spanner's do; one past `max_backoff_ms` returns the abort, the
+delay in `Diagnostics.retry_after_ms`.
 
 ## Limits
 

@@ -858,6 +858,16 @@ fn publishTwice(fake: *pubsub.testing.FakePubSub, client: *pubsub.Client) !void 
     defer sent.deinit();
     try std.testing.expectEqual(before + 2, fake.publishedCount("my-project", "orders"));
 }
+
+/// A refusal that asks for longer than the client waits: not retried, and
+/// the delay is there for the app to schedule its next try by.
+fn askedToWait(fake: *pubsub.testing.FakePubSub, client: *pubsub.Client, diag: *const pubsub.Diagnostics) !void {
+    const sent = fake.requestCount(.publish);
+    fake.refuseNextWithDelay(1, 503, .publish, .{ .ms = 30_000 });
+    try std.testing.expectError(error.Unavailable, client.topic("orders").publish(&.{.{ .data = "later" }}, .{}));
+    try std.testing.expectEqual(sent + 1, fake.requestCount(.publish));
+    try std.testing.expectEqual(30_000, diag.retry_after_ms.?);
+}
 // end snippet
 
 // snippet: pubsub-fake-state
@@ -883,6 +893,7 @@ const InMemory = struct {
     clock: pubsub.testing.FakeClock = .{},
     fake: pubsub.testing.FakePubSub = undefined,
     token: pubsub.StaticToken = .{ .token = "none" },
+    diag: pubsub.Diagnostics = .{},
     client: pubsub.Client = undefined,
 
     fn init(m: *InMemory) !void {
@@ -892,6 +903,7 @@ const InMemory = struct {
             .project_id = "my-project",
             .token_provider = m.token.provider(),
             .transport = m.fake.transport(),
+            .diagnostics = &m.diag,
         });
     }
 
@@ -909,6 +921,8 @@ test "the testing guide's code" {
     topic.deinit();
     try publishThroughAnOutage(&m.fake, &m.client);
     try publishTwice(&m.fake, &m.client);
+    try std.testing.expectEqual(3, m.fake.publishedCount("my-project", "orders"));
+    try askedToWait(&m.fake, &m.client, &m.diag);
     try std.testing.expectEqual(3, m.fake.publishedCount("my-project", "orders"));
     try tableGone(&m.fake, &m.client);
 }

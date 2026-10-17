@@ -53,6 +53,8 @@ test "the newest error, from a fake" {
   `setBucketState`, and `_Default`'s view leaving out data access audit
   logs.
 - **Faults**: `refuseNext` (a 429 carries production's quota details),
+  `refuseNextWithDelay` for one that asks the client to wait, in any of
+  the three forms,
   `dropNext`, `searchingNext` for empty pages with a token, `shortenNext`
   for short ones, `denyBucketList` and `denyViewList` for a 403.
 

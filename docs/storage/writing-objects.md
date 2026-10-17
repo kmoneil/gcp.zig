@@ -34,6 +34,11 @@ as before. `Options.idempotency_tokens = false` sends none and keeps
 only the conditions' retries. `Options.retry_unconditional_writes`
 retries every write, past the window too.
 
+A delay a refusal asks for is waited before any retry, a download's
+resume, a parallel upload's part or a resumable chunk's status query
+included, and one longer than `max_backoff_ms` ends the transfer with
+the delay in `Diagnostics.retry_after_ms`.
+
 A 412 on a write that may have been retried says so in `Diagnostics`:
 the first attempt may have succeeded, so `get` the object and compare
 checksums. An `if_generation_not_match` or `if_metageneration_not_match`

@@ -138,7 +138,10 @@ wildcard.
   as `error.Aborted`, which `addIamBinding` and `removeIamBinding`
   absorb by reading again. A bare `setIamPolicy` that reports
   `error.Aborted` after a transient failure may have landed: read the
-  policy again. A write without an etag is sent once.
+  policy again. A write without an etag is sent once. A grant that
+  starts over after `error.Aborted` waits at least the delay the
+  refusal asked for, and stops there when it is longer than
+  `max_backoff_ms`.
 - **A role a resource does not take**, another service's or a basic role
   on a bucket, is `error.InvalidArgument` with the service's words: "Role
   roles/pubsub.publisher is not supported for this resource."

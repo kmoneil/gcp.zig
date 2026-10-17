@@ -238,12 +238,12 @@ pub const FakePubSub = struct {
     /// The kinds of call a fault or a count can be about.
     pub const Calls = enum { all, publish, pull, acknowledge, modify_ack_deadline, admin };
 
-    const Fault = struct { n: usize = 0, which: Calls = .all, status: u16 = 503 };
+    const Fault = struct { n: usize = 0, which: Calls = .all, status: u16 = 503, delay: ?core.retry_after.Asked = null };
     const refuse = 0;
     const lose = 1;
     const drop = 2;
 
-    pub const Reply = struct { status: u16, body: []const u8 };
+    pub const Reply = struct { status: u16, headers: []const tp.Header = &.{}, body: []const u8 };
 
     const Label = struct { key: []const u8, value: []const u8 };
 
@@ -660,6 +660,13 @@ pub const FakePubSub = struct {
         f.setFault(refuse, .{ .n = n, .which = which, .status = status });
     }
 
+    /// Answers them as `refuseNext` does, and asks the client to wait
+    /// `delay.ms` before trying again, in `delay.form`: for a test of how
+    /// an app schedules its next try. No Google service measured sends one.
+    pub fn refuseNextWithDelay(f: *FakePubSub, n: usize, status: u16, which: Calls, delay: core.retry_after.Asked) void {
+        f.setFault(refuse, .{ .n = n, .which = which, .status = status, .delay = delay });
+    }
+
     /// Lets them land, and answers 503: an answer lost on the way back.
     pub fn loseAnswers(f: *FakePubSub, n: usize, which: Calls) void {
         f.setFault(lose, .{ .n = n, .which = which });
@@ -800,7 +807,7 @@ pub const FakePubSub = struct {
     fn send(ptr: *anyopaque, req: tp.Request, arena: Allocator) tp.Error!tp.Response {
         const f: *FakePubSub = @ptrCast(@alignCast(ptr));
         const reply = try f.serve(req.method, req.url, req.body orelse "", arena);
-        return .{ .status = reply.status, .body = reply.body };
+        return .{ .status = reply.status, .headers = reply.headers, .body = reply.body };
     }
 
     const Route = struct {
@@ -828,7 +835,9 @@ pub const FakePubSub = struct {
         if (f.takeFault(drop, call)) return error.ConnectionResetByPeer;
         if (f.takeFault(refuse, call)) {
             const status = f.faults[refuse].status;
-            return fail(arena, status, statusName(status), "The service is currently unavailable.");
+            const refused = try fail(arena, status, statusName(status), "The service is currently unavailable.");
+            const delay = f.faults[refuse].delay orelse return refused;
+            return .{ .status = refused.status, .headers = try delay.headers(arena), .body = try delay.intoBody(arena, refused.body) };
         }
         // What production does on its own, it does here before each call.
         try f.settleAll(f.awakeNow());
@@ -5726,6 +5735,30 @@ test "faults: a refusal changes nothing, a lost answer lands, a drop is a broken
     try testing.expectEqual(1, b.fake.requestCount(.modify_ack_deadline));
     try testing.expectEqual(6, b.fake.requestCount(.admin));
     try testing.expectEqual(18, b.fake.requestCount(.all));
+}
+
+test "faults: a refusal can ask for a delay in each form, and the client waits it or stops" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var made = try b.client.topic("orders").create(.{});
+    made.deinit();
+    for ([_]core.retry_after.Asked.Form{ .retry_after, .retry_after_ms, .retry_info, .all }) |form| {
+        const before = b.clock.sleep_count;
+        b.fake.refuseNextWithDelay(1, 503, .all, .{ .ms = 1_500, .form = form });
+        var read = try b.client.topic("orders").get();
+        read.deinit();
+        // `Retry-After` is whole seconds, so 1.5 s is sent as 2.
+        try testing.expectEqual(before + 1, b.clock.sleep_count);
+        try testing.expectEqual(@as(i64, if (form == .retry_after or form == .all) 2_000 else 1_500), b.clock.sleepMs(before));
+    }
+    // Past the client's cap: one attempt, and the delay kept for the app's
+    // own schedule.
+    const before = b.clock.sleep_count;
+    b.fake.refuseNextWithDelay(1, 503, .all, .{ .ms = 60_000 });
+    try testing.expectError(error.Unavailable, b.client.topic("orders").get());
+    try testing.expectEqual(before, b.clock.sleep_count);
+    try testing.expectEqual(60_000, b.diag.retry_after_ms.?);
 }
 
 test "a pull with nothing to give is held as long as asked, on the fake's clock" {

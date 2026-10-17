@@ -18,7 +18,8 @@ including the ones that did not change.
   `max_backoff_ms` stops the retries and returns the failure at once,
   rather than holding the task asleep for it: **a change in behaviour**
   for a server that asks for more than 10 s by default. A delay never
-  makes a status retryable. `core.retry_after` reads the three forms.
+  makes a status retryable. `core.retry_after` reads the three forms,
+  and its `Asked` writes a delay in any of them, for the fakes.
   Measured on 2026-10-17, none of the services these modules call sends
   any of them, so nothing changes against Google today.
 - auth: the token providers' and IAM Credentials' retry loops honour a
@@ -30,14 +31,21 @@ including the ones that did not change.
   its `ABORTED` asked for; one past the cap returns the abort.
 - logging: `entries.list` retries wait at least a server's delay, and a
   429 holds later reads back for the larger of its quota window and the
-  delay it asked for.
+  delay it asked for. `testing.FakeLogging.refuseNextWithDelay` scripts
+  a refusal that asks for one, in any of the three forms, and the fake's
+  `Reply` gains `headers`.
 - pubsub: the Publisher, schema commits, `detach` and the ack loops
   honour a server's delay. One past the cap ends a batch's retries before
   its deadline, and leaves ack ids still refused for now `.transient`,
   the delay kept beside the call's summary in `Diagnostics`. IAM grants
   that start over wait a refused write's delay.
-- resource_manager: nothing of its own: it never retries a 429, and its
-  refusals keep their delay in `Diagnostics` as every module's do.
+  `testing.FakePubSub.refuseNextWithDelay` scripts a refusal that asks
+  for a delay, in any of the three forms, and the fake's `Reply` gains
+  `headers`.
+- resource_manager: it never retries a 429, and its refusals keep their
+  delay in `Diagnostics` as every module's do.
+  `testing.FakeResourceManager.refuseNextWithDelay` scripts a refusal
+  that asks for one, and the fake's `Reply` gains `headers`.
 - secret_manager: IAM grants that start over wait a refused write's
   delay. A version read again after a checksum mismatch follows a 200,
   which asks for no delay, so it keeps its backoff.
