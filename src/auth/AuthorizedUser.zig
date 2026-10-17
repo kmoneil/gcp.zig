@@ -38,6 +38,16 @@ cache: Cache,
 transport: Transport,
 /// The built-in transport, when `Options.transport` was null.
 http: ?*HttpTransport,
+/// The account the file names, when it names one. Owned.
+file_account: ?[]u8,
+/// The email the last id_token named, checked; owned. This and the two
+/// fields after it change only during a fetch, under the cache's lock, and
+/// are read under it.
+account_email: ?[]u8 = null,
+/// Why the last token named no account, for Diagnostics. Static text.
+account_note: []const u8 = "no token was fetched yet",
+/// Whether a token was ever fetched, so `account` need not fetch one.
+fetched: bool = false,
 
 pub const Options = struct {
     /// Google's OAuth token endpoint. Plain http is accepted only to this
@@ -139,6 +149,9 @@ pub fn initFromJson(gpa: Allocator, io: std.Io, json: []const u8, options: Optio
     errdefer wipeFree(gpa, token_url);
     const user_agent = try gpa.dupe(u8, options.user_agent);
     errdefer wipeFree(gpa, user_agent);
+    // A name the file gives that is no address is no name at all.
+    const file_account = if (file.account) |a| if (token_response.isAccount(a)) try gpa.dupe(u8, a) else null else null;
+    errdefer if (file_account) |a| gpa.free(a);
 
     var http: ?*HttpTransport = null;
     const transport = options.transport orelse t: {
@@ -161,6 +174,7 @@ pub fn initFromJson(gpa: Allocator, io: std.Io, json: []const u8, options: Optio
         .cache = cache,
         .transport = transport,
         .http = http,
+        .file_account = file_account,
     };
 }
 
@@ -177,7 +191,61 @@ pub fn deinit(self: *AuthorizedUser) void {
     if (self.quota_project_id) |q| wipeFree(self.gpa, q);
     wipeFree(self.gpa, self.token_url);
     wipeFree(self.gpa, self.user_agent);
+    if (self.file_account) |a| self.gpa.free(a);
+    if (self.account_email) |a| self.gpa.free(a);
     self.* = undefined;
+}
+
+/// The account this login acts as, copied into `arena`: the email in the
+/// id_token Google's token endpoint sends with each token, when the login
+/// granted `openid` and `userinfo.email`, as gcloud's does; else the
+/// file's `account`, when it names one; else null, with the reason in
+/// Diagnostics. Fetches a token first when none was fetched yet. Google
+/// warns that a person's email may change over time. Never logged.
+pub fn account(self: *AuthorizedUser, io: std.Io, arena: Allocator) TokenProvider.Error!?[]const u8 {
+    {
+        try self.cache.mutex.lock(io);
+        defer self.cache.mutex.unlock(io);
+        if (self.fetched) return self.accountAnswer(arena);
+    }
+    // Through the cache, in scratch memory wiped after: the caller's arena
+    // gets no copy of the token.
+    var wiping: core.WipingAllocator = .init(self.gpa);
+    var scratch: std.heap.ArenaAllocator = .init(wiping.allocator());
+    defer scratch.deinit();
+    _ = try self.cache.getToken(io, scratch.allocator(), self.source());
+    try self.cache.mutex.lock(io);
+    defer self.cache.mutex.unlock(io);
+    return self.accountAnswer(arena);
+}
+
+/// Holds the cache's lock.
+fn accountAnswer(self: *AuthorizedUser, arena: Allocator) Allocator.Error!?[]const u8 {
+    if (self.account_email) |email| return try arena.dupe(u8, email);
+    if (self.file_account) |a| return try arena.dupe(u8, a);
+    if (self.diagnostics) |d| d.print("no account to name: {s}, and the credentials file names none", .{self.account_note});
+    return null;
+}
+
+/// Keeps what a token's answer says of the account. Runs during a fetch,
+/// under the cache's lock.
+fn noteIdentity(self: *AuthorizedUser, arena: Allocator, body: []const u8) Allocator.Error!void {
+    self.fetched = true;
+    switch (try token_response.identity(arena, body, self.client_id)) {
+        .email => |email| {
+            if (self.account_email) |kept| if (std.mem.eql(u8, kept, email)) return;
+            const copy = try self.gpa.dupe(u8, email);
+            if (self.account_email) |kept| self.gpa.free(kept);
+            self.account_email = copy;
+        },
+        // One that names no account leaves the last in place: the account
+        // cannot change under one refresh token.
+        .none => |why| self.account_note = why,
+    }
+}
+
+fn source(self: *AuthorizedUser) Cache.Source {
+    return .{ .ptr = self, .fetchFn = fetch };
 }
 
 /// The provider points at this struct, which must not move while the
@@ -203,7 +271,7 @@ fn getToken(ptr: *anyopaque, io: std.Io, arena: Allocator, scopes: []const []con
     // The scopes were fixed when the user logged in; a refresh cannot widen them.
     _ = scopes;
     const self = fromPtr(ptr);
-    return self.cache.getToken(io, arena, .{ .ptr = self, .fetchFn = fetch });
+    return self.cache.getToken(io, arena, self.source());
 }
 
 fn invalidate(ptr: *anyopaque) void {
@@ -285,6 +353,7 @@ fn exchange(self: *AuthorizedUser, io: std.Io, arena: Allocator, body: []const u
             }
             return .{ .fail = err };
         };
+        self.noteIdentity(arena, res.body) catch return .{ .fail = error.OutOfMemory };
         return .{ .token = fetched };
     }
     const oauth = token_response.parseError(arena, res.body) catch |err| return .{ .fail = err };
@@ -358,6 +427,10 @@ const Harness = struct {
 
     /// Initializes in place: the user points into the harness.
     fn init(h: *Harness, script: []const Reply) !void {
+        return h.initJson(script, file_json);
+    }
+
+    fn initJson(h: *Harness, script: []const Reply, json: []const u8) !void {
         h.* = .{
             .fake = .init(testing.allocator, script),
             .clock = .{},
@@ -367,10 +440,14 @@ const Harness = struct {
         };
         errdefer h.fake.deinit();
         errdefer h.arena.deinit();
-        h.user = try .initFromJson(testing.allocator, h.clock.io(), file_json, .{
+        h.user = try .initFromJson(testing.allocator, h.clock.io(), json, .{
             .diagnostics = &h.diag,
             .transport = h.fake.transport(),
         });
+    }
+
+    fn account(h: *Harness) TokenProvider.Error!?[]const u8 {
+        return h.user.account(h.clock.io(), h.arena.allocator());
     }
 
     fn deinit(h: *Harness) void {
@@ -518,6 +595,117 @@ test "AuthorizedUser: a dropped connection is retried; a bad endpoint is not" {
     try testing.expectEqualStrings("the token endpoint could not be reached: InvalidEndpoint", h.diag.message());
 }
 
+/// id_tokens for this file's client and another's, naming
+/// person@example.com, their signatures placeholders: none is checked.
+const id_token_mine = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIiwidHlwIjoiSldUIn0.eyJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJhdWQiOiJpZC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbSIsImF6cCI6ImlkLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29tIiwic3ViIjoiMTA0MjIzNDk3NTUzMTA4MDExMTExIiwiZW1haWwiOiJwZXJzb25AZXhhbXBsZS5jb20iLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZX0.c2lnbmF0dXJl";
+const id_token_theirs = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIiwidHlwIjoiSldUIn0.eyJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJhdWQiOiJvdGhlci5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbSIsImF6cCI6Im90aGVyLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29tIiwic3ViIjoiMTA0MjIzNDk3NTUzMTA4MDExMTExIiwiZW1haWwiOiJwZXJzb25AZXhhbXBsZS5jb20iLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZX0.c2lnbmF0dXJl";
+
+/// A token answer as production's refresh of a gcloud login sends it.
+fn tokenWith(comptime id_token: []const u8) Reply {
+    return .{ .respond = .{ .body = "{\"access_token\":\"ya29.SECRET-at\",\"expires_in\":3599,\"scope\":\"openid https://www.googleapis.com/auth/userinfo.email\",\"token_type\":\"Bearer\",\"id_token\":\"" ++ id_token ++ "\"}" } };
+}
+
+/// `file_json` naming its account, as `application-default login ACCOUNT`
+/// writes it.
+fn fileNaming(comptime account_field: []const u8) []const u8 {
+    return
+    \\{"type": "authorized_user", "account": "
+    ++ account_field ++
+        \\", "client_id": "id.apps.googleusercontent.com",
+        \\ "client_secret": "SECRET-cs", "refresh_token": "1//SECRET-rt/x+y=z"}
+    ;
+}
+
+test "AuthorizedUser.account: the id_token's email, from a token fetch the first call makes" {
+    var h: Harness = undefined;
+    try h.init(&.{ tokenWith(id_token_mine), token_ok });
+    defer h.deinit();
+    // Before any token, it fetches one, so the first call answers.
+    try testing.expectEqualStrings("person@example.com", (try h.account()).?);
+    try testing.expectEqual(1, h.fake.requests.items.len);
+    // That token serves the next call, and asking again sends nothing.
+    try testing.expectEqualStrings("ya29.SECRET-at", try h.get());
+    try testing.expectEqualStrings("person@example.com", (try h.account()).?);
+    try testing.expectEqual(1, h.fake.requests.items.len);
+    // A refresh that sends no id_token leaves the account as it was: it
+    // cannot change under one refresh token.
+    h.user.provider().invalidate();
+    _ = try h.get();
+    try testing.expectEqual(2, h.fake.requests.items.len);
+    try testing.expectEqualStrings("person@example.com", (try h.account()).?);
+}
+
+test "AuthorizedUser.account: answers from what it knows, and never refreshes a token for it" {
+    var h: Harness = undefined;
+    try h.init(&.{ tokenWith(id_token_mine), token_ok });
+    defer h.deinit();
+    _ = try h.get();
+    // Hours later the token has expired; naming the account sends nothing.
+    h.clock.now_ns += 2 * std.time.ns_per_hour;
+    try testing.expectEqualStrings("person@example.com", (try h.account()).?);
+    try testing.expectEqual(1, h.fake.requests.items.len);
+}
+
+test "AuthorizedUser.account: the file's account when no id_token names one, and the id_token's over it" {
+    {
+        var h: Harness = undefined;
+        try h.initJson(&.{token_ok}, fileNaming("named@example.com"));
+        defer h.deinit();
+        try testing.expectEqualStrings("named@example.com", (try h.account()).?);
+    }
+    {
+        var h: Harness = undefined;
+        try h.initJson(&.{tokenWith(id_token_mine)}, fileNaming("named@example.com"));
+        defer h.deinit();
+        try testing.expectEqualStrings("person@example.com", (try h.account()).?);
+    }
+}
+
+test "AuthorizedUser.account: nothing that names the account is null, and Diagnostics say why" {
+    // gcloud's usual file, an empty account, or one that is no address.
+    for ([_][]const u8{ file_json, fileNaming(""), fileNaming("not an address") }) |json| {
+        var h: Harness = undefined;
+        try h.initJson(&.{token_ok}, json);
+        defer h.deinit();
+        try testing.expectEqual(null, try h.account());
+        try testing.expectEqualStrings(
+            "no account to name: the token endpoint sent no id_token: the login may lack the openid and userinfo.email scopes, and the credentials file names none",
+            h.diag.message(),
+        );
+        // Asked again, it sends nothing: the login names nobody.
+        try testing.expectEqual(null, try h.account());
+        try testing.expectEqual(1, h.fake.requests.items.len);
+    }
+    // An id_token issued to another client's login names nobody here.
+    var h: Harness = undefined;
+    try h.init(&.{tokenWith(id_token_theirs)});
+    defer h.deinit();
+    try testing.expectEqual(null, try h.account());
+    try testing.expectEqualStrings(
+        "no account to name: the id_token was not issued to this login's client, and the credentials file names none",
+        h.diag.message(),
+    );
+}
+
+test "AuthorizedUser.account: fails as the token fetch it needs fails, and answers once one works" {
+    var h: Harness = undefined;
+    try h.init(&.{ unavailable, unavailable, unavailable, tokenWith(id_token_mine) });
+    defer h.deinit();
+    try testing.expectError(error.TokenUnavailable, h.account());
+    try testing.expectEqualStrings("person@example.com", (try h.account()).?);
+    try testing.expectEqual(4, h.fake.requests.items.len);
+}
+
+test "AuthorizedUser.account: the email reaches neither the log nor the caller's arena with the token" {
+    logging.capture.reset();
+    var h: Harness = undefined;
+    try h.init(&.{tokenWith(id_token_mine)});
+    defer h.deinit();
+    try testing.expectEqualStrings("person@example.com", (try h.account()).?);
+    try testing.expect(std.mem.indexOf(u8, logging.capture.text(), "person@example.com") == null);
+    try testing.expect(std.mem.indexOf(u8, logging.capture.text(), "SECRET") == null);
+}
+
 test "AuthorizedUser: a success without a usable token is InvalidTokenResponse" {
     var h: Harness = undefined;
     try h.init(&.{
@@ -663,8 +851,25 @@ test "AuthorizedUser: every allocation failure is OutOfMemory without leaks" {
             var user: AuthorizedUser = try .initFromFile(gpa, testing.io, path, .{});
             user.deinit();
         }
+
+        fn account(gpa: Allocator, reply: Reply) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, &.{ reply, reply });
+            defer fake.deinit();
+            var clock: test_util.FakeClock = .{};
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            var user: AuthorizedUser = try .initFromJson(gpa, clock.io(), fileNaming("named@example.com"), .{ .transport = fake.transport() });
+            defer user.deinit();
+            _ = try user.account(clock.io(), arena.allocator());
+            // A second token, its account as before.
+            user.provider().invalidate();
+            _ = try user.provider().getToken(clock.io(), arena.allocator(), test_scopes);
+            _ = try user.account(clock.io(), arena.allocator());
+        }
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.get, .{token_ok});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.account, .{tokenWith(id_token_mine)});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.account, .{token_ok});
     // Escapes make std.json allocate; without them it points into the body.
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.get, .{Reply{ .respond = .{
         .body = "{\"access_token\":\"ya29.\\u0053ECRET-at\",\"expires_in\":3599}",

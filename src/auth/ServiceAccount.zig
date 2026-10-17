@@ -249,6 +249,11 @@ pub fn projectId(self: *const ServiceAccount) ?[]const u8 {
     return self.project_id;
 }
 
+/// The service account the key belongs to: the file's `client_email`.
+pub fn clientEmail(self: *const ServiceAccount) []const u8 {
+    return self.client_email;
+}
+
 fn fromPtr(ptr: *anyopaque) *ServiceAccount {
     return @ptrCast(@alignCast(ptr));
 }

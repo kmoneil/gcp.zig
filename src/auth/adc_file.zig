@@ -60,6 +60,10 @@ pub const AuthorizedUser = struct {
     refresh_token: []const u8,
     /// The project to charge for quota, when the file names one.
     quota_project_id: ?[]const u8,
+    /// The account, when the login named one: gcloud writes `""` unless
+    /// `application-default login ACCOUNT` was run, and older files have
+    /// no such field.
+    account: ?[]const u8 = null,
 };
 
 /// A `service_account` key file's fields.
@@ -154,6 +158,7 @@ const WireSourceCredentials = struct {
 
 const Wire = struct {
     type: ?[]const u8 = null,
+    account: ?[]const u8 = null,
     client_id: ?[]const u8 = null,
     client_secret: ?[]const u8 = null,
     refresh_token: ?[]const u8 = null,
@@ -252,6 +257,7 @@ pub fn parse(arena: Allocator, json: []const u8, diag: ?*Diagnostics) Error!Cred
         .client_secret = try required(wire.client_secret, "client_secret", diag),
         .refresh_token = try required(wire.refresh_token, "refresh_token", diag),
         .quota_project_id = quota,
+        .account = emptyToNull(wire.account),
     } };
 }
 
