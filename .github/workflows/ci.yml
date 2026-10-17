@@ -511,7 +511,9 @@ jobs:
         # logging (0.39.0) starts at estimates from a local run, to be
         # re-sized from its first nights: its three fuzz properties took
         # 1.35 ms a run together, so 2M; the tail's slow property 31 ms,
-        # so 90K.
+        # so 90K. resource_manager (0.40.0) starts the same way: its five
+        # fuzz properties took 1.39 ms a run together, so 2M; the walk's
+        # slow property 0.29 ms, so 6M.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 630K }
           - { job: auth, module: auth, filter: fuzz, iterations: 850K }
@@ -532,6 +534,8 @@ jobs:
           - { job: heavy-firestore, module: firestore, filter: heavy property, iterations: 1400K }
           - { job: logging, module: logging, filter: fuzz, iterations: 2M }
           - { job: slow-logging, module: logging, filter: slow property, iterations: 90K }
+          - { job: resource_manager, module: resource_manager, filter: fuzz, iterations: 2M }
+          - { job: slow-resource_manager, module: resource_manager, filter: slow property, iterations: 6M }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     # actions: read finds and downloads the corpus an earlier run kept.

@@ -771,7 +771,7 @@ pub const FakeResourceManager = struct {
             .refused => |r| return r,
         }
         if (ref.len == 0 or std.mem.indexOfScalar(u8, ref, '/') != null) return notModelled(arena, "this call");
-        if (!validate.isProjectRef(ref)) return fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Fail to resolve resource 'projects/{s}'", .{ref}));
+        if (!resolvable(ref)) return fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Fail to resolve resource 'projects/{s}'", .{ref}));
         if (f.byRef(ref)) |s| {
             const v = s.current;
             if (!v.purged and (s.public or f.sees(principal, s, v.parent))) return ok(try render(arena, s, v, true));
@@ -924,6 +924,33 @@ fn decodeToken(token: []const u8) ?TokenAt {
     _ = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
     if (it.next() != null) return null;
     return .{ .listing = listing, .offset = offset };
+}
+
+/// Whether production reads `ref` as a project before it checks the
+/// caller's permission: digits, or an id of lowercase letters, digits and
+/// hyphens starting with a letter, after an optional `domain:`. Measured on
+/// 2026-10-17: "Bad_Id!" and "a..b" were refused, 400 "Fail to resolve
+/// resource", where an id that does not exist, or a number, was 403.
+fn resolvable(ref: []const u8) bool {
+    if (ref.len == 0) return false;
+    for (ref) |c| {
+        if (!std.ascii.isDigit(c)) break;
+    } else return true;
+    const colon = std.mem.lastIndexOfScalar(u8, ref, ':');
+    if (colon) |at| {
+        if (at == 0) return false;
+        for (ref[0..at]) |c| switch (c) {
+            'a'...'z', '0'...'9', '.', '-' => {},
+            else => return false,
+        };
+    }
+    const id = ref[if (colon) |at| at + 1 else 0..];
+    if (id.len == 0 or !std.ascii.isLower(id[0])) return false;
+    for (id) |c| switch (c) {
+        'a'...'z', '0'...'9', '-' => {},
+        else => return false,
+    };
+    return true;
 }
 
 /// A parent as production names one: "folders/N" or "organizations/N".
@@ -1283,6 +1310,17 @@ test "callers: no token and an unknown one are production's 401" {
     try testing.expectEqual(401, reply.status);
     try testing.expectError(error.Unauthenticated, r.client.allProjects(.{}));
     try testing.expect(std.mem.startsWith(u8, r.diag.message(), "Request had invalid authentication credentials."));
+    // Production reads a project's form before the caller's right to it.
+    try r.fake.addPrincipal("person-token", "home");
+    for ([_]struct { []const u8, u16 }{
+        .{ "a..b", 400 },                    .{ "Bad_Id%21", 400 },               .{ "a.b", 400 },
+        .{ "1a", 400 },                      .{ "%3Aa", 400 },                    .{ "example.com%3Aa-1", 403 },
+        .{ "99999999999999999999999", 403 }, .{ "zigps-no-such-project-x", 403 }, .{ "x%3A", 400 },
+    }) |case| {
+        const url = try std.fmt.allocPrint(arena.allocator(), "https://cloudresourcemanager.googleapis.com/v3/projects/{s}", .{case[0]});
+        const answer = try r.fake.serve(.{ .method = .GET, .url = url, .bearer = "person-token" }, arena.allocator());
+        try testing.expectEqual(case[1], answer.status);
+    }
     const get_unsigned = try r.fake.serve(.{ .method = .GET, .url = "https://cloudresourcemanager.googleapis.com/v3/projects/a-project" }, arena.allocator());
     try testing.expectEqual(401, get_unsigned.status);
     try testing.expect(std.mem.indexOf(u8, get_unsigned.body, "GetProject") != null);

@@ -77,6 +77,15 @@ Google, not only what Google documents, and where the emulators differ.
 | [Logs, buckets and views](logging/picker.md) | Log names, buckets and views, and a picker that orders them for a person |
 | [Testing](logging/testing.md) | An in-memory Cloud Logging for your own tests, with production's answers (experimental) |
 
+## 🗂️ Resource Manager
+
+| Guide | What's in it |
+| --- | --- |
+| [Overview](resource_manager/README.md) | A first program, the calls, and what production showed when measured (experimental) |
+| [Listing projects](resource_manager/projects.md) | The list a project switcher caches, matching letters locally, searching page by page, the query language as production read it, a project as it is now, and where each sits |
+| [The project charged](resource_manager/quota-project.md) | Which project each call is charged to, why none is named by default, and the refusals that name it |
+| [Testing](resource_manager/testing.md) | An in-memory Resource Manager for your own tests, with production's answers (experimental) |
+
 ## 🛠️ Working on zig-gcp
 
 | Guide | What's in it |

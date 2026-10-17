@@ -168,6 +168,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "firestore", .module = firestore },
                 .{ .name = "storage", .module = storage },
                 .{ .name = "logging", .module = logging },
+                .{ .name = "resource_manager", .module = resource_manager },
                 .{ .name = "core", .module = core },
             },
         }),
@@ -311,7 +312,7 @@ pub fn build(b: *std.Build) void {
     // examples, so they cannot rot between runs.
     const gcp_step = b.step(
         "test-integration-gcp",
-        "Run the Secret Manager, Cloud Storage, signed URL and Firestore tests against Google: GCP_TEST_PROJECT, GCP_TEST_BUCKET, FIRESTORE_TEST_DATABASE",
+        "Run the Secret Manager, Cloud Storage, signed URL, Firestore, Logging and Resource Manager tests against Google: GCP_TEST_PROJECT, GCP_TEST_BUCKET, FIRESTORE_TEST_DATABASE",
     );
     // Secret Manager has no emulator, so its tests need GCP_TEST_PROJECT
     // and GCP_TEST_TOKEN.
@@ -403,6 +404,24 @@ pub fn build(b: *std.Build) void {
     });
     gcp_step.dependOn(&streamed(b, logging_gcp_tests).step);
     test_step.dependOn(&logging_gcp_tests.step);
+    // Resource Manager against a real project, read only: GCP_TEST_PROJECT,
+    // a project the token's principal can see, and GCP_TEST_TOKEN.
+    const resource_manager_gcp_tests = b.addTest(.{
+        .name = "resource-manager-gcp-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/resource_manager_gcp_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "resource_manager", .module = resource_manager },
+                .{ .name = "core", .module = core },
+            },
+        }),
+        .filters = test_filters,
+        .test_runner = test_runner,
+    });
+    gcp_step.dependOn(&streamed(b, resource_manager_gcp_tests).step);
+    test_step.dependOn(&resource_manager_gcp_tests.step);
     // Signed URLs against a real bucket, which is the only place a
     // signature is checked: GCP_TEST_BUCKET, GCP_TEST_TOKEN, and a signer,
     // GCP_TEST_SIGNER_KEY or GCP_TEST_SIGNER_EMAIL.

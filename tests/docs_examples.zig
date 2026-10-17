@@ -1330,3 +1330,142 @@ test "the newest error, from a fake" {
     try std.testing.expectEqualStrings("boom", page.value.entries[0].payload.text);
 }
 // end snippet
+
+const rm = @import("resource_manager");
+
+// snippet: rm-first
+/// The switcher's list: every project the credentials can see, and where
+/// each sits, refreshed every 15 minutes or so and filtered locally.
+fn refresh(client: *rm.Client, gpa: std.mem.Allocator) !void {
+    var list = try client.allProjects(.{});
+    defer list.deinit();
+    var names = try client.parentNames(.{});
+    defer names.deinit();
+    for (list.value.projects) |p| {
+        const where = if (p.parent) |parent| names.value.label(parent) else "";
+        try remember(gpa, p.project_id, p.label(), where);
+    }
+}
+// end snippet
+
+/// What the Resource Manager guides' code kept, as an app's cache would.
+var remembered: std.ArrayList([3][]const u8) = .empty;
+
+fn remember(gpa: std.mem.Allocator, id: []const u8, label: []const u8, where: []const u8) !void {
+    try remembered.append(gpa, .{ try gpa.dupe(u8, id), try gpa.dupe(u8, label), try gpa.dupe(u8, where) });
+}
+
+fn forget(gpa: std.mem.Allocator) void {
+    for (remembered.items) |r| for (r) |s| gpa.free(s);
+    remembered.clearAndFree(gpa);
+}
+
+// snippet: rm-match
+/// What a switcher matches as a person types: the letters anywhere in the
+/// display name, the project id or the number, case aside.
+fn matches(p: rm.Project, letters: []const u8) bool {
+    if (std.ascii.findIgnoreCase(p.label(), letters) != null) return true;
+    if (std.ascii.findIgnoreCase(p.project_id, letters) != null) return true;
+    var buf: [20]u8 = undefined;
+    const number = std.fmt.bufPrint(&buf, "{d}", .{p.number}) catch unreachable;
+    return std.mem.indexOf(u8, number, letters) != null;
+}
+// end snippet
+
+fn countPages(client: *rm.Client, arena: std.mem.Allocator) !usize {
+    var count: usize = 0;
+    // snippet: rm-pages
+    var search = try client.searchProjects(.{ .query = "labels.team:payments", .page_size = 100 });
+    defer search.deinit();
+    var token: ?[]const u8 = null;
+    while (true) {
+        var page = try search.page(token);
+        defer page.deinit();
+        count += page.value.items.len;
+        // Only a null token ends a search; keep the next one past deinit.
+        token = if (page.value.next_page_token) |t| try arena.dupe(u8, t) else break;
+    }
+    // end snippet
+    return count;
+}
+
+fn explain(client: *rm.Client, gpa: std.mem.Allocator) !?[]const u8 {
+    // snippet: rm-refusal
+    var list = client.allProjects(.{}) catch |err| switch (err) {
+        error.ServiceDisabled, error.QuotaProjectDenied => {
+            const r = client.lastConsumerRefusal().?;
+            return try std.fmt.allocPrint(gpa, "{s} cannot be charged for this call: {s}", .{
+                r.consumer, r.link orelse "no link sent",
+            });
+        },
+        else => return err,
+    };
+    defer list.deinit();
+    // end snippet
+    return null;
+}
+
+test "the Resource Manager guides' code, against a fake" {
+    const gpa = std.testing.allocator;
+    var clock: rm.testing.FakeClock = .{ .now_ns = 1_792_141_200 * std.time.ns_per_s };
+    var fake: rm.testing.FakeResourceManager = .init(gpa, clock.io(), .{});
+    defer fake.deinit();
+    try fake.addOrganization(.{ .name = "organizations/1", .domain = "example.com" });
+    try fake.addFolder(.{ .name = "folders/2", .parent = "organizations/1", .display_name = "Payments" });
+    try fake.addProject(.{ .number = 41, .project_id = "pay-prod", .display_name = "Payments (prod)", .parent = "folders/2", .labels = &.{.{ .key = "team", .value = "payments" }} });
+    try fake.addProject(.{ .number = 42, .project_id = "web", .parent = "organizations/1" });
+    try fake.addProject(.{ .number = 43, .project_id = "oauth-client", .api_enabled = false });
+    try fake.addPrincipal("person", "my-home");
+    try fake.grant("person", "organizations/1");
+    var token: rm.StaticToken = .{ .token = "person" };
+    var client = try rm.Client.init(gpa, clock.io(), .{ .token_provider = token.provider(), .transport = fake.transport() });
+    defer client.deinit();
+
+    defer forget(gpa);
+    try refresh(&client, gpa);
+    try std.testing.expectEqual(2, remembered.items.len);
+    try std.testing.expectEqualStrings("Payments", remembered.items[0][2]);
+    try std.testing.expectEqualStrings("example.com", remembered.items[1][2]);
+
+    var page = try client.getProject("pay-prod");
+    defer page.deinit();
+    try std.testing.expect(matches(page.value, "PAY"));
+    try std.testing.expect(matches(page.value, "41"));
+    try std.testing.expect(!matches(page.value, "web"));
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    try std.testing.expectEqual(1, try countPages(&client, arena.allocator()));
+
+    try std.testing.expectEqual(null, try explain(&client, gpa));
+    // A person whose OAuth client's project has the API off.
+    try fake.addPrincipal("app-user", "oauth-client");
+    token.token = "app-user";
+    const why = (try explain(&client, gpa)).?;
+    defer gpa.free(why);
+    try std.testing.expect(std.mem.startsWith(u8, why, "projects/43 cannot be charged"));
+}
+
+// snippet: rm-fake
+test "the switcher finds a project by a few letters, from a fake" {
+    var clock: rm.testing.FakeClock = .{};
+    var fake: rm.testing.FakeResourceManager = .init(std.testing.allocator, clock.io(), .{});
+    defer fake.deinit();
+    try fake.addProject(.{ .number = 1, .project_id = "payments-prod", .display_name = "Payments" });
+    try fake.addProject(.{ .number = 2, .project_id = "web-front", .display_name = "Web" });
+    try fake.addPrincipal("person", "payments-prod");
+    try fake.grant("person", "payments-prod");
+    try fake.grant("person", "web-front");
+
+    var token: rm.StaticToken = .{ .token = "person" };
+    var client = try rm.Client.init(std.testing.allocator, clock.io(), .{
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    var list = try client.allProjects(.{});
+    defer list.deinit();
+    try std.testing.expectEqual(2, list.value.projects.len);
+    try std.testing.expect(matches(list.value.projects[0], "pay"));
+}
+// end snippet
