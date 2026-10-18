@@ -43,9 +43,20 @@ including the ones that did not change.
   key's ciphertext is `error.DecryptionFailed`. `PublicKey.verify` and
   `verifyDigest` check a signature here: ECDSA P-256, P-384 and
   secp256k1, Ed25519 and ML-DSA through std.crypto, RSA PKCS#1 v1.5 and
-  PSS through core.rsa, each held to signatures OpenSSL made. The fake
-  encrypts, signs and MACs with real keys (RSA from fixed test keys),
-  and gets each checksum wrong on request.
+  PSS through core.rsa, each held to signatures OpenSSL made and to
+  signatures Cloud KMS itself made. The fake encrypts, signs and MACs
+  with real keys (RSA from fixed test keys), and gets each checksum wrong
+  on request. IAM on key rings and keys (`iamPolicy`, `setIamPolicy`,
+  `addIamBinding`, `removeIamBinding`, `testIamPermissions`), and
+  `KeyVersion.waitUntilEnabled` for a version still being generated.
+  Measured in production on 2026-10-18 and held to since: software
+  asymmetric keys are usable within 0.2 s; the 64 KiB limits are 65,536
+  bytes inclusive; with `publicKeyFormat=PEM` the PEM arrives in
+  `publicKey.data`, not `pem`, and ML-DSA keys come as PEM too; a key
+  ring's delete finishes minutes after it is taken, so `KeyRing.delete`
+  returns once it is; a key ring holding keys, a deleted key's id
+  (`AlreadyExists`), a wrong AAD and another key's ciphertext each have
+  production's words in the fake.
 - core: `errors.decodePreconditionFailures` reads the
   `google.rpc.PreconditionFailure` details of an error body, and
   `names.KmsKeyName` parses a Cloud KMS key's or version's full name.

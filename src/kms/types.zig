@@ -295,6 +295,12 @@ pub const Ciphertext = struct {
     version: u64,
 };
 
+pub const WaitOptions = struct {
+    /// How long to wait in all, from the call. Google's own tests waited
+    /// 3.75 s and 30 s and both flaked; a FAQ says "a few minutes".
+    timeout_ms: u32 = 5 * std.time.ms_per_min,
+};
+
 pub const EncryptOptions = struct {
     /// Bound to the ciphertext: `decrypt` needs the same bytes. At most
     /// 64 KiB.
@@ -327,10 +333,11 @@ pub const PublicKey = struct {
     name: []const u8,
     algorithm: Algorithm,
     protection_level: ProtectionLevel = .unknown,
-    /// A PEM SubjectPublicKeyInfo, for classical algorithms; "" for
-    /// post-quantum ones.
+    /// A PEM SubjectPublicKeyInfo: every key production gave as one,
+    /// ML-DSA's included; "" for one it gave only in the NIST encoding.
     pem: []const u8 = "",
-    /// The NIST encoding of a post-quantum key; "" for classical ones.
+    /// The NIST encoding of a post-quantum key, when that is how it came;
+    /// "" otherwise.
     raw: []const u8 = "",
 
     /// Checks `signature` over `message` here, with std.crypto; no call.

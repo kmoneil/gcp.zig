@@ -19,6 +19,8 @@ const p256_oid = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
 const p384_oid = [_]u8{ 0x2b, 0x81, 0x04, 0x00, 0x22 };
 const secp256k1_oid = [_]u8{ 0x2b, 0x81, 0x04, 0x00, 0x0a };
 const ed25519_oid = [_]u8{ 0x2b, 0x65, 0x70 };
+/// id-ml-dsa-44, -65 and -87: 2.16.840.1.101.3.4.3.17 to .19.
+const mldsa_oid_prefix = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03 };
 
 /// The longest SubjectPublicKeyInfo read: an RSA 4096 one is under 600 bytes.
 const max_spki = 1024;
@@ -33,9 +35,9 @@ pub fn verify(pk: types.PublicKey, message: []const u8, signature: []const u8) V
         .ec_sign_p384_sha384 => verifyEc(ecdsa.EcdsaP384Sha384, &p384_oid, pk, .{ .message = message }, signature),
         .ec_sign_secp256k1_sha256 => verifyEc(ecdsa.EcdsaSecp256k1Sha256, &secp256k1_oid, pk, .{ .message = message }, signature),
         .ec_sign_ed25519 => verifyEd25519(pk, message, signature),
-        .pq_sign_ml_dsa_44 => verifyMlDsa(mldsa.MLDSA44, pk, message, signature),
-        .pq_sign_ml_dsa_65 => verifyMlDsa(mldsa.MLDSA65, pk, message, signature),
-        .pq_sign_ml_dsa_87 => verifyMlDsa(mldsa.MLDSA87, pk, message, signature),
+        .pq_sign_ml_dsa_44 => verifyMlDsa(mldsa.MLDSA44, 0x11, pk, message, signature),
+        .pq_sign_ml_dsa_65 => verifyMlDsa(mldsa.MLDSA65, 0x12, pk, message, signature),
+        .pq_sign_ml_dsa_87 => verifyMlDsa(mldsa.MLDSA87, 0x13, pk, message, signature),
         else => error.UnsupportedAlgorithm,
     };
 }
@@ -99,10 +101,14 @@ fn verifyEd25519(pk: types.PublicKey, message: []const u8, signature: []const u8
     sig.verify(message, key) catch return error.SignatureInvalid;
 }
 
-fn verifyMlDsa(comptime Scheme: type, pk: types.PublicKey, message: []const u8, signature: []const u8) VerifyError!void {
+/// From the NIST encoding, or from a PEM whose algorithm is the variant's
+/// OID, ending in `oid_last`, with no parameters.
+fn verifyMlDsa(comptime Scheme: type, comptime oid_last: u8, pk: types.PublicKey, message: []const u8, signature: []const u8) VerifyError!void {
     const key_len = Scheme.PublicKey.encoded_length;
-    if (pk.raw.len != key_len) return error.InvalidPublicKey;
-    const key = Scheme.PublicKey.fromBytes(pk.raw[0..key_len].*) catch return error.InvalidPublicKey;
+    var buf: [4096]u8 = undefined;
+    const raw = if (pk.raw.len > 0) pk.raw else try keyBits(try spkiOf(pk.pem, &buf), &(mldsa_oid_prefix ++ [_]u8{oid_last}), null);
+    if (raw.len != key_len) return error.InvalidPublicKey;
+    const key = Scheme.PublicKey.fromBytes(raw[0..key_len].*) catch return error.InvalidPublicKey;
     const sig_len = Scheme.Signature.encoded_length;
     if (signature.len != sig_len) return error.SignatureInvalid;
     const sig = Scheme.Signature.fromBytes(signature[0..sig_len].*) catch return error.SignatureInvalid;

@@ -415,10 +415,10 @@ test "a delete's operation is polled until done, and one that failed is its stat
         .{ .respond = .{ .body = "{\"name\":\"" ++ op ++ "\",\"done\":true,\"error\":{\"code\":9,\"message\":\"the key ring is not empty\"}}" } },
     }, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1, .max_backoff_ms = 2 } });
     defer h.deinit();
-    try h.client.keyRing("r").delete();
+    try h.client.keyRing("r").key("k").delete();
     try h.expectRequest(1, .GET, "https://cloudkms.googleapis.com/v1/" ++ op, null);
     try h.expectRequest(2, .GET, "https://cloudkms.googleapis.com/v1/" ++ op, null);
-    try testing.expectError(error.FailedPrecondition, h.client.keyRing("r").delete());
+    try testing.expectError(error.FailedPrecondition, h.client.keyRing("r").key("k").delete());
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "the key ring is not empty") != null);
     try h.expectRequestCount(4);
 }
@@ -432,9 +432,9 @@ test "a delete that outlasts the attempts, or names an operation this client wil
         .{ .respond = .{ .body = "{\"name\":\"https://evil.example/x\"}" } },
     }, .{ .retry = .{ .max_attempts = 1, .initial_backoff_ms = 1, .max_backoff_ms = 2 } });
     defer h.deinit();
-    try testing.expectError(error.DeadlineExceeded, h.client.keyRing("r").delete());
+    try testing.expectError(error.DeadlineExceeded, h.client.keyRing("r").key("k").delete());
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "still running as operation projects/my-project/locations/us-central1/operations/op1") != null);
-    try testing.expectError(error.InvalidResponse, h.client.keyRing("r").delete());
+    try testing.expectError(error.InvalidResponse, h.client.keyRing("r").key("k").delete());
     try h.expectRequestCount(3);
 }
 

@@ -7,6 +7,7 @@ const std = @import("std");
 const core = @import("core");
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
+const iam = @import("iam.zig");
 const integrity = @import("integrity.zig");
 const KeyVersion = @import("KeyVersion.zig");
 const names = @import("names.zig");
@@ -265,6 +266,40 @@ pub fn listVersions(self: Key, options: types.ListOptions) Error!types.Owned(typ
     return result;
 }
 
+/// The key's IAM policy, asked for as version 3: what it grants beside its
+/// key ring's. Versions have none of their own. Needs
+/// `cloudkms.cryptoKeys.getIamPolicy`.
+pub fn iamPolicy(self: Key) Error!types.Owned(core.iam.Policy) {
+    return iam.read(self.iamResource());
+}
+
+/// Writes `policy` as the key's, whole, as `KeyRing.setIamPolicy` does.
+pub fn setIamPolicy(self: Key, policy: core.iam.Policy) Error!types.Owned(core.iam.Policy) {
+    return iam.set(self.iamResource(), policy);
+}
+
+/// Grants `member` the role `role` on this key alone, such as
+/// `roles/cloudkms.cryptoKeyEncrypterDecrypter` for a service agent that
+/// encrypts a bucket or a secret with it, as `KeyRing.addIamBinding` does.
+pub fn addIamBinding(self: Key, role: []const u8, member: []const u8) Error!types.Owned(core.iam.Policy) {
+    return iam.change(self.iamResource(), .{ .grant = .{ .role = role, .member = member } });
+}
+
+/// Takes `member` out of the key's binding of `role`.
+pub fn removeIamBinding(self: Key, role: []const u8, member: []const u8) Error!types.Owned(core.iam.Policy) {
+    return iam.change(self.iamResource(), .{ .revoke = .{ .role = role, .member = member } });
+}
+
+/// The permissions the caller holds on the key, of `permissions`, as
+/// `KeyRing.testIamPermissions` says them.
+pub fn testIamPermissions(self: Key, permissions: []const []const u8) Error!types.Owned([]const []const u8) {
+    return iam.testPermissions(self.iamResource(), permissions);
+}
+
+fn iamResource(self: Key) iam.Resource {
+    return .{ .client = self.client, .target = self.target };
+}
+
 /// Deletes the key, and waits for the server to finish. Every version
 /// must be deleted first, so destroyed and its destroy delay passed, and
 /// no rotation scheduled; a key made by Autokey cannot be deleted. Its id
@@ -275,7 +310,7 @@ pub fn delete(self: Key) Error!void {
     try c.checkTarget(self.target);
     var scratch: std.heap.ArenaAllocator = .init(c.gpa);
     defer scratch.deinit();
-    return operations.delete(c, try self.target.path(scratch.allocator(), ""), "a key");
+    return operations.delete(c, try self.target.path(scratch.allocator(), ""), "a key", .done);
 }
 
 fn keyCall(self: Key, method: core.transport.Method, tail: []const u8, body: ?[]const u8) Error!types.Owned(types.KeyInfo) {
