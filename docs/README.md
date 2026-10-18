@@ -103,6 +103,16 @@ Google, not only what Google documents, and where the emulators differ.
 | [The Recorder](monitoring/recorder.md) | Counters, gauges, histograms and observers written every interval from a task of their own; stopping, descriptors, stats |
 | [Testing](monitoring/testing.md) | An in-memory Cloud Monitoring for your own tests, held to production's answers (experimental) |
 
+## 🔐 KMS
+
+| Guide | What's in it |
+| --- | --- |
+| [Overview](kms/README.md) | A first program, the calls, integrity, errors, and what production showed when measured (experimental) |
+| [Encrypting](kms/encrypting.md) | Encrypt and decrypt, AAD, which version is used, the plaintext wiped, more than 64 KiB |
+| [Signing and MACs](kms/signing.md) | Signing messages and digests, public keys, checking a signature on this machine, MAC tags |
+| [Keys](kms/keys.md) | Key rings, keys and versions; states, rotation, destroying and deleting; what is billed; IAM |
+| [Testing](kms/testing.md) | An in-memory Cloud KMS for your own tests, held to production's answers (experimental) |
+
 ## 🛠️ Working on zig-gcp
 
 | Guide | What's in it |

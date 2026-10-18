@@ -228,7 +228,7 @@ pub fn property(_: void, input: []const u8) !void {
             12 => { // delete a key
                 const expect: Expect = e: {
                     const k = liveKey(slot) orelse break :e .{ .err = error.NotFound };
-                    for (k.versions[0..k.count]) |v| if (v.state != .deleted) break :e .{ .err = error.FailedPrecondition };
+                    for (k.versions[0..k.count]) |v| if (v.state != .deleted) break :e .{ .err = error.InvalidArgument };
                     break :e .ok;
                 };
                 try expectOutcome(expect, key.delete(), "delete key");

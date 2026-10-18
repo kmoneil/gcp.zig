@@ -39,8 +39,9 @@ pub const Error = core.rpc.Error || error{
     /// or it refused a request checksum as not matching, which only bytes
     /// changed on the way can do. `Diagnostics` says which.
     IntegrityCheckFailed,
-    /// A ciphertext this key did not make: another key's, or bytes that are
-    /// not a Cloud KMS ciphertext. `Diagnostics` keeps the server's words.
+    /// A ciphertext this key did not make, or not with this AAD: another
+    /// AAD, another key's ciphertext, or bytes that are not a Cloud KMS
+    /// ciphertext. `Diagnostics` keeps the server's words, which say which.
     DecryptionFailed,
     /// `waitUntilEnabled` saw the version fail: `generation_failed` or
     /// `import_failed`, the reason in `Diagnostics`.

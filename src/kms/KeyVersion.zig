@@ -347,8 +347,9 @@ pub fn enable(self: KeyVersion) Error!types.Owned(types.VersionInfo) {
 }
 
 /// Stops the version being used, without destroying it; it is still
-/// billed. Disabling is eventually consistent: the version typically stays
-/// usable for up to a minute after, hours in exceptional cases.
+/// billed. Google says disabling is eventually consistent, the version
+/// usable for up to a minute after, hours in exceptional cases; measured,
+/// the next call was refused every time.
 pub fn disable(self: KeyVersion) Error!types.Owned(types.VersionInfo) {
     return self.setState(.disabled);
 }
@@ -428,7 +429,8 @@ fn transition(self: KeyVersion, method: []const u8, want: types.State) Error!typ
 }
 
 /// Deletes the version, and waits for the server to finish: one that is
-/// `destroyed`, or failed to generate or import. Its number is not reused.
+/// `destroyed`, or failed to generate or import; in any other state it is
+/// `error.FailedPrecondition`. Its number is not reused.
 pub fn delete(self: KeyVersion) Error!void {
     const c = self.client;
     rpc.begin(c);

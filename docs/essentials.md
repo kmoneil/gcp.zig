@@ -188,7 +188,7 @@ while (select.cancel()) |other| switch (other) {
 Each module logs through `std.log` under a scope of its own:
 `.gcp_pubsub`, `.gcp_storage`, `.gcp_secret_manager`, `.gcp_firestore`,
 `.gcp_logging`, `.gcp_resource_manager`, `.gcp_error_reporting`,
-`.gcp_monitoring` and `.gcp_auth`.
+`.gcp_monitoring`, `.gcp_kms` and `.gcp_auth`.
 Each request goes to `debug` (method, path, status, attempt, time) and
 each retry to `warn`. Nothing sensitive is logged: no token, no message
 data or attribute value, no secret or even its length, no signed URL or

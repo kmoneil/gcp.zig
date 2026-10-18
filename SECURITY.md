@@ -169,6 +169,38 @@ What this does not defend against: swap, a core dump, a debugger, and the
 buffers inside the HTTP and TLS layers, which this library cannot reach.
 Once a caller copies the bytes elsewhere, that copy is theirs to manage.
 
+## Keys in Cloud KMS
+
+The `kms` module never uses an answer that fails its checksums, and a
+decrypt leaves no copy of the plaintext behind.
+
+- **Every answer is checked before it is used:** the server's word that
+  it got each request checksum, each returned byte string against its
+  checksum, and the version that answered. A failed check is tried again
+  and finally `error.IntegrityCheckFailed`, the bytes never handed over.
+  `integrity faults: each check catches its fault, once tried again and
+  past the attempts refused`, `encrypt: each failed check is tried again,
+  and past the attempts is IntegrityCheckFailed`, `slow property: the
+  client against the fake matches a plain model, and no checksum fault is
+  a wrong success`.
+- **Decrypted bytes are wiped,** with everything that carried them: the
+  response body, the parser's scratch space and a failed attempt, and an
+  encrypt wipes the plaintext it sent. `decrypt: the plaintext is wiped
+  from every buffer the call filled, and from the result's at deinit`,
+  `deinit wipes every byte the arena held`.
+- **No format specifier prints a plaintext.** `clear wipes and empties,
+  and no format specifier prints the bytes`.
+- **Nothing a key touched reaches the log:** no plaintext, its base64 or
+  checksum, ciphertext, signature, MAC, random bytes or token. `log
+  hygiene: no plaintext, ciphertext, signature, MAC, random bytes,
+  checksum or token`.
+- **A signature is checked against a key only once that key decodes as
+  its algorithm's,** and any key or signature bytes are an answer or an
+  error. `fuzz verify: arbitrary keys and signatures are refused, never a
+  crash`.
+- **These calls always use https,** as Secret Manager's do. `init: each
+  option this client will not use is refused with its reason`.
+
 ## Talking to a server
 
 - **Any response yields a value or an error, never a crash or a leak.**

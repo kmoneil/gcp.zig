@@ -88,8 +88,9 @@ pub fn encrypt(self: Key, plaintext: []const u8, options: types.EncryptOptions) 
 /// Decrypts what `encrypt` made with this key, with the AAD it was given.
 /// The ciphertext names its version, which must still be enabled: a
 /// disabled one is `error.KeyVersionDisabled`, a destroyed or scheduled one
-/// `error.KeyVersionDestroyed`, its name in `Diagnostics`. Another key's
-/// ciphertext, or bytes that are not one, is `error.DecryptionFailed`. The
+/// `error.KeyVersionDestroyed`, its name in `Diagnostics`. Another AAD,
+/// another key's ciphertext, or bytes that are not one, is
+/// `error.DecryptionFailed`, the server's words saying which. The
 /// plaintext comes back in memory its `deinit` wipes, and every other
 /// buffer that held it is wiped before the call returns.
 ///
@@ -214,9 +215,10 @@ pub fn update(self: Key, changes: types.KeyUpdate) Error!types.Owned(types.KeyIn
 }
 
 /// Makes `version_id` the version `encrypt` uses, for an `encrypt_decrypt`
-/// key, and answers the key. Encrypt may go on using the old primary for
-/// up to a minute, hours in exceptional cases: `Ciphertext.version` says
-/// which version each encrypt used.
+/// key, and answers the key. Google says encrypt may go on using the old
+/// primary for up to a minute, hours in exceptional cases, though the
+/// next encrypt used the new one each time it was measured:
+/// `Ciphertext.version` says which version each encrypt used.
 pub fn setPrimary(self: Key, version_id: u64) Error!types.Owned(types.KeyInfo) {
     const c = self.client;
     rpc.begin(c);
@@ -302,8 +304,9 @@ fn iamResource(self: Key) iam.Resource {
 
 /// Deletes the key, and waits for the server to finish. Every version
 /// must be deleted first, so destroyed and its destroy delay passed, and
-/// no rotation scheduled; a key made by Autokey cannot be deleted. Its id
-/// is then retired in the project for good: `Client.listRetiredKeys`.
+/// no rotation scheduled, or the server refuses it as
+/// `error.InvalidArgument`; a key made by Autokey cannot be deleted. Its
+/// id is then retired in the project for good: `Client.listRetiredKeys`.
 pub fn delete(self: Key) Error!void {
     const c = self.client;
     rpc.begin(c);
