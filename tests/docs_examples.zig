@@ -1161,6 +1161,57 @@ test "the subscribing guide's code, against the in-memory Pub/Sub" {
     try std.testing.expectEqual(0, fake.backlog("my-project", "orders-worker"));
 }
 
+// snippet: pubsub-publish-request
+/// Writes the request a publish of `messages` will send, then sends it.
+fn showAndPublish(
+    topic: pubsub.Topic,
+    messages: []const pubsub.Message,
+    options: pubsub.PublishOptions,
+    out: *std.Io.Writer,
+) !pubsub.Owned(pubsub.PublishResult) {
+    var request = try topic.publishRequest(messages, options);
+    defer request.deinit();
+    try out.print("{t} {s}\n{s}\n", .{ request.value.method, request.value.url, request.value.body });
+    if (request.value.gzip) try out.writeAll("(sent gzip-compressed)\n");
+    return topic.publish(messages, options);
+}
+// end snippet
+
+test "the publishing guide's request preview, against the in-memory Pub/Sub" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var fake: pubsub.testing.FakePubSub = .init(gpa, io, .{});
+    defer fake.deinit();
+    var token: pubsub.StaticToken = .{ .token = "none" };
+    var client = try pubsub.Client.init(gpa, io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    var topic = try client.topic("orders").create(.{});
+    topic.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var sent = try showAndPublish(client.topic("orders"), &.{.{ .data = "hello", .attributes = &.{.{ .key = "origin", .value = "zig" }} }}, .{ .ordering_key = "user-42" }, &out.writer);
+    sent.deinit();
+    try std.testing.expectEqualStrings(
+        \\POST https://pubsub.googleapis.com/v1/projects/my-project/topics/orders:publish
+        \\{"messages":[{"data":"aGVsbG8=","attributes":{"origin":"zig"},"orderingKey":"user-42"}]}
+        \\
+    , out.written());
+
+    out.clearRetainingCapacity();
+    const long: [300]u8 = @splat('x');
+    var big = try showAndPublish(client.topic("orders"), &.{.{ .data = &long }}, .{ .compression = .{} }, &out.writer);
+    big.deinit();
+    try std.testing.expect(std.mem.endsWith(u8, out.written(), "\n(sent gzip-compressed)\n"));
+
+    // Refused before sending, the same way publish refuses it.
+    try std.testing.expectError(error.InvalidMessage, showAndPublish(client.topic("orders"), &.{.{}}, .{}, &out.writer));
+}
+
 const logging = @import("logging");
 
 /// How many entries the Logging guides' code showed.

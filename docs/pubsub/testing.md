@@ -191,7 +191,7 @@ Each as production answered when it was measured, refusals in its words:
 | Area | Guide |
 | --- | --- |
 | Topics and subscriptions: made, read, updated by mask, deleted, listed in pages; their defaults and bounds | [Topics and subscriptions](topics-and-subscriptions.md) |
-| Publish, pull, acknowledge, lease changes and nacks; a lease that lapses | [Overview](README.md) |
+| Publish, gzip-compressed or not, pull, acknowledge, lease changes and nacks; a lease that lapses | [Overview](README.md), [Publishing](publishing.md#compressed-publishing) |
 | Filters, ordering keys, dead letters and delivery attempts, retry policies, retention, exactly-once delivery | [Topics and subscriptions](topics-and-subscriptions.md), [Subscribing](subscribing.md) |
 | Snapshots, seeking to a snapshot or a time, detaching, a topic's retention | [Replaying and purging](replay.md) |
 | Schemas and their revisions, a topic's schema settings, the attributes on a message | [Schemas](schemas.md) |

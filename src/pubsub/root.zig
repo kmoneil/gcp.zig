@@ -35,6 +35,7 @@ pub const Message = @import("types.zig").Message;
 pub const PublishOptions = @import("types.zig").PublishOptions;
 pub const Compression = @import("types.zig").Compression;
 pub const PublishResult = @import("types.zig").PublishResult;
+pub const PublishRequest = @import("types.zig").PublishRequest;
 pub const PageOptions = @import("types.zig").PageOptions;
 pub const PullOptions = @import("types.zig").PullOptions;
 pub const PullResult = @import("types.zig").PullResult;

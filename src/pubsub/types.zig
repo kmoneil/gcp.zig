@@ -44,6 +44,22 @@ pub const PublishResult = struct {
     message_ids: []const []const u8,
 };
 
+/// The request `Topic.publish` sends, built without sending it: see
+/// `Topic.publishRequest`.
+pub const PublishRequest = struct {
+    /// Always POST.
+    method: @import("core").transport.Method,
+    /// The whole URL, the client's endpoint included.
+    url: []const u8,
+    /// The JSON body before any compression: byte for byte what `publish`
+    /// sends uncompressed, and what a compressed one decompresses to.
+    body: []const u8,
+    /// Whether `publish` sends `body` gzip-compressed, with
+    /// `Content-Encoding: gzip`: compression asked for, and a body of at
+    /// least its `min_bytes`.
+    gzip: bool,
+};
+
 pub const PageOptions = struct {
     /// Results per page. 0 lets the server choose.
     page_size: u32 = 100,
