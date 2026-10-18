@@ -14,6 +14,7 @@ const core = @import("core");
 
 pub const Client = @import("Client.zig");
 pub const Metric = @import("Metric.zig");
+pub const Recorder = @import("Recorder.zig");
 
 pub const TokenProvider = core.TokenProvider;
 pub const StaticToken = core.StaticToken;
@@ -79,6 +80,7 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("Client.zig");
     _ = @import("Metric.zig");
+    _ = @import("Recorder.zig");
     _ = @import("codec.zig");
     _ = @import("errors.zig");
     _ = @import("filter.zig");
