@@ -316,13 +316,8 @@ fn checkKmsKey(diag: ?*core.Diagnostics, name: []const u8) CheckError!void {
 /// Cloud KMS key's name, which a bucket's default key must be.
 pub fn isKmsKeyName(name: []const u8) bool {
     if (!std.unicode.utf8ValidateSlice(name)) return false;
-    var parts = std.mem.splitScalar(u8, name, '/');
-    for ([_]?[]const u8{ "projects", null, "locations", null, "keyRings", null, "cryptoKeys", null }) |want| {
-        const part = parts.next() orelse return false;
-        if (part.len == 0) return false;
-        if (want) |literal| if (!std.mem.eql(u8, part, literal)) return false;
-    }
-    return parts.next() == null;
+    const parsed = core.names.KmsKeyName.parse(name) orelse return false;
+    return parsed.version == null;
 }
 
 fn checkPublicAccessPrevention(diag: ?*core.Diagnostics, value: types.PublicAccessPrevention) CheckError!void {

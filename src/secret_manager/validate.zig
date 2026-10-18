@@ -132,18 +132,10 @@ fn labelTextProblem(text: []const u8) ?[]const u8 {
 /// `projects/P/locations/L/keyRings/R/cryptoKeys/K`, or null for any other
 /// form. Each part is non-empty printable ASCII without `/`.
 pub fn kmsKeyLocation(name: []const u8) ?[]const u8 {
-    var parts = std.mem.splitScalar(u8, name, '/');
-    const expect = [_][]const u8{ "projects", "", "locations", "", "keyRings", "", "cryptoKeys", "" };
-    var location: []const u8 = "";
-    for (expect, 0..) |want, i| {
-        const part = parts.next() orelse return null;
-        if (part.len == 0) return null;
-        for (part) |c| if (c <= ' ' or c >= 0x7f) return null;
-        if (want.len > 0 and !std.mem.eql(u8, part, want)) return null;
-        if (i == 3) location = part;
-    }
-    if (parts.next() != null) return null;
-    return location;
+    const parsed = core.names.KmsKeyName.parse(name) orelse return null;
+    if (parsed.version != null) return null;
+    for (name) |c| if (c <= ' ' or c >= 0x7f) return null;
+    return parsed.location;
 }
 
 /// Annotation keys: 1 to 64 ASCII letters and digits, with `.`, `_` and
