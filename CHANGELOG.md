@@ -31,6 +31,19 @@ including the ones that did not change.
   Google documents 60) and reduces series by group. A page holds points,
   so one series can span pages, as production's did. A 200 can still be
   incomplete, which `SeriesPage.incomplete()` says.
+  `Recorder` writes a program's metrics every interval from a task of its
+  own: counters (cumulative), gauges (the last value, at every write),
+  histograms (cumulative distributions with the exact count, mean and sum
+  of squared deviations), and observers, callbacks read at each write for
+  values the program keeps elsewhere. Any task records; recording never
+  fails or waits, and what cannot be kept is counted in `Stats`. It keeps
+  production's rules: 5 s at least between a series' points, a
+  cumulative start kept until a total falls, at most 200 series a
+  request, and a last write at `stop` that waits out the floor (`.wait`)
+  or leaves such a series out (`.skip`). It reads each instrument's
+  descriptor and creates it when missing, once, unless `.auto`, and stops
+  an instrument whose descriptor exists with another kind or value type.
+  `flush` writes what is due now, for a program with no task to spare.
   `monitoring.testing.FakeMonitoring` keeps descriptors and points and
   refuses what production refused, in its words: a point under 2.5 s
   after its series' last (production's floor, where Google documents
