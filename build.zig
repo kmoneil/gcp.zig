@@ -72,6 +72,15 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "core", .module = core }},
     });
 
+    // Cloud Error Reporting, the read side: error groups, their counts and
+    // events, and a group's status. It imports core, never a service.
+    const error_reporting = b.addModule("error_reporting", .{
+        .root_source_file = b.path("src/error_reporting/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core }},
+    });
+
     // Every test build runs under std's test runner with one fix, which
     // keeps std.debug from swallowing a task's cancel (see the top of
     // tools/test_runner.zig).
@@ -98,6 +107,7 @@ pub fn build(b: *std.Build) void {
         .{ "firestore", firestore },
         .{ "logging", logging },
         .{ "resource_manager", resource_manager },
+        .{ "error_reporting", error_reporting },
     };
     // The nightly fuzz job runs one module per job, so each gets the whole
     // time budget: `--fuzz=N` fuzzes every property N times, and the
@@ -105,12 +115,12 @@ pub fn build(b: *std.Build) void {
     const only_module = b.option(
         []const u8,
         "module",
-        "Run only this module's unit tests: core, auth, pubsub, secret_manager, storage, firestore, logging or resource_manager",
+        "Run only this module's unit tests: core, auth, pubsub, secret_manager, storage, firestore, logging, resource_manager or error_reporting",
     );
     if (only_module) |name| {
         for (unit_modules) |entry| {
             if (std.mem.eql(u8, entry[0], name)) break;
-        } else std.process.fatal("-Dmodule={s} names no module; use core, auth, pubsub, secret_manager, storage, firestore, logging or resource_manager", .{name});
+        } else std.process.fatal("-Dmodule={s} names no module; use core, auth, pubsub, secret_manager, storage, firestore, logging, resource_manager or error_reporting", .{name});
     }
     const test_step = b.step("test", "Run unit, property and fuzz-corpus tests");
     // The same tests without what `test` compiles beside them, the examples
@@ -464,7 +474,7 @@ pub fn build(b: *std.Build) void {
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list" }) |name| {
+    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard" }) |name| {
         // whoami, secret, gcs_cp, gcs_sign, gcs_notify, quickstart, iam,
         // secret_rotation, firestore, logs_read, logs_tail and
         // projects_list pick their own credentials.
@@ -484,6 +494,8 @@ pub fn build(b: *std.Build) void {
             &.{ .{ .name = "logging", .module = logging }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "projects_list"))
             &.{ .{ .name = "resource_manager", .module = resource_manager }, .{ .name = "auth", .module = auth } }
+        else if (std.mem.eql(u8, name, "error_dashboard"))
+            &.{ .{ .name = "error_reporting", .module = error_reporting }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "gcs_notify") or std.mem.eql(u8, name, "quickstart"))
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else
