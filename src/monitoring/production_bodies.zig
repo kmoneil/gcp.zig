@@ -805,3 +805,242 @@ pub const read_period_9s =
     \\  }
     \\}
 ;
+
+/// A read without view of one series with two points, newest first. HTTP 200.
+pub const read_full_status = 200;
+pub const read_full =
+    \\{
+    \\  "timeSeries": [
+    \\    {
+    \\      "metric": {
+    \\        "labels": {
+    \\          "k": "mix1"
+    \\        },
+    \\        "type": "custom.googleapis.com/zigps-m0-62b2c8/gauge"
+    \\      },
+    \\      "resource": {
+    \\        "type": "generic_task",
+    \\        "labels": {
+    \\          "project_id": "extractctl",
+    \\          "task_id": "62b2c8-a",
+    \\          "job": "m0",
+    \\          "location": "us-central1",
+    \\          "namespace": "zigps"
+    \\        }
+    \\      },
+    \\      "metricKind": "GAUGE",
+    \\      "valueType": "INT64",
+    \\      "points": [
+    \\        {
+    \\          "interval": {
+    \\            "startTime": "2026-10-18T13:46:51.146Z",
+    \\            "endTime": "2026-10-18T13:46:51.146Z"
+    \\          },
+    \\          "value": {
+    \\            "int64Value": "2"
+    \\          }
+    \\        },
+    \\        {
+    \\          "interval": {
+    \\            "startTime": "2026-10-18T13:46:35.949Z",
+    \\            "endTime": "2026-10-18T13:46:35.949Z"
+    \\          },
+    \\          "value": {
+    \\            "int64Value": "1"
+    \\          }
+    \\        }
+    \\      ]
+    \\    }
+    \\  ],
+    \\  "unit": "1"
+    \\}
+;
+
+/// The same read with pageSize 1: the newer point. HTTP 200.
+pub const read_page_1_status = 200;
+pub const read_page_1 =
+    \\{
+    \\  "timeSeries": [
+    \\    {
+    \\      "metric": {
+    \\        "labels": {
+    \\          "k": "mix1"
+    \\        },
+    \\        "type": "custom.googleapis.com/zigps-m0-62b2c8/gauge"
+    \\      },
+    \\      "resource": {
+    \\        "type": "generic_task",
+    \\        "labels": {
+    \\          "task_id": "62b2c8-a",
+    \\          "location": "us-central1",
+    \\          "project_id": "extractctl",
+    \\          "namespace": "zigps",
+    \\          "job": "m0"
+    \\        }
+    \\      },
+    \\      "metricKind": "GAUGE",
+    \\      "valueType": "INT64",
+    \\      "points": [
+    \\        {
+    \\          "interval": {
+    \\            "startTime": "2026-10-18T13:46:51.146Z",
+    \\            "endTime": "2026-10-18T13:46:51.146Z"
+    \\          },
+    \\          "value": {
+    \\            "int64Value": "2"
+    \\          }
+    \\        }
+    \\      ]
+    \\    }
+    \\  ],
+    \\  "nextPageToken": "COPqxbCV3v3n-wESqQEiIAoaCgsIy5vT1gYQgJHPRRILCMub09YGEICRz0USAhACKgxnZW5lcmljX3Rhc2syd2oWCgdwcm9qZWN0Ggs4MjE1MDcyMDc5OGoXCghsb2NhdGlvbhoLdXMtY2VudHJhbDFqEgoJbmFtZXNwYWNlGgV6aWdwc2oJCgNqb2IaAm0wahMKB3Rhc2tfaWQaCDYyYjJjOC1hchAKCG1ldHJpYzprGgRtaXgx",
+    \\  "unit": "1"
+    \\}
+;
+
+/// Its next page: the older point, the same series again. HTTP 200.
+pub const read_page_2_status = 200;
+pub const read_page_2 =
+    \\{
+    \\  "timeSeries": [
+    \\    {
+    \\      "metric": {
+    \\        "labels": {
+    \\          "k": "mix1"
+    \\        },
+    \\        "type": "custom.googleapis.com/zigps-m0-62b2c8/gauge"
+    \\      },
+    \\      "resource": {
+    \\        "type": "generic_task",
+    \\        "labels": {
+    \\          "location": "us-central1",
+    \\          "job": "m0",
+    \\          "project_id": "extractctl",
+    \\          "namespace": "zigps",
+    \\          "task_id": "62b2c8-a"
+    \\        }
+    \\      },
+    \\      "metricKind": "GAUGE",
+    \\      "valueType": "INT64",
+    \\      "points": [
+    \\        {
+    \\          "interval": {
+    \\            "startTime": "2026-10-18T13:46:35.949Z",
+    \\            "endTime": "2026-10-18T13:46:35.949Z"
+    \\          },
+    \\          "value": {
+    \\            "int64Value": "1"
+    \\          }
+    \\        }
+    \\      ]
+    \\    }
+    \\  ],
+    \\  "unit": "1"
+    \\}
+;
+
+/// view=HEADERS with pageSize 1: one series, no points. HTTP 200.
+pub const read_headers_status = 200;
+pub const read_headers =
+    \\{
+    \\  "timeSeries": [
+    \\    {
+    \\      "metric": {
+    \\        "labels": {
+    \\          "k": "ns"
+    \\        },
+    \\        "type": "custom.googleapis.com/zigps-m0-62b2c8/gauge"
+    \\      },
+    \\      "resource": {
+    \\        "type": "generic_task",
+    \\        "labels": {
+    \\          "job": "m0",
+    \\          "namespace": "",
+    \\          "project_id": "extractctl",
+    \\          "task_id": "62b2c8-ns",
+    \\          "location": "us-central1"
+    \\        }
+    \\      },
+    \\      "metricKind": "GAUGE",
+    \\      "valueType": "INT64"
+    \\    }
+    \\  ],
+    \\  "nextPageToken": "COSXkZzgxtX80AESgQEqDGdlbmVyaWNfdGFzazJxahYKB3Byb2plY3QaCzgyMTUwNzIwNzk4ahcKCGxvY2F0aW9uGgt1cy1jZW50cmFsMWoNCgluYW1lc3BhY2UaAGoJCgNqb2IaAm0wahQKB3Rhc2tfaWQaCTYyYjJjOC1uc3IOCghtZXRyaWM6axoCbnM",
+    \\  "unit": "1"
+    \\}
+;
+
+/// ALIGN_MAX over 60 s and REDUCE_SUM across every series. HTTP 200.
+pub const read_aligned_status = 200;
+pub const read_aligned =
+    \\{
+    \\  "timeSeries": [
+    \\    {
+    \\      "metric": {
+    \\        "type": "custom.googleapis.com/zigps-m0-62b2c8/gauge"
+    \\      },
+    \\      "resource": {
+    \\        "type": "generic_task",
+    \\        "labels": {
+    \\          "project_id": "extractctl"
+    \\        }
+    \\      },
+    \\      "metricKind": "GAUGE",
+    \\      "valueType": "INT64",
+    \\      "points": [
+    \\        {
+    \\          "interval": {
+    \\            "startTime": "2026-10-18T13:46:53.230Z",
+    \\            "endTime": "2026-10-18T13:46:53.230Z"
+    \\          },
+    \\          "value": {
+    \\            "int64Value": "71"
+    \\          }
+    \\        }
+    \\      ]
+    \\    }
+    \\  ],
+    \\  "unit": "1"
+    \\}
+;
+
+/// A filter matching the label value a\"b\\c, escaped with backslashes. HTTP 200.
+pub const read_escaped_status = 200;
+pub const read_escaped =
+    \\{
+    \\  "timeSeries": [
+    \\    {
+    \\      "metric": {
+    \\        "labels": {
+    \\          "k": "a\"b\\c"
+    \\        },
+    \\        "type": "custom.googleapis.com/zigps-m0-62b2c8/gauge"
+    \\      },
+    \\      "resource": {
+    \\        "type": "generic_task",
+    \\        "labels": {
+    \\          "job": "m0",
+    \\          "location": "us-central1",
+    \\          "namespace": "zigps",
+    \\          "project_id": "extractctl",
+    \\          "task_id": "62b2c8-a"
+    \\        }
+    \\      },
+    \\      "metricKind": "GAUGE",
+    \\      "valueType": "INT64",
+    \\      "points": [
+    \\        {
+    \\          "interval": {
+    \\            "startTime": "2026-10-18T13:46:44.893Z",
+    \\            "endTime": "2026-10-18T13:46:44.893Z"
+    \\          },
+    \\          "value": {
+    \\            "int64Value": "4"
+    \\          }
+    \\        }
+    \\      ]
+    \\    }
+    \\  ],
+    \\  "unit": "1"
+    \\}
+;

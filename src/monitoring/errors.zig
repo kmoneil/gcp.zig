@@ -27,12 +27,16 @@ pub const Error = core.rpc.Error || error{
     /// Two series with the same metric type, metric labels and resource in
     /// one write: production writes the first and refuses the second.
     DuplicateSeries,
+    /// A read's filter with a label key, a value or a resource type this
+    /// client will not write into one.
+    InvalidFilter,
     /// A project, resource type or page token this client will not put in
     /// a request: nothing is sent.
     InvalidName,
     /// A success response, or a write's summary, could not be decoded.
     /// Never retried.
     InvalidResponse,
-    /// Options out of range: a retry policy, a user agent, a page size.
+    /// Options out of range: a retry policy, a user agent, an aggregation
+    /// that is always wrong, a read's start after its end.
     InvalidOptions,
 };

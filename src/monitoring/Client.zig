@@ -696,7 +696,11 @@ fn randomSeries(g: *test_util.ByteGen, a: Allocator, i: usize) !types.TimeSeries
                 .count = count,
                 .mean = if (count == 0) 0 else 1.5,
                 .sum_of_squared_deviation = if (count == 0) 0 else 0.25,
-                .buckets = .{ .explicit = &.{ 1, 2, 4 } },
+                .buckets = g.pick(types.Distribution.Buckets, &.{
+                    .{ .explicit = &.{ 1, 2, 4 } },
+                    .{ .linear = .{ .num_finite = 2, .width = 0.5, .offset = -1 } },
+                    .{ .exponential = .{ .num_finite = 3, .growth_factor = 1.5, .scale = 2 } },
+                }),
                 .bucket_counts = counts,
             } };
         },
@@ -714,13 +718,23 @@ fn sameValue(a: types.Value, b: types.Value) bool {
         .distribution => |x| x.count == b.distribution.count and x.mean == b.distribution.mean and
             x.sum_of_squared_deviation == b.distribution.sum_of_squared_deviation and
             std.mem.eql(u64, x.bucket_counts, b.distribution.bucket_counts) and
-            std.mem.eql(f64, x.buckets.explicit, b.distribution.buckets.explicit),
+            sameBuckets(x.buckets, b.distribution.buckets),
+    };
+}
+
+fn sameBuckets(a: types.Distribution.Buckets, b: types.Distribution.Buckets) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .explicit => |x| std.mem.eql(f64, x, b.explicit),
+        .linear => |x| x.num_finite == b.linear.num_finite and x.width == b.linear.width and x.offset == b.linear.offset,
+        .exponential => |x| x.num_finite == b.exponential.num_finite and x.growth_factor == b.exponential.growth_factor and x.scale == b.exponential.scale,
     };
 }
 
 /// Any series: the client refuses it before sending, or the fake, which
 /// parses requests with code of its own, keeps exactly what was sent, or
-/// says in a summary why not, and the counts add up.
+/// says in a summary why not, and the counts add up. What it kept, a read
+/// gives back exactly.
 fn writeRoundTripProperty(_: void, input: []const u8) !void {
     const gpa = test_util.propertyAllocator();
     var g: test_util.ByteGen = .init(input);
@@ -756,8 +770,23 @@ fn writeRoundTripProperty(_: void, input: []const u8) !void {
         const kept = try fake.points(a, s.metric_type, s.metric_labels);
         if (kept.len == 0) continue;
         try testing.expectEqual(1, kept.len);
-        try testing.expectEqual(@divFloor(s.end.nanoseconds, std.time.ns_per_us) * std.time.ns_per_us, kept[0].end.nanoseconds);
+        const end_us = @divFloor(s.end.nanoseconds, std.time.ns_per_us) * std.time.ns_per_us;
+        try testing.expectEqual(end_us, kept[0].end.nanoseconds);
         try testing.expect(sameValue(s.value, kept[0].value));
+
+        var page = try client.metric(s.metric_type).read(.{
+            .start = .{ .nanoseconds = end_us - std.time.ns_per_s },
+            .end = .{ .nanoseconds = end_us },
+            .filter = .{ .metric_labels = &.{.{ .key = "i", .value = s.metric_labels[0].value }} },
+        });
+        defer page.deinit();
+        try testing.expectEqual(1, page.value.series.len);
+        const got = page.value.series[0];
+        try testing.expectEqual(s.kind, got.kind);
+        try testing.expectEqual(s.value.valueType(), got.value_type);
+        try testing.expectEqual(end_us, got.points[0].end.nanoseconds);
+        try testing.expect(sameValue(s.value, got.points[0].value.?));
+        for (s.metric_labels) |l| try testing.expectEqualStrings(l.value, got.label(l.key).?);
     }
 }
 

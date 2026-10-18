@@ -44,6 +44,17 @@ pub const MetricPage = @import("types.zig").MetricPage;
 pub const ResourceTypeInfo = @import("types.zig").ResourceTypeInfo;
 pub const ListOptions = @import("types.zig").ListOptions;
 pub const ResourceTypePage = @import("types.zig").ResourceTypePage;
+pub const Aligner = @import("types.zig").Aligner;
+pub const Reducer = @import("types.zig").Reducer;
+pub const Match = @import("types.zig").Match;
+pub const Filter = @import("types.zig").Filter;
+pub const Aggregation = @import("types.zig").Aggregation;
+pub const View = @import("types.zig").View;
+pub const ReadOptions = @import("types.zig").ReadOptions;
+pub const ReadPoint = @import("types.zig").ReadPoint;
+pub const Series = @import("types.zig").Series;
+pub const ExecutionError = @import("types.zig").ExecutionError;
+pub const SeriesPage = @import("types.zig").SeriesPage;
 
 /// The fixed limits and naming rules the client checks before sending.
 pub const limits = @import("validate.zig");
@@ -70,6 +81,7 @@ test {
     _ = @import("Metric.zig");
     _ = @import("codec.zig");
     _ = @import("errors.zig");
+    _ = @import("filter.zig");
     _ = @import("fake_monitoring.zig");
     _ = @import("logging.zig");
     _ = @import("names.zig");

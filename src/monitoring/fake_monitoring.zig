@@ -292,7 +292,8 @@ pub const FakeMonitoring = struct {
                 if (target.rest.len != 0) return notModelled(arena, "this path under timeSeries");
                 return switch (req.method) {
                     .POST => f.write(arena, req.body orelse ""),
-                    else => notModelled(arena, "reading time series"),
+                    .GET => f.read(arena, params),
+                    else => notModelled(arena, "this method on timeSeries"),
                 };
             },
         }
@@ -708,6 +709,188 @@ pub const FakeMonitoring = struct {
 
     const older_start = "write for resource failed: Points must be written in order. One or more of the points specified had an older start time than the most recent point.";
 
+    // Reads.
+
+    /// One series as a read gives it back.
+    const OutSeries = struct {
+        metric_type: []const u8,
+        metric_labels: []const types.Label,
+        resource_type: []const u8,
+        /// With `project_id`, as production gave them back.
+        resource_labels: []const types.Label,
+        kind: types.Kind,
+        value_type: types.ValueType,
+        /// Newest first.
+        points: []const Point,
+    };
+
+    fn read(f: *FakeMonitoring, arena: Allocator, params: []const Param) Allocator.Error!Reply {
+        const filter_text = paramOf(params, "filter") orelse return fail(arena, 400, "INVALID_ARGUMENT", read_no_type);
+        const parsed = try parseFilter(arena, filter_text) orelse return notModelled(arena, "a filter of another shape");
+        const metric_type = parsed.metric_type orelse return fail(arena, 400, "INVALID_ARGUMENT", read_no_type);
+        const end_text = paramOf(params, "interval.endTime") orelse return notModelled(arena, "a read without an end time");
+        const end = (core.timestamp.parse(end_text) catch return notModelled(arena, "an end time it cannot read")).nanoseconds;
+        const start = if (paramOf(params, "interval.startTime")) |t| (core.timestamp.parse(t) catch return notModelled(arena, "a start time it cannot read")).nanoseconds else end;
+        if (start > end) return fail(arena, 400, "INVALID_ARGUMENT", "Field interval.endTime had an invalid value: The start time must be less than or equal to the end time.");
+
+        for (params) |p| if (std.mem.startsWith(u8, p.name, "secondaryAggregation.")) return notModelled(arena, "a secondary aggregation");
+        const aligner_name = paramOf(params, "aggregation.perSeriesAligner") orelse "ALIGN_NONE";
+        const reducer_name = paramOf(params, "aggregation.crossSeriesReducer") orelse "REDUCE_NONE";
+        if (!std.mem.eql(u8, reducer_name, "REDUCE_NONE") and std.mem.eql(u8, aligner_name, "ALIGN_NONE")) return fail(arena, 400, "INVALID_ARGUMENT", "Request was missing field aggregation.perSeriesAligner.");
+        var period_ns: i96 = 0;
+        if (!std.mem.eql(u8, aligner_name, "ALIGN_NONE")) {
+            const period_text = paramOf(params, "aggregation.alignmentPeriod") orelse "0";
+            const seconds = periodSeconds(period_text) orelse return notModelled(arena, "an alignment period it cannot read");
+            if (seconds < validate.min_alignment_period_s) return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Field aggregation.alignmentPeriod had an invalid value of \"{s}\": The alignment period must be greater than or equal to 10s.", .{period_text}));
+            period_ns = @as(i96, seconds) * std.time.ns_per_s;
+        }
+        const aligner = alignerOf(aligner_name) orelse return notModelled(arena, try arena.print("the aligner {s}", .{aligner_name}));
+        const reducer = reducerOf(reducer_name) orelse return notModelled(arena, try arena.print("the reducer {s}", .{reducer_name}));
+        const headers = if (paramOf(params, "view")) |v| std.mem.eql(u8, v, "HEADERS") else false;
+
+        const d = f.descriptors.get(metric_type) orelse return fail(arena, 404, "NOT_FOUND", try arena.print("Cannot find metric(s) that match type = \"{s}\". If a metric was created recently, it could take up to 10 minutes to become available. Please try again soon.", .{metric_type}));
+        if (aligner != .none) {
+            if (d.kind != .gauge) return notModelled(arena, "aligning a metric that is not a gauge");
+            switch (d.value_type) {
+                .int64, .double => {},
+                .bool => if (aligner != .count) return notModelled(arena, "this aligner on a bool metric"),
+                else => return notModelled(arena, "aligning this value type"),
+            }
+        }
+
+        // The series the filter selects, with their points in the interval.
+        var raw: std.ArrayList(OutSeries) = .empty;
+        for (f.series.values()) |s| {
+            if (!std.mem.eql(u8, s.metric_type, metric_type)) continue;
+            if (!f.selects(parsed.conditions, s)) continue;
+            var pts: std.ArrayList(Point) = .empty;
+            var i = s.points.items.len;
+            while (i > 0) {
+                i -= 1;
+                const p = s.points.items[i];
+                const in = if (start == end) p.end.nanoseconds == end else p.end.nanoseconds > start and p.end.nanoseconds <= end;
+                if (in) try pts.append(arena, .{ .start = if (s.kind == .gauge) p.end else p.start, .end = p.end, .value = p.value });
+            }
+            if (pts.items.len == 0) continue;
+            try raw.append(arena, .{
+                .metric_type = s.metric_type,
+                .metric_labels = s.metric_labels,
+                .resource_type = s.resource_type,
+                .resource_labels = try f.withProject(arena, s.resource_labels),
+                .kind = s.kind,
+                .value_type = s.value_type,
+                .points = pts.items,
+            });
+        }
+
+        var out = raw.items;
+        if (aligner != .none) {
+            for (out) |*s| s.* = try alignSeries(arena, s.*, aligner, start, end, period_ns);
+            if (reducer != .none) out = try f.reduce(arena, out, reducer, paramsOf(arena, params, "aggregation.groupByFields") catch return error.OutOfMemory);
+        }
+        return f.renderRead(arena, out, params, headers, d.unit);
+    }
+
+    /// The resource's labels with `project_id` first, as a read shows them.
+    fn withProject(f: *const FakeMonitoring, arena: Allocator, labels: []const types.Label) Allocator.Error![]const types.Label {
+        const out = try arena.alloc(types.Label, labels.len + 1);
+        out[0] = .{ .key = "project_id", .value = f.options.project_id };
+        @memcpy(out[1..], labels);
+        return out;
+    }
+
+    fn selects(f: *const FakeMonitoring, conditions: []const Condition, s: *const Series) bool {
+        for (conditions) |c| {
+            const have: ?[]const u8 = switch (c.field) {
+                .resource_type => s.resource_type,
+                .metric_label => labelValue(s.metric_labels, c.key),
+                .resource_label => if (std.mem.eql(u8, c.key, "project_id")) f.options.project_id else labelValue(s.resource_labels, c.key),
+            };
+            const value = have orelse return false;
+            const ok = switch (c.op) {
+                .equals => std.mem.eql(u8, value, c.value),
+                .not_equals => !std.mem.eql(u8, value, c.value),
+                .starts_with => std.mem.startsWith(u8, value, c.value),
+                .ends_with => std.mem.endsWith(u8, value, c.value),
+                .has_substring => std.mem.indexOf(u8, value, c.value) != null,
+            };
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    /// Series grouped by their resource type and the `group_by` fields,
+    /// each group's aligned values combined at each period's end.
+    fn reduce(f: *const FakeMonitoring, arena: Allocator, series: []const OutSeries, reducer: types.Reducer, group_by: []const []const u8) Allocator.Error![]OutSeries {
+        var groups: std.StringArrayHashMapUnmanaged(std.ArrayList(OutSeries)) = .empty;
+        for (series) |s| {
+            var key: std.Io.Writer.Allocating = .init(arena);
+            key.writer.writeAll(s.resource_type) catch return error.OutOfMemory;
+            for (group_by) |g| key.writer.print("\x00{s}", .{fieldValue(s, g) orelse ""}) catch return error.OutOfMemory;
+            const gop = try groups.getOrPut(arena, key.written());
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(arena, s);
+        }
+        const out = try arena.alloc(OutSeries, groups.count());
+        for (groups.values(), out) |members, *o| {
+            const first = members.items[0];
+            var metric_labels: std.ArrayList(types.Label) = .empty;
+            var resource_labels: std.ArrayList(types.Label) = .empty;
+            try resource_labels.append(arena, .{ .key = "project_id", .value = f.options.project_id });
+            for (group_by) |g| {
+                const value = fieldValue(first, g) orelse continue;
+                if (std.mem.startsWith(u8, g, "metric.labels.")) try metric_labels.append(arena, .{ .key = g["metric.labels.".len..], .value = value });
+                if (std.mem.startsWith(u8, g, "resource.labels.")) try resource_labels.append(arena, .{ .key = g["resource.labels.".len..], .value = value });
+            }
+            // Every period end any member has, newest first.
+            var ends: std.ArrayList(i96) = .empty;
+            for (members.items) |m| for (m.points) |p| {
+                for (ends.items) |e| {
+                    if (e == p.end.nanoseconds) break;
+                } else try ends.append(arena, p.end.nanoseconds);
+            };
+            std.mem.sort(i96, ends.items, {}, std.sort.desc(i96));
+            var value_type = first.value_type;
+            const pts = try arena.alloc(Point, ends.items.len);
+            for (ends.items, pts) |e, *p| {
+                var values: std.ArrayList(types.Value) = .empty;
+                for (members.items) |m| for (m.points) |mp| {
+                    if (mp.end.nanoseconds == e) try values.append(arena, mp.value);
+                };
+                const reduced = combine(reducer, values.items);
+                value_type = reduced.valueType();
+                p.* = .{ .start = .{ .nanoseconds = e }, .end = .{ .nanoseconds = e }, .value = reduced };
+            }
+            o.* = .{
+                .metric_type = first.metric_type,
+                .metric_labels = metric_labels.items,
+                .resource_type = first.resource_type,
+                .resource_labels = resource_labels.items,
+                .kind = .gauge,
+                .value_type = value_type,
+                .points = pts,
+            };
+        }
+        return out;
+    }
+
+    fn renderRead(f: *const FakeMonitoring, arena: Allocator, series: []const OutSeries, params: []const Param, headers: bool, unit: []const u8) Allocator.Error!Reply {
+        _ = f;
+        std.mem.sort(OutSeries, @constCast(series), {}, struct {
+            fn lessThan(_: void, a: OutSeries, b: OutSeries) bool {
+                return std.mem.lessThan(u8, a.resource_type, b.resource_type) or
+                    (std.mem.eql(u8, a.resource_type, b.resource_type) and labelsLess(a.metric_labels, b.metric_labels, a.resource_labels, b.resource_labels));
+            }
+        }.lessThan);
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        writeRead(&jw, series, params, headers, unit) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+            error.InvalidToken => return pageTokenRefusal(arena),
+        };
+        return .{ .status = 200, .body = out.written() };
+    }
+
     fn refused(code: u8, reason: []const u8) Verdict {
         return .{ .refused = .{ .code = code, .reason = reason } };
     }
@@ -821,6 +1004,419 @@ pub const FakeMonitoring = struct {
     }
 };
 
+const read_no_type = "The provided filter matches more than one metric. TimeSeries data are limited to a single metric per request.";
+
+const Condition = struct {
+    field: enum { resource_type, metric_label, resource_label },
+    key: []const u8 = "",
+    op: types.Match.Op,
+    value: []const u8,
+};
+
+const ParsedFilter = struct {
+    metric_type: ?[]const u8 = null,
+    conditions: []const Condition,
+};
+
+/// The fake's own reading of a filter, as the client writes them: `field
+/// op value` terms joined by AND, a value a quoted string with `\"` and
+/// `\\` escapes, or `starts_with`, `ends_with` or `has_substring` of one.
+/// Null for anything else.
+fn parseFilter(arena: Allocator, text: []const u8) Allocator.Error!?ParsedFilter {
+    var p: Scanner = .{ .text = text };
+    var conditions: std.ArrayList(Condition) = .empty;
+    var metric_type: ?[]const u8 = null;
+    while (true) {
+        p.skipSpaces();
+        const name = p.identifier() orelse return null;
+        p.skipSpaces();
+        const negated = if (p.take("!=")) true else if (p.take("=")) false else return null;
+        p.skipSpaces();
+        var op: types.Match.Op = if (negated) .not_equals else .equals;
+        var value: []const u8 = undefined;
+        if (p.peek() == '"') {
+            value = try p.quoted(arena) orelse return null;
+        } else {
+            if (negated) return null;
+            const function = p.identifier() orelse return null;
+            op = std.meta.stringToEnum(types.Match.Op, function) orelse return null;
+            if (op == .equals or op == .not_equals or !p.take("(")) return null;
+            value = try p.quoted(arena) orelse return null;
+            if (!p.take(")")) return null;
+        }
+        if (std.mem.eql(u8, name, "metric.type")) {
+            if (op != .equals or metric_type != null) return null;
+            metric_type = value;
+        } else if (std.mem.eql(u8, name, "resource.type")) {
+            try conditions.append(arena, .{ .field = .resource_type, .op = op, .value = value });
+        } else if (std.mem.startsWith(u8, name, "metric.labels.")) {
+            try conditions.append(arena, .{ .field = .metric_label, .key = name["metric.labels.".len..], .op = op, .value = value });
+        } else if (std.mem.startsWith(u8, name, "resource.labels.")) {
+            try conditions.append(arena, .{ .field = .resource_label, .key = name["resource.labels.".len..], .op = op, .value = value });
+        } else return null;
+        p.skipSpaces();
+        if (p.done()) break;
+        if (!p.take("AND")) return null;
+    }
+    return .{ .metric_type = metric_type, .conditions = conditions.items };
+}
+
+const Scanner = struct {
+    text: []const u8,
+    at: usize = 0,
+
+    fn done(s: *const Scanner) bool {
+        return s.at >= s.text.len;
+    }
+
+    fn peek(s: *const Scanner) u8 {
+        return if (s.done()) 0 else s.text[s.at];
+    }
+
+    fn skipSpaces(s: *Scanner) void {
+        while (!s.done() and s.text[s.at] == ' ') s.at += 1;
+    }
+
+    fn take(s: *Scanner, word: []const u8) bool {
+        if (!std.mem.startsWith(u8, s.text[s.at..], word)) return false;
+        s.at += word.len;
+        return true;
+    }
+
+    fn identifier(s: *Scanner) ?[]const u8 {
+        const from = s.at;
+        while (!s.done()) : (s.at += 1) switch (s.text[s.at]) {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '.' => {},
+            else => break,
+        };
+        return if (s.at == from) null else s.text[from..s.at];
+    }
+
+    fn quoted(s: *Scanner, arena: Allocator) Allocator.Error!?[]const u8 {
+        if (!s.take("\"")) return null;
+        var out: std.ArrayList(u8) = .empty;
+        while (!s.done()) {
+            const c = s.text[s.at];
+            s.at += 1;
+            switch (c) {
+                '"' => return out.items,
+                '\\' => {
+                    if (s.done()) return null;
+                    const next = s.text[s.at];
+                    if (next != '"' and next != '\\') return null;
+                    try out.append(arena, next);
+                    s.at += 1;
+                },
+                else => try out.append(arena, c),
+            }
+        }
+        return null;
+    }
+};
+
+/// "60s": whole seconds. Null for anything else.
+fn periodSeconds(text: []const u8) ?u64 {
+    if (text.len < 2 or text[text.len - 1] != 's') return std.fmt.parseInt(u64, text, 10) catch null;
+    return std.fmt.parseInt(u64, text[0 .. text.len - 1], 10) catch null;
+}
+
+/// The aligners the fake models, on gauges: none, and those that turn a
+/// period's points into one.
+fn alignerOf(name: []const u8) ?types.Aligner {
+    inline for (.{ .none, .min, .max, .mean, .sum, .count }) |a| {
+        if (std.mem.eql(u8, name, comptime types.Aligner.wire(a))) return a;
+    }
+    return null;
+}
+
+fn reducerOf(name: []const u8) ?types.Reducer {
+    inline for (.{ .none, .min, .max, .mean, .sum, .count }) |r| {
+        if (std.mem.eql(u8, name, comptime types.Reducer.wire(r))) return r;
+    }
+    return null;
+}
+
+/// A gauge's points, one per period: periods end at the read's end and
+/// every `period_ns` before it, each holding the points in (its end minus
+/// the period, its end]; a period with none has no point. Newest first.
+fn alignSeries(arena: Allocator, s: FakeMonitoring.OutSeries, aligner: types.Aligner, start: i96, end: i96, period_ns: i96) Allocator.Error!FakeMonitoring.OutSeries {
+    var pts: std.ArrayList(FakeMonitoring.Point) = .empty;
+    var window_end = end;
+    while (window_end > start or (start == end and window_end == end)) : (window_end -= period_ns) {
+        var values: std.ArrayList(types.Value) = .empty;
+        for (s.points) |p| {
+            if (p.end.nanoseconds > window_end - period_ns and p.end.nanoseconds <= window_end) try values.append(arena, p.value);
+        }
+        if (values.items.len > 0) try pts.append(arena, .{ .start = .{ .nanoseconds = window_end }, .end = .{ .nanoseconds = window_end }, .value = combine(switch (aligner) {
+            .min => .min,
+            .max => .max,
+            .mean => .mean,
+            .sum => .sum,
+            .count => .count,
+            else => unreachable,
+        }, values.items) });
+        if (start == end) break;
+    }
+    var out = s;
+    out.points = pts.items;
+    out.value_type = if (pts.items.len > 0) pts.items[0].value.valueType() else switch (aligner) {
+        .mean => .double,
+        .count => .int64,
+        else => s.value_type,
+    };
+    return out;
+}
+
+/// Values combined as an aligner or a reducer of the same name does: min,
+/// max and sum keep their type (a sum of int64s and doubles is a double),
+/// mean is a double, count an int64.
+fn combine(how: types.Reducer, values: []const types.Value) types.Value {
+    if (how == .count) return .{ .int64 = @intCast(values.len) };
+    var all_int = true;
+    for (values) |v| if (v != .int64) {
+        all_int = false;
+    };
+    if (how != .mean and all_int) {
+        var acc: i64 = values[0].int64;
+        for (values[1..]) |v| acc = switch (how) {
+            .min => @min(acc, v.int64),
+            .max => @max(acc, v.int64),
+            else => acc +% v.int64,
+        };
+        return .{ .int64 = acc };
+    }
+    var acc: f64 = asDouble(values[0]);
+    for (values[1..]) |v| acc = switch (how) {
+        .min => @min(acc, asDouble(v)),
+        .max => @max(acc, asDouble(v)),
+        else => acc + asDouble(v),
+    };
+    if (how == .mean) acc /= @floatFromInt(values.len);
+    return .{ .double = acc };
+}
+
+/// What min, max, sum and mean see: only numbers reach them.
+fn asDouble(v: types.Value) f64 {
+    return switch (v) {
+        .int64 => |n| @floatFromInt(n),
+        .double => |d| d,
+        else => unreachable,
+    };
+}
+
+/// A group-by field's value in a series: `metric.labels.K`,
+/// `resource.labels.K`, or `resource.type`.
+fn fieldValue(s: FakeMonitoring.OutSeries, field: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, field, "resource.type")) return s.resource_type;
+    if (std.mem.startsWith(u8, field, "metric.labels.")) return labelValue(s.metric_labels, field["metric.labels.".len..]);
+    if (std.mem.startsWith(u8, field, "resource.labels.")) return labelValue(s.resource_labels, field["resource.labels.".len..]);
+    return null;
+}
+
+fn labelsLess(a_metric: []const types.Label, b_metric: []const types.Label, a_resource: []const types.Label, b_resource: []const types.Label) bool {
+    const order = labelsOrder(a_metric, b_metric);
+    if (order != .eq) return order == .lt;
+    return labelsOrder(a_resource, b_resource) == .lt;
+}
+
+fn labelsOrder(a: []const types.Label, b: []const types.Label) std.math.Order {
+    for (a[0..@min(a.len, b.len)], b[0..@min(a.len, b.len)]) |x, y| {
+        const k = std.mem.order(u8, x.key, y.key);
+        if (k != .eq) return k;
+        const v = std.mem.order(u8, x.value, y.value);
+        if (v != .eq) return v;
+    }
+    return std.math.order(a.len, b.len);
+}
+
+/// A read's page. With FULL, `pageSize` counts points, so a series whose
+/// points do not fit comes again on the next page, as production's did;
+/// with HEADERS it counts series.
+fn writeRead(jw: *Stringify, series: []const FakeMonitoring.OutSeries, params: []const Param, headers: bool, unit: []const u8) (Stringify.Error || error{InvalidToken})!void {
+    var size: usize = 100_000;
+    if (paramOf(params, "pageSize")) |text| {
+        const n = std.fmt.parseInt(usize, text, 10) catch return error.InvalidToken;
+        if (n != 0) size = @min(n, 100_000);
+    }
+    var from: usize = 0;
+    if (paramOf(params, "pageToken")) |t| {
+        if (!std.mem.startsWith(u8, t, "p")) return error.InvalidToken;
+        from = std.fmt.parseInt(usize, t[1..], 10) catch return error.InvalidToken;
+    }
+    var total: usize = 0;
+    for (series) |s| total += if (headers) 1 else s.points.len;
+    if (from > total) return error.InvalidToken;
+    const to = @min(total, from + size);
+
+    try jw.beginObject();
+    var position: usize = 0;
+    var opened = false;
+    for (series) |s| {
+        const count = if (headers) 1 else s.points.len;
+        defer position += count;
+        if (position + count <= from or position >= to) continue;
+        if (!opened) {
+            try jw.objectField("timeSeries");
+            try jw.beginArray();
+            opened = true;
+        }
+        try jw.beginObject();
+        try jw.objectField("metric");
+        try jw.beginObject();
+        if (s.metric_labels.len > 0) {
+            try jw.objectField("labels");
+            try writeLabelObject(jw, s.metric_labels);
+        }
+        try jw.objectField("type");
+        try jw.write(s.metric_type);
+        try jw.endObject();
+        try jw.objectField("resource");
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(s.resource_type);
+        try jw.objectField("labels");
+        try writeLabelObject(jw, s.resource_labels);
+        try jw.endObject();
+        try jw.objectField("metricKind");
+        try jw.write(s.kind.wire());
+        try jw.objectField("valueType");
+        try jw.write(s.value_type.wire());
+        if (!headers) {
+            const lo = @max(from, position) - position;
+            const hi = @min(to, position + count) - position;
+            try jw.objectField("points");
+            try jw.beginArray();
+            for (s.points[lo..hi]) |p| {
+                try jw.beginObject();
+                try jw.objectField("interval");
+                try jw.beginObject();
+                var buf: [core.timestamp.max_len]u8 = undefined;
+                if (p.start) |st| {
+                    try jw.objectField("startTime");
+                    try jw.write(core.timestamp.format(&buf, st));
+                }
+                try jw.objectField("endTime");
+                try jw.write(core.timestamp.format(&buf, p.end));
+                try jw.endObject();
+                try jw.objectField("value");
+                try writePointValue(jw, p.value);
+                try jw.endObject();
+            }
+            try jw.endArray();
+        }
+        try jw.endObject();
+    }
+    if (opened) try jw.endArray();
+    if (to < total) {
+        try jw.objectField("nextPageToken");
+        try jw.print("\"p{d}\"", .{to});
+    }
+    if (unit.len > 0) {
+        try jw.objectField("unit");
+        try jw.write(unit);
+    }
+    try jw.endObject();
+}
+
+fn writeLabelObject(jw: *Stringify, labels: []const types.Label) Stringify.Error!void {
+    try jw.beginObject();
+    for (labels) |l| {
+        try jw.objectField(l.key);
+        try jw.write(l.value);
+    }
+    try jw.endObject();
+}
+
+/// A value as production writes one: int64s as strings, doubles as numbers
+/// or "NaN", "Infinity" and "-Infinity".
+fn writePointValue(jw: *Stringify, v: types.Value) Stringify.Error!void {
+    try jw.beginObject();
+    switch (v) {
+        .bool => |b| {
+            try jw.objectField("boolValue");
+            try jw.write(b);
+        },
+        .int64 => |n| {
+            try jw.objectField("int64Value");
+            try jw.print("\"{d}\"", .{n});
+        },
+        .double => |d| {
+            try jw.objectField("doubleValue");
+            try fakeDouble(jw, d);
+        },
+        .string => |s| {
+            try jw.objectField("stringValue");
+            try jw.write(s);
+        },
+        .distribution => |d| {
+            try jw.objectField("distributionValue");
+            try jw.beginObject();
+            if (d.count != 0) {
+                try jw.objectField("count");
+                try jw.print("\"{d}\"", .{d.count});
+            }
+            if (d.mean != 0) {
+                try jw.objectField("mean");
+                try fakeDouble(jw, d.mean);
+            }
+            if (d.sum_of_squared_deviation != 0) {
+                try jw.objectField("sumOfSquaredDeviation");
+                try fakeDouble(jw, d.sum_of_squared_deviation);
+            }
+            try jw.objectField("bucketOptions");
+            try jw.beginObject();
+            switch (d.buckets) {
+                .linear => |l| {
+                    try jw.objectField("linearBuckets");
+                    try jw.beginObject();
+                    try jw.objectField("numFiniteBuckets");
+                    try jw.write(l.num_finite);
+                    try jw.objectField("width");
+                    try fakeDouble(jw, l.width);
+                    try jw.objectField("offset");
+                    try fakeDouble(jw, l.offset);
+                    try jw.endObject();
+                },
+                .exponential => |e| {
+                    try jw.objectField("exponentialBuckets");
+                    try jw.beginObject();
+                    try jw.objectField("numFiniteBuckets");
+                    try jw.write(e.num_finite);
+                    try jw.objectField("growthFactor");
+                    try fakeDouble(jw, e.growth_factor);
+                    try jw.objectField("scale");
+                    try fakeDouble(jw, e.scale);
+                    try jw.endObject();
+                },
+                .explicit => |bounds| {
+                    try jw.objectField("explicitBuckets");
+                    try jw.beginObject();
+                    try jw.objectField("bounds");
+                    try jw.beginArray();
+                    for (bounds) |b| try fakeDouble(jw, b);
+                    try jw.endArray();
+                    try jw.endObject();
+                },
+            }
+            try jw.endObject();
+            if (d.bucket_counts.len > 0) {
+                try jw.objectField("bucketCounts");
+                try jw.beginArray();
+                for (d.bucket_counts) |c| try jw.print("\"{d}\"", .{c});
+                try jw.endArray();
+            }
+            try jw.endObject();
+        },
+    }
+    try jw.endObject();
+}
+
+fn fakeDouble(jw: *Stringify, d: f64) Stringify.Error!void {
+    if (std.math.isNan(d)) return jw.write("NaN");
+    if (std.math.isInf(d)) return jw.write(if (d > 0) "Infinity" else "-Infinity");
+    try jw.print("{e}", .{d});
+}
+
 // Routes and parameters.
 
 const Route = struct {
@@ -879,6 +1475,13 @@ fn parseParams(arena: Allocator, query: []const u8) Allocator.Error!?[]const Par
 fn paramOf(params: []const Param, name: []const u8) ?[]const u8 {
     for (params) |p| if (std.mem.eql(u8, p.name, name)) return p.value;
     return null;
+}
+
+/// Every value of a repeated parameter, in order.
+fn paramsOf(arena: Allocator, params: []const Param, name: []const u8) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (params) |p| if (std.mem.eql(u8, p.name, name)) try out.append(arena, p.value);
+    return out.items;
 }
 
 /// The prefix of `metric.type = starts_with("X")`, the one filter the fake
@@ -1880,7 +2483,7 @@ test "what the fake does not answer: no credentials, another project, other path
     const other = try b.fake.serve(.{ .method = .GET, .url = "https://monitoring.googleapis.com/v3/projects/someone-else/metricDescriptors", .bearer = "t" }, a);
     try testing.expectEqual(501, other.status);
     for ([_]struct { tp.Method, []const u8 }{
-        .{ .GET, "timeSeries" },
+        .{ .DELETE, "timeSeries" },
         .{ .PUT, "metricDescriptors" },
         .{ .PATCH, "metricDescriptors/custom.googleapis.com/x" },
         .{ .POST, "monitoredResourceDescriptors" },
@@ -1975,6 +2578,13 @@ test "corners: two refusal codes in one summary, falling doubles, layouts, displ
     const kept = try b.fake.points(a, "custom.googleapis.com/latency", &.{});
     try testing.expectEqual(2, kept[0].value.distribution.count);
     try testing.expectEqual(2.0, kept[0].value.distribution.buckets.exponential.growth_factor);
+    var latency = try b.client.metric("custom.googleapis.com/latency").read(.{ .start = b.at(-60_000), .end = b.at(0) });
+    defer latency.deinit();
+    const read_back = latency.value.series[0].points[0].value.?.distribution;
+    try testing.expectEqual(3, read_back.buckets.exponential.num_finite);
+    try testing.expectEqual(2.0, read_back.buckets.exponential.growth_factor);
+    try testing.expectEqual(1.0, read_back.buckets.exponential.scale);
+    try testing.expectEqualSlices(u64, &.{ 0, 1, 1 }, read_back.bucket_counts);
     var linear = dist;
     linear.metric_type = "custom.googleapis.com/sizes";
     linear.value = .{ .distribution = .{ .buckets = .{ .linear = .{ .num_finite = 2, .width = 10, .offset = 0 } } } };
@@ -2005,4 +2615,329 @@ test "corners: two refusal codes in one summary, falling doubles, layouts, displ
     // A key past 100 bytes for a metric that exists: not measured.
     const long_key = try b.raw(a, .POST, "timeSeries", "{\"timeSeries\":[{\"metric\":{\"type\":\"custom.googleapis.com/named\",\"labels\":{\"" ++ test_util.repeat("k", 101) ++ "\":\"v\"}},\"resource\":{\"type\":\"global\"},\"points\":[{\"interval\":{\"endTime\":\"2026-10-18T13:46:35Z\"},\"value\":{\"boolValue\":true}}]}]}");
     try testing.expectEqual(501, long_key.status);
+}
+
+/// Writes a gauge point for each (labels, value), each on its own task.
+fn seed(b: *Bench, metric_type: []const u8, points: []const struct { []const types.Label, i64, i64 }) !void {
+    for (points, 0..) |p, i| {
+        var id: [8]u8 = undefined;
+        const task_id = try std.fmt.bufPrint(&id, "t{d}", .{i});
+        var result = try b.client.write(&.{.{
+            .metric_type = metric_type,
+            .metric_labels = p[0],
+            .resource = .{ .generic_task = .{ .location = "us-central1", .namespace = "zigps", .job = if (i % 2 == 0) "m0" else "m1", .task_id = task_id } },
+            .kind = .gauge,
+            .end = b.at(p[1]),
+            .value = .{ .int64 = p[2] },
+        }});
+        defer result.deinit();
+        try testing.expect(result.value.ok());
+    }
+}
+
+test "reads: what a filter selects, newest first, (start, end]" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    const g = "custom.googleapis.com/reads";
+    try seed(&b, g, &.{
+        .{ &.{.{ .key = "path", .value = "/api/orders" }}, -60_000, 1 },
+        .{ &.{.{ .key = "path", .value = "/web/home" }}, -50_000, 2 },
+        .{ &.{.{ .key = "path", .value = "a\"b\\c" }}, -40_000, 3 },
+    });
+    // A second point for the first series, on its own task.
+    var more = try b.client.write(&.{.{ .metric_type = g, .metric_labels = &.{.{ .key = "path", .value = "/api/orders" }}, .resource = .{ .generic_task = .{ .location = "us-central1", .namespace = "zigps", .job = "m0", .task_id = "t0" } }, .kind = .gauge, .end = b.at(-10_000), .value = .{ .int64 = 4 } }});
+    more.deinit();
+    const m = b.client.metric(g);
+    const window: types.ReadOptions = .{ .start = b.at(-120_000), .end = b.at(0) };
+
+    var all = try m.read(window);
+    defer all.deinit();
+    try testing.expectEqual(3, all.value.series.len);
+    var points: usize = 0;
+    for (all.value.series) |s| {
+        points += s.points.len;
+        try testing.expectEqualStrings("my-project", s.resourceLabel("project_id").?);
+        try testing.expectEqual(types.Kind.gauge, s.kind);
+    }
+    try testing.expectEqual(4, points);
+
+    const cases = [_]struct { types.Filter, usize }{
+        .{ .{ .metric_labels = &.{.{ .key = "path", .op = .starts_with, .value = "/api" }} }, 1 },
+        .{ .{ .metric_labels = &.{.{ .key = "path", .op = .ends_with, .value = "home" }} }, 1 },
+        .{ .{ .metric_labels = &.{.{ .key = "path", .op = .has_substring, .value = "/" }} }, 2 },
+        .{ .{ .metric_labels = &.{.{ .key = "path", .op = .not_equals, .value = "/web/home" }} }, 2 },
+        .{ .{ .metric_labels = &.{.{ .key = "path", .value = "a\"b\\c" }} }, 1 },
+        .{ .{ .metric_labels = &.{.{ .key = "missing", .op = .not_equals, .value = "x" }} }, 0 },
+        .{ .{ .resource_type = "generic_task", .resource_labels = &.{.{ .key = "job", .value = "m1" }} }, 1 },
+        .{ .{ .resource_labels = &.{.{ .key = "project_id", .value = "my-project" }} }, 3 },
+        .{ .{ .resource_type = "global" }, 0 },
+    };
+    for (cases) |c| {
+        var opts = window;
+        opts.filter = c[0];
+        var page = try m.read(opts);
+        defer page.deinit();
+        try testing.expectEqual(c[1], page.value.series.len);
+    }
+
+    var orders = try m.read(.{ .start = window.start, .end = window.end, .filter = .{ .metric_labels = &.{.{ .key = "path", .value = "/api/orders" }} } });
+    defer orders.deinit();
+    const p = orders.value.series[0].points;
+    try testing.expectEqual(4, p[0].value.?.int64);
+    try testing.expectEqual(1, p[1].value.?.int64);
+    // The start is out, the end in.
+    var narrow = try m.read(.{ .start = b.at(-60_000), .end = b.at(-10_000) });
+    defer narrow.deinit();
+    var narrow_points: usize = 0;
+    for (narrow.value.series) |s| narrow_points += s.points.len;
+    try testing.expectEqual(3, narrow_points);
+    // With no start, the instant at the end.
+    var instant = try m.read(.{ .end = b.at(-40_000) });
+    defer instant.deinit();
+    try testing.expectEqual(1, instant.value.series.len);
+    try testing.expectEqual(3, instant.value.series[0].points[0].value.?.int64);
+}
+
+test "reads: a series spans pages of points; headers page by series" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    const g = "custom.googleapis.com/pages";
+    const labels: []const types.Label = &.{.{ .key = "k", .value = "mix1" }};
+    for ([_]i64{ -20_000, -10_000, 0 }, 1..) |at, v| {
+        var r = try b.client.write(&.{gaugeAt(g, labels, b.at(at), @intCast(v))});
+        r.deinit();
+    }
+    try seed(&b, g, &.{.{ &.{.{ .key = "k", .value = "other" }}, -5_000, 9 }});
+    const m = b.client.metric(g);
+    var seen: std.ArrayList(i64) = .empty;
+    defer seen.deinit(testing.allocator);
+    var token: ?[]const u8 = null;
+    var pages: usize = 0;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    while (true) {
+        var page = try m.read(.{ .start = b.at(-60_000), .end = b.at(0), .page_size = 2, .page_token = token });
+        defer page.deinit();
+        pages += 1;
+        var on_page: usize = 0;
+        for (page.value.series) |s| for (s.points) |pt| {
+            try seen.append(testing.allocator, pt.value.?.int64);
+            on_page += 1;
+        };
+        try testing.expect(on_page <= 2);
+        token = if (page.value.next_page_token) |t| try arena.allocator().dupe(u8, t) else null;
+        if (token == null) break;
+    }
+    try testing.expectEqual(2, pages);
+    try testing.expectEqual(4, seen.items.len);
+
+    var headers = try m.read(.{ .start = b.at(-60_000), .end = b.at(0), .view = .headers, .page_size = 1 });
+    defer headers.deinit();
+    try testing.expectEqual(1, headers.value.series.len);
+    try testing.expectEqual(0, headers.value.series[0].points.len);
+    try testing.expect(headers.value.next_page_token != null);
+    try testing.expectError(error.InvalidArgument, m.read(.{ .end = b.at(0), .page_token = "p99" }));
+}
+
+test "reads: aligned and reduced as production answered, the fake's own reading of the rest" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    const g = "custom.googleapis.com/aligned";
+    var made = try b.client.metric(g).create(.{ .kind = .gauge, .value_type = .int64, .unit = "1", .labels = &.{.{ .key = "region" }} });
+    made.deinit();
+    try seed(&b, g, &.{
+        .{ &.{.{ .key = "region", .value = "eu" }}, -50_000, 30 },
+        .{ &.{.{ .key = "region", .value = "eu" }}, -40_000, 20 },
+        .{ &.{.{ .key = "region", .value = "us" }}, -30_000, 21 },
+        .{ &.{.{ .key = "region", .value = "eu" }}, -90_000, 100 },
+    });
+    const m = b.client.metric(g);
+    // As milestone 0 read: ALIGN_MAX over 60 s, REDUCE_SUM, no group-by:
+    // one series, no metric labels, project_id alone, at the read's end.
+    var summed = try m.read(.{ .start = b.at(-60_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .max, .reducer = .sum } });
+    defer summed.deinit();
+    try testing.expectEqual(1, summed.value.series.len);
+    const s = summed.value.series[0];
+    try testing.expectEqual(0, s.metric_labels.len);
+    try testing.expectEqual(1, s.resource_labels.len);
+    try testing.expectEqual(types.ValueType.int64, s.value_type);
+    try testing.expectEqual(71, s.points[0].value.?.int64);
+    try testing.expectEqual(b.at(0).nanoseconds, s.points[0].end.nanoseconds);
+    try testing.expectEqual(b.at(0).nanoseconds, s.points[0].start.?.nanoseconds);
+    try testing.expectEqualStrings("1", summed.value.unit);
+
+    var by_region = try m.read(.{ .start = b.at(-60_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .mean, .reducer = .max, .group_by = &.{"metric.labels.region"} } });
+    defer by_region.deinit();
+    try testing.expectEqual(2, by_region.value.series.len);
+    for (by_region.value.series) |r| {
+        try testing.expectEqual(types.ValueType.double, r.value_type);
+        // Each point is a series of its own task: eu's means are 30 and 20.
+        const want: f64 = if (std.mem.eql(u8, r.label("region").?, "eu")) 30 else 21;
+        try testing.expectEqual(want, r.points[0].value.?.double);
+    }
+
+    // Two periods over two minutes: one point each, newest first.
+    var periods = try m.read(.{ .start = b.at(-120_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .count, .reducer = .sum } });
+    defer periods.deinit();
+    const pts = periods.value.series[0].points;
+    try testing.expectEqual(2, pts.len);
+    try testing.expectEqual(3, pts[0].value.?.int64);
+    try testing.expectEqual(1, pts[1].value.?.int64);
+    try testing.expectEqual(b.at(-60_000).nanoseconds, pts[1].end.nanoseconds);
+    var counted = try m.read(.{ .start = b.at(-60_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .min, .reducer = .count, .group_by = &.{"resource.labels.job"} } });
+    defer counted.deinit();
+    try testing.expectEqual(2, counted.value.series.len);
+    var mins = try m.read(.{ .start = b.at(-60_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .sum, .reducer = .min } });
+    defer mins.deinit();
+    try testing.expectEqual(20, mins.value.series[0].points[0].value.?.int64);
+    var means = try m.read(.{ .start = b.at(-60_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .max, .reducer = .mean } });
+    defer means.deinit();
+    try testing.expectEqual(71.0 / 3.0, means.value.series[0].points[0].value.?.double);
+
+    // Not modelled: other aligners, cumulative metrics, a second aggregation.
+    try testing.expectError(error.Unimplemented, m.read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .rate } }));
+    try testing.expectError(error.Unimplemented, m.read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .max, .reducer = .percentile_99 } }));
+    try testing.expectError(error.Unimplemented, m.read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .max }, .secondary_aggregation = .{ .alignment_period_s = 120, .aligner = .max } }));
+    try testing.expectError(error.Unimplemented, m.read(.{ .end = b.at(0), .filter = .{ .raw = "metric.labels.region = one_of(\"eu\")" } }));
+    var cum = try b.client.write(&.{.{ .metric_type = "custom.googleapis.com/total", .resource = .global, .kind = .cumulative, .start = b.at(-60_000), .end = b.at(0), .value = .{ .int64 = 1 } }});
+    cum.deinit();
+    try testing.expectError(error.Unimplemented, b.client.metric("custom.googleapis.com/total").read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .max } }));
+    var flags = try b.client.write(&.{.{ .metric_type = "custom.googleapis.com/flag", .resource = .global, .kind = .gauge, .end = b.at(0), .value = .{ .bool = true } }});
+    flags.deinit();
+    try testing.expectError(error.Unimplemented, b.client.metric("custom.googleapis.com/flag").read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .max } }));
+    var flag_count = try b.client.metric("custom.googleapis.com/flag").read(.{ .start = b.at(-60_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .count } });
+    defer flag_count.deinit();
+    try testing.expectEqual(1, flag_count.value.series[0].points[0].value.?.int64);
+}
+
+test "reads refused in production's words" {
+    var b: Bench = undefined;
+    try b.init(.{ .project_id = "extractctl" });
+    defer b.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectError(error.NotFound, b.client.metric("custom.googleapis.com/zigps-m0b-b66e4f/nothing").read(.{ .end = b.at(0) }));
+    try testing.expectEqualStrings(try messageOf(a, production.read_unknown_type), b.diag.message());
+    var made = try b.client.metric("custom.googleapis.com/zigps-m0-62b2c8/gauge").create(.{ .kind = .gauge, .value_type = .int64 });
+    made.deinit();
+    const base = "timeSeries?filter=metric.type%20%3D%20%22custom.googleapis.com%2Fzigps-m0-62b2c8%2Fgauge%22&interval.endTime=2026-10-18T13%3A46%3A35Z";
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "timeSeries?interval.endTime=2026-10-18T13%3A46%3A35Z", production.read_no_type },
+        .{ "timeSeries?filter=metric.labels.k%20%3D%20%22x%22&interval.endTime=2026-10-18T13%3A46%3A35Z", production.read_no_type },
+        .{ base ++ "&aggregation.perSeriesAligner=ALIGN_MAX", production.read_no_period },
+        .{ base ++ "&aggregation.perSeriesAligner=ALIGN_MAX&aggregation.alignmentPeriod=9s", production.read_period_9s },
+        .{ base ++ "&aggregation.crossSeriesReducer=REDUCE_SUM", production.read_no_aligner },
+        .{ base ++ "&interval.startTime=2026-10-18T13%3A46%3A36Z", production.read_start_after_end },
+    };
+    for (cases) |c| {
+        const reply = try b.raw(a, .GET, c[0], null);
+        try testing.expectEqual(400, reply.status);
+        try testing.expectEqualStrings(try messageOf(a, c[1]), try messageOf(a, reply.body));
+    }
+    for ([_][]const u8{
+        "timeSeries?filter=metric.type%20%3D%20%22x%22",
+        base ++ "&interval.startTime=yesterday",
+        "timeSeries?filter=metric.type%20%3D%20%22x%22&interval.endTime=never",
+        base ++ "&aggregation.perSeriesAligner=ALIGN_MAX&aggregation.alignmentPeriod=1m",
+        base ++ "&aggregation.perSeriesAligner=ALIGN_DELTA&aggregation.alignmentPeriod=60s",
+        "timeSeries?filter=metric.type%20%3D%20%22x%22%20OR%20metric.type%20%3D%20%22y%22&interval.endTime=2026-10-18T13%3A46%3A35Z",
+        "timeSeries?filter=metric.type%20!%3D%20%22x%22&interval.endTime=2026-10-18T13%3A46%3A35Z",
+    }) |path| try testing.expectEqual(501, (try b.raw(a, .GET, path, null)).status);
+    try testing.expectEqual(400, (try b.raw(a, .GET, base ++ "&pageSize=x", null)).status);
+}
+
+fn filterProperty(_: void, input: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var g: test_util.ByteGen = .init(input);
+    var metric: std.ArrayList(types.Match) = .empty;
+    var resource: std.ArrayList(types.Match) = .empty;
+    for (0..g.intRange(usize, 0, 4)) |_| {
+        var buf: [16]u8 = undefined;
+        const m: types.Match = .{
+            .key = g.pick([]const u8, &.{ "k", "Region", "a_1", "1bad", "a.b" }),
+            .op = g.pick(types.Match.Op, &.{ .equals, .not_equals, .starts_with, .ends_with, .has_substring }),
+            .value = try a.dupe(u8, if (g.boolean()) g.utf8(&buf, 16) else g.slice(16)),
+        };
+        try (if (g.boolean()) &metric else &resource).append(a, m);
+    }
+    const f: types.Filter = .{
+        .metric_labels = metric.items,
+        .resource_labels = resource.items,
+        .resource_type = if (g.boolean()) g.pick([]const u8, &.{ "generic_task", "global", "a b" }) else null,
+    };
+    if (filter_mod.problem(f) != null) return;
+    const text = try filter_mod.build(a, "custom.googleapis.com/x", f);
+    const parsed = (try parseFilter(a, text)).?;
+    try testing.expectEqualStrings("custom.googleapis.com/x", parsed.metric_type.?);
+    var want: std.ArrayList(Condition) = .empty;
+    for (f.metric_labels) |m| try want.append(a, .{ .field = .metric_label, .key = m.key, .op = m.op, .value = m.value });
+    if (f.resource_type) |t| try want.append(a, .{ .field = .resource_type, .op = .equals, .value = t });
+    for (f.resource_labels) |m| try want.append(a, .{ .field = .resource_label, .key = m.key, .op = m.op, .value = m.value });
+    try testing.expectEqual(want.items.len, parsed.conditions.len);
+    for (want.items, parsed.conditions) |w, p| {
+        try testing.expectEqual(w.field, p.field);
+        try testing.expectEqualStrings(w.key, p.key);
+        try testing.expectEqual(w.op, p.op);
+        try testing.expectEqualStrings(w.value, p.value);
+    }
+}
+
+test "fuzz filters: what the builder writes, the fake's own parser reads back as the same conditions" {
+    try test_util.fuzzBytes({}, filterProperty, .{ .corpus = &.{ "", "\x03\x00\x01\x02\x05a\"b\\c" } });
+}
+
+const filter_mod = @import("filter.zig");
+
+test "reads: a period's several points, group-by fields it does not know, an unclosed escape" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const g = "custom.googleapis.com/several";
+    for ([_]i64{ -50_000, -40_000, -30_000 }, [_]i64{ 5, 9, 7 }) |at, v| {
+        var r = try b.client.write(&.{gaugeAt(g, &.{}, b.at(at), v)});
+        r.deinit();
+    }
+    const m = b.client.metric(g);
+    var max = try m.read(.{ .start = b.at(-60_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .max } });
+    defer max.deinit();
+    try testing.expectEqual(9, max.value.series[0].points[0].value.?.int64);
+    var min = try m.read(.{ .start = b.at(-60_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .min } });
+    defer min.deinit();
+    try testing.expectEqual(5, min.value.series[0].points[0].value.?.int64);
+    var sum = try m.read(.{ .start = b.at(-60_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .sum, .reducer = .sum, .group_by = &.{"metadata.user_labels.team"} } });
+    defer sum.deinit();
+    try testing.expectEqual(21, sum.value.series[0].points[0].value.?.int64);
+    const unclosed = try b.raw(a, .GET, "timeSeries?filter=metric.type%20%3D%20%22a%5C&interval.endTime=2026-10-18T13%3A46%3A35Z", null);
+    try testing.expectEqual(501, unclosed.status);
+    const never_closed = try b.raw(a, .GET, "timeSeries?filter=metric.type%20%3D%20%22abc&interval.endTime=2026-10-18T13%3A46%3A35Z", null);
+    try testing.expectEqual(501, never_closed.status);
+    const bad_escape = try b.raw(a, .GET, "timeSeries?filter=metric.type%20%3D%20%22a%5Cn%22&interval.endTime=2026-10-18T13%3A46%3A35Z", null);
+    try testing.expectEqual(501, bad_escape.status);
+}
+
+test "reads: a point on a period's start belongs to the period before, (start, end] as a read's interval" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    const g = "custom.googleapis.com/edges";
+    for ([_]i64{ -60_000, -30_000 }, [_]i64{ 1, 2 }) |at, v| {
+        var r = try b.client.write(&.{gaugeAt(g, &.{}, b.at(at), v)});
+        r.deinit();
+    }
+    var periods = try b.client.metric(g).read(.{ .start = b.at(-120_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .count } });
+    defer periods.deinit();
+    const pts = periods.value.series[0].points;
+    try testing.expectEqual(2, pts.len);
+    try testing.expectEqual(1, pts[0].value.?.int64);
+    try testing.expectEqual(b.at(-60_000).nanoseconds, pts[1].end.nanoseconds);
+    try testing.expectEqual(1, pts[1].value.?.int64);
 }

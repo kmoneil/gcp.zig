@@ -23,12 +23,22 @@ including the ones that did not change.
   own. `Client.metric(type)` creates, reads and deletes a descriptor;
   `Client.listMetrics` lists them by prefix; `Client.resourceType` and
   `Client.listResourceTypes` read the resource types.
+  `Metric.read` reads a metric's series a page at a time: points in
+  (start, end], newest first, or with `.headers` only which series there
+  are; a `Filter` of label matches and a resource type, its values
+  escaped as production matched them; an `Aggregation` that aligns each
+  series' points per period (10 s at least, as production held it, where
+  Google documents 60) and reduces series by group. A page holds points,
+  so one series can span pages, as production's did. A 200 can still be
+  incomplete, which `SeriesPage.incomplete()` says.
   `monitoring.testing.FakeMonitoring` keeps descriptors and points and
   refuses what production refused, in its words: a point under 2.5 s
   after its series' last (production's floor, where Google documents
   5 s), out of order, too far ahead or back, a duplicate, a kind or value
-  type its descriptor does not take, and more. `examples/monitoring.zig
-  --fake` runs offline. Measured in production on 2026-10-18 before it
+  type its descriptor does not take, and more. It answers reads by its
+  own reading of the filter, unaligned or with the gauge aligners and
+  reducers min, max, mean, sum and count, and pages them as production
+  did. `examples/monitoring.zig --fake` runs offline. Measured in production on 2026-10-18 before it
   was built: the 2.5 s floor, a metric type of up to 512 characters,
   microsecond timestamps, NaN and the infinities taken as doubles, and
   a descriptor that reads back 404 for about 2 s after its create.
