@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.43.0 (unreleased)
+## 0.43.0 (2026-10-18)
 
 - error_reporting: new module, **experimental**: Cloud Error Reporting's
   read side, for an error dashboard (issue #207). `Client.groupStats`
