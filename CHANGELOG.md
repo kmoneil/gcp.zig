@@ -4,6 +4,39 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.44.0 (unreleased)
+
+- monitoring: new module, **experimental**: Cloud Monitoring's v3 API,
+  for a program's own metrics. `Client.write` sends one point to each of
+  up to 200 series and returns a `WriteResult`: how many points the
+  server wrote, and how many it refused and why, by status. Production
+  answers a write that refused any point with HTTP 400 and keeps the
+  rest, so that is a result, not an error. Each series is checked
+  before sending: metric types (up to 512 characters, as production
+  allowed, though Google documents 200), label keys and values, an
+  interval its kind allows, distributions that add up, no series twice.
+  A failed write is retried only when it never left (a refused
+  connection, a failed name lookup), unless `write_retries = .transient`
+  asks for more: a stored point sent again is refused. `Resource` names
+  the resource types that take user metrics with their required labels
+  as fields, and `Resource.randomTaskId` gives a process an id of its
+  own. `Client.metric(type)` creates, reads and deletes a descriptor;
+  `Client.listMetrics` lists them by prefix; `Client.resourceType` and
+  `Client.listResourceTypes` read the resource types.
+  `monitoring.testing.FakeMonitoring` keeps descriptors and points and
+  refuses what production refused, in its words: a point under 2.5 s
+  after its series' last (production's floor, where Google documents
+  5 s), out of order, too far ahead or back, a duplicate, a kind or value
+  type its descriptor does not take, and more. `examples/monitoring.zig
+  --fake` runs offline. Measured in production on 2026-10-18 before it
+  was built: the 2.5 s floor, a metric type of up to 512 characters,
+  microsecond timestamps, NaN and the infinities taken as doubles, and
+  a descriptor that reads back 404 for about 2 s after its create.
+- core: `query.writePath` writes a path of segments with its slashes
+  literal, as Cloud Monitoring needs a metric type.
+- auth, error_reporting, firestore, logging, pubsub, resource_manager,
+  secret_manager and storage: unchanged.
+
 ## 0.43.0 (2026-10-18)
 
 - error_reporting: new module, **experimental**: Cloud Error Reporting's
