@@ -46,7 +46,8 @@ pub const Order = enum {
     count,
     /// By the group's latest error.
     last_seen,
-    /// By when the group was made.
+    /// By when the group was made, newest first: by first seen, as
+    /// production orders it.
     created,
     /// By how many users the group's errors reached.
     affected_users,
@@ -260,8 +261,9 @@ pub const TimedCount = struct {
 pub const GroupStats = struct {
     group: Group,
     count: u64 = 0,
-    /// Distinct users, by `ErrorContext.user` or an HTTP request's remote
-    /// address; 0 when the errors named none.
+    /// Distinct users, by `ErrorContext.user`; 0 when the errors named
+    /// none. An error that named only a remote address was not counted
+    /// when measured, though Google's reference says one is.
     affected_users: u64 = 0,
     /// Ascending, non-overlapping, inside the period: every bucket, those
     /// with no errors too. Empty unless `timed_count_seconds` was set.
