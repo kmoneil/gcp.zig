@@ -62,7 +62,10 @@ pub const FakeKms = struct {
     keys: std.StringArrayHashMapUnmanaged(*Key) = .empty,
     /// Every key id ever deleted, by full name: never usable again.
     retired: std.ArrayList(Retired) = .empty,
-    operations: usize = 0,
+    /// IAM policies set, by the key ring's or key's full name.
+    policies: std.StringArrayHashMapUnmanaged(Policy) = .empty,
+    /// When each operation is done, by its number less one.
+    operations: std.ArrayList(i96) = .empty,
     faults: [3]Fault = .{ .{}, .{}, .{} },
     corruption: struct { n: usize = 0, kind: Corruption = .flip_payload } = .{},
     calls: usize = 0,
@@ -176,6 +179,10 @@ pub const FakeKms = struct {
 
     const Retired = struct { name: []const u8, original: []const u8, delete_time: i96 };
 
+    /// A policy as set: its bindings as JSON, its version, and how many
+    /// writes came before, which names its etag.
+    const Policy = struct { bindings: []const u8, version: i64, serial: u32 };
+
     pub fn init(gpa: Allocator, io: std.Io, options: Options) FakeKms {
         return .{ .gpa = gpa, .io = io, .options = options, .store = .init(gpa) };
     }
@@ -184,6 +191,8 @@ pub const FakeKms = struct {
         f.rings.deinit(f.gpa);
         f.keys.deinit(f.gpa);
         f.retired.deinit(f.gpa);
+        f.policies.deinit(f.gpa);
+        f.operations.deinit(f.gpa);
         f.store.deinit();
         f.* = undefined;
     }
@@ -373,7 +382,7 @@ pub const FakeKms = struct {
                 .GET => f.listRings(arena, target, params),
                 else => htmlNotFound(arena),
             },
-            .key_ring => if (target.method.len > 0) notModelled(arena, "this method on a key ring") else switch (req.method) {
+            .key_ring => if (target.method.len > 0) f.iamRoute(arena, req.method, target.ring_name, f.rings.contains(target.ring_name), target.method, body) else switch (req.method) {
                 .GET => f.getRing(arena, target),
                 .DELETE => f.deleteRing(arena, target),
                 else => htmlNotFound(arena),
@@ -476,10 +485,11 @@ pub const FakeKms = struct {
     fn deleteRing(f: *FakeKms, arena: Allocator, target: Target) Allocator.Error!Reply {
         if (!f.rings.contains(target.ring_name)) return notFound(arena, "KeyRing", target.ring_name);
         for (f.keys.values()) |k| if (std.mem.eql(u8, k.ring, target.ring_name)) {
-            return fail(arena, 400, "FAILED_PRECONDITION", try arena.print("fake: KeyRing {s} still holds keys; delete them first", .{target.ring_name}));
+            return failInfo(arena, 400, "FAILED_PRECONDITION", "KeyRings can only be deleted if all associated CryptoKeys have already been deleted.", "KEYRING_HAS_NON_DELETED_CRYPTOKEYS", &.{});
         };
         _ = f.rings.orderedRemove(target.ring_name);
-        return f.startOperation(arena, target, null);
+        // Production's was not done 10 s on; its id was free after 422 s.
+        return f.startOperation(arena, target, null, ring_delete_ns);
     }
 
     // Keys.
@@ -508,6 +518,9 @@ pub const FakeKms = struct {
         if (algorithm == .unknown or protection == .unknown) return fail(arena, 400, "INVALID_ARGUMENT", "fake: a key names an algorithm and a protection level this fake knows");
         if (algorithm.purpose() != purpose) return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("fake: algorithm {s} is not for purpose {s}", .{ algorithm.wire(), purpose.wire() }));
         if (protection != .software and protection != .hsm) return notModelled(arena, "an external or single-tenant key");
+        if (algorithm == .ec_sign_secp256k1_sha256 and protection == .software) {
+            return failInfo(arena, 400, "INVALID_ARGUMENT", "Algorithm EC_SIGN_SECP256K1_SHA256 is not supported for protection level: SOFTWARE", "ALGORITHM_NOT_SUPPORTED_FOR_PROTECTION_LEVEL", &.{ .{ "protection_level", "SOFTWARE" }, .{ "algorithm", "EC_SIGN_SECP256K1_SHA256" } });
+        }
         var delay = default_destroy_delay_s;
         if (stringField(o, "destroyScheduledDuration")) |d| {
             delay = durationSeconds(d) orelse return fail(arena, 400, "INVALID_ARGUMENT", "fake: destroyScheduledDuration is a duration");
@@ -543,6 +556,9 @@ pub const FakeKms = struct {
     }
 
     fn keyRoute(f: *FakeKms, arena: Allocator, method: tp.Method, target: Target, params: []const Param, body: []const u8) Allocator.Error!Reply {
+        if (std.mem.endsWith(u8, target.method, "IamPolicy") or std.mem.eql(u8, target.method, "testIamPermissions")) {
+            return f.iamRoute(arena, method, target.key_name, f.keys.contains(target.key_name), target.method, body);
+        }
         const k = f.keys.get(target.key_name) orelse return notFound(arena, "CryptoKey", target.key_name);
         if (std.mem.eql(u8, target.method, "updatePrimaryVersion")) {
             if (method != .POST) return htmlNotFound(arena);
@@ -563,7 +579,7 @@ pub const FakeKms = struct {
     }
 
     fn setPrimary(f: *FakeKms, arena: Allocator, k: *Key, body: []const u8) Allocator.Error!Reply {
-        if (k.purpose != .encrypt_decrypt) return fail(arena, 400, "INVALID_ARGUMENT", "fake: only ENCRYPT_DECRYPT keys have a primary version");
+        if (k.purpose != .encrypt_decrypt) return precondition(arena, try arena.print("Keys with purpose {s} do not have a primary version.", .{k.purpose.wire()}), "CRYPTO_SCHEME_MISMATCH", k.name);
         const root = parseJson(arena, body) orelse return invalidJson(arena);
         if (root != .object) return invalidJson(arena);
         const text = stringField(root.object, "cryptoKeyVersionId") orelse return invalidJson(arena);
@@ -586,12 +602,16 @@ pub const FakeKms = struct {
         var paths = std.mem.splitScalar(u8, mask, ',');
         var rotation_named = false;
         while (paths.next()) |p| {
+            // Production took snake case as well as the documented camel.
             if (std.mem.eql(u8, p, "labels")) {
                 labels = try storedLabels(f.store.allocator(), o) orelse return invalidJson(arena);
                 if (validate.labelsProblem(labels)) |problem| return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("fake: {s}", .{problem}));
-            } else if (std.mem.eql(u8, p, "rotationPeriod") or std.mem.eql(u8, p, "nextRotationTime")) {
+            } else if (oneOf(p, &.{ "rotationPeriod", "nextRotationTime", "rotation_period", "next_rotation_time" })) {
                 rotation_named = true;
-            } else if (std.mem.eql(u8, p, "versionTemplate.algorithm")) {
+            } else if (oneOf(p, &.{ "destroyScheduledDuration", "destroy_scheduled_duration", "purpose", "importOnly", "import_only" })) {
+                const proto = if (oneOf(p, &.{ "destroyScheduledDuration", "destroy_scheduled_duration" })) "destroy_scheduled_duration" else if (std.mem.eql(u8, p, "purpose")) "purpose" else "import_only";
+                return failInfo(arena, 400, "INVALID_ARGUMENT", try arena.print("Field crypto_key.{s} may not be updated. The value is immutable.", .{proto}), "IMMUTABLE_FIELD", &.{.{ "field_name", try arena.print("crypto_key.{s}", .{proto}) }});
+            } else if (oneOf(p, &.{ "versionTemplate.algorithm", "version_template.algorithm" })) {
                 const t = objectField(o, "versionTemplate") orelse return invalidJson(arena);
                 algorithm = types.Algorithm.fromWire(stringField(t, "algorithm") orelse "");
                 if (algorithm == .unknown or algorithm.purpose() != k.purpose) return fail(arena, 400, "INVALID_ARGUMENT", "fake: the template's algorithm is of the key's purpose");
@@ -600,8 +620,9 @@ pub const FakeKms = struct {
             }
         }
         if (rotation_named) {
-            if (k.purpose != .encrypt_decrypt and (o.get("rotationPeriod") != null or o.get("nextRotationTime") != null)) {
-                return fail(arena, 400, "INVALID_ARGUMENT", "fake: only ENCRYPT_DECRYPT keys rotate");
+            // Production refused even clearing them, on another purpose.
+            if (k.purpose != .encrypt_decrypt) {
+                return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Fields crypto_key.next_rotation_time and crypto_key.rotation_period must not be set if purpose is {s}.", .{k.purpose.wire()}));
             }
             if (try rotationOf(arena, o)) |r| switch (r) {
                 .refusal => |reply| return reply,
@@ -629,7 +650,7 @@ pub const FakeKms = struct {
         const retired_name = try std.fmt.allocPrint(f.store.allocator(), "{s}/retiredResources/r{d}", .{ target.location_name, f.retired.items.len + 1 });
         try f.retired.append(f.gpa, .{ .name = retired_name, .original = k.name, .delete_time = f.nowNs() });
         _ = f.keys.orderedRemove(k.name);
-        return f.startOperation(arena, target, retired_name);
+        return f.startOperation(arena, target, retired_name, 0);
     }
 
     fn listKeys(f: *FakeKms, arena: Allocator, target: Target, params: []const Param) Allocator.Error!Reply {
@@ -694,12 +715,15 @@ pub const FakeKms = struct {
             return .{ .status = 200, .body = try renderVersion(arena, k, v.*) };
         }
         if (std.mem.eql(u8, target.method, "restore")) {
-            if (v.state != .destroy_scheduled) return transitionRefused(arena, target.version_name, v.state);
+            if (v.state != .destroy_scheduled) return precondition(arena, try arena.print("The request cannot be fulfilled. Resource {s} has crypto_key_version.state: {s}, but DESTROY_SCHEDULED is required.", .{ target.version_name, v.state.wire() }), "SPECIFIC_ENUM_VALUE_REQUIRED", target.version_name);
             v.state = .disabled;
             v.destroy_time = null;
             return .{ .status = 200, .body = try renderVersion(arena, k, v.*) };
         }
         if (std.mem.eql(u8, target.method, "encrypt")) return f.encrypt(arena, k, v, body);
+        if (std.mem.eql(u8, target.method, "decrypt")) {
+            return failInfo(arena, 400, "INVALID_ARGUMENT", try arena.print("{s} is not a valid resource type for this request.", .{target.version_name}), "INVALID_RESOURCE_TYPE", &.{.{ "resource_name", target.version_name }});
+        }
         if (std.mem.eql(u8, target.method, "asymmetricSign")) return f.sign(arena, k, v, target.version_name, body);
         if (std.mem.eql(u8, target.method, "macSign")) return f.mac(arena, k, v, target.version_name, body, false);
         if (std.mem.eql(u8, target.method, "macVerify")) return f.mac(arena, k, v, target.version_name, body, true);
@@ -725,7 +749,7 @@ pub const FakeKms = struct {
             else => return transitionRefused(arena, target.version_name, v.state),
         }
         v.deleted = true;
-        return f.startOperation(arena, target, null);
+        return f.startOperation(arena, target, null, 0);
     }
 
     fn liveVersion(k: *Key, id: u64) ?*Version {
@@ -734,21 +758,62 @@ pub const FakeKms = struct {
         return if (v.deleted) null else v;
     }
 
+    // IAM: policies kept, enforced on no one.
+
+    fn iamRoute(f: *FakeKms, arena: Allocator, method: tp.Method, name: []const u8, exists: bool, call: []const u8, body: []const u8) Allocator.Error!Reply {
+        if (std.mem.eql(u8, call, "testIamPermissions")) {
+            if (method != .POST) return htmlNotFound(arena);
+            const o = (try requestObject(arena, body)) orelse return invalidJson(arena);
+            const asked = o.get("permissions") orelse return invalidJson(arena);
+            if (asked != .array) return invalidJson(arena);
+            // On a resource that does not exist, none is held, as Google
+            // documents; on one that does, every one, since the fake
+            // enforces nothing.
+            if (!exists or asked.array.items.len == 0) return .{ .status = 200, .body = "{}" };
+            var out: std.Io.Writer.Allocating = .init(arena);
+            var jw: Stringify = .{ .writer = &out.writer };
+            jw.write(.{ .permissions = asked }) catch return error.OutOfMemory;
+            return .{ .status = 200, .body = out.written() };
+        }
+        if (!exists) return notFound(arena, "Resource", name);
+        if (std.mem.eql(u8, call, "getIamPolicy")) {
+            if (method != .GET) return htmlNotFound(arena);
+            return .{ .status = 200, .body = try renderPolicy(arena, f.policies.get(name)) };
+        }
+        if (!std.mem.eql(u8, call, "setIamPolicy")) return notModelled(arena, try arena.print("{s} on a key ring or key", .{call}));
+        if (method != .POST) return htmlNotFound(arena);
+        const o = (try requestObject(arena, body)) orelse return invalidJson(arena);
+        const policy = objectField(o, "policy") orelse return invalidJson(arena);
+        const current = f.policies.get(name);
+        if (stringField(policy, "etag")) |etag| {
+            if (!std.mem.eql(u8, etag, try etagOf(arena, current))) return fail(arena, 409, "ABORTED", "There were concurrent policy changes. Please retry the whole read-modify-write with exponential backoff.");
+        }
+        var bindings: std.Io.Writer.Allocating = .init(f.store.allocator());
+        var jw: Stringify = .{ .writer = &bindings.writer };
+        jw.write(policy.get("bindings") orelse JsonValue{ .array = .init(arena) }) catch return error.OutOfMemory;
+        const policy_version: i64 = if (policy.get("version")) |v| @intCast(crcOf(v) orelse 1) else 1;
+        const stored_name = if (f.policies.getKey(name)) |k| k else try f.store.allocator().dupe(u8, name);
+        try f.policies.put(f.gpa, stored_name, .{ .bindings = bindings.written(), .version = policy_version, .serial = if (current) |c| c.serial + 1 else 1 });
+        return .{ .status = 200, .body = try renderPolicy(arena, f.policies.get(name)) };
+    }
+
     // Cryptography.
 
-    /// The fake's ciphertext: a magic, the version, a nonce, AES-256-GCM
-    /// over the plaintext with the key's name and the AAD as associated
-    /// data, so another key's ciphertext fails as production's does.
-    const ciphertext_magic = "FKC1";
-    const ciphertext_overhead = ciphertext_magic.len + 8 + Aes256Gcm.nonce_length + Aes256Gcm.tag_length;
+    /// The fake's ciphertext: a magic, the key's name hashed, the version,
+    /// a nonce, then AES-256-GCM over the plaintext with the key's name and
+    /// the AAD as associated data. The hash tells another key's ciphertext
+    /// from one whose AAD is wrong, as production's answers do.
+    const ciphertext_magic = "FKC2";
+    const ciphertext_overhead = ciphertext_magic.len + 8 + 8 + Aes256Gcm.nonce_length + Aes256Gcm.tag_length;
+    const header_len = ciphertext_magic.len + 8 + 8;
 
     fn encrypt(f: *FakeKms, arena: Allocator, k: *Key, pinned: ?*Version, body: []const u8) Allocator.Error!Reply {
         if (k.purpose != .encrypt_decrypt) return wrongPurpose(arena, k, "encrypt");
         const o = (try requestObject(arena, body)) orelse return invalidJson(arena);
         const plaintext = (try checkedBytes(arena, o, "plaintext", "plaintext")).value orelse return invalidJson(arena);
         const aad = (try checkedBytes(arena, o, "additionalAuthenticatedData", "additional_authenticated_data")).value orelse return invalidJson(arena);
+        if (try sizeRefusal(arena, &.{ .{ "plaintext", plaintext.len }, .{ "additional_authenticated_data", aad.len } })) |r| return r;
         if (try checksumRefusal(arena, o, &.{ .{ "plaintext", "plaintext" }, .{ "additionalAuthenticatedData", "additional_authenticated_data" } })) |r| return r;
-        if (plaintext.len > validate.max_payload or aad.len > validate.max_payload) return fail(arena, 400, "INVALID_ARGUMENT", "fake: plaintext and AAD are at most 64 KiB each");
         const v = pinned orelse (if (k.primary) |p| &k.versions.items[p - 1] else return fail(arena, 400, "FAILED_PRECONDITION", "fake: the key has no primary version"));
         const name = try versionName(arena, k, v.id);
         if (v.state != .enabled) return notEnabled(arena, name, v.state);
@@ -756,11 +821,12 @@ pub const FakeKms = struct {
         if (corruption == .refuse_checksum) return checksumRefused(arena, "plaintext");
         const out = try arena.alloc(u8, ciphertext_overhead + plaintext.len);
         @memcpy(out[0..4], ciphertext_magic);
-        std.mem.writeInt(u64, out[4..12], v.id, .big);
-        const nonce = out[12..][0..Aes256Gcm.nonce_length];
+        std.mem.writeInt(u64, out[4..12], std.hash.Wyhash.hash(0, k.name), .big);
+        std.mem.writeInt(u64, out[12..20], v.id, .big);
+        const nonce = out[header_len..][0..Aes256Gcm.nonce_length];
         f.io.random(nonce);
         const ad = try std.mem.concat(arena, u8, &.{ k.name, "\x00", aad });
-        const ct = out[12 + Aes256Gcm.nonce_length ..][0..plaintext.len];
+        const ct = out[header_len + Aes256Gcm.nonce_length ..][0..plaintext.len];
         const tag = out[out.len - Aes256Gcm.tag_length ..][0..Aes256Gcm.tag_length];
         Aes256Gcm.encrypt(ct, tag, plaintext, ad, nonce.*, v.material.aes);
         return f.cryptoAnswer(arena, corruption, .{
@@ -776,22 +842,25 @@ pub const FakeKms = struct {
         const o = (try requestObject(arena, body)) orelse return invalidJson(arena);
         const ciphertext = (try checkedBytes(arena, o, "ciphertext", "ciphertext")).value orelse return invalidJson(arena);
         const aad = (try checkedBytes(arena, o, "additionalAuthenticatedData", "additional_authenticated_data")).value orelse return invalidJson(arena);
+        if (try sizeRefusal(arena, &.{.{ "additional_authenticated_data", aad.len }})) |r| return r;
         if (try checksumRefusal(arena, o, &.{ .{ "ciphertext", "ciphertext" }, .{ "additionalAuthenticatedData", "additional_authenticated_data" } })) |r| return r;
+        // Production's words, 2026-10-18, for each.
         const invalid = "Decryption failed: the ciphertext is invalid.";
-        const wrong_key = "Decryption failed: verify that 'name' refers to the correct CryptoKey.";
         if (ciphertext.len < ciphertext_overhead or !std.mem.eql(u8, ciphertext[0..4], ciphertext_magic)) return fail(arena, 400, "INVALID_ARGUMENT", invalid);
-        const id = std.mem.readInt(u64, ciphertext[4..12], .big);
-        const v = liveVersion(k, id) orelse return fail(arena, 400, "INVALID_ARGUMENT", wrong_key);
+        const wrong_key = failInfo(arena, 400, "INVALID_ARGUMENT", "Decryption failed: verify that 'name' refers to the correct CryptoKey.", "INDECIPHERABLE_CIPHERTEXT_FOR_CRYPTOKEY", &.{});
+        if (std.mem.readInt(u64, ciphertext[4..12], .big) != std.hash.Wyhash.hash(0, k.name)) return wrong_key;
+        const id = std.mem.readInt(u64, ciphertext[12..20], .big);
+        const v = liveVersion(k, id) orelse return wrong_key;
         if (v.state != .enabled) return notEnabled(arena, try versionName(arena, k, v.id), v.state);
-        if (v.material.* != .aes) return fail(arena, 400, "INVALID_ARGUMENT", wrong_key);
+        if (v.material.* != .aes) return wrong_key;
         const corruption = f.takeCorruption();
         if (corruption == .refuse_checksum) return checksumRefused(arena, "ciphertext");
-        const nonce = ciphertext[12..][0..Aes256Gcm.nonce_length];
-        const ct = ciphertext[12 + Aes256Gcm.nonce_length .. ciphertext.len - Aes256Gcm.tag_length];
+        const nonce = ciphertext[header_len..][0..Aes256Gcm.nonce_length];
+        const ct = ciphertext[header_len + Aes256Gcm.nonce_length .. ciphertext.len - Aes256Gcm.tag_length];
         const tag = ciphertext[ciphertext.len - Aes256Gcm.tag_length ..][0..Aes256Gcm.tag_length];
         const plaintext = try arena.alloc(u8, ct.len);
         const ad = try std.mem.concat(arena, u8, &.{ k.name, "\x00", aad });
-        Aes256Gcm.decrypt(plaintext, ct, tag.*, ad, nonce.*, v.material.aes) catch return fail(arena, 400, "INVALID_ARGUMENT", wrong_key);
+        Aes256Gcm.decrypt(plaintext, ct, tag.*, ad, nonce.*, v.material.aes) catch return fail(arena, 400, "INVALID_ARGUMENT", "Decryption failed.");
         return f.cryptoAnswer(arena, corruption, .{
             .payload = .{ "plaintext", plaintext },
             .flags = &.{.{ "usedPrimary", k.primary == v.id }},
@@ -806,31 +875,47 @@ pub const FakeKms = struct {
         const want = v.algorithm.signInput() orelse return notModelled(arena, try arena.print("signing with {s}", .{v.algorithm.wire()}));
         var input: []const u8 = undefined;
         var flag: []const u8 = undefined;
+        var data_given = false;
         switch (want) {
-            .digest => |kind| {
-                if (o.get("data") != null) return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("fake: {s} signs a digest, not data", .{v.algorithm.wire()}));
-                const digest = objectField(o, "digest") orelse return fail(arena, 400, "INVALID_ARGUMENT", "fake: a digest is required");
-                if (digest.count() != 1 or !std.mem.eql(u8, digest.keys()[0], @tagName(kind))) return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("fake: {s} signs a {s} digest", .{ v.algorithm.wire(), @tagName(kind) }));
+            .digest => |kind| if (o.get("data") != null) {
+                // Production signed data sent to a key that takes a digest,
+                // hashing it itself (2026-10-18).
+                const data = (try checkedBytes(arena, o, "data", "data")).value orelse return invalidJson(arena);
+                if (try sizeRefusal(arena, &.{.{ "data", data.len }})) |r| return r;
+                if (try checksumRefusal(arena, o, &.{.{ "data", "data" }})) |r| return r;
+                var buf: [64]u8 = undefined;
+                input = try arena.dupe(u8, kind.digest(data, &buf));
+                flag = "verifiedDataCrc32c";
+                data_given = true;
+            } else {
+                const digest = objectField(o, "digest") orelse return fail(arena, 400, "INVALID_ARGUMENT", "fake: a digest or data is required");
+                if (digest.count() != 1) return invalidJson(arena);
+                const sent = digest.keys()[0];
+                if (!std.mem.eql(u8, sent, @tagName(kind))) return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("The digest {s} is not valid for CryptoKeys with algorithm {s}.", .{ try std.ascii.allocUpperString(arena, sent), v.algorithm.wire() }));
                 input = (try checkedBytes(arena, digest, @tagName(kind), "")).value orelse return invalidJson(arena);
-                if (input.len != kind.length()) return fail(arena, 400, "INVALID_ARGUMENT", "fake: the digest's length is not its algorithm's");
+                if (input.len != kind.length()) {
+                    const field = try arena.print("digest.{s}", .{@tagName(kind)});
+                    return failInfo(arena, 400, "INVALID_ARGUMENT", try arena.print("Request field {s} must have length of {d}. Provided value had length {d}.", .{ field, kind.length(), input.len }), "INVALID_REQUEST_FIELD_SIZE", &.{ .{ "actual_size", try arena.print("{d}", .{input.len}) }, .{ "expected_size", try arena.print("{d}", .{kind.length()}) }, .{ "field_name", field } });
+                }
                 if (o.get("digestCrc32c")) |crc| if (crcOf(crc) != core.crc32c.hash(input)) return checksumRefused(arena, "digest");
                 flag = "verifiedDigestCrc32c";
             },
             .data => {
                 if (o.get("digest") != null) return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("fake: {s} signs data, not a digest", .{v.algorithm.wire()}));
                 input = (try checkedBytes(arena, o, "data", "data")).value orelse return invalidJson(arena);
-                if (input.len > validate.max_payload) return fail(arena, 400, "INVALID_ARGUMENT", "fake: data is at most 64 KiB");
+                if (try sizeRefusal(arena, &.{.{ "data", input.len }})) |r| return r;
                 if (try checksumRefusal(arena, o, &.{.{ "data", "data" }})) |r| return r;
                 flag = "verifiedDataCrc32c";
+                data_given = true;
             },
         }
         const corruption = f.takeCorruption();
-        if (corruption == .refuse_checksum) return checksumRefused(arena, if (want == .data) "data" else "digest");
+        if (corruption == .refuse_checksum) return checksumRefused(arena, if (data_given) "data" else "digest");
         const signature = (try f.signWith(arena, v, input)) orelse return notModelled(arena, try arena.print("signing with {s}", .{v.algorithm.wire()}));
         return f.cryptoAnswer(arena, corruption, .{
             .name = name,
             .payload = .{ "signature", signature },
-            .flags = &.{.{ flag, o.get(if (want == .data) "dataCrc32c" else "digestCrc32c") != null }},
+            .flags = &.{.{ flag, o.get(if (data_given) "dataCrc32c" else "digestCrc32c") != null }},
             .protection_level = v.protection_level,
         });
     }
@@ -878,7 +963,7 @@ pub const FakeKms = struct {
         if (v.state != .enabled) return notEnabled(arena, name, v.state);
         const o = (try requestObject(arena, body)) orelse return invalidJson(arena);
         const data = (try checkedBytes(arena, o, "data", "data")).value orelse return invalidJson(arena);
-        if (data.len > validate.max_payload) return fail(arena, 400, "INVALID_ARGUMENT", "fake: data is at most 64 KiB");
+        if (try sizeRefusal(arena, &.{.{ "data", data.len }})) |r| return r;
         if (try checksumRefusal(arena, o, if (verify) &.{ .{ "data", "data" }, .{ "mac", "mac" } } else &.{.{ "data", "data" }})) |r| return r;
         const corruption = f.takeCorruption();
         if (corruption == .refuse_checksum) return checksumRefused(arena, "data");
@@ -911,11 +996,18 @@ pub const FakeKms = struct {
         const v = liveVersion(k, target.version) orelse return notFound(arena, "CryptoKeyVersion", target.version_name);
         if (k.purpose != .asymmetric_sign) return wrongPurpose(arena, k, "getPublicKey");
         if (v.state != .enabled) return notEnabled(arena, target.version_name, v.state);
-        const format = paramOf(params, "publicKeyFormat") orelse "PEM";
-        const pq = v.algorithm.postQuantum();
-        if (pq and !std.mem.eql(u8, format, "NIST_PQC")) return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("fake: Only NIST_PQC format is supported for {s}.", .{v.algorithm.wire()}));
-        if (!pq and !std.mem.eql(u8, format, "PEM")) return notModelled(arena, try arena.print("public key format {s}", .{format}));
-        const key = (try publicKeyOf(arena, v)) orelse return notModelled(arena, try arena.print("a public key for {s}", .{v.algorithm.wire()}));
+        // As production answered, 2026-10-18: with no format, the PEM in
+        // `pem`; asked for as PEM, in `publicKey.data`, ML-DSA's too; DER,
+        // the SubjectPublicKeyInfo itself; NIST_PQC, a post-quantum key's
+        // own encoding.
+        const format = paramOf(params, "publicKeyFormat");
+        const der = (try spkiDerOf(arena, v)) orelse return notModelled(arena, try arena.print("a public key for {s}", .{v.algorithm.wire()}));
+        const key: []const u8 = if (format) |fmt| k: {
+            if (std.mem.eql(u8, fmt, "PEM")) break :k try pemOf(arena, der);
+            if (std.mem.eql(u8, fmt, "DER")) break :k der;
+            if (std.mem.eql(u8, fmt, "NIST_PQC") and v.algorithm.postQuantum()) break :k rawOf(v).?;
+            return notModelled(arena, try arena.print("public key format {s} for {s}", .{ fmt, v.algorithm.wire() }));
+        } else try pemOf(arena, der);
         // A public key's request carries no checksum to refuse.
         const corruption = f.takeCorruption();
         var shown = key;
@@ -933,7 +1025,6 @@ pub const FakeKms = struct {
             .format = format,
             .key = shown,
             .crc = core.crc32c.hash(key),
-            .pem = !pq,
         }) catch return error.OutOfMemory;
         return .{ .status = 200, .body = out.written() };
     }
@@ -997,19 +1088,25 @@ pub const FakeKms = struct {
         return .{ .status = 200, .body = out.written() };
     }
 
+    /// How long the fake takes to finish a key ring's delete: production's
+    /// id was free again 422 s on.
+    pub const ring_delete_ns: i96 = 422 * std.time.ns_per_s;
+
     /// A delete's operation: the work done, the answer not, as production
-    /// answered; read back, it is done.
-    fn startOperation(f: *FakeKms, arena: Allocator, target: Target, retired: ?[]const u8) Allocator.Error!Reply {
-        f.operations += 1;
-        return .{ .status = 200, .body = try renderOperation(arena, target.location_name, f.operations, retired, false) };
+    /// answered. Read back after `takes_ns`, it is done: at once for a key
+    /// or a version, as production's were 0.2 s later.
+    fn startOperation(f: *FakeKms, arena: Allocator, target: Target, retired: ?[]const u8, takes_ns: i96) Allocator.Error!Reply {
+        try f.operations.append(f.gpa, f.nowNs() + takes_ns);
+        return .{ .status = 200, .body = try renderOperation(arena, target.location_name, f.operations.items.len, retired, false) };
     }
 
     fn getOperation(f: *FakeKms, arena: Allocator, route_text: []const u8) Allocator.Error!Reply {
         const name = route_text["/v1/".len..];
         const at = std.mem.lastIndexOf(u8, name, "/operations/op-") orelse return notFound(arena, "Operation", name);
         const n = std.fmt.parseInt(usize, name[at + "/operations/op-".len ..], 10) catch return notFound(arena, "Operation", name);
-        if (n == 0 or n > f.operations) return notFound(arena, "Operation", name);
-        return .{ .status = 200, .body = try renderOperation(arena, name[0..at], n, null, true) };
+        if (n == 0 or n > f.operations.items.len) return notFound(arena, "Operation", name);
+        const done = f.operations.items[n - 1] <= f.nowNs();
+        return .{ .status = 200, .body = try renderOperation(arena, name[0..at], n, null, done) };
     }
 
     // Rendering.
@@ -1075,6 +1172,20 @@ pub const FakeKms = struct {
     }
 };
 
+/// "ACAB" for a resource whose policy was never set, as production
+/// answered a fresh key ring's; a new etag at every write after.
+fn etagOf(arena: Allocator, policy: ?FakeKms.Policy) Allocator.Error![]const u8 {
+    const p = policy orelse return "ACAB";
+    return arena.print("BwY{d}", .{p.serial});
+}
+
+fn renderPolicy(arena: Allocator, policy: ?FakeKms.Policy) Allocator.Error![]const u8 {
+    const etag = try etagOf(arena, policy);
+    const p = policy orelse return arena.print("{{\"etag\":\"{s}\"}}", .{etag});
+    if (std.mem.eql(u8, p.bindings, "[]")) return arena.print("{{\"version\":{d},\"etag\":\"{s}\"}}", .{ p.version, etag });
+    return arena.print("{{\"version\":{d},\"etag\":\"{s}\",\"bindings\":{s}}}", .{ p.version, etag, p.bindings });
+}
+
 fn writeAnswer(jw: *Stringify, a: FakeKms.Answer, corruption: ?FakeKms.Corruption) Stringify.Error!void {
     try jw.beginObject();
     if (a.name) |n| {
@@ -1113,35 +1224,37 @@ const PublicKeyAnswer = struct {
     name: []const u8,
     algorithm: types.Algorithm,
     protection_level: types.ProtectionLevel,
-    format: []const u8,
+    /// Null when none was asked for: the key goes in `pem`.
+    format: ?[]const u8,
     key: []const u8,
     crc: u32,
-    /// The key is a PEM, also in `pem` with its checksum.
-    pem: bool,
 };
 
 fn writePublicKey(jw: *Stringify, a: PublicKeyAnswer) Stringify.Error!void {
     try jw.beginObject();
-    if (a.pem) {
+    if (a.format == null) {
         try jw.objectField("pem");
         try jw.write(a.key);
-        try jw.objectField("pemCrc32c");
-        try jw.print("\"{d}\"", .{a.crc});
     }
     try jw.objectField("algorithm");
     try jw.write(a.algorithm.wire());
+    if (a.format == null) {
+        try jw.objectField("pemCrc32c");
+        try jw.print("\"{d}\"", .{a.crc});
+    }
     try jw.objectField("name");
     try jw.write(a.name);
     try jw.objectField("protectionLevel");
     try jw.write(a.protection_level.wire());
+    const fmt = a.format orelse return jw.endObject();
     try jw.objectField("publicKeyFormat");
-    try jw.write(a.format);
+    try jw.write(fmt);
     try jw.objectField("publicKey");
     try jw.beginObject();
-    try jw.objectField("data");
-    try core.base64.writeJsonString(jw, a.key);
     try jw.objectField("crc32cChecksum");
     try jw.print("\"{d}\"", .{a.crc});
+    try jw.objectField("data");
+    try core.base64.writeJsonString(jw, a.key);
     try jw.endObject();
     try jw.endObject();
 }
@@ -1171,9 +1284,17 @@ fn macOf(a: types.Algorithm, key: []const u8, data: []const u8, buf: *[64]u8) []
     }
 }
 
-/// A classical version's public key as a PEM SubjectPublicKeyInfo, or a
-/// post-quantum one's NIST encoding; null for one the fake does not model.
-fn publicKeyOf(arena: Allocator, v: *const FakeKms.Version) Allocator.Error!?[]const u8 {
+/// A post-quantum version's public key in its NIST encoding, or null.
+fn rawOf(v: *const FakeKms.Version) ?[]const u8 {
+    return switch (v.material.*) {
+        inline .mldsa44, .mldsa65, .mldsa87 => |*kp| &kp.public_key.toBytes(),
+        else => null,
+    };
+}
+
+/// A version's public key as a DER SubjectPublicKeyInfo, copied into
+/// `arena`; null for one the fake does not model.
+fn spkiDerOf(arena: Allocator, v: *const FakeKms.Version) Allocator.Error!?[]const u8 {
     var der_buf: [core.rsa.max_spki_len]u8 = undefined;
     const der: []const u8 = switch (v.material.*) {
         .p256 => |kp| ecSpki(&der_buf, &.{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 }, &kp.public_key.toUncompressedSec1()),
@@ -1190,10 +1311,29 @@ fn publicKeyOf(arena: Allocator, v: *const FakeKms.Version) Allocator.Error!?[]c
             defer key.deinit();
             break :rsa key.publicKey().writeSpki(&der_buf);
         },
-        inline .mldsa44, .mldsa65, .mldsa87 => |kp| return try arena.dupe(u8, &kp.public_key.toBytes()),
+        inline .mldsa44, .mldsa65, .mldsa87 => |kp, tag| {
+            // SEQUENCE { SEQUENCE { id-ml-dsa-N }, BIT STRING key }, as
+            // production's PEM for ML-DSA-65 was.
+            const last: u8 = switch (tag) {
+                .mldsa44 => 0x11,
+                .mldsa65 => 0x12,
+                else => 0x13,
+            };
+            const raw = kp.public_key.toBytes();
+            const algorithm = [_]u8{ 0x30, 0x0b, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, last };
+            const bits_len = raw.len + 1;
+            const inner_len = algorithm.len + 4 + bits_len;
+            var out: std.Io.Writer.Allocating = .init(arena);
+            const w = &out.writer;
+            w.writeAll(&.{ 0x30, 0x82, @intCast(inner_len >> 8), @intCast(inner_len & 0xff) }) catch return error.OutOfMemory;
+            w.writeAll(&algorithm) catch return error.OutOfMemory;
+            w.writeAll(&.{ 0x03, 0x82, @intCast(bits_len >> 8), @intCast(bits_len & 0xff), 0x00 }) catch return error.OutOfMemory;
+            w.writeAll(&raw) catch return error.OutOfMemory;
+            return out.written();
+        },
         else => return null,
     };
-    return try pemOf(arena, der);
+    return try arena.dupe(u8, der);
 }
 
 /// SEQUENCE { SEQUENCE { ecPublicKey, curve }, BIT STRING point }, for a
@@ -1268,13 +1408,17 @@ fn checksumRefusal(arena: Allocator, o: std.json.ObjectMap, fields: []const stru
 }
 
 /// "The checksum in field plaintext_crc32c did not match the data in
-/// field plaintext.", as Google's data-integrity guide quotes it.
+/// field plaintext.", with its `ErrorInfo`, as production answered.
 fn checksumRefused(arena: Allocator, field: []const u8) Allocator.Error!FakeKms.Reply {
-    return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("The checksum in field {s}_crc32c did not match the data in field {s}.", .{ field, field }));
+    const checksum_field = try arena.print("{s}_crc32c", .{field});
+    return failInfo(arena, 400, "INVALID_ARGUMENT", try arena.print("The checksum in field {s} did not match the data in field {s}.", .{ checksum_field, field }), "INVALID_CHECKSUM", &.{ .{ "checksum_field", checksum_field }, .{ "data_field", field } });
 }
 
+/// A call on a key of another purpose, in the words production used for an
+/// encrypt with a signing key.
 fn wrongPurpose(arena: Allocator, k: *const FakeKms.Key, call: []const u8) Allocator.Error!FakeKms.Reply {
-    return fail(arena, 400, "FAILED_PRECONDITION", try arena.print("fake: {s} is not for a key of purpose {s}: {s}", .{ call, k.purpose.wire(), k.name }));
+    const expected: []const u8 = if (std.mem.eql(u8, call, "encrypt") or std.mem.eql(u8, call, "decrypt")) "ENCRYPT_DECRYPT" else if (std.mem.startsWith(u8, call, "mac")) "MAC" else "ASYMMETRIC_SIGN";
+    return precondition(arena, try arena.print("Operation requested for Key {s} has incorrect key purpose: {s}, expected key purpose is: {s}", .{ k.name, k.purpose.wire(), expected }), "CRYPTO_SCHEME_MISMATCH", k.name);
 }
 
 const Target = struct {
@@ -1626,7 +1770,7 @@ pub fn notEnabled(arena: Allocator, version_name: []const u8, state: types.State
 
 /// A state change the machine forbids, in production's words.
 fn transitionRefused(arena: Allocator, version_name: []const u8, state: types.State) Allocator.Error!FakeKms.Reply {
-    return fail(arena, 400, "FAILED_PRECONDITION", try arena.print("The request cannot be fulfilled. Resource {s} has value {s} in field crypto_key_version.state.", .{ version_name, state.wire() }));
+    return precondition(arena, try arena.print("The request cannot be fulfilled. Resource {s} has value {s} in field crypto_key_version.state.", .{ version_name, state.wire() }), "INVALID_ENUM_VALUE_CHOICE", version_name);
 }
 
 /// A create under a deleted key's id, in production's words.
@@ -1645,8 +1789,83 @@ fn retiredRefusal(arena: Allocator, name: []const u8, retired: []const u8) Alloc
     } }, .{}) };
 }
 
+/// "CryptoKeyVersion projects/... not found.", as production wrote it of a
+/// version; the fake writes it of every kind.
 fn notFound(arena: Allocator, kind: []const u8, name: []const u8) Allocator.Error!FakeKms.Reply {
-    return fail(arena, 404, "NOT_FOUND", try arena.print("fake: {s} {s} not found.", .{ kind, name }));
+    return fail(arena, 404, "NOT_FOUND", try arena.print("{s} {s} not found.", .{ kind, name }));
+}
+
+/// A refusal with a `google.rpc.ErrorInfo` of `reason`, its metadata as
+/// pairs, as production wrote its field-size, checksum and other refusals.
+fn failInfo(arena: Allocator, code: u16, status: []const u8, message: []const u8, reason: []const u8, metadata: []const [2][]const u8) Allocator.Error!FakeKms.Reply {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeFailInfo(&jw, code, status, message, reason, metadata) catch return error.OutOfMemory;
+    return .{ .status = code, .body = out.written() };
+}
+
+fn writeFailInfo(jw: *Stringify, code: u16, status: []const u8, message: []const u8, reason: []const u8, metadata: []const [2][]const u8) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("error");
+    try jw.beginObject();
+    try jw.objectField("code");
+    try jw.write(code);
+    try jw.objectField("message");
+    try jw.write(message);
+    try jw.objectField("status");
+    try jw.write(status);
+    try jw.objectField("details");
+    try jw.beginArray();
+    try jw.beginObject();
+    try jw.objectField("@type");
+    try jw.write("type.googleapis.com/google.rpc.ErrorInfo");
+    try jw.objectField("reason");
+    try jw.write(reason);
+    try jw.objectField("domain");
+    try jw.write("cloudkms.googleapis.com");
+    if (metadata.len > 0) {
+        try jw.objectField("metadata");
+        try jw.beginObject();
+        for (metadata) |m| {
+            try jw.objectField(m[0]);
+            try jw.write(m[1]);
+        }
+        try jw.endObject();
+    }
+    try jw.endObject();
+    try jw.endArray();
+    try jw.endObject();
+    try jw.endObject();
+}
+
+/// `FAILED_PRECONDITION` with a `google.rpc.PreconditionFailure` of one
+/// violation, as production answered a wrong purpose and a forbidden state
+/// change.
+fn precondition(arena: Allocator, message: []const u8, violation: []const u8, subject: []const u8) Allocator.Error!FakeKms.Reply {
+    return .{ .status = 400, .body = try Stringify.valueAlloc(arena, .{ .@"error" = .{
+        .code = 400,
+        .message = message,
+        .status = "FAILED_PRECONDITION",
+        .details = .{.{
+            .@"@type" = "type.googleapis.com/google.rpc.PreconditionFailure",
+            .violations = .{.{ .type = violation, .subject = subject }},
+        }},
+    } }, .{}) };
+}
+
+/// The first field past 64 KiB, in production's words, or null.
+fn sizeRefusal(arena: Allocator, fields: []const struct { []const u8, usize }) Allocator.Error!?FakeKms.Reply {
+    for (fields) |f| {
+        if (f[1] <= validate.max_payload) continue;
+        const actual = try arena.print("{d}", .{f[1]});
+        return try failInfo(arena, 400, "INVALID_ARGUMENT", try arena.print("Request field {s} must have length of at least 0, but not more than 65536. Provided value had length {d}.", .{ f[0], f[1] }), "INVALID_REQUEST_FIELD_SIZE", &.{ .{ "field_name", f[0] }, .{ "max_expected_size", "65536" }, .{ "min_expected_size", "0" }, .{ "actual_size", actual } });
+    }
+    return null;
+}
+
+fn oneOf(text: []const u8, options: []const []const u8) bool {
+    for (options) |o| if (std.mem.eql(u8, text, o)) return true;
+    return false;
 }
 
 fn invalidId(arena: Allocator, field: []const u8, id: []const u8) Allocator.Error!FakeKms.Reply {
@@ -1820,7 +2039,7 @@ test "an asymmetric version is pending for the fake's delay, and a version-less 
     try testing.expectEqual(types.Algorithm.ec_sign_p256_sha256, ready.value.algorithm);
     ready.deinit();
     // Signing keys have no primary to set.
-    try testing.expectError(error.InvalidArgument, key.setPrimary(1));
+    try testing.expectError(error.FailedPrecondition, key.setPrimary(1));
 
     const bare = ring.key("bare");
     var b = try bare.create(.{ .purpose = .mac, .algorithm = .hmac_sha256, .first_version = false });
@@ -1900,7 +2119,7 @@ test "the fake refuses what production would: missing rings, state changes the m
     info.deinit();
     // The client checks first; the fake refuses the same when sent raw.
     try testing.expectError(error.FailedPrecondition, key.version(1).restore());
-    try testing.expect(std.mem.indexOf(u8, r.diag.message(), "has value ENABLED in field crypto_key_version.state") != null);
+    try testing.expect(std.mem.indexOf(u8, r.diag.message(), "has crypto_key_version.state: ENABLED, but DESTROY_SCHEDULED is required.") != null);
     try testing.expectError(error.NotFound, key.version(9).get());
     try testing.expectError(error.NotFound, key.setPrimary(9));
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -2013,7 +2232,7 @@ test "routes no client call takes: operations read back, a disabled new version,
         .{ .PUT, loc ++ "/keyRings/r/cryptoKeys/k2", "{}", 404, "Error 404" },
         .{ .GET, loc ++ "/keyRings/r/cryptoKeys/k2:updatePrimaryVersion", null, 404, "Error 404" },
         .{ .POST, loc ++ "/keyRings/r/cryptoKeys/k2:frobnicate", "{}", 501, "this method on a key" },
-        .{ .POST, loc ++ "/keyRings/r:getIamPolicy", "{}", 501, "this method on a key ring" },
+        .{ .POST, loc ++ "/keyRings/r:frobnicate", "{}", 501, "frobnicate on a key ring or key" },
         .{ .PUT, loc ++ "/keyRings/r", "{}", 404, "Error 404" },
         .{ .PUT, loc ++ "/keyRings", "{}", 404, "Error 404" },
         .{ .PUT, loc ++ "/keyRings/r/cryptoKeys", "{}", 404, "Error 404" },
@@ -2021,7 +2240,10 @@ test "routes no client call takes: operations read back, a disabled new version,
         .{ .POST, "https://cloudkms.googleapis.com/v1/projects/my-project/locations", "{}", 404, "Error 404" },
         .{ .GET, "https://cloudkms.googleapis.com/v1/projects/other/locations", null, 501, "a project other than the fake's own" },
         .{ .GET, loc ++ "/keyRings?a", null, 400, "Invalid query string" },
-        .{ .PATCH, loc ++ "/keyRings/r/cryptoKeys/k2?updateMask=purpose", "{}", 501, "updateMask path purpose" },
+        .{ .PATCH, loc ++ "/keyRings/r/cryptoKeys/k2?updateMask=purpose", "{}", 400, "Field crypto_key.purpose may not be updated. The value is immutable." },
+        .{ .PATCH, loc ++ "/keyRings/r/cryptoKeys/k2?updateMask=destroy_scheduled_duration", "{}", 400, "\"reason\":\"IMMUTABLE_FIELD\"" },
+        .{ .PATCH, loc ++ "/keyRings/r/cryptoKeys/k2?updateMask=versionTemplate.protectionLevel", "{}", 501, "updateMask path versionTemplate.protectionLevel" },
+        .{ .POST, loc ++ "/keyRings/r/cryptoKeys/k2/cryptoKeyVersions/1:decrypt", "{}", 400, "is not a valid resource type for this request." },
         .{ .PATCH, loc ++ "/keyRings/r/cryptoKeys/k2?updateMask=rotationPeriod,nextRotationTime", "{\"rotationPeriod\":\"60s\",\"nextRotationTime\":\"2026-10-19T00:00:00Z\"}", 400, "Invalid rotation period." },
         .{ .PATCH, loc ++ "/keyRings/r/cryptoKeys/k2/cryptoKeyVersions/1?updateMask=algorithm", "{}", 501, "updateMask algorithm" },
         .{ .POST, loc ++ "/keyRings/r/cryptoKeys/k2:updatePrimaryVersion", "{\"cryptoKeyVersionId\":\"2\"}", 501, "not enabled" },
@@ -2072,13 +2294,17 @@ test "encrypt and decrypt: round trips with AAD, the primary and older versions,
     var c1b = try key.encrypt("attack at dawn", .{ .aad = "ctx" });
     defer c1b.deinit();
     try testing.expect(!std.mem.eql(u8, c1.value.bytes, c1b.value.bytes));
-    // The wrong AAD, another key's ciphertext, and bytes that are not one.
+    // The wrong AAD, another key's ciphertext, and bytes that are not one,
+    // each in production's words.
     try testing.expectError(error.DecryptionFailed, key.decrypt(c1.value.bytes, .{}));
+    try testing.expectEqualStrings("Decryption failed.", r.diag.message());
     const other = r.client.keyRing("r").key("other");
     var other_info = try other.create(.{ .purpose = .encrypt_decrypt });
     other_info.deinit();
     try testing.expectError(error.DecryptionFailed, other.decrypt(c1.value.bytes, .{ .aad = "ctx" }));
+    try testing.expectEqualStrings("Decryption failed: verify that 'name' refers to the correct CryptoKey.", r.diag.message());
     try testing.expectError(error.DecryptionFailed, key.decrypt("not a ciphertext at all, not even close to one", .{}));
+    try testing.expectEqualStrings("Decryption failed: the ciphertext is invalid.", r.diag.message());
     // A second version made primary: old ciphertexts still decrypt, by
     // version 1, which is not the primary.
     var v2 = try key.createVersion();
@@ -2119,7 +2345,7 @@ test "sign and verify here: every signing algorithm the fake models, by message 
     try ringRig(&r, testing.allocator, .{});
     defer r.deinit();
     const algorithms = [_]types.Algorithm{
-        .ec_sign_p256_sha256,      .ec_sign_p384_sha384,        .ec_sign_secp256k1_sha256,
+        .ec_sign_p256_sha256,      .ec_sign_p384_sha384,        .rsa_sign_pss_4096_sha256,
         .ec_sign_ed25519,          .rsa_sign_pkcs1_2048_sha256, .rsa_sign_pss_2048_sha256,
         .rsa_sign_pss_3072_sha256, .rsa_sign_pkcs1_4096_sha512, .rsa_sign_pss_4096_sha512,
         .pq_sign_ml_dsa_44,        .pq_sign_ml_dsa_65,          .pq_sign_ml_dsa_87,
@@ -2134,7 +2360,10 @@ test "sign and verify here: every signing algorithm the fake models, by message 
         var pk = try v.publicKey();
         defer pk.deinit();
         try testing.expectEqual(algorithm, pk.value.algorithm);
-        try testing.expectEqual(algorithm.postQuantum(), pk.value.raw.len > 0);
+        // Every key the fake models comes as a PEM, ML-DSA's too, as
+        // production's did.
+        try testing.expect(std.mem.startsWith(u8, pk.value.pem, "-----BEGIN PUBLIC KEY-----\n"));
+        try testing.expectEqualStrings("", pk.value.raw);
         var sig = try v.sign(algorithm, "the message");
         defer sig.deinit();
         try pk.value.verify("the message", sig.value);
@@ -2221,8 +2450,16 @@ test "the fake's other refusals: a pending version, the wrong input, the wrong f
     r.advance(1);
     // The algorithm the caller names is what is sent: another one is the
     // server's refusal.
-    try testing.expectError(error.InvalidArgument, key.version(1).sign(.ec_sign_ed25519, "m"));
+    // Data to a key that signs a digest is signed by its digest, as
+    // production did, so naming Ed25519 for a P-256 key gets a P-256
+    // signature; a digest of another algorithm is refused.
+    var by_data = try key.version(1).sign(.ec_sign_ed25519, "m");
+    defer by_data.deinit();
+    var p256 = try key.version(1).publicKey();
+    defer p256.deinit();
+    try p256.value.verify("m", by_data.value);
     try testing.expectError(error.InvalidArgument, key.version(1).sign(.ec_sign_p384_sha384, "m"));
+    try testing.expect(std.mem.indexOf(u8, r.diag.message(), "The digest SHA384 is not valid for CryptoKeys with algorithm EC_SIGN_P256_SHA256.") != null);
     var random = try r.client.randomBytes(32);
     try testing.expectEqual(32, random.value.len);
     random.deinit();
@@ -2233,20 +2470,23 @@ test "the fake's other refusals: a pending version, the wrong input, the wrong f
     const a = arena.allocator();
     const base = test_util.base;
     const raw = [_]struct { tp.Method, []const u8, ?[]const u8, u16, []const u8 }{
-        .{ .GET, base ++ "/keyRings/r/cryptoKeys/s/cryptoKeyVersions/1/publicKey?publicKeyFormat=DER", null, 501, "public key format DER" },
+        .{ .GET, base ++ "/keyRings/r/cryptoKeys/s/cryptoKeyVersions/1/publicKey?publicKeyFormat=DER", null, 200, "\"publicKeyFormat\":\"DER\"" },
+        .{ .GET, base ++ "/keyRings/r/cryptoKeys/s/cryptoKeyVersions/1/publicKey", null, 200, "\"pemCrc32c\"" },
+        .{ .GET, base ++ "/keyRings/r/cryptoKeys/s/cryptoKeyVersions/1/publicKey?publicKeyFormat=NIST_PQC", null, 501, "public key format NIST_PQC" },
+        .{ .POST, base ++ "/keyRings/r/cryptoKeys/s/cryptoKeyVersions/1:asymmetricSign", "{\"data\":\"bQ==\",\"dataCrc32c\":\"1\"}", 400, "data_crc32c" },
         .{ .POST, base ++ "/keyRings/r/cryptoKeys/s/cryptoKeyVersions/1/publicKey", "{}", 404, "Error 404" },
         .{ .POST, base ++ ":generateRandomBytes", "{\"lengthBytes\":16}", 400, "from an HSM" },
         .{ .POST, base ++ ":generateRandomBytes", "{\"lengthBytes\":7,\"protectionLevel\":\"HSM\"}", 400, "8 to 1024" },
         .{ .POST, base ++ ":generateRandomBytes", "{\"protectionLevel\":\"HSM\"}", 400, "Invalid JSON" },
         .{ .GET, base ++ ":generateRandomBytes", null, 404, "Error 404" },
-        .{ .POST, base ++ "/keyRings/r/cryptoKeys/s/cryptoKeyVersions/1:asymmetricSign", "{\"digest\":{\"sha256\":\"AAAA\"}}", 400, "length is not" },
-        .{ .POST, base ++ "/keyRings/r/cryptoKeys/s/cryptoKeyVersions/1:asymmetricSign", "{}", 400, "digest is required" },
+        .{ .POST, base ++ "/keyRings/r/cryptoKeys/s/cryptoKeyVersions/1:asymmetricSign", "{\"digest\":{\"sha256\":\"AAAA\"}}", 400, "Request field digest.sha256 must have length of 32. Provided value had length 3." },
+        .{ .POST, base ++ "/keyRings/r/cryptoKeys/s/cryptoKeyVersions/1:asymmetricSign", "{}", 400, "a digest or data is required" },
         .{ .POST, base ++ "/keyRings/r/cryptoKeys/s/cryptoKeyVersions/1:asymmetricSign", "{\"digest\":{\"sha256\":\"5GsyAWXuyR5jRPoQNA1bMggwTWytKdDVrtGEZtHZ2A4=\"},\"digestCrc32c\":\"1\"}", 400, "The checksum in field digest_crc32c" },
         .{ .POST, base ++ "/keyRings/r/cryptoKeys/e:encrypt", "{\"plaintext\":\"aGVsbG8=\",\"plaintextCrc32c\":\"1\"}", 400, "The checksum in field plaintext_crc32c did not match the data in field plaintext." },
         .{ .POST, base ++ "/keyRings/r/cryptoKeys/e:encrypt", "{\"plaintext\":\"aGVsbG8=\",\"plaintextCrc32c\":\"2591144780\",\"additionalAuthenticatedData\":\"eA==\",\"additionalAuthenticatedDataCrc32c\":\"7\"}", 400, "field additional_authenticated_data_crc32c" },
         .{ .POST, base ++ "/keyRings/r/cryptoKeys/e:encrypt", "{\"plaintext\":\"!!\"}", 400, "Invalid JSON" },
         .{ .POST, base ++ "/keyRings/r/cryptoKeys/e:encrypt", "[1]", 400, "Invalid JSON" },
-        .{ .POST, base ++ "/keyRings/r/cryptoKeys/s:encrypt", "{}", 400, "not for a key of purpose ASYMMETRIC_SIGN" },
+        .{ .POST, base ++ "/keyRings/r/cryptoKeys/s:encrypt", "{}", 400, "has incorrect key purpose: ASYMMETRIC_SIGN, expected key purpose is: ENCRYPT_DECRYPT" },
         .{ .GET, base ++ "/keyRings/r/cryptoKeys/s:encrypt", null, 404, "Error 404" },
     };
     for (raw) |case| {
@@ -2256,6 +2496,25 @@ test "the fake's other refusals: a pending version, the wrong input, the wrong f
             return error.TestUnexpectedResult;
         }
     }
+}
+
+test "a key ring's delete is taken at once and done later, as production's was" {
+    var r: Rig = undefined;
+    try r.init(testing.allocator, .{});
+    defer r.deinit();
+    var made = try r.client.keyRing("gone").create();
+    made.deinit();
+    try r.client.keyRing("gone").delete();
+    try testing.expectError(error.NotFound, r.client.keyRing("gone").get());
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const op = test_util.base ++ "/operations/op-1";
+    const pending = try r.fake.serve(.{ .method = .GET, .url = op, .bearer = "t" }, a);
+    try testing.expect(std.mem.indexOf(u8, pending.body, "\"done\"") == null);
+    r.advance(@intCast(@divTrunc(FakeKms.ring_delete_ns, std.time.ns_per_s)));
+    const done = try r.fake.serve(.{ .method = .GET, .url = op, .bearer = "t" }, a);
+    try testing.expect(std.mem.indexOf(u8, done.body, "\"done\":true") != null);
 }
 
 test "keys whose cryptography the fake does not model are made and managed, and their use is 501" {
@@ -2357,6 +2616,105 @@ test "integrity faults: each check catches its fault, once tried again and past 
     }
 }
 
+test "IAM on key rings and keys: a fresh policy, grants and revokes, a stale write refused, permissions tested" {
+    var r: Rig = undefined;
+    try ringRig(&r, testing.allocator, .{});
+    defer r.deinit();
+    const ring = r.client.keyRing("r");
+    const agent = "serviceAccount:service-1@gs-project-accounts.iam.gserviceaccount.com";
+    var fresh = try ring.iamPolicy();
+    try testing.expectEqualStrings("ACAB", fresh.value.etag.?);
+    try testing.expectEqual(0, fresh.value.bindings.len);
+    fresh.deinit();
+    var granted = try ring.addIamBinding("roles/cloudkms.cryptoKeyEncrypterDecrypter", agent);
+    try testing.expect(granted.value.grants("roles/cloudkms.cryptoKeyEncrypterDecrypter", agent));
+    granted.deinit();
+    // Granted already: read, nothing written.
+    var again = try ring.addIamBinding("roles/cloudkms.cryptoKeyEncrypterDecrypter", agent);
+    try testing.expectEqualStrings("BwY1", again.value.etag.?);
+    again.deinit();
+    var read = try ring.iamPolicy();
+    try testing.expect(read.value.grants("roles/cloudkms.cryptoKeyEncrypterDecrypter", agent));
+    read.deinit();
+    var revoked = try ring.removeIamBinding("roles/cloudkms.cryptoKeyEncrypterDecrypter", agent);
+    try testing.expect(!revoked.value.grants("roles/cloudkms.cryptoKeyEncrypterDecrypter", agent));
+    revoked.deinit();
+    // A write under an etag that is no longer the policy's.
+    try testing.expectError(error.Aborted, ring.setIamPolicy(.{ .etag = "ACAB", .bindings = &.{} }));
+    var whole = try ring.setIamPolicy(.{ .bindings = &.{.{ .role = "roles/cloudkms.viewer", .members = &.{"user:a@example.com"} }} });
+    try testing.expect(whole.value.grants("roles/cloudkms.viewer", "user:a@example.com"));
+    whole.deinit();
+    // Keys have their own; tested permissions are every one asked on a key
+    // that exists, none on one that does not.
+    const key = ring.key("k");
+    var made = try key.create(.{ .purpose = .encrypt_decrypt });
+    made.deinit();
+    var key_granted = try key.addIamBinding("roles/cloudkms.cryptoKeyEncrypterDecrypter", agent);
+    try testing.expect(key_granted.value.grants("roles/cloudkms.cryptoKeyEncrypterDecrypter", agent));
+    key_granted.deinit();
+    var key_policy = try key.iamPolicy();
+    key_policy.deinit();
+    var key_set = try key.setIamPolicy(.{ .bindings = &.{} });
+    key_set.deinit();
+    var key_revoked = try key.removeIamBinding("roles/cloudkms.cryptoKeyEncrypterDecrypter", agent);
+    key_revoked.deinit();
+    const asked = [_][]const u8{ "cloudkms.cryptoKeyVersions.useToEncrypt", "cloudkms.cryptoKeys.get" };
+    var held = try key.testIamPermissions(&asked);
+    try testing.expectEqual(2, held.value.len);
+    held.deinit();
+    var none = try ring.key("missing").testIamPermissions(&asked);
+    try testing.expectEqual(0, none.value.len);
+    none.deinit();
+    var ring_held = try ring.testIamPermissions(&asked);
+    try testing.expectEqual(2, ring_held.value.len);
+    ring_held.deinit();
+    try testing.expectError(error.NotFound, ring.key("missing").iamPolicy());
+    // What no server takes is refused before sending.
+    const calls = r.fake.callCount();
+    try testing.expectError(error.InvalidArgument, ring.addIamBinding("cloudkms.admin", agent));
+    try testing.expectError(error.InvalidArgument, ring.addIamBinding("roles/cloudkms.admin", "someone"));
+    try testing.expectError(error.InvalidArgument, key.setIamPolicy(.{ .bindings = &.{.{ .role = "admin", .members = &.{"user:a@example.com"} }} }));
+    try testing.expectError(error.InvalidArgument, key.testIamPermissions(&.{}));
+    try testing.expectError(error.InvalidName, r.client.keyRing("a b").iamPolicy());
+    try testing.expectEqual(calls, r.fake.callCount());
+}
+
+test "waitUntilEnabled: waits out generation, refuses what waiting will not change, and gives up at the timeout" {
+    var r: Rig = undefined;
+    try ringRig(&r, testing.allocator, .{ .fake = .{ .generation_delay_ms = 2500 }, .retry = .{ .initial_backoff_ms = 500, .max_backoff_ms = 1000 } });
+    defer r.deinit();
+    const key = r.client.keyRing("r").key("s");
+    var made = try key.create(.{ .purpose = .asymmetric_sign, .algorithm = .rsa_sign_pss_2048_sha256 });
+    made.deinit();
+    const before = r.clock.now_ns;
+    var ready = try key.version(1).waitUntilEnabled(.{});
+    try testing.expectEqual(types.State.enabled, ready.value.state);
+    ready.deinit();
+    try testing.expect(r.clock.now_ns - before >= 2500 * std.time.ns_per_ms);
+    try testing.expect(r.clock.now_ns - before < 10 * std.time.ns_per_s);
+    // Enabled already: one read.
+    const calls = r.fake.callCount();
+    var at_once = try key.version(1).waitUntilEnabled(.{});
+    at_once.deinit();
+    try testing.expectEqual(calls + 1, r.fake.callCount());
+    // A version that waiting cannot enable.
+    var d = try key.version(1).disable();
+    d.deinit();
+    try testing.expectError(error.KeyVersionDisabled, key.version(1).waitUntilEnabled(.{}));
+    try testing.expect(std.mem.indexOf(u8, r.diag.message(), "DISABLED") != null);
+    var gone = try key.version(1).destroy();
+    gone.deinit();
+    try testing.expectError(error.KeyVersionDestroyed, key.version(1).waitUntilEnabled(.{}));
+    // Still pending at the timeout.
+    var v2 = try key.createVersion();
+    v2.deinit();
+    const start = r.clock.now_ns;
+    try testing.expectError(error.DeadlineExceeded, key.version(2).waitUntilEnabled(.{ .timeout_ms = 1200 }));
+    try testing.expect(std.mem.indexOf(u8, r.diag.message(), "still PENDING_GENERATION after") != null);
+    try testing.expect(r.clock.now_ns - start <= 1300 * std.time.ns_per_ms);
+    try testing.expectError(error.NotFound, key.version(9).waitUntilEnabled(.{}));
+}
+
 fn cryptoAllocations(gpa: Allocator) !void {
     var r: Rig = undefined;
     try ringRig(&r, gpa, .{});
@@ -2383,6 +2741,10 @@ fn cryptoAllocations(gpa: Allocator) !void {
     _ = try mac.version(1).macVerify("d", t.value);
     var rb = try r.client.randomBytes(8);
     rb.deinit();
+    var granted = try mac.addIamBinding("roles/cloudkms.viewer", "user:a@example.com");
+    granted.deinit();
+    var held = try r.client.keyRing("r").testIamPermissions(&.{"cloudkms.keyRings.get"});
+    held.deinit();
 }
 
 test "crypto calls against the fake: every allocation failure is OutOfMemory without leaks" {

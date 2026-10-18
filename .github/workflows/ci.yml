@@ -534,7 +534,11 @@ jobs:
         # took 0.58 ms a run together, so 2M; the Recorder's slow property
         # 0.31 ms, also 2M, well under the aim after slow-resource_manager
         # showed CI can cost several times the Mac. Both are to be re-sized
-        # from their first nights.
+        # from their first nights. kms (0.45.0) starts the same way: its
+        # three fuzz properties took 0.57 ms a run together on the Mac
+        # (1M in 568 s), so 2M; its model property, the client against
+        # the fake with checksum faults, 2.6 ms (30K in 77 s), so 300K,
+        # about 52 minutes at four times the Mac.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 630K }
           - { job: auth, module: auth, filter: fuzz, iterations: 850K }
@@ -560,6 +564,8 @@ jobs:
           - { job: error_reporting, module: error_reporting, filter: fuzz, iterations: 2500K }
           - { job: monitoring, module: monitoring, filter: fuzz, iterations: 2M }
           - { job: slow-monitoring, module: monitoring, filter: slow property, iterations: 2M }
+          - { job: kms, module: kms, filter: fuzz, iterations: 2M }
+          - { job: slow-kms, module: kms, filter: slow property, iterations: 300K }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     # actions: read finds and downloads the corpus an earlier run kept.

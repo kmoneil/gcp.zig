@@ -17,9 +17,21 @@ const names = @import("names.zig");
 const rpc = @import("rpc.zig");
 const Error = @import("errors.zig").Error;
 
+/// How long a delete is waited for.
+pub const Wait = enum {
+    /// Until its operation is done: a key's and a version's were done
+    /// 0.2 s after the first answer, as measured.
+    done,
+    /// Only until it is accepted: a key ring's operation was not done 10 s
+    /// later, its id free again after 422 s (2026-10-18). A delete the
+    /// server takes does not fail afterwards; the refusals (keys left in
+    /// the ring) come in the first answer.
+    started,
+};
+
 /// Deletes what `path` names (`what` says what, for the log and
-/// `Diagnostics`), and waits for its operation to finish.
-pub fn delete(client: *Client, path: []const u8, what: []const u8) Error!void {
+/// `Diagnostics`), and waits as `wait` says.
+pub fn delete(client: *Client, path: []const u8, what: []const u8, wait_for: Wait) Error!void {
     var attempt: u32 = 0;
     var response: std.heap.ArenaAllocator = .init(client.gpa);
     defer response.deinit();
@@ -44,6 +56,7 @@ pub fn delete(client: *Client, path: []const u8, what: []const u8) Error!void {
     defer scratch.deinit();
     const op = codec.decodeOperation(scratch.allocator(), scratch.allocator(), body) catch |err|
         return rpc.decodeFailed(client, err, "delete operation");
+    if (wait_for == .started and op.failure == null) return;
     return wait(client, op, what);
 }
 

@@ -42,6 +42,9 @@ pub const Error = core.rpc.Error || error{
     /// A ciphertext this key did not make: another key's, or bytes that are
     /// not a Cloud KMS ciphertext. `Diagnostics` keeps the server's words.
     DecryptionFailed,
+    /// `waitUntilEnabled` saw the version fail: `generation_failed` or
+    /// `import_failed`, the reason in `Diagnostics`.
+    KeyVersionFailed,
     /// A success response could not be decoded. Never retried.
     InvalidResponse,
 };

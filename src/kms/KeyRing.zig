@@ -7,6 +7,7 @@ const std = @import("std");
 const core = @import("core");
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
+const iam = @import("iam.zig");
 const Key = @import("Key.zig");
 const names = @import("names.zig");
 const operations = @import("operations.zig");
@@ -64,17 +65,19 @@ pub fn get(self: KeyRing) Error!types.Owned(types.KeyRingInfo) {
     return result;
 }
 
-/// Deletes the key ring, and waits for the server to finish. Every key in
-/// it must be deleted first, and every import job expired (they expire
-/// three days after they are made). Its id is free again after 5 to 10
-/// minutes.
+/// Deletes the key ring: every key in it must be deleted first
+/// (`error.FailedPrecondition` otherwise), and every import job expired
+/// (they expire three days after they are made). Returns once the server
+/// has taken the delete, which it finishes in the background: measured,
+/// its operation was not done 10 s later, and the id was free again after
+/// 7 minutes.
 pub fn delete(self: KeyRing) Error!void {
     const c = self.client;
     rpc.begin(c);
     try c.checkTarget(self.target);
     var scratch: std.heap.ArenaAllocator = .init(c.gpa);
     defer scratch.deinit();
-    return operations.delete(c, try self.target.path(scratch.allocator(), ""), "a key ring");
+    return operations.delete(c, try self.target.path(scratch.allocator(), ""), "a key ring", .started);
 }
 
 /// A handle on the key `key_id` in this key ring. Makes no call; `key_id`
@@ -83,6 +86,51 @@ pub fn key(self: KeyRing, key_id: []const u8) Key {
     var target = self.target;
     target.key = key_id;
     return .{ .client = self.client, .target = target };
+}
+
+/// The key ring's IAM policy, asked for as version 3, conditional bindings
+/// included. A fresh key ring's is empty, with the etag "ACAB", as
+/// measured. Its keys' policies add to it. Needs
+/// `cloudkms.keyRings.getIamPolicy`.
+pub fn iamPolicy(self: KeyRing) Error!types.Owned(core.iam.Policy) {
+    return iam.read(self.iamResource());
+}
+
+/// Writes `policy` as the key ring's, whole, and returns it as stored.
+/// Pass a policy `iamPolicy` read, changed: its etag makes the write fail
+/// with `error.Aborted` if the policy changed since. A write that carries
+/// an etag is retried; one without is sent once. Needs
+/// `cloudkms.keyRings.setIamPolicy`, which Cloud KMS Admin has and Editor
+/// does not.
+pub fn setIamPolicy(self: KeyRing, policy: core.iam.Policy) Error!types.Owned(core.iam.Policy) {
+    return iam.set(self.iamResource(), policy);
+}
+
+/// Grants `member` the role `role` on the key ring, such as
+/// `roles/cloudkms.cryptoKeyEncrypterDecrypter`, unless it holds it
+/// already, and returns the policy as it then is: a read, a change and a
+/// write under the read's etag, started over when another change came in
+/// between, up to the retry policy's attempts.
+pub fn addIamBinding(self: KeyRing, role: []const u8, member: []const u8) Error!types.Owned(core.iam.Policy) {
+    return iam.change(self.iamResource(), .{ .grant = .{ .role = role, .member = member } });
+}
+
+/// Takes `member` out of the key ring's binding of `role`, the way
+/// `addIamBinding` grants.
+pub fn removeIamBinding(self: KeyRing, role: []const u8, member: []const u8) Error!types.Owned(core.iam.Policy) {
+    return iam.change(self.iamResource(), .{ .revoke = .{ .role = role, .member = member } });
+}
+
+/// The permissions the caller holds on the key ring, of `permissions`: 1 to
+/// 100. A key ring that does not exist answers none, not
+/// `error.NotFound`, and Google says the answer "may fail open": for
+/// building permission-aware tools, not for authorization.
+pub fn testIamPermissions(self: KeyRing, permissions: []const []const u8) Error!types.Owned([]const []const u8) {
+    return iam.testPermissions(self.iamResource(), permissions);
+}
+
+fn iamResource(self: KeyRing) iam.Resource {
+    return .{ .client = self.client, .target = self.target };
 }
 
 /// One page of the keys in this key ring.

@@ -123,10 +123,11 @@ fn signWith(self: KeyVersion, input: types.SignInput, bytes: []const u8) Error!t
     }
 }
 
-/// The version's public key, for an asymmetric key: a PEM for classical
-/// algorithms, the NIST encoding for post-quantum ones, checked against its
-/// checksum. It never changes, so keep it while the version lives. A
-/// version that is not enabled is that state's error.
+/// The version's public key, for an asymmetric key, checked against its
+/// checksum: a PEM SubjectPublicKeyInfo, ML-DSA's too, or the NIST
+/// encoding when the server says a key has only that, as Tink reports of
+/// SLH-DSA. It never changes, so keep it while the version lives. A version
+/// that is not enabled is that state's error.
 pub fn publicKey(self: KeyVersion) Error!types.Owned(types.PublicKey) {
     const c = self.client;
     rpc.begin(c);
@@ -135,8 +136,8 @@ pub fn publicKey(self: KeyVersion) Error!types.Owned(types.PublicKey) {
     defer scratch.deinit();
     const a = scratch.allocator();
     const name = try self.target.name(a);
-    // PEM unless the server says the key has only the NIST encoding, as a
-    // post-quantum one does: asking which first would cost a read.
+    // PEM unless the server says the key has only the NIST encoding:
+    // asking which first would cost a read.
     var format: []const u8 = "PEM";
     var tries: integrity.Attempts = .{ .client = c, .what = "publicKey" };
     while (true) {
@@ -159,7 +160,9 @@ pub fn publicKey(self: KeyVersion) Error!types.Owned(types.PublicKey) {
             result.deinit();
             return rpc.decodeFailed(c, err, "public key");
         };
-        const pq = answer.algorithm.postQuantum();
+        // Asked for as PEM, production answered the PEM in `publicKey.data`
+        // and no `pem`; asked with no format, in `pem` (2026-10-18).
+        const pem_asked = std.mem.eql(u8, format, "PEM");
         const problem: ?[]const u8 = if (answer.pem.len == 0 and answer.data.len == 0)
             "the answer holds no key"
         else if (answer.pem.len > 0 and !integrity.matches(answer.pem, answer.pem_crc32c))
@@ -168,10 +171,8 @@ pub fn publicKey(self: KeyVersion) Error!types.Owned(types.PublicKey) {
             "the key does not match its checksum"
         else if (answer.name != null and !std.mem.eql(u8, answer.name.?, name))
             "the answer names another version"
-        else if (pq and answer.data.len == 0)
-            "a post-quantum key came without its encoding"
-        else if (!pq and answer.pem.len == 0)
-            "a classical key came without its PEM"
+        else if (!pem_asked and answer.data.len == 0)
+            "the key asked for in the NIST encoding came without it"
         else
             null;
         if (problem) |reason| {
@@ -187,8 +188,8 @@ pub fn publicKey(self: KeyVersion) Error!types.Owned(types.PublicKey) {
             .name = owned_name,
             .algorithm = answer.algorithm,
             .protection_level = answer.protection_level,
-            .pem = if (pq) "" else answer.pem,
-            .raw = if (pq) answer.data else "",
+            .pem = if (!pem_asked) "" else if (answer.pem.len > 0) answer.pem else answer.data,
+            .raw = if (pem_asked) "" else answer.data,
         };
         return result;
     }
@@ -292,6 +293,54 @@ pub fn get(self: KeyVersion) Error!types.Owned(types.VersionInfo) {
     return self.request(scratch.allocator(), .{ .method = .GET, .path = try self.target.path(scratch.allocator(), "") });
 }
 
+/// Waits until the version is `enabled`, as a new asymmetric version is
+/// after `pending_generation`, reading it under the client's backoff, and
+/// answers it. A version that failed to generate or import is
+/// `error.KeyVersionFailed`; one disabled, destroyed or scheduled for
+/// destruction is that state's error at once; still pending after
+/// `options.timeout_ms` is `error.DeadlineExceeded`. Symmetric and MAC
+/// versions are enabled when made, and answer at the first read.
+pub fn waitUntilEnabled(self: KeyVersion, options: types.WaitOptions) Error!types.Owned(types.VersionInfo) {
+    const c = self.client;
+    rpc.begin(c);
+    try c.checkTarget(self.target);
+    const started = std.Io.Clock.awake.now(c.io).nanoseconds;
+    const budget_ns = @as(i96, options.timeout_ms) * std.time.ns_per_ms;
+    var attempt: u32 = 0;
+    while (true) {
+        attempt += 1;
+        var info = try self.get();
+        const state = info.value.state;
+        switch (state) {
+            .enabled => return info,
+            .pending_generation, .pending_import => {},
+            .generation_failed, .import_failed => {
+                if (c.diagnostics) |d| d.print("the version is {s}: {s}", .{ state.wire(), if (state == .generation_failed) info.value.generation_failure_reason else info.value.import_failure_reason });
+                info.deinit();
+                return error.KeyVersionFailed;
+            },
+            else => {
+                if (c.diagnostics) |d| d.print("the version is {s}, and will not be enabled by waiting", .{state.wire()});
+                info.deinit();
+                return switch (state) {
+                    .disabled => error.KeyVersionDisabled,
+                    .destroy_scheduled, .destroyed => error.KeyVersionDestroyed,
+                    else => error.FailedPrecondition,
+                };
+            },
+        }
+        info.deinit();
+        const elapsed = std.Io.Clock.awake.now(c.io).nanoseconds - started;
+        if (elapsed >= budget_ns) {
+            if (c.diagnostics) |d| d.print("the version is still {s} after {d} ms", .{ state.wire(), @divTrunc(elapsed, std.time.ns_per_ms) });
+            return error.DeadlineExceeded;
+        }
+        const wait_ms: u32 = rpc.waitMs(c, attempt) orelse c.retry.max_backoff_ms;
+        const left_ms: u32 = @intCast(@min(std.math.maxInt(u32), @divTrunc(budget_ns - elapsed + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+        try c.io.sleep(.fromMilliseconds(@max(1, @min(wait_ms, left_ms))), .awake);
+    }
+}
+
 /// Makes a `disabled` version usable again.
 pub fn enable(self: KeyVersion) Error!types.Owned(types.VersionInfo) {
     return self.setState(.enabled);
@@ -386,7 +435,7 @@ pub fn delete(self: KeyVersion) Error!void {
     try c.checkTarget(self.target);
     var scratch: std.heap.ArenaAllocator = .init(c.gpa);
     defer scratch.deinit();
-    return operations.delete(c, try self.target.path(scratch.allocator(), ""), "a key version");
+    return operations.delete(c, try self.target.path(scratch.allocator(), ""), "a key version", .done);
 }
 
 fn request(self: KeyVersion, scratch: std.mem.Allocator, call: rpc.Call) Error!types.Owned(types.VersionInfo) {
@@ -497,6 +546,114 @@ test "a refusal naming the version's state is that state's error" {
     try testing.expectError(error.KeyVersionDestroyed, h.client.keyRing("r").key("k").version(1).enable());
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), v1) != null);
     try testing.expectEqualStrings("FAILED_PRECONDITION", h.diag.status());
+}
+
+test "waitUntilEnabled: a version that failed to generate says why" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "{\"name\":\"" ++ v1 ++ "\",\"state\":\"GENERATION_FAILED\",\"generationFailureReason\":\"the HSM said no\"}" } },
+        .{ .respond = .{ .body = "{\"name\":\"" ++ v1 ++ "\",\"state\":\"IMPORT_FAILED\",\"importFailureReason\":\"bad wrapping\"}" } },
+        .{ .respond = .{ .body = "{\"name\":\"" ++ v1 ++ "\",\"state\":\"EXTERNAL_DESTRUCTION_FAILED\"}" } },
+    }, .{});
+    defer h.deinit();
+    const v = h.client.keyRing("r").key("k").version(1);
+    try testing.expectError(error.KeyVersionFailed, v.waitUntilEnabled(.{}));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "the HSM said no") != null);
+    try testing.expectError(error.KeyVersionFailed, v.waitUntilEnabled(.{}));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "bad wrapping") != null);
+    try testing.expectError(error.FailedPrecondition, v.waitUntilEnabled(.{}));
+    try testing.expectError(error.InvalidName, h.client.keyRing("r").key("k").version(0).waitUntilEnabled(.{}));
+}
+
+test "golden: IAM paths on a key ring and a key" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "{\"etag\":\"ACAB\"}" } },
+        .{ .respond = .{ .body = "{\"version\":1,\"etag\":\"BwX1\"}" } },
+        .{ .respond = .{ .body = "{\"permissions\":[\"cloudkms.cryptoKeys.get\"]}" } },
+    }, .{});
+    defer h.deinit();
+    const key = h.client.keyRing("r").key("k");
+    var p = try h.client.keyRing("r").iamPolicy();
+    p.deinit();
+    try h.expectRequest(0, .GET, base ++ "/keyRings/r:getIamPolicy?options.requestedPolicyVersion=3", null);
+    var s = try key.setIamPolicy(.{ .etag = "ACAB", .bindings = &.{.{ .role = "roles/cloudkms.viewer", .members = &.{"user:a@example.com"} }} });
+    s.deinit();
+    try h.expectRequest(1, .POST, base ++ "/keyRings/r/cryptoKeys/k:setIamPolicy", "{\"policy\":{\"version\":1,\"etag\":\"ACAB\",\"bindings\":[{\"role\":\"roles/cloudkms.viewer\",\"members\":[\"user:a@example.com\"]}]}}");
+    var t = try key.testIamPermissions(&.{"cloudkms.cryptoKeys.get"});
+    t.deinit();
+    try h.expectRequest(2, .POST, base ++ "/keyRings/r/cryptoKeys/k:testIamPermissions", "{\"permissions\":[\"cloudkms.cryptoKeys.get\"]}");
+}
+
+test "IAM: a policy written without an etag is sent once, and one with an etag retried" {
+    var h: Harness = undefined;
+    const unavailable = "{\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\"}}";
+    try h.init(&.{
+        .{ .respond = .{ .status = 503, .body = unavailable } },
+        .{ .respond = .{ .status = 503, .body = unavailable } },
+        .{ .respond = .{ .body = "{\"version\":1,\"etag\":\"BwX2\"}" } },
+    }, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1, .max_backoff_ms = 2 } });
+    defer h.deinit();
+    const ring = h.client.keyRing("r");
+    try testing.expectError(error.Unavailable, ring.setIamPolicy(.{ .bindings = &.{} }));
+    try h.expectRequestCount(1);
+    var p = try ring.setIamPolicy(.{ .etag = "BwX1", .bindings = &.{} });
+    p.deinit();
+    try h.expectRequestCount(3);
+}
+
+test "IAM: a grant whose write lost to another change reads and writes again" {
+    var h: Harness = undefined;
+    const aborted = "{\"error\":{\"code\":409,\"message\":\"There were concurrent policy changes. Please retry the whole read-modify-write with exponential backoff.\",\"status\":\"ABORTED\"}}";
+    try h.init(&.{
+        .{ .respond = .{ .body = "{\"etag\":\"ACAB\"}" } },
+        .{ .respond = .{ .status = 409, .body = aborted } },
+        .{ .respond = .{ .body = "{\"version\":1,\"etag\":\"BwX2\",\"bindings\":[{\"role\":\"roles/cloudkms.viewer\",\"members\":[\"user:b@example.com\"]}]}" } },
+        .{ .respond = .{ .body = "{\"version\":1,\"etag\":\"BwX3\",\"bindings\":[{\"role\":\"roles/cloudkms.viewer\",\"members\":[\"user:b@example.com\",\"user:a@example.com\"]}]}" } },
+    }, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1, .max_backoff_ms = 2 } });
+    defer h.deinit();
+    var p = try h.client.keyRing("r").addIamBinding("roles/cloudkms.viewer", "user:a@example.com");
+    defer p.deinit();
+    try testing.expect(p.value.grants("roles/cloudkms.viewer", "user:a@example.com"));
+    try testing.expect(p.value.grants("roles/cloudkms.viewer", "user:b@example.com"));
+    try h.expectRequest(3, .POST, base ++ "/keyRings/r:setIamPolicy", "{\"policy\":{\"version\":1,\"etag\":\"BwX2\",\"bindings\":[{\"role\":\"roles/cloudkms.viewer\",\"members\":[\"user:b@example.com\",\"user:a@example.com\"]}]}}");
+    try h.expectRequestCount(4);
+}
+
+test "production's keys and signatures: each family's public key read as production sent it, and its signature verified here" {
+    const production = @import("production_bodies.zig");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (production.signed) |entry| {
+        const nist = std.mem.eql(u8, entry.algorithm, "PQ_SIGN_ML_DSA_65");
+        // ML-DSA's key read as PEM; its NIST encoding is checked below.
+        const answer = if (nist) production.mldsa_pem_answer else entry.public_key;
+        var h: Harness = undefined;
+        try h.init(&.{.{ .respond = .{ .body = answer } }}, .{});
+        defer h.deinit();
+        const name = (try std.json.parseFromSliceLeaky(struct { name: []const u8 }, a, answer, .{ .ignore_unknown_fields = true })).name;
+        const parsed = core.names.KmsKeyName.parse(name).?;
+        const v: KeyVersion = .{ .client = &h.client, .target = .{ .project = parsed.project, .location = parsed.location, .key_ring = parsed.key_ring, .key = parsed.key, .version = 1 } };
+        var pk = try v.publicKey();
+        defer pk.deinit();
+        try testing.expectEqualStrings(entry.algorithm, pk.value.algorithm.wire());
+        const signature = try core.base64.decode(a, entry.signature_b64);
+        pk.value.verify("the message", signature) catch |err| {
+            std.debug.print("{s}: {t}\n", .{ entry.algorithm, err });
+            return err;
+        };
+        try testing.expectError(error.SignatureInvalid, pk.value.verify("the messagE", signature));
+        if (nist) {
+            const raw_answer = try codec.decodePublicKey(a, a, entry.public_key);
+            const raw: types.PublicKey = .{ .name = name, .algorithm = .pq_sign_ml_dsa_65, .raw = raw_answer.data };
+            try raw.verify("the message", signature);
+        }
+    }
+    // With no format asked, production put the PEM in `pem`.
+    const no_format = try codec.decodePublicKey(a, a, production.ec_no_format_answer);
+    try testing.expect(std.mem.startsWith(u8, no_format.pem, "-----BEGIN PUBLIC KEY-----"));
+    try testing.expect(integrity.matches(no_format.pem, no_format.pem_crc32c));
 }
 
 test "version 0 is InvalidName, and nothing goes out" {
@@ -636,8 +793,6 @@ test "publicKey: each failed check is tried again, and past the attempts is Inte
         .{ "{\"pem\":\"PEMTEXT\",\"algorithm\":\"EC_SIGN_P256_SHA256\"}", "PEM does not match" },
         .{ "{\"pem\":\"PEMTEXT\",\"pemCrc32c\":\"" ++ crc_pem ++ "\",\"algorithm\":\"EC_SIGN_P256_SHA256\",\"publicKey\":{\"data\":\"UEVNVEVYVA==\",\"crc32cChecksum\":\"2\"}}", "key does not match" },
         .{ "{\"pem\":\"PEMTEXT\",\"pemCrc32c\":\"" ++ crc_pem ++ "\",\"algorithm\":\"EC_SIGN_P256_SHA256\",\"name\":\"" ++ v1 ++ "9\"}", "names another version" },
-        .{ "{\"pem\":\"PEMTEXT\",\"pemCrc32c\":\"" ++ crc_pem ++ "\",\"algorithm\":\"PQ_SIGN_ML_DSA_44\"}", "without its encoding" },
-        .{ "{\"algorithm\":\"EC_SIGN_P256_SHA256\",\"publicKey\":{\"data\":\"UEVNVEVYVA==\",\"crc32cChecksum\":\"" ++ crc_pem ++ "\"}}", "without its PEM" },
     };
     for (cases) |case| {
         var h: Harness = undefined;
