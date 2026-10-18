@@ -4,6 +4,33 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.43.0 (unreleased)
+
+- error_reporting: new module, **experimental**: Cloud Error Reporting's
+  read side, for an error dashboard (issue #207). `Client.groupStats`
+  lists what each error group's errors in a period came to, page by page:
+  counts, distinct users, first and last seen, the services hit, a
+  representative stack trace, and with `timed_count_seconds` every bucket
+  of the period for a trend chart, aligned at the end or on a grid. At
+  most 100 buckets a period, as production allows, checked before
+  sending. `Client.events` lists one group's errors, newest first.
+  `Client.group(id).get()` reads a group, the only call that sees a muted
+  one, and `setStatus` resolves, acknowledges, mutes or reopens it,
+  putting its tracking issues back, since the API replaces what an update
+  leaves out. `headlineOf` gives a stack trace's line that names the
+  exception. Each client counts its calls against Error Reporting's
+  per-user quota, 60 a minute, and refuses one past it at once with the
+  wait, rather than spend a minute refused; a `Budget` can be shared by
+  the clients of one user. A disabled API is `error.ServiceDisabled` with
+  the link that turns it on, and an id that names no group
+  `error.NotFound`, though production answers it 400.
+  `error_reporting.testing.FakeErrorReporting` keeps errors a test
+  reports and computes group stats from them as production does, muting,
+  reopening and refusals included. `examples/error_dashboard.zig --fake`
+  runs offline. Measured in production on 2026-10-18 before it was built.
+- auth, core, firestore, logging, pubsub, resource_manager,
+  secret_manager and storage: unchanged.
+
 ## 0.42.0 (2026-10-17)
 
 - auth: `Credentials.account` names the account any credentials act as
