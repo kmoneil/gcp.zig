@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.44.0 (unreleased)
+## 0.44.0 (2026-10-18)
 
 - monitoring: new module, **experimental**: Cloud Monitoring's v3 API,
   for a program's own metrics. `Client.write` sends one point to each of
