@@ -172,25 +172,20 @@ pub fn publish(
 ) Error!Owned(types.PublishResult) {
     const c = self.client;
     rpc.begin(c);
-    try rpc.checkId(c, "topic", self.id);
-    try validate.publish(messages, options.ordering_key, c.diagnostics);
-    if (options.compression) |compression| try validate.compression(compression, c.diagnostics);
     var scratch: std.heap.ArenaAllocator = .init(c.gpa);
     defer scratch.deinit();
-    const a = scratch.allocator();
-    const path = try url.resourcePath(a, c.project_id, .topics, self.id, ":publish");
-    const body = try codec.encodePublish(a, messages, options.ordering_key);
+    const built = try self.buildPublish(scratch.allocator(), messages, options);
     // Compressed once: a retry sends the same bytes. Apart from the arena,
     // so the compressor's memory is back before the request goes.
-    const compressed = try rpc.compressBody(c.gpa, body, options.compression);
+    const compressed = try rpc.compressBody(c.gpa, built.body, options.compression);
     defer if (compressed) |bytes| c.gpa.free(bytes);
 
     var result: Owned(types.PublishResult) = try .init(c.gpa);
     errdefer result.deinit();
     const response = try rpc.execute(c, result.arena, .{
         .method = .POST,
-        .path = path,
-        .body = compressed orelse body,
+        .path = built.path,
+        .body = compressed orelse built.body,
         .headers = if (compressed != null) rpc.gzip_headers else &.{},
         .retry = c.retry_publish,
         .retryable = rpc.isPublishRetryable,
@@ -198,6 +193,53 @@ pub fn publish(
     result.value = codec.decodePublish(result.arena.allocator(), response, messages.len) catch |err|
         return rpc.decodeFailed(c, err, "publish");
     return result;
+}
+
+/// The request `publish` sends for the same `messages` and `options`, built
+/// without sending it: to show before the call, or to record after it.
+/// `publish` builds its request the same way, so the URL and the body are
+/// byte for byte what it sends, the body before any compression (see
+/// `PublishRequest.gzip`). The same checks run first and fail with the
+/// same errors, so a request built here is one `publish` will send.
+/// Credentials and other headers are not part of it.
+pub fn publishRequest(
+    self: Topic,
+    messages: []const types.Message,
+    options: types.PublishOptions,
+) Error!Owned(types.PublishRequest) {
+    const c = self.client;
+    rpc.begin(c);
+    var result: Owned(types.PublishRequest) = try .init(c.gpa);
+    errdefer result.deinit();
+    const a = result.arena.allocator();
+    const built = try self.buildPublish(a, messages, options);
+    result.value = .{
+        .method = .POST,
+        .url = try std.mem.concat(a, u8, &.{ c.base_url, built.path }),
+        .body = built.body,
+        .gzip = rpc.compresses(built.body.len, options.compression),
+    };
+    return result;
+}
+
+const BuiltPublish = struct { path: []const u8, body: []const u8 };
+
+/// A publish's checks, then its path and body: what `publish` sends and
+/// `publishRequest` shows.
+fn buildPublish(
+    self: Topic,
+    arena: std.mem.Allocator,
+    messages: []const types.Message,
+    options: types.PublishOptions,
+) Error!BuiltPublish {
+    const c = self.client;
+    try rpc.checkId(c, "topic", self.id);
+    try validate.publish(messages, options.ordering_key, c.diagnostics);
+    if (options.compression) |compression| try validate.compression(compression, c.diagnostics);
+    return .{
+        .path = try url.resourcePath(arena, c.project_id, .topics, self.id, ":publish"),
+        .body = try codec.encodePublish(arena, messages, options.ordering_key),
+    };
 }
 
 /// One page of the subscriptions attached to the topic, each by its full
@@ -626,6 +668,199 @@ test "publish: every allocation failure with compression is OutOfMemory without 
         }
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.publish, .{});
+}
+
+/// Asserts that request `index` is the one `want` describes: its method
+/// and URL, `Content-Encoding: gzip` exactly when `want.gzip`, and a body
+/// that is `want.body`, decompressed first when gzipped.
+fn expectSent(h: *const Harness, index: usize, want: types.PublishRequest) !void {
+    const r = try h.fake.request(index);
+    try testing.expectEqual(want.method, r.method);
+    try testing.expectEqualStrings(want.url, r.url);
+    if (want.gzip) {
+        try testing.expectEqualStrings("gzip", r.header("content-encoding").?);
+        const back = try gunzip(r.body.?);
+        defer testing.allocator.free(back);
+        try testing.expectEqualStrings(want.body, back);
+    } else {
+        try testing.expectEqual(null, r.header("content-encoding"));
+        try testing.expectEqualStrings(want.body, r.body.?);
+    }
+}
+
+test "publishRequest: the URL and body are what publish sends, a quote, a non-ASCII character and an ordering key among them" {
+    const messages: []const types.Message = &.{
+        .{ .data = "say \"hi\" \\ to Zoë ✓", .attributes = &.{ .{ .key = "z-first", .value = "a \"quoted\" é" }, .{ .key = "a-second", .value = "" } } },
+        .{ .attributes = &.{.{ .key = "only", .value = "attr" }} },
+        .{ .data = "\x00\xff binary" },
+    };
+    // The emulator, then production: the URL carries the client's endpoint.
+    for ([_]?[]const u8{ null, "token" }, [_][]const u8{ "http://localhost:8085", "https://pubsub.googleapis.com" }) |token, base| {
+        var h: Harness = undefined;
+        try h.init(&.{.{ .respond = .{ .body = "{\"messageIds\":[\"1\",\"2\",\"3\"]}" } }}, .{ .token = token });
+        defer h.deinit();
+        const orders = h.client.topic("orders");
+        var preview = try orders.publishRequest(messages, .{ .ordering_key = "user-✓" });
+        defer preview.deinit();
+        try h.expectRequestCount(0);
+        const want_url = try std.mem.concat(testing.allocator, u8, &.{ base, "/v1/projects/p/topics/orders:publish" });
+        defer testing.allocator.free(want_url);
+        try testing.expectEqual(.POST, preview.value.method);
+        try testing.expectEqualStrings(want_url, preview.value.url);
+        try testing.expectEqualStrings(
+            "{\"messages\":[{\"data\":\"c2F5ICJoaSIgXCB0byBab8OrIOKckw==\",\"attributes\":{\"z-first\":\"a \\\"quoted\\\" é\",\"a-second\":\"\"},\"orderingKey\":\"user-✓\"}," ++
+                "{\"attributes\":{\"only\":\"attr\"},\"orderingKey\":\"user-✓\"}," ++
+                "{\"data\":\"AP8gYmluYXJ5\",\"orderingKey\":\"user-✓\"}]}",
+            preview.value.body,
+        );
+        try testing.expect(!preview.value.gzip);
+
+        var sent = try orders.publish(messages, .{ .ordering_key = "user-✓" });
+        sent.deinit();
+        try expectSent(&h, 0, preview.value);
+        try h.expectRequestCount(1);
+    }
+}
+
+test "publishRequest: gzip says whether publish compresses, and the body is what a compressed one decompresses to" {
+    var h: Harness = undefined;
+    const replies: [4]FakeReply = @splat(.{ .respond = .{ .body = "{\"messageIds\":[\"1\"]}" } });
+    try h.init(&replies, .{});
+    defer h.deinit();
+    const orders = h.client.topic("orders");
+    const messages: []const types.Message = &.{.{ .data = test_util.repeat("compress me ", 40) }};
+    const plain = try plainBody(messages);
+    defer testing.allocator.free(plain);
+    const len: u32 = @intCast(plain.len);
+    // At min_bytes, past it, a byte short of it, and no compression.
+    const cases = [_]struct { ?types.Compression, bool }{
+        .{ .{ .min_bytes = len }, true },
+        .{ .{ .level = 1 }, true },
+        .{ .{ .min_bytes = len + 1 }, false },
+        .{ null, false },
+    };
+    for (cases, 0..) |case, i| {
+        var preview = try orders.publishRequest(messages, .{ .compression = case[0] });
+        defer preview.deinit();
+        try testing.expectEqual(case[1], preview.value.gzip);
+        try testing.expectEqualStrings(plain, preview.value.body);
+        var sent = try orders.publish(messages, .{ .compression = case[0] });
+        sent.deinit();
+        try expectSent(&h, i, preview.value);
+    }
+    try h.expectRequestCount(4);
+}
+
+test "publishRequest: the checks publish makes fail it the same way, and nothing is sent" {
+    var h: Harness = undefined;
+    try h.init(&.{}, .{});
+    defer h.deinit();
+    const orders = h.client.topic("orders");
+    try testing.expectError(error.InvalidResourceId, h.client.topic("a/b/c").publishRequest(&.{.{ .data = "x" }}, .{}));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "invalid topic id") != null);
+    try testing.expectError(error.InvalidMessage, orders.publishRequest(&.{}, .{}));
+    try testing.expectError(error.InvalidMessage, orders.publishRequest(&.{.{}}, .{}));
+    try testing.expectEqualStrings("message 0 has no data and no attributes", h.diag.message());
+    try testing.expectError(error.InvalidMessage, orders.publishRequest(&.{.{ .data = "x" }}, .{ .ordering_key = "\xff" }));
+    // Even for a body too short to be compressed.
+    try testing.expectError(error.InvalidArgument, orders.publishRequest(&.{.{ .data = "x" }}, .{ .compression = .{ .level = 0 } }));
+    try testing.expectEqualStrings("compression level 0 is outside 1 to 9", h.diag.message());
+    try h.expectRequestCount(0);
+
+    // A later success leaves no message from the failure before it.
+    var preview = try orders.publishRequest(&.{.{ .data = "x" }}, .{});
+    defer preview.deinit();
+    try testing.expectEqualStrings("", h.diag.message());
+}
+
+test "publishRequest: every allocation failure is OutOfMemory without leaks" {
+    const Run = struct {
+        fn build(gpa: std.mem.Allocator) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, &.{});
+            defer fake.deinit();
+            var clock: test_util.FakeClock = .{};
+            var client = try Client.init(gpa, clock.io(), .{
+                .project_id = "p",
+                .endpoint = .{ .url = "localhost:8085", .emulator = true },
+                .transport = fake.transport(),
+            });
+            defer client.deinit();
+            var preview = try client.topic("orders").publishRequest(&.{
+                .{ .data = "hello", .attributes = &.{.{ .key = "k", .value = "v" }} },
+                .{ .data = "world" },
+            }, .{ .ordering_key = "key", .compression = .{} });
+            preview.deinit();
+        }
+    };
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.build, .{});
+}
+
+/// Any topic id, messages and options: `publishRequest` fails exactly when
+/// `publish` fails before sending, with the same error, and otherwise
+/// describes the one request `publish` then sends.
+fn publishRequestProperty(_: void, input: []const u8) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g: test_util.ByteGen = .init(input);
+
+    const id = g.pick([]const u8, &.{ "orders", "a%41+b", "x.y~z_1", "go", "googthing", "a/b", "Orders-2" });
+    const messages = try a.alloc(types.Message, g.intRange(usize, 0, 4));
+    for (messages) |*m| {
+        var attrs: std.ArrayList(types.Attribute) = .empty;
+        for (0..g.intRange(usize, 0, 3)) |_| {
+            var key_buf: [12]u8 = undefined;
+            var value_buf: [16]u8 = undefined;
+            // Raw bytes now and then, so invalid UTF-8 reaches the checks.
+            const key = try a.dupe(u8, if (g.intRange(u8, 0, 7) == 0) g.slice(12) else g.utf8(&key_buf, 12));
+            const value = try a.dupe(u8, g.utf8(&value_buf, 16));
+            try attrs.append(a, .{ .key = key, .value = value });
+        }
+        m.* = .{ .data = try a.dupe(u8, g.slice(g.pick(usize, &.{ 0, 8, 80, 400 }))), .attributes = attrs.items };
+    }
+    var key_buf: [16]u8 = undefined;
+    const ordering_key: ?[]const u8 = switch (g.intRange(u8, 0, 3)) {
+        0 => null,
+        1 => "",
+        2 => try a.dupe(u8, g.utf8(&key_buf, 16)),
+        else => try a.dupe(u8, g.slice(16)),
+    };
+    const compression: ?types.Compression = if (g.boolean()) .{
+        .level = g.int(u4),
+        .min_bytes = g.pick(u32, &.{ 0, 1, 64, 240, 1000 }),
+    } else null;
+    const options: types.PublishOptions = .{ .ordering_key = ordering_key, .compression = compression };
+
+    var ids: std.ArrayList(u8) = .empty;
+    try ids.appendSlice(a, "{\"messageIds\":[");
+    for (0..messages.len) |i| try ids.appendSlice(a, if (i == 0) "\"1\"" else ",\"1\"");
+    try ids.appendSlice(a, "]}");
+    const replies = [_]FakeReply{.{ .respond = .{ .body = ids.items } }};
+    var h: Harness = undefined;
+    try h.init(&replies, .{ .token = if (g.boolean()) "token" else null });
+    defer h.deinit();
+    const topic = h.client.topic(id);
+
+    var preview = topic.publishRequest(messages, options) catch |err| {
+        const message = try a.dupe(u8, h.diag.message());
+        try testing.expectError(err, topic.publish(messages, options));
+        try testing.expectEqualStrings(message, h.diag.message());
+        try h.expectRequestCount(0);
+        return;
+    };
+    defer preview.deinit();
+    var sent = try topic.publish(messages, options);
+    sent.deinit();
+    try h.expectRequestCount(1);
+    try expectSent(&h, 0, preview.value);
+}
+
+test "fuzz publishRequest: a request built is the one publish sends, and one refused is refused by publish alike" {
+    try test_util.fuzzBytes({}, publishRequestProperty, .{ .corpus = &.{
+        "",
+        "\x00\x02\x01\x41\x42\x00\x03\x02\x05",
+        "\x06\x01\x00\x03\xff\xfe\x01\x01\x06\x00\x10\x00",
+    } });
 }
 
 const agent = "serviceAccount:service-82150720798@gs-project-accounts.iam.gserviceaccount.com";

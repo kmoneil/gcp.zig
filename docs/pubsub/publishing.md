@@ -7,7 +7,8 @@
 [Retries, flushing and stopping](#retries-flushing-and-stopping) ·
 [Ordering keys](#ordering-keys) ·
 [A topic with a schema](#a-topic-with-a-schema) ·
-[Compressed publishing](#compressed-publishing)
+[Compressed publishing](#compressed-publishing) ·
+[Seeing a request before it goes](#seeing-a-request-before-it-goes)
 
 ## Publishing at volume
 
@@ -179,3 +180,41 @@ limit to the body decompressed: 10.8 MB of JSON, sent as 10,566 bytes of
 gzip, was refused. The emulator takes them too. Pull answers already
 come back compressed: the transport accepts gzip, and production gzips
 them.
+
+## Seeing a request before it goes
+
+`Topic.publishRequest` builds the request `publish` would send for the
+same messages and options, and sends nothing: for an application that
+shows a write before the user confirms it, or records each write it
+makes.
+
+<!-- snippet: tests/docs_examples.zig#pubsub-publish-request -->
+```zig
+/// Writes the request a publish of `messages` will send, then sends it.
+fn showAndPublish(
+    topic: pubsub.Topic,
+    messages: []const pubsub.Message,
+    options: pubsub.PublishOptions,
+    out: *std.Io.Writer,
+) !pubsub.Owned(pubsub.PublishResult) {
+    var request = try topic.publishRequest(messages, options);
+    defer request.deinit();
+    try out.print("{t} {s}\n{s}\n", .{ request.value.method, request.value.url, request.value.body });
+    if (request.value.gzip) try out.writeAll("(sent gzip-compressed)\n");
+    return topic.publish(messages, options);
+}
+```
+
+- **It is what `publish` sends.** `publish` builds its request the same
+  way, so the URL, the client's endpoint included, and the body agree
+  with it byte for byte.
+- **The body is the one before compression.** `gzip` says whether
+  `publish` compresses it, with `Content-Encoding: gzip`; a compressed
+  body decompresses to exactly this one.
+- **The same checks run first.** A request `publishRequest` refuses,
+  with `error.InvalidMessage` for an empty message or
+  `error.InvalidArgument` for a compression level out of range, is one
+  `publish` refuses the same way, before sending anything.
+- **Headers are left out,** credentials among them.
+- **One call, not a batch.** A `Publisher` builds its batches as it
+  goes, so there is no request to show until it sends one.

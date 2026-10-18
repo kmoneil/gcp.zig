@@ -34,8 +34,20 @@ including the ones that did not change.
   exception and frames with file paths aside, first seen is the first
   error processed, and "newest first by creation" orders by first seen.
   The guide is docs/error_reporting/.
-- auth, core, firestore, logging, pubsub, resource_manager,
-  secret_manager and storage: unchanged.
+- pubsub: `Topic.publishRequest` builds the request `publish` sends for
+  the same messages and options and sends nothing, for an application
+  that shows a write before it goes or records it after (issue #228). A
+  `PublishRequest` holds the method, the whole URL and the body before
+  any compression, and `gzip` says whether `publish` compresses it.
+  `publish` builds its request the same way, so the two agree byte for
+  byte, and both make the same checks and fail them the same way. No
+  existing call changes. `pubsub.testing.FakePubSub` now takes a
+  gzip-compressed publish, as production and the emulator do, and holds
+  the 10,485,760-byte limit to the body decompressed, as production
+  does; until now it refused one, so a test that published with
+  `compression` failed against it.
+- auth, core, firestore, logging, resource_manager, secret_manager and
+  storage: unchanged.
 
 ## 0.42.0 (2026-10-17)
 

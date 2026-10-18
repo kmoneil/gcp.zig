@@ -86,15 +86,21 @@ pub const gzip_headers: []const core.transport.Header = &.{.{ .name = "Content-E
 /// logged. A failed check is a compressor bug, and compressing only saves
 /// bandwidth, so it never stops the publish.
 pub fn compressBody(gpa: Allocator, body: []const u8, compression: ?types.Compression) Allocator.Error!?[]u8 {
-    const c = compression orelse return null;
-    if (body.len < c.min_bytes) return null;
-    return core.gzip.compress(gpa, body, c.level) catch |err| switch (err) {
+    if (!compresses(body.len, compression)) return null;
+    return core.gzip.compress(gpa, body, compression.?.level) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.CheckFailed => {
             logging.warn("a publish of {d} bytes did not decompress to itself after compressing; sending it uncompressed", .{body.len});
             return null;
         },
     };
+}
+
+/// Whether `compressBody` compresses a body of `len` bytes: compression
+/// asked for, and the body at least its `min_bytes`.
+pub fn compresses(len: usize, compression: ?types.Compression) bool {
+    const c = compression orelse return false;
+    return len >= c.min_bytes;
 }
 
 /// Checks a topic or subscription id before any request.

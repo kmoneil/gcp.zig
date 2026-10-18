@@ -806,8 +806,33 @@ pub const FakePubSub = struct {
 
     fn send(ptr: *anyopaque, req: tp.Request, arena: Allocator) tp.Error!tp.Response {
         const f: *FakePubSub = @ptrCast(@alignCast(ptr));
-        const reply = try f.serve(req.method, req.url, req.body orelse "", arena);
+        var body = req.body orelse "";
+        // A compressed publish, taken as production takes one: its limits
+        // hold to the body decompressed.
+        if (gzipped(req.headers)) body = try gunzip(arena, body) orelse {
+            const reply = try notModelled(arena, "a gzip body that does not decompress");
+            return .{ .status = reply.status, .headers = reply.headers, .body = reply.body };
+        };
+        const reply = try f.serve(req.method, req.url, body, arena);
         return .{ .status = reply.status, .headers = reply.headers, .body = reply.body };
+    }
+
+    fn gzipped(headers: []const tp.Header) bool {
+        for (headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "content-encoding") and std.ascii.eqlIgnoreCase(h.value, "gzip")) return true;
+        }
+        return false;
+    }
+
+    /// `body` decompressed, or null when it is not gzip that decompresses.
+    fn gunzip(arena: Allocator, body: []const u8) Allocator.Error!?[]u8 {
+        const window = try arena.alloc(u8, core.flate.max_window_len);
+        var in: std.Io.Reader = .fixed(body);
+        var inflate: core.flate.Decompress = .init(&in, .gzip, window);
+        return inflate.reader.allocRemaining(arena, .unlimited) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.ReadFailed, error.StreamTooLong => null,
+        };
     }
 
     const Route = struct {
@@ -5092,6 +5117,47 @@ test "a message goes from a publish to a pull, and an ack takes it away" {
     var none = try b.client.subscription("worker").pull(.{ .return_immediately = true });
     defer none.deinit();
     try testing.expectEqual(0, none.value.messages.len);
+}
+
+test "a gzip-compressed publish is taken as production takes one, its limit held to the body decompressed" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var topic = try b.client.topic("orders").create(.{});
+    topic.deinit();
+    var sub = try b.client.subscription("worker").create(.{ .topic_id = "orders" });
+    sub.deinit();
+
+    const long = xs(300);
+    var sent = try b.client.topic("orders").publish(&.{.{ .data = &long, .attributes = &.{.{ .key = "k", .value = "v" }} }}, .{ .compression = .{} });
+    sent.deinit();
+    var got = try b.client.subscription("worker").pull(.{});
+    defer got.deinit();
+    try testing.expectEqual(1, got.value.messages.len);
+    try testing.expectEqualStrings(&long, got.value.messages[0].data);
+    try testing.expectEqualStrings("v", got.value.messages[0].attribute("k").?);
+
+    const url = "https://pubsub.googleapis.com/v1/projects/p/topics/orders:publish";
+    const gzip: []const tp.Header = &.{.{ .name = "Content-Encoding", .value = "gzip" }};
+    const before = b.fake.publishedCount("p", "orders");
+    // Production refused 10.8 MB of JSON sent as 10,566 bytes of gzip.
+    var bulk: std.Io.Writer.Allocating = .init(a);
+    try bulk.writer.writeAll("{\"messages\":[{\"data\":\"");
+    try bulk.writer.splatByteAll('A', max_publish_bytes);
+    try bulk.writer.writeAll("\"}]}");
+    const packed_big = try core.gzip.compress(a, bulk.written(), 6);
+    try testing.expect(packed_big.len < 64 * 1024);
+    const over = try b.fake.transport().send(.{ .method = .POST, .url = url, .body = packed_big, .headers = gzip }, a);
+    try testing.expectEqual(400, over.status);
+    try testing.expect(std.mem.indexOf(u8, over.body, "Request payload size exceeds the limit: 10485760 bytes.") != null);
+    // Bytes that are not gzip: what production answers was never measured.
+    const garbled = try b.fake.transport().send(.{ .method = .POST, .url = url, .body = "{\"messages\":[]}", .headers = gzip }, a);
+    try testing.expectEqual(501, garbled.status);
+    try testing.expect(std.mem.indexOf(u8, garbled.body, "fake: a gzip body that does not decompress is not modelled yet") != null);
+    try testing.expectEqual(before, b.fake.publishedCount("p", "orders"));
 }
 
 /// `n` of the letter x, for text of a chosen length.
