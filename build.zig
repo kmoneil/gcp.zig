@@ -196,6 +196,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "auth", .module = auth },
                 .{ .name = "error_reporting", .module = error_reporting },
                 .{ .name = "monitoring", .module = monitoring },
+                .{ .name = "kms", .module = kms },
                 .{ .name = "secret_manager", .module = secret_manager },
                 .{ .name = "firestore", .module = firestore },
                 .{ .name = "storage", .module = storage },
@@ -344,7 +345,7 @@ pub fn build(b: *std.Build) void {
     // examples, so they cannot rot between runs.
     const gcp_step = b.step(
         "test-integration-gcp",
-        "Run the Secret Manager, Cloud Storage, signed URL, Firestore, Logging, Resource Manager, Error Reporting and Monitoring tests against Google: GCP_TEST_PROJECT, GCP_TEST_BUCKET, FIRESTORE_TEST_DATABASE",
+        "Run the Secret Manager, Cloud Storage, signed URL, Firestore, Logging, Resource Manager, Error Reporting, Monitoring and KMS tests against Google: GCP_TEST_PROJECT, GCP_TEST_BUCKET, FIRESTORE_TEST_DATABASE, KMS_TEST_KEY_RING",
     );
     // Secret Manager has no emulator, so its tests need GCP_TEST_PROJECT
     // and GCP_TEST_TOKEN.
@@ -493,6 +494,25 @@ pub fn build(b: *std.Build) void {
     });
     gcp_step.dependOn(&streamed(b, error_reporting_gcp_tests).step);
     test_step.dependOn(&error_reporting_gcp_tests.step);
+    // Cloud KMS against a key ring kept for the suite: GCP_TEST_PROJECT,
+    // GCP_TEST_TOKEN and KMS_TEST_KEY_RING, on which the token's principal
+    // holds roles/cloudkms.admin and roles/cloudkms.cryptoOperator. Keys
+    // are destroyed as a run ends and deleted by a later run.
+    const kms_gcp_tests = b.addTest(.{
+        .name = "kms-gcp-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/kms_gcp_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "kms", .module = kms },
+            },
+        }),
+        .filters = test_filters,
+        .test_runner = test_runner,
+    });
+    gcp_step.dependOn(&streamed(b, kms_gcp_tests).step);
+    test_step.dependOn(&kms_gcp_tests.step);
     // Signed URLs against a real bucket, which is the only place a
     // signature is checked: GCP_TEST_BUCKET, GCP_TEST_TOKEN, and a signer,
     // GCP_TEST_SIGNER_KEY or GCP_TEST_SIGNER_EMAIL.
@@ -534,11 +554,11 @@ pub fn build(b: *std.Build) void {
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "pubsub_metrics" }) |name| {
+    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "pubsub_metrics", "kms" }) |name| {
         // whoami, secret, gcs_cp, gcs_sign, gcs_notify, quickstart, iam,
         // secret_rotation, firestore, logs_read, logs_tail, projects_list,
-        // error_dashboard, monitoring and pubsub_metrics pick their own
-        // credentials.
+        // error_dashboard, monitoring, pubsub_metrics and kms pick their
+        // own credentials.
         const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "secret"))
@@ -561,6 +581,8 @@ pub fn build(b: *std.Build) void {
             &.{ .{ .name = "monitoring", .module = monitoring }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "pubsub_metrics"))
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "monitoring", .module = monitoring }, .{ .name = "auth", .module = auth } }
+        else if (std.mem.eql(u8, name, "kms"))
+            &.{ .{ .name = "kms", .module = kms }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "gcs_notify") or std.mem.eql(u8, name, "quickstart"))
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else

@@ -23,17 +23,20 @@
 //!   `PreconditionFailure` production sends, and a state change the
 //!   machine forbids is `FAILED_PRECONDITION` in production's words.
 //! - Deletes answer an operation that is not done yet, and done when read,
-//!   as production's was (0.2 s later, on 2026-10-18).
+//!   as production's was (0.2 s later, on 2026-10-18); a key ring's is
+//!   done 422 s later, as production's was.
 //! - Faults a test asks for, and a call served and then answered with an
 //!   error, as a lost answer is.
 //!
-//! Where it differs, until milestone 0 measures production: messages for
-//! a missing resource, a delete out of order and a create refused are its
-//! own; a key ring id is free again at once, where production takes 5 to
-//! 10 minutes. Not modelled, each answered 501 with the reason: filters
-//! and orders on lists, another project, import jobs, EKM, Autokey, IAM
-//! enforcement (every caller may do everything), quotas, and the eventual
-//! consistency of a disable or a primary change.
+//! Its refusals are in production's words, status and reason wherever
+//! production was seen to refuse (milestone 0 of the KMS spec, and the
+//! replay in tests/kms_gcp_integration.zig, both 2026-10-18); the few it
+//! words itself start `fake:`. Where it differs: a deleted key ring's id
+//! is free again at once, where production's took 422 s. Not modelled,
+//! each answered 501 with the reason: filters and orders on lists, another
+//! project, import jobs, EKM, Autokey, IAM enforcement (every caller may
+//! do everything), quotas, and the eventual consistency of a disable or a
+//! primary change, which production showed at once on 2026-10-18.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -643,11 +646,15 @@ pub const FakeKms = struct {
     }
 
     fn deleteKey(f: *FakeKms, arena: Allocator, target: Target, k: *Key) Allocator.Error!Reply {
+        // Production's words and status, on 2026-10-18: INVALID_ARGUMENT,
+        // where a key ring holding keys is FAILED_PRECONDITION. Versions
+        // left came first there when a rotation was scheduled too.
         for (k.versions.items) |v| if (!v.deleted) {
-            return fail(arena, 400, "FAILED_PRECONDITION", try arena.print("fake: CryptoKey {s} still has versions that are not deleted", .{k.name}));
+            return fail(arena, 400, "INVALID_ARGUMENT", "CryptoKeys can only be deleted if all associated CryptoKeyVersions have already been deleted.");
         };
-        if (k.next_rotation != null) return fail(arena, 400, "FAILED_PRECONDITION", try arena.print("fake: CryptoKey {s} has automatic rotation scheduled", .{k.name}));
-        const retired_name = try std.fmt.allocPrint(f.store.allocator(), "{s}/retiredResources/r{d}", .{ target.location_name, f.retired.items.len + 1 });
+        if (k.next_rotation != null) return fail(arena, 400, "INVALID_ARGUMENT", "Cannot delete a CryptoKey with rotation_schedule set.");
+        // A UUID, as production's are.
+        const retired_name = try std.fmt.allocPrint(f.store.allocator(), "{s}/retiredResources/00000000-0000-4000-8000-{d:0>12}", .{ target.location_name, f.retired.items.len + 1 });
         try f.retired.append(f.gpa, .{ .name = retired_name, .original = k.name, .delete_time = f.nowNs() });
         _ = f.keys.orderedRemove(k.name);
         return f.startOperation(arena, target, retired_name, 0);
@@ -746,7 +753,7 @@ pub const FakeKms = struct {
     fn deleteVersion(f: *FakeKms, arena: Allocator, target: Target, v: *Version) Allocator.Error!Reply {
         switch (v.state) {
             .destroyed, .generation_failed, .import_failed => {},
-            else => return transitionRefused(arena, target.version_name, v.state),
+            else => return fail(arena, 400, "FAILED_PRECONDITION", try arena.print("Invalid CryptoKeyVersion state for deletion: {s}", .{v.state.wire()})),
         }
         v.deleted = true;
         return f.startOperation(arena, target, null, 0);
@@ -1991,7 +1998,8 @@ test "a symmetric key's whole life: versions made, rotated by hand, destroyed, r
     try testing.expectError(error.NotFound, old.get());
 
     // The key keeps version 2, so it cannot go yet, nor its ring.
-    try testing.expectError(error.FailedPrecondition, key.delete());
+    try testing.expectError(error.InvalidArgument, key.delete());
+    try testing.expectEqualStrings("CryptoKeys can only be deleted if all associated CryptoKeyVersions have already been deleted.", r.diag.message());
     try testing.expectError(error.FailedPrecondition, ring.delete());
     var listed = try key.listVersions(.{});
     try testing.expectEqual(1, listed.value.versions.len);
@@ -2068,8 +2076,7 @@ test "automatic rotation makes a version and makes it primary, on the clock, unt
     var twice = try key.get();
     try testing.expectEqual(4, twice.value.primary.?.id);
     twice.deinit();
-    // A key with rotation scheduled cannot be deleted; turned off, it can,
-    // once its versions are gone.
+    // Turned off, rotation stops.
     var off = try key.update(.{ .rotation = .clear });
     try testing.expectEqual(null, off.value.next_rotation);
     try testing.expectEqual(null, off.value.rotation_period_s);
@@ -2078,6 +2085,17 @@ test "automatic rotation makes a version and makes it primary, on the clock, unt
     var still = try key.get();
     try testing.expectEqual(4, still.value.primary.?.id);
     still.deinit();
+
+    // A key with rotation scheduled cannot be deleted, even with no
+    // version, as production refuses it; turned off, it can.
+    const bare = ring.key("bare");
+    var b = try bare.create(.{ .purpose = .encrypt_decrypt, .first_version = false, .rotation = .{ .period_s = 86_400, .next = .{ .nanoseconds = r.clock.now_ns + 30 * day * std.time.ns_per_s } } });
+    b.deinit();
+    try testing.expectError(error.InvalidArgument, bare.delete());
+    try testing.expectEqualStrings("Cannot delete a CryptoKey with rotation_schedule set.", r.diag.message());
+    var cleared = try bare.update(.{ .rotation = .clear });
+    cleared.deinit();
+    try bare.delete();
 }
 
 test "updates: labels replaced and cleared, the template's algorithm, refusals of another purpose's" {
@@ -2745,6 +2763,61 @@ fn cryptoAllocations(gpa: Allocator) !void {
     granted.deinit();
     var held = try r.client.keyRing("r").testIamPermissions(&.{"cloudkms.keyRings.get"});
     held.deinit();
+}
+
+test "log hygiene: no plaintext, ciphertext, signature, MAC, random bytes, checksum or token" {
+    const logging = @import("logging.zig");
+    logging.capture.reset();
+    var r: Rig = undefined;
+    try ringRig(&r, testing.allocator, .{});
+    defer r.deinit();
+    const sym = r.client.keyRing("r").key("sym");
+    var a = try sym.create(.{ .purpose = .encrypt_decrypt });
+    a.deinit();
+    r.fake.refuseNext(1, 503);
+    var ct = try sym.encrypt("s3cr3t-plain", .{ .aad = "ctx" });
+    defer ct.deinit();
+    var p = try sym.decrypt(ct.value.bytes, .{ .aad = "ctx" });
+    p.deinit();
+    const sig = r.client.keyRing("r").key("sig");
+    var b = try sig.create(.{ .purpose = .asymmetric_sign, .algorithm = .ec_sign_ed25519 });
+    b.deinit();
+    var s = try sig.version(1).sign(.ec_sign_ed25519, "m");
+    defer s.deinit();
+    const mac = r.client.keyRing("r").key("mac");
+    var m = try mac.create(.{ .purpose = .mac, .algorithm = .hmac_sha256 });
+    m.deinit();
+    var t = try mac.version(1).macSign("d");
+    defer t.deinit();
+    _ = try mac.version(1).macVerify("d", t.value);
+    var random = try r.client.randomBytes(16);
+    defer random.deinit();
+
+    const log = logging.capture.text();
+    try testing.expect(log.len > 0);
+    const encoder = std.base64.standard.Encoder;
+    var buffers: [5][512]u8 = undefined;
+    // The plaintext, the base64 it went in and its checksum; what came
+    // back, in the base64 it came in; and the bearer token.
+    const forbidden = [_][]const u8{
+        "s3cr3t-plain",
+        encoder.encode(&buffers[0], "s3cr3t-plain"),
+        "866759889",
+        encoder.encode(&buffers[1], ct.value.bytes),
+        encoder.encode(&buffers[2], s.value),
+        encoder.encode(&buffers[3], t.value),
+        encoder.encode(&buffers[4], random.value),
+        "ya29",
+    };
+    for (forbidden) |text| {
+        if (std.mem.indexOf(u8, log, text) != null) {
+            std.debug.print("log leaked \"{s}\":\n{s}\n", .{ text, log });
+            return error.TestLeakedSecret;
+        }
+    }
+    // What it does say is which call was made, and that it was retried.
+    try testing.expect(std.mem.indexOf(u8, log, "cryptoKeys/sym:encrypt") != null);
+    try testing.expect(std.mem.indexOf(u8, log, "retrying") != null);
 }
 
 test "crypto calls against the fake: every allocation failure is OutOfMemory without leaks" {

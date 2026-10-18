@@ -1797,3 +1797,273 @@ test "the Monitoring guides' code, against the in-memory Cloud Monitoring" {
     try std.testing.expectEqual(41, (try fake.points(a, "custom.googleapis.com/shop/sent", &.{}))[0].value.int64);
     try std.testing.expectEqual(0, recorder.stats().points_refused);
 }
+
+const kms = @import("kms");
+
+// snippet: kms-seal
+/// Encrypts a value for storage, bound to the record it belongs to: a
+/// ciphertext copied into another record does not decrypt there.
+fn seal(key: kms.Key, record_id: []const u8, value: []const u8) !kms.Owned(kms.Ciphertext) {
+    return key.encrypt(value, .{ .aad = record_id });
+}
+
+/// The value back, in memory its `deinit` wipes.
+fn unseal(key: kms.Key, record_id: []const u8, ciphertext: []const u8) !kms.Plaintext {
+    return key.decrypt(ciphertext, .{ .aad = record_id });
+}
+// end snippet
+
+// snippet: kms-keys
+/// Makes the key ring and the two keys an application uses: one that
+/// encrypts, rotated every 90 days, and one that signs. What exists
+/// already is left as it is.
+fn makeKeys(client: *kms.Client, now: std.Io.Timestamp) !void {
+    const ring = client.keyRing("app");
+    if (ring.create()) |made| {
+        var info = made;
+        info.deinit();
+    } else |err| if (err != error.AlreadyExists) return err;
+
+    const ninety_days = 90 * std.time.s_per_day;
+    if (ring.key("config").create(.{
+        .purpose = .encrypt_decrypt,
+        .rotation = .{ .period_s = ninety_days, .next = .{ .nanoseconds = now.nanoseconds + ninety_days * std.time.ns_per_s } },
+    })) |made| {
+        var info = made;
+        info.deinit();
+    } else |err| if (err != error.AlreadyExists) return err;
+
+    const releases = ring.key("releases");
+    if (releases.create(.{ .purpose = .asymmetric_sign, .algorithm = .ec_sign_p256_sha256 })) |made| {
+        var info = made;
+        info.deinit();
+        // An asymmetric version is made after the create answers.
+        var ready = try releases.version(1).waitUntilEnabled(.{});
+        ready.deinit();
+    } else |err| if (err != error.AlreadyExists) return err;
+}
+// end snippet
+
+// snippet: kms-sign
+/// Signs a release's manifest, and checks the signature here against the
+/// version's public key, as whoever downloads the release would.
+fn signManifest(version: kms.KeyVersion, manifest: []const u8) !kms.Owned([]const u8) {
+    var signature = try version.sign(.ec_sign_p256_sha256, manifest);
+    errdefer signature.deinit();
+    var public_key = try version.publicKey();
+    defer public_key.deinit();
+    try public_key.value.verify(manifest, signature.value);
+    return signature;
+}
+// end snippet
+
+// snippet: kms-mac
+/// A webhook body's tag, made with an HMAC key that never leaves Cloud
+/// KMS, and checked there when the body comes back.
+fn tagBody(version: kms.KeyVersion, body: []const u8) !kms.Owned([]const u8) {
+    return version.macSign(body);
+}
+
+fn bodyIsOurs(version: kms.KeyVersion, body: []const u8, tag: []const u8) !bool {
+    return version.macVerify(body, tag);
+}
+// end snippet
+
+// snippet: kms-retire
+/// Retires a version no ciphertext needs any more: scheduled for
+/// destruction the first time, restorable until its destroy time, and
+/// deleted by a run after that.
+fn retireVersion(key: kms.Key, id: u64) !void {
+    var info = try key.version(id).get();
+    defer info.deinit();
+    switch (info.value.state) {
+        .enabled, .disabled => {
+            var scheduled = try key.version(id).destroy();
+            scheduled.deinit();
+        },
+        .destroyed => try key.version(id).delete(),
+        else => {},
+    }
+}
+// end snippet
+
+// snippet: kms-iam
+/// Lets a project's Cloud Storage service agent use a key for a bucket's
+/// default encryption: on that key alone, not on its key ring.
+fn letStorageUse(key: kms.Key, project_number: []const u8, buffer: []u8) !void {
+    const member = try std.fmt.bufPrint(buffer, "serviceAccount:service-{s}@gs-project-accounts.iam.gserviceaccount.com", .{project_number});
+    var policy = try key.addIamBinding("roles/cloudkms.cryptoKeyEncrypterDecrypter", member);
+    defer policy.deinit();
+}
+// end snippet
+
+// snippet: kms-fake
+test "a sealed value opens only for its own record, in the in-memory Cloud KMS" {
+    var clock: kms.testing.FakeClock = .{ .now_ns = 1_792_300_000 * std.time.ns_per_s };
+    var fake: kms.testing.FakeKms = .init(std.testing.allocator, clock.io(), .{ .project_id = "my-project" });
+    defer fake.deinit();
+    var token: kms.StaticToken = .{ .token = "none" };
+    var client = try kms.Client.init(std.testing.allocator, clock.io(), .{
+        .project_id = "my-project",
+        .location = "us-central1",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    try makeKeys(&client, std.Io.Clock.real.now(clock.io()));
+
+    const key = client.keyRing("app").key("config");
+    var sealed = try seal(key, "user-42", "s3cr3t");
+    defer sealed.deinit();
+    var value = try unseal(key, "user-42", sealed.value.bytes);
+    defer value.deinit();
+    try std.testing.expectEqualStrings("s3cr3t", value.bytes());
+    // Another record's AAD is refused, as production refuses it.
+    try std.testing.expectError(error.DecryptionFailed, unseal(key, "user-43", sealed.value.bytes));
+
+    // The fake's keys are real: its signatures verify here.
+    var signature = try signManifest(client.keyRing("app").key("releases").version(1), "v1.2.3");
+    defer signature.deinit();
+}
+// end snippet
+
+/// A rig for the snippets above: the keys `makeKeys` makes, in a fake.
+const KmsRig = struct {
+    clock: kms.testing.FakeClock,
+    fake: kms.testing.FakeKms,
+    token: kms.StaticToken,
+    client: kms.Client,
+
+    fn init(r: *KmsRig) !void {
+        r.clock = .{ .now_ns = 1_792_300_000 * std.time.ns_per_s };
+        r.fake = .init(std.testing.allocator, r.clock.io(), .{ .project_id = "my-project" });
+        errdefer r.fake.deinit();
+        r.token = .{ .token = "none" };
+        r.client = try .init(std.testing.allocator, r.clock.io(), .{
+            .project_id = "my-project",
+            .location = "us-central1",
+            .token_provider = r.token.provider(),
+            .transport = r.fake.transport(),
+        });
+        errdefer r.client.deinit();
+        try makeKeys(&r.client, std.Io.Clock.real.now(r.clock.io()));
+    }
+
+    fn deinit(r: *KmsRig) void {
+        r.client.deinit();
+        r.fake.deinit();
+    }
+};
+
+test "makeKeys leaves what exists as it is" {
+    var r: KmsRig = undefined;
+    try r.init();
+    defer r.deinit();
+    try makeKeys(&r.client, std.Io.Clock.real.now(r.clock.io()));
+    var config = try r.client.keyRing("app").key("config").get();
+    defer config.deinit();
+    try std.testing.expectEqual(90 * std.time.s_per_day, config.value.rotation_period_s.?);
+    try std.testing.expectEqual(1, config.value.primary.?.id);
+}
+
+test "a webhook body's tag: ours, and not once the body changes" {
+    var r: KmsRig = undefined;
+    try r.init();
+    defer r.deinit();
+    const hooks = r.client.keyRing("app").key("hooks");
+    var made = try hooks.create(.{ .purpose = .mac, .algorithm = .hmac_sha256 });
+    made.deinit();
+    var tag = try tagBody(hooks.version(1), "{\"order\":42}");
+    defer tag.deinit();
+    try std.testing.expect(try bodyIsOurs(hooks.version(1), "{\"order\":42}", tag.value));
+    try std.testing.expect(!try bodyIsOurs(hooks.version(1), "{\"order\":43}", tag.value));
+}
+
+test "a version retired: scheduled, then deleted once destroyed" {
+    var r: KmsRig = undefined;
+    try r.init();
+    defer r.deinit();
+    const key = r.client.keyRing("app").key("config");
+    var second = try key.createVersion();
+    second.deinit();
+    var primary = try key.setPrimary(2);
+    primary.deinit();
+    try retireVersion(key, 1);
+    var scheduled = try key.version(1).get();
+    try std.testing.expectEqual(.destroy_scheduled, scheduled.value.state);
+    scheduled.deinit();
+    // Nothing to do while it waits; the key's destroy delay is 30 days.
+    try retireVersion(key, 1);
+    r.clock.now_ns += 30 * std.time.ns_per_day;
+    try retireVersion(key, 1);
+    try std.testing.expectError(error.NotFound, key.version(1).get());
+}
+
+test "a key's own grant to a service agent" {
+    var r: KmsRig = undefined;
+    try r.init();
+    defer r.deinit();
+    const key = r.client.keyRing("app").key("config");
+    var buffer: [128]u8 = undefined;
+    try letStorageUse(key, "123456789", &buffer);
+    var policy = try key.iamPolicy();
+    defer policy.deinit();
+    try std.testing.expect(policy.value.grants("roles/cloudkms.cryptoKeyEncrypterDecrypter", "serviceAccount:service-123456789@gs-project-accounts.iam.gserviceaccount.com"));
+}
+
+// snippet: kms-envelope
+/// Data of any size, encrypted here with a key of its own, which Cloud
+/// KMS encrypts in turn: only those 32 bytes go to the server.
+const Envelope = struct {
+    wrapped_key: []const u8,
+    nonce: [12]u8,
+    tag: [16]u8,
+    sealed: []const u8,
+};
+
+const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
+
+fn envelopeSeal(a: std.mem.Allocator, io: std.Io, key: kms.Key, data: []const u8) !Envelope {
+    var data_key: [Aes256Gcm.key_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &data_key);
+    io.random(&data_key);
+    var nonce: [Aes256Gcm.nonce_length]u8 = undefined;
+    io.random(&nonce);
+    const sealed = try a.alloc(u8, data.len);
+    errdefer a.free(sealed);
+    var tag: [Aes256Gcm.tag_length]u8 = undefined;
+    Aes256Gcm.encrypt(sealed, &tag, data, "", nonce, data_key);
+    var wrapped = try key.encrypt(&data_key, .{});
+    defer wrapped.deinit();
+    return .{ .wrapped_key = try a.dupe(u8, wrapped.value.bytes), .nonce = nonce, .tag = tag, .sealed = sealed };
+}
+
+fn envelopeOpen(a: std.mem.Allocator, key: kms.Key, envelope: Envelope) ![]u8 {
+    var data_key = try key.decrypt(envelope.wrapped_key, .{});
+    defer data_key.deinit();
+    if (data_key.bytes().len != Aes256Gcm.key_length) return error.DecryptionFailed;
+    const data = try a.alloc(u8, envelope.sealed.len);
+    errdefer a.free(data);
+    try Aes256Gcm.decrypt(data, envelope.sealed, envelope.tag, "", envelope.nonce, data_key.bytes()[0..Aes256Gcm.key_length].*);
+    return data;
+}
+// end snippet
+
+test "an envelope carries more than Cloud KMS takes in one call" {
+    var r: KmsRig = undefined;
+    try r.init();
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const data = try a.alloc(u8, 200 * 1024);
+    for (data, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const key = r.client.keyRing("app").key("config");
+    try std.testing.expectError(error.TooLarge, key.encrypt(data, .{}));
+    const envelope = try envelopeSeal(a, std.testing.io, key, data);
+    try std.testing.expect(envelope.wrapped_key.len < 200);
+    try std.testing.expectEqualSlices(u8, data, try envelopeOpen(a, key, envelope));
+    var tampered = envelope;
+    tampered.tag[0] ^= 1;
+    try std.testing.expectError(error.AuthenticationFailed, envelopeOpen(a, key, tampered));
+}

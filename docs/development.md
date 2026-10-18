@@ -74,9 +74,10 @@ slow and heavy properties (`slow-storage`, `heavy-storage`), and its
 fault properties, which drive whole transfers through injected faults
 (`fault-storage`, `fault-gzip`), Firestore's model of writes against
 its fake (`heavy-firestore`), Logging's tail by polling against its
-fake (`slow-logging`), and Resource Manager's walk of every page against
-its fake (`slow-resource_manager`). A test that fails while being fuzzed
-fails its job, and the input is attached to the run as
+fake (`slow-logging`), Resource Manager's walk of every page against its
+fake (`slow-resource_manager`), and KMS's model of calls against its fake
+with checksum faults injected (`slow-kms`). A test that fails while
+being fuzzed fails its job, and the input is attached to the run as
 `fuzz-failure-<job>`, such as `fuzz-failure-pubsub`.
 
 ## Integration tests
@@ -260,6 +261,26 @@ million series a month; a run takes about a minute.
 ```sh
 GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth print-access-token) \
     zig build test-integration-gcp -Dtest-filter=monitoring
+```
+
+### KMS
+
+Cloud KMS has no emulator, so its tests need a key ring kept for them,
+`KMS_TEST_KEY_RING`, in `KMS_TEST_LOCATION` (us-central1 when unset), on
+which the token's principal holds Cloud KMS Admin and Cloud KMS CryptoKey
+Operator; Editor cannot use keys. Each run makes software keys with a
+1-day destroy delay, `zigps-<run>-<what>`, and schedules every version
+of them for destruction as it ends. A key cannot be deleted until its
+versions are, so each run starts by sweeping what earlier runs left:
+destroyed versions deleted, then their keys, and any empty `zigps-` key
+ring but the kept one. The first test runs one script of 81 operations
+against production and `FakeKms`, failing on any outcome the two do not
+share; the second reads what only production has. A run bills eight
+versions for about a day, a cent or two, and takes about a minute.
+
+```sh
+GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth print-access-token) \
+    KMS_TEST_KEY_RING=my-test-ring zig build test-integration-gcp -Dtest-filter=kms
 ```
 
 ### Secret Manager and bucket settings

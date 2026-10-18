@@ -26,8 +26,8 @@ pub fn id(self: KeyRing) []const u8 {
 
 /// Creates the key ring. An id already taken in the location is
 /// `error.AlreadyExists`, and one whose key ring was deleted in the last
-/// 5 to 10 minutes may be too. A create whose answer was lost is read back
-/// rather than sent again.
+/// few minutes may be too (7, when measured). A create whose answer was
+/// lost is read back rather than sent again.
 pub fn create(self: KeyRing) Error!types.Owned(types.KeyRingInfo) {
     const c = self.client;
     rpc.begin(c);

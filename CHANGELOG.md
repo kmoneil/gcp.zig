@@ -39,15 +39,17 @@ including the ones that did not change.
   call sends the CRC-32C of each bytes field and checks the answer: the
   server's `verified` flags, its checksums, the version it names. A check
   that fails, or the server's refusal of a request checksum, is tried
-  again like a 503 and then is `error.IntegrityCheckFailed`. Another
-  key's ciphertext is `error.DecryptionFailed`. `PublicKey.verify` and
+  again like a 503 and then is `error.IntegrityCheckFailed`. Another AAD,
+  or another key's ciphertext, is `error.DecryptionFailed`.
+  `PublicKey.verify` and
   `verifyDigest` check a signature here: ECDSA P-256, P-384 and
   secp256k1, Ed25519 and ML-DSA through std.crypto, RSA PKCS#1 v1.5 and
   PSS through core.rsa, each held to signatures OpenSSL made and to
   signatures Cloud KMS itself made. The fake encrypts, signs and MACs
   with real keys (RSA from fixed test keys), and gets each checksum wrong
   on request. IAM on key rings and keys (`iamPolicy`, `setIamPolicy`,
-  `addIamBinding`, `removeIamBinding`, `testIamPermissions`), and
+  `addIamBinding`, `removeIamBinding`, `testIamPermissions`, with
+  `kms.iam` for the policy's type and helpers), and
   `KeyVersion.waitUntilEnabled` for a version still being generated.
   Measured in production on 2026-10-18 and held to since: software
   asymmetric keys are usable within 0.2 s; the 64 KiB limits are 65,536
@@ -56,7 +58,12 @@ including the ones that did not change.
   ring's delete finishes minutes after it is taken, so `KeyRing.delete`
   returns once it is; a key ring holding keys, a deleted key's id
   (`AlreadyExists`), a wrong AAD and another key's ciphertext each have
-  production's words in the fake.
+  production's words in the fake; deleting a key with versions left, or
+  with rotation scheduled, is `error.InvalidArgument`, as production
+  answers. A production suite holds the fake to production's outcome for
+  each of 81 operations (`zig build test-integration-gcp` with
+  `KMS_TEST_KEY_RING`). Guides in docs/kms, and `examples/kms.zig`, which
+  runs offline with `--fake`.
 - core: `errors.decodePreconditionFailures` reads the
   `google.rpc.PreconditionFailure` details of an error body, and
   `names.KmsKeyName` parses a Cloud KMS key's or version's full name.
