@@ -27,6 +27,21 @@ pub const Error = core.rpc.Error || error{
     /// `Diagnostics` says which, and names the version.
     KeyVersionDestroyed,
 
+    /// Plaintext, AAD, data to sign or to MAC past 64 KiB, or a request
+    /// for more than 1,024 random bytes: nothing is sent.
+    TooLarge,
+    /// A digest whose length is not its algorithm's: 32 bytes for SHA-256,
+    /// 48 for SHA-384, 64 for SHA-512. Nothing is sent.
+    InvalidDigest,
+    /// An answer that failed its checksums, after the retry policy's
+    /// attempts: the server did not get a checksum that was sent, a
+    /// checksum it sent does not match its bytes, it named another version,
+    /// or it refused a request checksum as not matching, which only bytes
+    /// changed on the way can do. `Diagnostics` says which.
+    IntegrityCheckFailed,
+    /// A ciphertext this key did not make: another key's, or bytes that are
+    /// not a Cloud KMS ciphertext. `Diagnostics` keeps the server's words.
+    DecryptionFailed,
     /// A success response could not be decoded. Never retried.
     InvalidResponse,
 };

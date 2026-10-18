@@ -23,6 +23,12 @@ pub const min_rotation_s: u32 = 24 * std.time.s_per_hour;
 pub const max_rotation_s: u32 = 876_000 * std.time.s_per_hour;
 /// The longest filter or order this client sends.
 pub const max_query_text = 2048;
+/// Plaintext, AAD, data to sign and data to MAC: at most 64 KiB each. HSM
+/// keys take 8 KiB of plaintext and AAD together, which the server checks.
+pub const max_payload = 64 * 1024;
+/// Random bytes come 8 to 1,024 at a time.
+pub const min_random_bytes = 8;
+pub const max_random_bytes = 1024;
 
 pub fn isProject(id: []const u8) bool {
     return core.names.isProjectId(id);

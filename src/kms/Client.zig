@@ -12,6 +12,7 @@ const Allocator = std.mem.Allocator;
 const core = @import("core");
 const codec = @import("codec.zig");
 const errors = @import("errors.zig");
+const integrity = @import("integrity.zig");
 const Key = @import("Key.zig");
 const KeyRing = @import("KeyRing.zig");
 const names = @import("names.zig");
@@ -229,6 +230,49 @@ pub fn listLocations(self: *Client, options: types.ListOptions) Error!types.Owne
     return result;
 }
 
+/// `len` random bytes, 8 to 1,024, from a Cloud HSM in the client's
+/// location, checked against their checksum. Billed as a crypto operation;
+/// software and external keys have no such call.
+pub fn randomBytes(self: *Client, len: u16) Error!types.Owned([]const u8) {
+    rpc.begin(self);
+    if (len < validate.min_random_bytes or len > validate.max_random_bytes) {
+        if (self.diagnostics) |d| d.print("random bytes come 8 to 1,024 at a time; {d} asked", .{len});
+        return if (len > validate.max_random_bytes) error.TooLarge else error.InvalidOptions;
+    }
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const target: names.Target = .{ .project = self.project, .location = self.location };
+    const path = try target.path(a, ":generateRandomBytes");
+    const body = try codec.encodeRandom(a, len);
+    var tries: integrity.Attempts = .{ .client = self, .what = "randomBytes" };
+    while (true) {
+        tries.next();
+        var result: types.Owned([]const u8) = try .init(self.gpa);
+        const answer_body = rpc.execute(self, result.arena, .{ .method = .POST, .path = path, .body = body }) catch |err| {
+            result.deinit();
+            return err;
+        };
+        const answer = codec.decodeRandom(result.arena.allocator(), a, answer_body) catch |err| {
+            result.deinit();
+            return rpc.decodeFailed(self, err, "random bytes");
+        };
+        const problem: ?[]const u8 = if (!integrity.matches(answer.data, answer.data_crc32c))
+            "the bytes do not match their checksum"
+        else if (answer.data.len != len)
+            "the answer holds another number of bytes than asked"
+        else
+            null;
+        if (problem) |reason| {
+            result.deinit();
+            try tries.failed(reason);
+            continue;
+        }
+        result.value = answer.data;
+        return result;
+    }
+}
+
 /// One page of the keys deleted in the client's location. A deleted key's
 /// id can never be used again in its project; these records say which.
 pub fn listRetiredKeys(self: *Client, options: types.ListOptions) Error!types.Owned(types.RetiredKeyPage) {
@@ -406,6 +450,21 @@ test "a delete whose operation cannot be read is InvalidResponse, and an error w
     try testing.expectError(error.Unknown, h.client.keyRing("r").delete());
 }
 
+test "production's answers: a delete not done at first and done when read, a retired id refused" {
+    const production = @import("production_bodies.zig");
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = production.delete_key_started } },
+        .{ .respond = .{ .body = production.delete_key_done } },
+        .{ .respond = .{ .status = 400, .body = production.create_retired_key } },
+    }, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1, .max_backoff_ms = 2 } });
+    defer h.deinit();
+    try h.client.keyRing("zigps-kms").key("zigps-m0-fe7c50-bare").delete();
+    try h.expectRequest(1, .GET, "https://cloudkms.googleapis.com/v1/projects/extractctl/locations/us-central1/operations/6f74f131-e1d9-404a-b8af-1b71cc214ada", null);
+    try testing.expectError(error.AlreadyExists, h.client.keyRing("zigps-kms").key("zigps-m0-fe7c50-bare").create(.{ .purpose = .encrypt_decrypt }));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "has already been deleted") != null);
+}
+
 test "a delete retried after a lost answer: NOT_FOUND then means the first one landed" {
     var h: Harness = undefined;
     const not_found = "{\"error\":{\"code\":404,\"status\":\"NOT_FOUND\"}}";
@@ -420,4 +479,37 @@ test "a delete retried after a lost answer: NOT_FOUND then means the first one l
     // On the first attempt, it is the caller's.
     try testing.expectError(error.NotFound, h.client.keyRing("r").key("k").delete());
     try h.expectRequestCount(3);
+}
+
+test "golden: randomBytes asks an HSM for 8 to 1,024 bytes and checks them" {
+    var h: Harness = undefined;
+    const good = "{\"data\":\"MDEyMzQ1Njc4OWFiY2RlZg==\",\"dataCrc32c\":\"1121128862\"}";
+    try h.init(&.{
+        // 32 asked, 16 sent, twice.
+        .{ .respond = .{ .body = good } },
+        .{ .respond = .{ .body = good } },
+        .{ .respond = .{ .body = good } },
+        // A checksum that does not match, then a good answer.
+        .{ .respond = .{ .body = "{\"data\":\"MDEyMzQ1Njc4OWFiY2RlZg==\",\"dataCrc32c\":\"9\"}" } },
+        .{ .respond = .{ .body = good } },
+        // 8 asked, 16 sent, twice.
+        .{ .respond = .{ .body = good } },
+        .{ .respond = .{ .body = good } },
+    }, .{ .retry = .{ .max_attempts = 2, .initial_backoff_ms = 1, .max_backoff_ms = 2 } });
+    defer h.deinit();
+    // Fewer bytes than asked is refused as more is.
+    try testing.expectError(error.IntegrityCheckFailed, h.client.randomBytes(32));
+    var r = try h.client.randomBytes(16);
+    defer r.deinit();
+    try testing.expectEqualStrings("0123456789abcdef", r.value);
+    try h.expectRequest(2, .POST, base ++ ":generateRandomBytes", "{\"lengthBytes\":16,\"protectionLevel\":\"HSM\"}");
+    // A checksum that does not match is fetched again.
+    var again = try h.client.randomBytes(16);
+    again.deinit();
+    // Another number of bytes than asked is refused.
+    try testing.expectError(error.IntegrityCheckFailed, h.client.randomBytes(8));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "another number of bytes") != null);
+    try testing.expectError(error.InvalidOptions, h.client.randomBytes(7));
+    try testing.expectError(error.TooLarge, h.client.randomBytes(1025));
+    try h.expectRequestCount(7);
 }

@@ -522,7 +522,7 @@ fn serviceAccountJson(arena: Allocator) ![]const u8 {
         .{ "type", "service_account" },
         .{ "project_id", "sa-project" },
         .{ "private_key_id", "kid-1" },
-        .{ "private_key", @import("rsa.zig").test_key_1024 },
+        .{ "private_key", @import("core").rsa.test_key_1024 },
         .{ "client_email", "robot@sa-project.iam.gserviceaccount.com" },
         .{ "token_uri", "https://oauth2.googleapis.com/token" },
     }) |field| {

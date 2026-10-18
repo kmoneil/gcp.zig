@@ -28,9 +28,30 @@ including the ones that did not change.
   `Diagnostics`. `kms.testing.FakeKms` holds key rings, keys and versions
   with the state machine Google documents, on the clock: pending
   asymmetric versions, destroy delays, rotation, retired key ids.
+  Using keys: `Key.encrypt` (up to 64 KiB, with AAD, by the primary or a
+  pinned version, answering the version used) and `Key.decrypt`, whose
+  `Plaintext` is wiped by its `deinit`, as is every buffer the call
+  filled; `KeyVersion.sign` (the caller names the algorithm, so no read
+  comes first: a digest made here for ECDSA and RSA, the message for
+  Ed25519 and ML-DSA), `signDigest`, `publicKey` (PEM, or the NIST
+  encoding for a post-quantum key), `macSign` and `macVerify` (a MAC that
+  does not match is `false`); `Client.randomBytes` from an HSM. Every
+  call sends the CRC-32C of each bytes field and checks the answer: the
+  server's `verified` flags, its checksums, the version it names. A check
+  that fails, or the server's refusal of a request checksum, is tried
+  again like a 503 and then is `error.IntegrityCheckFailed`. Another
+  key's ciphertext is `error.DecryptionFailed`. `PublicKey.verify` and
+  `verifyDigest` check a signature here: ECDSA P-256, P-384 and
+  secp256k1, Ed25519 and ML-DSA through std.crypto, RSA PKCS#1 v1.5 and
+  PSS through core.rsa, each held to signatures OpenSSL made. The fake
+  encrypts, signs and MACs with real keys (RSA from fixed test keys),
+  and gets each checksum wrong on request.
 - core: `errors.decodePreconditionFailures` reads the
   `google.rpc.PreconditionFailure` details of an error body, and
   `names.KmsKeyName` parses a Cloud KMS key's or version's full name.
+  `core.rsa`, moved from auth, signs a digest with PKCS#1 v1.5 or PSS over
+  SHA-256, SHA-384 or SHA-512, verifies both, and reads and writes public
+  keys as SubjectPublicKeyInfo; auth signs as it did.
 - storage and secret_manager: their checks of a KMS key's name use
   `core.names.KmsKeyName`; what they accept is unchanged.
 - auth, error_reporting, firestore, logging, monitoring, pubsub and

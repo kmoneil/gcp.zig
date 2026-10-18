@@ -27,7 +27,7 @@ const Cache = @import("Cache.zig");
 const adc_file = @import("adc_file.zig");
 const form = @import("form.zig");
 const logging = @import("logging.zig");
-const rsa = @import("rsa.zig");
+const rsa = @import("core").rsa;
 const token_response = @import("token_response.zig");
 
 gpa: Allocator,

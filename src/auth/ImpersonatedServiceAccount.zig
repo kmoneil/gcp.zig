@@ -462,7 +462,7 @@ fn isPrintable(text: []const u8) bool {
 const testing = std.testing;
 const test_util = core.testing;
 const Reply = test_util.FakeTransport.Reply;
-const rsa = @import("rsa.zig");
+const rsa = @import("core").rsa;
 
 const test_target = "sa@p.iam.gserviceaccount.com";
 const google_url = "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/" ++ test_target ++ ":generateAccessToken";

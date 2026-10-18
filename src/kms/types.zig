@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const core = @import("core");
+const verify_impl = @import("verify.zig");
 
 pub const Owned = core.Owned;
 
@@ -202,6 +203,146 @@ pub const Algorithm = enum {
             else => false,
         };
     }
+
+    /// What a signature of this algorithm is made over, or null for one
+    /// that does not sign, or signs input this library does not prepare:
+    /// raw PKCS#1 (a DigestInfo the caller builds) and ML-DSA's external mu.
+    pub fn signInput(a: Algorithm) ?SignInput {
+        return switch (a) {
+            .ec_sign_p256_sha256,
+            .ec_sign_secp256k1_sha256,
+            .rsa_sign_pss_2048_sha256,
+            .rsa_sign_pss_3072_sha256,
+            .rsa_sign_pss_4096_sha256,
+            .rsa_sign_pkcs1_2048_sha256,
+            .rsa_sign_pkcs1_3072_sha256,
+            .rsa_sign_pkcs1_4096_sha256,
+            .pq_sign_hash_slh_dsa_sha2_128s_sha256,
+            => .{ .digest = .sha256 },
+            .ec_sign_p384_sha384 => .{ .digest = .sha384 },
+            .rsa_sign_pss_4096_sha512, .rsa_sign_pkcs1_4096_sha512 => .{ .digest = .sha512 },
+            .ec_sign_ed25519, .pq_sign_ml_dsa_44, .pq_sign_ml_dsa_65, .pq_sign_ml_dsa_87, .pq_sign_slh_dsa_sha2_128s => .data,
+            else => null,
+        };
+    }
+
+    /// Whether the public key comes in the NIST encoding rather than as a
+    /// PEM: the post-quantum ones.
+    pub fn postQuantum(a: Algorithm) bool {
+        return switch (a) {
+            .pq_sign_ml_dsa_44,
+            .pq_sign_ml_dsa_65,
+            .pq_sign_ml_dsa_87,
+            .pq_sign_slh_dsa_sha2_128s,
+            .pq_sign_hash_slh_dsa_sha2_128s_sha256,
+            .pq_sign_ml_dsa_44_external_mu,
+            .pq_sign_ml_dsa_65_external_mu,
+            .pq_sign_ml_dsa_87_external_mu,
+            .ml_kem_768,
+            .ml_kem_1024,
+            .kem_xwing,
+            => true,
+            else => false,
+        };
+    }
+};
+
+/// A digest a signing key takes in place of the message.
+pub const DigestKind = enum {
+    sha256,
+    sha384,
+    sha512,
+
+    pub fn length(d: DigestKind) usize {
+        return switch (d) {
+            .sha256 => 32,
+            .sha384 => 48,
+            .sha512 => 64,
+        };
+    }
+
+    /// `msg`'s digest, into `out`, which is at least 64 bytes.
+    pub fn digest(d: DigestKind, msg: []const u8, out: []u8) []const u8 {
+        const sha2 = std.crypto.hash.sha2;
+        switch (d) {
+            inline else => |t| {
+                const H = switch (t) {
+                    .sha256 => sha2.Sha256,
+                    .sha384 => sha2.Sha384,
+                    .sha512 => sha2.Sha512,
+                };
+                H.hash(msg, out[0..H.digest_length], .{});
+                return out[0..H.digest_length];
+            },
+        }
+    }
+};
+
+/// What a signature is made over.
+pub const SignInput = union(enum) {
+    /// The message's digest, made here.
+    digest: DigestKind,
+    /// The message itself, at most 64 KiB.
+    data,
+};
+
+/// What `Key.encrypt` answers.
+pub const Ciphertext = struct {
+    /// Opaque: they name the version that made them, which `decrypt` finds.
+    bytes: []const u8,
+    /// The version the server encrypted with. After a primary change it may
+    /// be the old primary for a while.
+    version: u64,
+};
+
+pub const EncryptOptions = struct {
+    /// Bound to the ciphertext: `decrypt` needs the same bytes. At most
+    /// 64 KiB.
+    aad: []const u8 = "",
+    /// Encrypt with this version rather than the primary.
+    version: ?u64 = null,
+};
+
+pub const DecryptOptions = struct {
+    /// The bytes `encrypt` was given as `aad`.
+    aad: []const u8 = "",
+};
+
+/// Why a signature did not verify on this machine.
+pub const VerifyError = error{
+    /// The signature is not this key's over this message or digest.
+    SignatureInvalid,
+    /// An algorithm this library cannot verify here: SLH-DSA, which std
+    /// does not have; a digest for an algorithm that signs data (Ed25519,
+    /// ML-DSA); one that does not sign.
+    UnsupportedAlgorithm,
+    /// A public key that does not decode as its algorithm's.
+    InvalidPublicKey,
+};
+
+/// A version's public key, as `KeyVersion.publicKey` answers it. It never
+/// changes, so it may be kept for as long as the version lives.
+pub const PublicKey = struct {
+    /// The version's name.
+    name: []const u8,
+    algorithm: Algorithm,
+    protection_level: ProtectionLevel = .unknown,
+    /// A PEM SubjectPublicKeyInfo, for classical algorithms; "" for
+    /// post-quantum ones.
+    pem: []const u8 = "",
+    /// The NIST encoding of a post-quantum key; "" for classical ones.
+    raw: []const u8 = "",
+
+    /// Checks `signature` over `message` here, with std.crypto; no call.
+    pub fn verify(pk: PublicKey, message: []const u8, signature: []const u8) VerifyError!void {
+        return verify_impl.verify(pk, message, signature);
+    }
+
+    /// Checks `signature` over a digest made elsewhere: the ECDSA and RSA
+    /// algorithms, whose signatures are made over a digest.
+    pub fn verifyDigest(pk: PublicKey, digest: []const u8, signature: []const u8) VerifyError!void {
+        return verify_impl.verifyDigest(pk, digest, signature);
+    }
 };
 
 /// A version's state. Only `enabled` versions can be used.
@@ -380,7 +521,7 @@ pub const RetiredKey = struct {
     name: []const u8,
     /// The deleted key's full name.
     original_name: []const u8,
-    /// Such as "cloudkms.googleapis.com/CryptoKey".
+    /// "CryptoKey", as production wrote it.
     resource_type: []const u8 = "",
     delete_time: ?std.Io.Timestamp = null,
 };
@@ -435,4 +576,22 @@ test "billing: every state until destroyed" {
     try testing.expect(State.disabled.billed());
     try testing.expect(State.destroy_scheduled.billed());
     try testing.expect(!State.destroyed.billed());
+}
+
+test "signing algorithms: what each signs, and which keys come in the NIST encoding" {
+    try testing.expectEqual(SignInput{ .digest = .sha256 }, Algorithm.ec_sign_p256_sha256.signInput().?);
+    try testing.expectEqual(SignInput{ .digest = .sha384 }, Algorithm.ec_sign_p384_sha384.signInput().?);
+    try testing.expectEqual(SignInput{ .digest = .sha512 }, Algorithm.rsa_sign_pss_4096_sha512.signInput().?);
+    try testing.expectEqual(SignInput.data, Algorithm.pq_sign_ml_dsa_87.signInput().?);
+    try testing.expectEqual(null, Algorithm.rsa_sign_raw_pkcs1_3072.signInput());
+    try testing.expectEqual(null, Algorithm.hmac_sha256.signInput());
+    // Every algorithm that signs is of the signing purpose.
+    inline for (@typeInfo(Algorithm).@"enum".field_names) |tag| {
+        const a = @field(Algorithm, tag);
+        if (a.signInput() != null) try testing.expectEqual(Purpose.asymmetric_sign, a.purpose());
+    }
+    try testing.expect(Algorithm.kem_xwing.postQuantum());
+    try testing.expect(!Algorithm.ec_sign_ed25519.postQuantum());
+    var buf: [64]u8 = undefined;
+    for ([_]DigestKind{ .sha256, .sha384, .sha512 }) |d| try testing.expectEqual(d.length(), d.digest("m", &buf).len);
 }
