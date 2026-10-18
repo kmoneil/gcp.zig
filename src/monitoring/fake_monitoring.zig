@@ -25,8 +25,10 @@
 //!   location that is not a region or zone; label keys, label values and
 //!   strings past their limits, more than 30 labels; a distribution whose
 //!   counts do not add up, or of linear width 0; a cumulative start moved
-//!   earlier, or a total that fell under the same start. A reset, a start
-//!   1 ms or more after the series' last end, is taken.
+//!   earlier. A reset, a start 1 ms or more after the series' last end, is
+//!   taken, and so is a total that falls under the same start, and the
+//!   series' last point sent again as it was, kept once; with another
+//!   value it is too soon after itself.
 //! - Requests refused whole, as production refused them: none or more than
 //!   200 series, a resource `project_id` naming another project, a
 //!   descriptor production would not create.
@@ -495,7 +497,9 @@ pub const FakeMonitoring = struct {
         value: types.Value,
     };
 
-    const Verdict = union(enum) { ok, refused: struct { code: u8, reason: []const u8 } };
+    /// `same`: the series' last point again, end, start and value, which
+    /// production took and kept once.
+    const Verdict = union(enum) { ok, same, refused: struct { code: u8, reason: []const u8 } };
 
     fn write(f: *FakeMonitoring, arena: Allocator, body: []const u8) Allocator.Error!Reply {
         const root = parseJson(arena, body) orelse return invalidJson(arena);
@@ -547,7 +551,7 @@ pub const FakeMonitoring = struct {
         var written: u32 = 0;
         var first: ?usize = null;
         for (verdicts, 0..) |v, i| switch (v) {
-            .ok => written += 1,
+            .ok, .same => written += 1,
             .refused => if (first == null) {
                 first = i;
             },
@@ -685,12 +689,16 @@ pub const FakeMonitoring = struct {
         const last = series.points.items[series.points.items.len - 1];
         const end = truncated(s.end);
         if (end < last.end.nanoseconds) return refused(3, "write for resource failed: Points must be written in order. One or more of the points specified had an older end time than the most recent point.");
+        // The last point again, as it was: taken, and kept once. With
+        // another value, it is too soon after itself.
+        if (end == last.end.nanoseconds and samePoint(last, s)) return .same;
         if (end - last.end.nanoseconds < min_gap_ns) return refused(9, try arena.print("write for resource failed: One or more points were written more frequently than the maximum sampling period configured for the metric. {{Metric: {s}, Timestamps: {{Youngest Existing: '{f}', New: '{f}'}}}}", .{ s.metric_type, Stamp{ .ns = last.end.nanoseconds }, Stamp{ .ns = end } }));
         if (kind != .gauge) {
             const start = truncated(s.start.?);
             const series_start = last.start.?.nanoseconds;
+            // A total that falls under the same start is taken, as
+            // production took one on 2026-10-18.
             if (start < series_start) return refused(3, older_start);
-            if (start == series_start and fell(last.value, s.value)) return refused(3, older_start);
         }
         return .ok;
     }
@@ -749,6 +757,19 @@ pub const FakeMonitoring = struct {
         const headers = if (paramOf(params, "view")) |v| std.mem.eql(u8, v, "HEADERS") else false;
 
         const d = f.descriptors.get(metric_type) orelse return fail(arena, 404, "NOT_FOUND", try arena.print("Cannot find metric(s) that match type = \"{s}\". If a metric was created recently, it could take up to 10 minutes to become available. Please try again soon.", .{metric_type}));
+        // A label the metric has no descriptor for, as production answered
+        // on 2026-10-18; a resource label no resource type has.
+        for (parsed.conditions) |c| switch (c.field) {
+            .metric_label => {
+                for (d.labels.items) |l| {
+                    if (std.mem.eql(u8, l.key, c.key)) break;
+                } else return fail(arena, 404, "NOT_FOUND", try arena.print("Cannot find metric(s) that match type = \"{s}\" label = \"{s}\". If a metric was created recently, it could take up to 10 minutes to become available. Please try again soon.", .{ metric_type, c.key }));
+            },
+            .resource_label => {
+                if (!knownResourceLabel(c.key)) return fail(arena, 400, "INVALID_ARGUMENT", "The supplied filter does not specify a valid combination of metric and monitored resource descriptors. The query will not return any time series.");
+            },
+            .resource_type => {},
+        };
         if (aligner != .none) {
             if (d.kind != .gauge) return notModelled(arena, "aligning a metric that is not a gauge");
             switch (d.value_type) {
@@ -1568,6 +1589,12 @@ const catalog = [_]CatalogType{
     .{ .type = "k8s_pod", .display_name = "Kubernetes Pod", .labels = &.{ project_label, .{ "location", "" }, .{ "cluster_name", "" }, .{ "namespace_name", "" }, .{ "pod_name", "" } }, .location_labels = &.{"location"} },
 };
 
+/// Whether any resource type the fake knows has a label `key`.
+fn knownResourceLabel(key: []const u8) bool {
+    for (&catalog) |*r| for (r.labels) |l| if (std.mem.eql(u8, l[0], key)) return true;
+    return false;
+}
+
 fn catalogType(name: []const u8) ?*const CatalogType {
     for (&catalog) |*c| if (std.mem.eql(u8, c.type, name)) return c;
     return null;
@@ -1882,13 +1909,22 @@ fn truncated(ns: i96) i96 {
     return @divFloor(ns, std.time.ns_per_us) * std.time.ns_per_us;
 }
 
-/// Whether a cumulative total fell from `before` to `after`.
-fn fell(before: types.Value, after: types.Value) bool {
-    return switch (after) {
-        .int64 => |n| before == .int64 and n < before.int64,
-        .double => |d| before == .double and d < before.double,
-        .distribution => |d| before == .distribution and d.count < before.distribution.count,
-        else => false,
+/// Whether `s` is `last` again: its start, if it has one, and its value.
+fn samePoint(last: FakeMonitoring.Point, s: FakeMonitoring.Sent) bool {
+    if (last.start) |st| if (s.start == null or truncated(s.start.?) != st.nanoseconds) return false;
+    return sameValue(last.value, s.value);
+}
+
+fn sameValue(a: types.Value, b: types.Value) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .bool => |x| x == b.bool,
+        .int64 => |x| x == b.int64,
+        .double => |x| @as(u64, @bitCast(x)) == @as(u64, @bitCast(b.double)),
+        .string => |x| std.mem.eql(u8, x, b.string),
+        .distribution => |x| x.count == b.distribution.count and x.mean == b.distribution.mean and
+            x.sum_of_squared_deviation == b.distribution.sum_of_squared_deviation and
+            std.mem.eql(u64, x.bucket_counts, b.distribution.bucket_counts),
     };
 }
 
@@ -2254,19 +2290,23 @@ test "the sampling floor is 2.5 s from the series' last point, as production hel
     const g = "custom.googleapis.com/floor";
     const labels: []const types.Label = &.{.{ .key = "k", .value = "a" }};
     // Each gap counted from the last point kept.
-    const steps = [_]struct { i64, bool }{
-        .{ 0, true },
-        .{ 2_499, false },
-        .{ 2_500, true },
-        .{ 2_500, false }, // the same end again
-        .{ 4_999, false },
-        .{ 5_000, true },
-        .{ 1_000, false }, // older: out of order
+    const steps = [_]struct { i64, i64, bool }{
+        .{ 0, 1, true },
+        .{ 2_499, 1, false },
+        .{ 2_500, 1, true },
+        // The same point again: taken, and kept once, as production did.
+        .{ 2_500, 1, true },
+        // The same end with another value: too soon after itself.
+        .{ 2_500, 2, false },
+        .{ 4_999, 1, false },
+        .{ 5_000, 1, true },
+        .{ 1_000, 1, false }, // older: out of order
     };
     for (steps) |s| {
-        var result = try b.client.write(&.{gaugeAt(g, labels, b.at(s[0]), 1)});
+        var result = try b.client.write(&.{gaugeAt(g, labels, b.at(s[0]), s[1])});
         defer result.deinit();
-        try testing.expectEqual(s[1], result.value.ok());
+        try testing.expectEqual(s[2], result.value.ok());
+        if (!result.value.ok() and s[0] == 2_500) try testing.expectEqual(error.FailedPrecondition, result.value.refused[0].reason);
     }
     const kept = try b.fake.points(a, g, labels);
     try testing.expectEqual(3, kept.len);
@@ -2291,24 +2331,27 @@ test "a cumulative series keeps its start, and starts over after its last end" {
     const earlier = try refusedReason(&b, &.{cum.at(&b, -150_000, -30_000, 20)});
     defer testing.allocator.free(earlier);
     try testing.expectEqualStrings(reasonOf(try messageOf(a, production.write_cumulative_earlier)), earlier);
-    const falls = try refusedReason(&b, &.{cum.at(&b, -120_000, -30_000, 2)});
-    defer testing.allocator.free(falls);
-    try testing.expectEqualStrings(reasonOf(try messageOf(a, production.write_cumulative_falls)), falls);
-    var more = try b.client.write(&.{cum.at(&b, -120_000, -30_000, 12)});
+    // A total that falls under the same start is taken, as production
+    // took 10, 5, 7 and 0 on 2026-10-18.
+    var falls = try b.client.write(&.{cum.at(&b, -120_000, -30_000, 2)});
+    defer falls.deinit();
+    try testing.expect(falls.value.ok());
+    var more = try b.client.write(&.{cum.at(&b, -120_000, -25_000, 12)});
     defer more.deinit();
     try testing.expect(more.value.ok());
     // A reset: a new start 1 ms after the last end.
-    var reset = try b.client.write(&.{cum.at(&b, -29_999, -20_000, 1)});
+    var reset = try b.client.write(&.{cum.at(&b, -24_999, -20_000, 1)});
     defer reset.deinit();
     try testing.expect(reset.value.ok());
     const kept = try b.fake.points(a, c, &.{});
-    try testing.expectEqual(3, kept.len);
-    try testing.expectEqual(b.at(-29_999).nanoseconds, kept[2].start.?.nanoseconds);
+    try testing.expectEqual(4, kept.len);
+    try testing.expectEqual(2, kept[1].value.int64);
+    try testing.expectEqual(b.at(-24_999).nanoseconds, kept[3].start.?.nanoseconds);
     // A start moved later, inside the last interval: production took one
     // and lost a point; the fake says it does not model it.
-    try testing.expectError(error.Unimplemented, b.client.write(&.{cum.at(&b, -25_000, -10_000, 5)}));
+    try testing.expectError(error.Unimplemented, b.client.write(&.{cum.at(&b, -22_000, -10_000, 5)}));
     try testing.expect(std.mem.indexOf(u8, b.diag.message(), "cumulative start moved later") != null);
-    try testing.expectEqual(3, b.fake.pointCount());
+    try testing.expectEqual(4, b.fake.pointCount());
 }
 
 test "descriptors: created, made again, refused with another kind, read, listed and deleted" {
@@ -2451,17 +2494,17 @@ test "faults: refused, dropped, and served but answered with an error" {
     b.fake.dropNext(1);
     try testing.expectError(error.ConnectionResetByPeer, b.client.write(&.{gaugeAt(g, &.{}, b.at(0), 1)}));
     try testing.expectEqual(0, b.fake.pointCount());
-    // A 504 that stored the point: tried again, it is refused as too
-    // soon, which is why writes are not retried by default.
+    // A 504 that stored the point.
     b.fake.loseNext(1, 504);
     try testing.expectError(error.DeadlineExceeded, b.client.write(&.{gaugeAt(g, &.{}, b.at(0), 1)}));
     try testing.expectEqual(1, b.fake.pointCount());
     b.client.write_retries = .transient;
     b.fake.loseNext(1, 504);
+    // Tried again, the same point is taken and kept once, as production
+    // took a point sent twice on 2026-10-18.
     var replayed = try b.client.write(&.{gaugeAt(g, &.{}, b.at(5_000), 2)});
     defer replayed.deinit();
-    try testing.expectEqual(0, replayed.value.written);
-    try testing.expectEqual(error.FailedPrecondition, replayed.value.refused[0].reason);
+    try testing.expect(replayed.value.ok());
     try testing.expectEqual(2, b.fake.pointCount());
     b.fake.refuseNextWithDelay(1, 429, .{ .ms = 3, .form = .retry_after_ms });
     var after_delay = try b.client.write(&.{gaugeAt(g, &.{}, b.at(10_000), 3)});
@@ -2554,7 +2597,7 @@ test "corners: two refusal codes in one summary, falling doubles, layouts, displ
     try testing.expectEqual(2, both.value.refused[1].points);
     try testing.expectEqualStrings("FAILED_PRECONDITION", b.diag.status());
 
-    // A cumulative double, and a distribution, whose totals fell.
+    // A cumulative double, and a distribution, whose totals fell: taken.
     const cum: types.TimeSeries = .{ .metric_type = "custom.googleapis.com/seconds", .resource = probe_task, .kind = .cumulative, .start = b.at(-60_000), .end = b.at(-30_000), .value = .{ .double = 2.5 } };
     var ok = try b.client.write(&.{cum});
     ok.deinit();
@@ -2563,7 +2606,7 @@ test "corners: two refusal codes in one summary, falling doubles, layouts, displ
     lower.value = .{ .double = 1 };
     var fell_double = try b.client.write(&.{lower});
     defer fell_double.deinit();
-    try testing.expect(!fell_double.value.ok());
+    try testing.expect(fell_double.value.ok());
     const layout: types.Distribution.Buckets = .{ .exponential = .{ .num_finite = 3, .growth_factor = 2, .scale = 1 } };
     var dist = cum;
     dist.metric_type = "custom.googleapis.com/latency";
@@ -2574,13 +2617,14 @@ test "corners: two refusal codes in one summary, falling doubles, layouts, displ
     dist.value = .{ .distribution = .{ .count = 1, .mean = 3, .buckets = layout, .bucket_counts = &.{ 0, 1 } } };
     var fell_count = try b.client.write(&.{dist});
     defer fell_count.deinit();
-    try testing.expect(!fell_count.value.ok());
+    try testing.expect(fell_count.value.ok());
     const kept = try b.fake.points(a, "custom.googleapis.com/latency", &.{});
     try testing.expectEqual(2, kept[0].value.distribution.count);
     try testing.expectEqual(2.0, kept[0].value.distribution.buckets.exponential.growth_factor);
     var latency = try b.client.metric("custom.googleapis.com/latency").read(.{ .start = b.at(-60_000), .end = b.at(0) });
     defer latency.deinit();
-    const read_back = latency.value.series[0].points[0].value.?.distribution;
+    // The older point, as written first: points come newest first.
+    const read_back = latency.value.series[0].points[1].value.?.distribution;
     try testing.expectEqual(3, read_back.buckets.exponential.num_finite);
     try testing.expectEqual(2.0, read_back.buckets.exponential.growth_factor);
     try testing.expectEqual(1.0, read_back.buckets.exponential.scale);
@@ -2600,7 +2644,7 @@ test "corners: two refusal codes in one summary, falling doubles, layouts, displ
     // Deleting one metric keeps the others' points.
     const before = b.fake.pointCount();
     try b.client.metric("custom.googleapis.com/seconds").delete();
-    try testing.expectEqual(before - 1, b.fake.pointCount());
+    try testing.expectEqual(before - 2, b.fake.pointCount());
 
     // Doubles spelled as production spells what JSON cannot.
     for ([_][]const u8{ "Infinity", "-Infinity" }, 0..) |spelled, i| {
@@ -2668,7 +2712,7 @@ test "reads: what a filter selects, newest first, (start, end]" {
         .{ .{ .metric_labels = &.{.{ .key = "path", .op = .has_substring, .value = "/" }} }, 2 },
         .{ .{ .metric_labels = &.{.{ .key = "path", .op = .not_equals, .value = "/web/home" }} }, 2 },
         .{ .{ .metric_labels = &.{.{ .key = "path", .value = "a\"b\\c" }} }, 1 },
-        .{ .{ .metric_labels = &.{.{ .key = "missing", .op = .not_equals, .value = "x" }} }, 0 },
+
         .{ .{ .resource_type = "generic_task", .resource_labels = &.{.{ .key = "job", .value = "m1" }} }, 1 },
         .{ .{ .resource_labels = &.{.{ .key = "project_id", .value = "my-project" }} }, 3 },
         .{ .{ .resource_type = "global" }, 0 },
@@ -2680,6 +2724,15 @@ test "reads: what a filter selects, newest first, (start, end]" {
         defer page.deinit();
         try testing.expectEqual(c[1], page.value.series.len);
     }
+    // A label the descriptor lacks, and a resource label no resource type
+    // has, in production's words.
+    var missing = window;
+    missing.filter = .{ .metric_labels = &.{.{ .key = "missing", .op = .not_equals, .value = "x" }} };
+    try testing.expectError(error.NotFound, m.read(missing));
+    try testing.expectEqualStrings("Cannot find metric(s) that match type = \"custom.googleapis.com/reads\" label = \"missing\". If a metric was created recently, it could take up to 10 minutes to become available. Please try again soon.", b.diag.message());
+    missing.filter = .{ .resource_labels = &.{.{ .key = "missing", .value = "x" }} };
+    try testing.expectError(error.InvalidArgument, m.read(missing));
+    try testing.expectEqualStrings("The supplied filter does not specify a valid combination of metric and monitored resource descriptors. The query will not return any time series.", b.diag.message());
 
     var orders = try m.read(.{ .start = window.start, .end = window.end, .filter = .{ .metric_labels = &.{.{ .key = "path", .value = "/api/orders" }} } });
     defer orders.deinit();
@@ -2940,4 +2993,38 @@ test "reads: a point on a period's start belongs to the period before, (start, e
     try testing.expectEqual(1, pts[0].value.?.int64);
     try testing.expectEqual(b.at(-60_000).nanoseconds, pts[1].end.nanoseconds);
     try testing.expectEqual(1, pts[1].value.?.int64);
+}
+
+test "the same point twice, of every value type: kept once; changed, refused as too soon" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    const values = [_]types.Value{
+        .{ .bool = true },
+        .{ .double = 0.5 },
+        .{ .string = "s" },
+        .{ .distribution = .{ .count = 1, .mean = 2, .buckets = .{ .explicit = &.{1} }, .bucket_counts = &.{ 0, 1 } } },
+    };
+    const changed = [_]types.Value{
+        .{ .bool = false },
+        .{ .double = 0.25 },
+        .{ .string = "t" },
+        .{ .distribution = .{ .count = 2, .mean = 2, .buckets = .{ .explicit = &.{1} }, .bucket_counts = &.{ 0, 2 } } },
+    };
+    for (values, changed, 0..) |v, c, i| {
+        // A metric of each value type.
+        var name: [40]u8 = undefined;
+        const s: types.TimeSeries = .{ .metric_type = try std.fmt.bufPrint(&name, "external.googleapis.com/twice{d}", .{i}), .resource = .global, .kind = .gauge, .end = b.at(0), .value = v };
+        for (0..2) |_| {
+            var r = try b.client.write(&.{s});
+            defer r.deinit();
+            try testing.expect(r.value.ok());
+        }
+        var other = s;
+        other.value = c;
+        var r = try b.client.write(&.{other});
+        defer r.deinit();
+        try testing.expectEqual(error.FailedPrecondition, r.value.refused[0].reason);
+    }
+    try testing.expectEqual(4, b.fake.pointCount());
 }

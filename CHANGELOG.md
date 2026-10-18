@@ -16,8 +16,9 @@ including the ones that did not change.
   allowed, though Google documents 200), label keys and values, an
   interval its kind allows, distributions that add up, no series twice.
   A failed write is retried only when it never left (a refused
-  connection, a failed name lookup), unless `write_retries = .transient`
-  asks for more: a stored point sent again is refused. `Resource` names
+  connection, a failed name lookup), as Google's clients retry none,
+  unless `write_retries = .transient` asks for 429s, 5xx and dropped
+  connections too; production kept a point sent twice once. `Resource` names
   the resource types that take user metrics with their required labels
   as fields, and `Resource.randomTaskId` gives a process an id of its
   own. `Client.metric(type)` creates, reads and deletes a descriptor;
@@ -51,10 +52,18 @@ including the ones that did not change.
   type its descriptor does not take, and more. It answers reads by its
   own reading of the filter, unaligned or with the gauge aligners and
   reducers min, max, mean, sum and count, and pages them as production
-  did. `examples/monitoring.zig --fake` runs offline. Measured in production on 2026-10-18 before it
-  was built: the 2.5 s floor, a metric type of up to 512 characters,
-  microsecond timestamps, NaN and the infinities taken as doubles, and
-  a descriptor that reads back 404 for about 2 s after its create.
+  did. A production suite runs one script of 60 operations against
+  production and the fake and holds the fake to every outcome; it
+  corrected three facts measured before: a point sent twice is kept
+  once, a cumulative total that falls under the same start is taken, and
+  a filter on a label nobody has is refused. Measured in production on
+  2026-10-18: the 2.5 s floor, a metric type of up to 512 characters, a
+  10 s alignment period, microsecond timestamps, NaN and the infinities
+  taken as doubles, a descriptor that reads back 404 for about 2 s after
+  its create, and a point readable 0.2 s after its write.
+  `examples/monitoring.zig --fake` writes, reads back and lists offline;
+  `examples/pubsub_metrics.zig` turns a Pub/Sub subscriber's counts into
+  metrics through a `Recorder`. The guide is docs/monitoring/.
 - core: `query.writePath` writes a path of segments with its slashes
   literal, as Cloud Monitoring needs a metric type.
 - auth, error_reporting, firestore, logging, pubsub, resource_manager,

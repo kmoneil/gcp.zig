@@ -244,6 +244,24 @@ GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth print-access-token) \
     zig build test-integration-gcp -Dtest-filter=error_reporting
 ```
 
+### Monitoring
+
+Cloud Monitoring has no emulator, so its tests need a project with the
+API on and a token that may write and read metrics and create and delete
+descriptors (Editor may). Each run writes only under
+`custom.googleapis.com/zigps-<run>/` and deletes every descriptor there
+as it ends, failed or not. The tests write every value type and read it
+back, run a `Recorder` over three intervals, and replay one script of 60
+operations against production and `FakeMonitoring`, failing on any
+outcome the two do not share; an operation production answers with a
+5xx is sent again. Writes are free and the reads far inside the free
+million series a month; a run takes about a minute.
+
+```sh
+GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth print-access-token) \
+    zig build test-integration-gcp -Dtest-filter=monitoring
+```
+
 ### Secret Manager and bucket settings
 
 Secret Manager has no emulator, so its tests need a real project. They

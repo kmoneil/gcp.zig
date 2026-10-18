@@ -529,7 +529,12 @@ jobs:
         # 38871479649, 39014731663 and 39109651208): fake-pubsub took
         # 106, 102 and 109 minutes at 1M and drops to 800K; pubsub 98, 96
         # and 109 at 1150K and drops to 950K. heavy-firestore took 82, 83
-        # and then 97 at 1400K and drops to 1300K.
+        # and then 97 at 1400K and drops to 1300K. monitoring (0.44.0)
+        # starts at estimates from a local run: its four fuzz properties
+        # took 0.58 ms a run together, so 2M; the Recorder's slow property
+        # 0.31 ms, also 2M, well under the aim after slow-resource_manager
+        # showed CI can cost several times the Mac. Both are to be re-sized
+        # from their first nights.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 630K }
           - { job: auth, module: auth, filter: fuzz, iterations: 850K }
@@ -553,6 +558,8 @@ jobs:
           - { job: resource_manager, module: resource_manager, filter: fuzz, iterations: 2M }
           - { job: slow-resource_manager, module: resource_manager, filter: slow property, iterations: 2M }
           - { job: error_reporting, module: error_reporting, filter: fuzz, iterations: 2500K }
+          - { job: monitoring, module: monitoring, filter: fuzz, iterations: 2M }
+          - { job: slow-monitoring, module: monitoring, filter: slow property, iterations: 2M }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     # actions: read finds and downloads the corpus an earlier run kept.

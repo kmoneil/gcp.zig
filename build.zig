@@ -186,6 +186,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "pubsub", .module = mod },
                 .{ .name = "auth", .module = auth },
                 .{ .name = "error_reporting", .module = error_reporting },
+                .{ .name = "monitoring", .module = monitoring },
                 .{ .name = "secret_manager", .module = secret_manager },
                 .{ .name = "firestore", .module = firestore },
                 .{ .name = "storage", .module = storage },
@@ -334,7 +335,7 @@ pub fn build(b: *std.Build) void {
     // examples, so they cannot rot between runs.
     const gcp_step = b.step(
         "test-integration-gcp",
-        "Run the Secret Manager, Cloud Storage, signed URL, Firestore, Logging and Resource Manager tests against Google: GCP_TEST_PROJECT, GCP_TEST_BUCKET, FIRESTORE_TEST_DATABASE",
+        "Run the Secret Manager, Cloud Storage, signed URL, Firestore, Logging, Resource Manager, Error Reporting and Monitoring tests against Google: GCP_TEST_PROJECT, GCP_TEST_BUCKET, FIRESTORE_TEST_DATABASE",
     );
     // Secret Manager has no emulator, so its tests need GCP_TEST_PROJECT
     // and GCP_TEST_TOKEN.
@@ -444,6 +445,26 @@ pub fn build(b: *std.Build) void {
     });
     gcp_step.dependOn(&streamed(b, resource_manager_gcp_tests).step);
     test_step.dependOn(&resource_manager_gcp_tests.step);
+    // Cloud Monitoring against a real project with the API on:
+    // GCP_TEST_PROJECT and GCP_TEST_TOKEN, a token that may write and read
+    // metrics and create and delete descriptors. Each run writes under its
+    // own zigps- prefix and deletes every descriptor there.
+    const monitoring_gcp_tests = b.addTest(.{
+        .name = "monitoring-gcp-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/monitoring_gcp_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "monitoring", .module = monitoring },
+                .{ .name = "core", .module = core },
+            },
+        }),
+        .filters = test_filters,
+        .test_runner = test_runner,
+    });
+    gcp_step.dependOn(&streamed(b, monitoring_gcp_tests).step);
+    test_step.dependOn(&monitoring_gcp_tests.step);
     // Error Reporting against a real project with the API on:
     // GCP_TEST_PROJECT and GCP_TEST_TOKEN, a token that may report errors
     // and read and update groups. Each run reports a few errors of its own.
@@ -504,10 +525,11 @@ pub fn build(b: *std.Build) void {
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring" }) |name| {
+    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "pubsub_metrics" }) |name| {
         // whoami, secret, gcs_cp, gcs_sign, gcs_notify, quickstart, iam,
         // secret_rotation, firestore, logs_read, logs_tail, projects_list,
-        // error_dashboard and monitoring pick their own credentials.
+        // error_dashboard, monitoring and pubsub_metrics pick their own
+        // credentials.
         const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "secret"))
@@ -528,6 +550,8 @@ pub fn build(b: *std.Build) void {
             &.{ .{ .name = "error_reporting", .module = error_reporting }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "monitoring"))
             &.{ .{ .name = "monitoring", .module = monitoring }, .{ .name = "auth", .module = auth } }
+        else if (std.mem.eql(u8, name, "pubsub_metrics"))
+            &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "monitoring", .module = monitoring }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "gcs_notify") or std.mem.eql(u8, name, "quickstart"))
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else
