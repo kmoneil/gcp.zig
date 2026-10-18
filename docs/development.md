@@ -225,6 +225,25 @@ GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth print-access-token) \
     zig build test-integration-gcp -Dtest-filter=resource_manager
 ```
 
+### Error Reporting
+
+Error Reporting has no emulator, so its tests need a project with the
+API on and a token that may report errors and read and update groups
+(Editor may). Each run reports a few errors of its own through
+`events.report`, which the module never calls, under the service
+`zigps-er-<run>`, with the run id in every frame so no other run's
+errors share their groups. Error Reporting keeps them 30 days; there is
+no way to delete one group's. Statuses change only on those groups, and a
+muted one is opened again whatever happens. The first test asks
+production and `FakeErrorReporting`, fed the same errors, ten group-stats
+queries and fails on any answer the two do not share. Calls are free; a
+run takes about a minute.
+
+```sh
+GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth print-access-token) \
+    zig build test-integration-gcp -Dtest-filter=error_reporting
+```
+
 ### Secret Manager and bucket settings
 
 Secret Manager has no emulator, so its tests need a real project. They

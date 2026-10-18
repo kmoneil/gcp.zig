@@ -1516,3 +1516,91 @@ test "the auth guide's code: the account a gcloud login names" {
     try std.testing.expectEqualStrings("person@example.com", try signedInAs(creds, std.testing.io, arena.allocator()));
     try std.testing.expectEqual(1, fake.requests.items.len);
 }
+
+const er = @import("error_reporting");
+
+// snippet: er-dashboard
+/// The dashboard's table: the busiest groups over a day, each with its
+/// hourly counts for a trend chart, and whether it is new in the period.
+fn dashboard(client: *er.Client, rows: *std.ArrayList(Row), gpa: std.mem.Allocator) !void {
+    var query = try client.groupStats(.{ .period = .day, .timed_count_seconds = 3600, .page_size = 20 });
+    defer query.deinit();
+    var page = try query.page(null);
+    defer page.deinit();
+    const begin = page.value.time_range_begin.?;
+    for (page.value.items) |s| {
+        const new = if (s.first_seen) |f| f.nanoseconds >= begin.nanoseconds else false;
+        var trend: [24]u64 = @splat(0);
+        for (s.timed_counts, 0..) |t, i| if (i < trend.len) {
+            trend[i] = t.count;
+        };
+        try rows.append(gpa, .{
+            .group_id = try gpa.dupe(u8, s.group.id),
+            .headline = try gpa.dupe(u8, if (s.representative) |r| r.headline() else ""),
+            .count = s.count,
+            .new = new,
+            .trend = trend,
+        });
+    }
+}
+// end snippet
+
+// snippet: er-resolve
+/// Marks a group resolved, keeping its tracking issues: a new error will
+/// open it again on its own.
+fn resolve(client: *er.Client, group_id: []const u8) !void {
+    var group = try client.group(group_id).setStatus(.resolved);
+    defer group.deinit();
+}
+// end snippet
+
+const Row = struct { group_id: []const u8, headline: []const u8, count: u64, new: bool, trend: [24]u64 };
+
+// snippet: er-fake
+/// A dashboard test with deterministic data: errors reported to the fake,
+/// on a clock the test sets, read back through a real client.
+fn dashboardTest(gpa: std.mem.Allocator) !void {
+    var clock: er.testing.FakeClock = .{ .now_ns = 1_792_324_800 * std.time.ns_per_s };
+    var fake: er.testing.FakeErrorReporting = .init(gpa, clock.io(), .{ .project_id = "my-project" });
+    defer fake.deinit();
+    const trace = "java.lang.NullPointerException: customer is null\n\tat Billing.charge(Billing.java:88)";
+    for (0..3) |i| _ = try fake.report(.{
+        .message = trace,
+        .time = .{ .nanoseconds = (1_792_324_800 - @as(i96, @intCast(i)) * 3600) * std.time.ns_per_s },
+        .service = .{ .service = "billing" },
+    });
+    var token: er.StaticToken = .{ .token = "test" };
+    var client = try er.Client.init(gpa, clock.io(), .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+
+    var rows: std.ArrayList(Row) = .empty;
+    defer {
+        for (rows.items) |r| {
+            gpa.free(r.group_id);
+            gpa.free(r.headline);
+        }
+        rows.deinit(gpa);
+    }
+    try dashboard(&client, &rows, gpa);
+    try std.testing.expectEqual(1, rows.items.len);
+    try std.testing.expectEqual(3, rows.items[0].count);
+    try std.testing.expectEqualStrings("java.lang.NullPointerException: customer is null", rows.items[0].headline);
+}
+// end snippet
+
+test "the Error Reporting guides' code, against a fake" {
+    try dashboardTest(std.testing.allocator);
+    var clock: er.testing.FakeClock = .{ .now_ns = 1_792_324_800 * std.time.ns_per_s };
+    var fake: er.testing.FakeErrorReporting = .init(std.testing.allocator, clock.io(), .{});
+    defer fake.deinit();
+    const id = try fake.report(.{ .message = "TypeError: x" });
+    var token: er.StaticToken = .{ .token = "test" };
+    var client = try er.Client.init(std.testing.allocator, clock.io(), .{ .project_id = "my-project", .token_provider = token.provider(), .transport = fake.transport() });
+    defer client.deinit();
+    try resolve(&client, id);
+    try std.testing.expectEqual(.resolved, fake.status(id).?);
+}

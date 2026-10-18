@@ -26,8 +26,14 @@ including the ones that did not change.
   `error.NotFound`, though production answers it 400.
   `error_reporting.testing.FakeErrorReporting` keeps errors a test
   reports and computes group stats from them as production does, muting,
-  reopening and refusals included. `examples/error_dashboard.zig --fake`
-  runs offline. Measured in production on 2026-10-18 before it was built.
+  reopening and refusals included; a production suite asks production
+  and the fake the same ten queries and holds the fake to every answer.
+  `examples/error_dashboard.zig --fake` runs offline. Measured in
+  production on 2026-10-18 before it was built: among what that found,
+  distinct users count only an error's `user`, groups are made by
+  exception and frames with file paths aside, first seen is the first
+  error processed, and "newest first by creation" orders by first seen.
+  The guide is docs/error_reporting/.
 - auth, core, firestore, logging, pubsub, resource_manager,
   secret_manager and storage: unchanged.
 

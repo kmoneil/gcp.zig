@@ -175,6 +175,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "pubsub", .module = mod },
                 .{ .name = "auth", .module = auth },
+                .{ .name = "error_reporting", .module = error_reporting },
                 .{ .name = "secret_manager", .module = secret_manager },
                 .{ .name = "firestore", .module = firestore },
                 .{ .name = "storage", .module = storage },
@@ -433,6 +434,25 @@ pub fn build(b: *std.Build) void {
     });
     gcp_step.dependOn(&streamed(b, resource_manager_gcp_tests).step);
     test_step.dependOn(&resource_manager_gcp_tests.step);
+    // Error Reporting against a real project with the API on:
+    // GCP_TEST_PROJECT and GCP_TEST_TOKEN, a token that may report errors
+    // and read and update groups. Each run reports a few errors of its own.
+    const error_reporting_gcp_tests = b.addTest(.{
+        .name = "error-reporting-gcp-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/error_reporting_gcp_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "error_reporting", .module = error_reporting },
+                .{ .name = "core", .module = core },
+            },
+        }),
+        .filters = test_filters,
+        .test_runner = test_runner,
+    });
+    gcp_step.dependOn(&streamed(b, error_reporting_gcp_tests).step);
+    test_step.dependOn(&error_reporting_gcp_tests.step);
     // Signed URLs against a real bucket, which is the only place a
     // signature is checked: GCP_TEST_BUCKET, GCP_TEST_TOKEN, and a signer,
     // GCP_TEST_SIGNER_KEY or GCP_TEST_SIGNER_EMAIL.

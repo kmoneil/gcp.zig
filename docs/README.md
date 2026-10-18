@@ -86,6 +86,13 @@ Google, not only what Google documents, and where the emulators differ.
 | [The project charged](resource_manager/quota-project.md) | Which project each call is charged to, why none is named by default, and the refusals that name it |
 | [Testing](resource_manager/testing.md) | An in-memory Resource Manager for your own tests, with production's answers (experimental) |
 
+## 🚨 Error Reporting
+
+| Guide | What's in it |
+| --- | --- |
+| [Overview](error_reporting/README.md) | A dashboard's first program, periods and buckets, statuses and muted groups, the quota, locations, and what production showed when measured (experimental) |
+| [Testing](error_reporting/testing.md) | An in-memory Error Reporting for your own tests, held to production's answers (experimental) |
+
 ## 🛠️ Working on zig-gcp
 
 | Guide | What's in it |

@@ -13,7 +13,8 @@
 //!   exception type and top frames, which a test says with its own keys.
 //! - Group stats computed from the events, as production's came out: the
 //!   period ends now, in whole seconds, 7 days when none is asked; counts,
-//!   distinct users (by user, or an HTTP request's remote address), every
+//!   distinct users (by `user` alone: production counted no error that
+//!   named only a remote address), every
 //!   timed bucket in both alignments, at most 100 a period; first seen is
 //!   the time of the group's first error to arrive, last seen the latest
 //!   error's time in whole seconds, both whatever the period; the services
@@ -423,7 +424,9 @@ fn before(key: OrderKey, a: FakeErrorReporting.Computed, b: FakeErrorReporting.C
     const x: i128, const y: i128 = switch (key) {
         .count => .{ a.count, b.count },
         .last_seen => .{ a.last_in_range_ns, b.last_in_range_ns },
-        .created => .{ a.g.order, b.g.order },
+        // Production's "created" is first seen: measured, its order followed
+        // each group's first error, not the order the groups were made.
+        .created => .{ a.first_seen orelse 0, b.first_seen orelse 0 },
         .affected_users => .{ a.users, b.users },
     };
     if (x != y) return x > y;
@@ -453,8 +456,7 @@ fn compute(arena: Allocator, g: *FakeErrorReporting.Stored, params: []const Para
         count += 1;
         last_in_range = @max(last_in_range, ns);
         if (representative == null) representative = e;
-        const who = e.context.user orelse if (e.context.http_request) |h| h.remote_ip else null;
-        if (who) |u| if (u.len > 0 and !contains(users.items, u)) try users.append(arena, u);
+        if (e.context.user) |u| if (u.len > 0 and !contains(users.items, u)) try users.append(arena, u);
         if (!hasService(services.items, e.service)) try services.append(arena, e.service);
     }
     return .{
@@ -1028,8 +1030,9 @@ test "through the client: errors grouped and counted, as production counts them"
     try testing.expectEqualStrings("projects/my-project/groups/fakeG1", py.group.name);
     try testing.expectEqual(.open, py.group.status);
     try testing.expectEqual(3, py.count);
-    // A user and an address: two.
-    try testing.expectEqual(2, py.affected_users);
+    // One user twice, and an error with only an address, which production
+    // does not count: one.
+    try testing.expectEqual(1, py.affected_users);
     // First seen is the first to arrive; last seen the latest, in whole
     // seconds.
     try testing.expectEqual(at(3 * 3600).nanoseconds, py.first_seen.?.nanoseconds);
@@ -1068,7 +1071,7 @@ test "through the client: each order, a service filter, a shorter period, groups
     inline for (.{
         .{ types.Order.created, &[_][]const u8{ g.node, g.java, g.py } },
         .{ types.Order.last_seen, &[_][]const u8{ g.py, g.node, g.java } },
-        // Two users, then a tie at none, broken by age.
+        // One user, then a tie at none, broken by age.
         .{ types.Order.affected_users, &[_][]const u8{ g.py, g.java, g.node } },
     }) |case| {
         var page = try r.stats(.{ .period = .day, .order = case[0] });
@@ -1101,6 +1104,18 @@ test "through the client: each order, a service filter, a shorter period, groups
         defer page.deinit();
         try testing.expectEqual(at(7 * 24 * 3600).nanoseconds, page.value.time_range_begin.?.nanoseconds);
     }
+}
+
+test "through the client: newest first by creation is by first seen, as production orders it" {
+    var r: Rig = undefined;
+    try r.init(.{}, null);
+    defer r.deinit();
+    // Made first, but its first error is the newer.
+    const made_first = try r.fake.report(.{ .message = "A", .time = at(100) });
+    const made_second = try r.fake.report(.{ .message = "B", .time = at(5000) });
+    var page = try r.stats(.{ .period = .day, .order = .created });
+    defer page.deinit();
+    try expectIds(page.value, &.{ made_first, made_second });
 }
 
 test "through the client: timed counts, every bucket, at the end or rounded, summing to the count" {
