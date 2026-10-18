@@ -64,6 +64,11 @@ pub const JsonArraySplitter = @import("JsonArraySplitter.zig");
 /// CRC-32C, the checksum Google sends beside payload bytes.
 pub const crc32c = @import("crc32c.zig");
 
+/// RSA with a private key held here: PKCS#1 v1.5 and PSS signatures from a
+/// digest, as a service account key signs and as Cloud KMS's fake does, and
+/// public keys read and written as SubjectPublicKeyInfo.
+pub const rsa = @import("rsa.zig");
+
 /// gzip, zlib and deflate decompression: std's.
 pub const flate = @import("flate.zig");
 
@@ -104,6 +109,7 @@ test {
     _ = @import("rpc.zig");
     _ = @import("retry.zig");
     _ = @import("retry_after.zig");
+    _ = @import("rsa.zig");
     _ = @import("testing.zig");
     _ = @import("timestamp.zig");
     _ = @import("duration.zig");

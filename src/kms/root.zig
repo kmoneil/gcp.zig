@@ -15,6 +15,8 @@ pub const Client = @import("Client.zig");
 pub const KeyRing = @import("KeyRing.zig");
 pub const Key = @import("Key.zig");
 pub const KeyVersion = @import("KeyVersion.zig");
+/// What `Key.decrypt` answers, wiped by its `deinit`.
+pub const Plaintext = @import("Plaintext.zig");
 
 pub const TokenProvider = core.TokenProvider;
 pub const StaticToken = core.StaticToken;
@@ -47,6 +49,13 @@ pub const LocationInfo = @import("types.zig").LocationInfo;
 pub const LocationPage = @import("types.zig").LocationPage;
 pub const RetiredKey = @import("types.zig").RetiredKey;
 pub const RetiredKeyPage = @import("types.zig").RetiredKeyPage;
+pub const DigestKind = @import("types.zig").DigestKind;
+pub const SignInput = @import("types.zig").SignInput;
+pub const Ciphertext = @import("types.zig").Ciphertext;
+pub const EncryptOptions = @import("types.zig").EncryptOptions;
+pub const DecryptOptions = @import("types.zig").DecryptOptions;
+pub const VerifyError = @import("types.zig").VerifyError;
+pub const PublicKey = @import("types.zig").PublicKey;
 
 /// The fixed limits and naming rules the client checks before sending.
 pub const limits = @import("validate.zig");
@@ -76,8 +85,12 @@ test {
     _ = @import("codec.zig");
     _ = @import("errors.zig");
     _ = @import("fake_kms.zig");
+    _ = @import("integrity.zig");
+    _ = @import("Plaintext.zig");
+    _ = @import("verify.zig");
     _ = @import("logging.zig");
     _ = @import("names.zig");
+    _ = @import("production_bodies.zig");
     _ = @import("operations.zig");
     _ = @import("rpc.zig");
     _ = @import("types.zig");

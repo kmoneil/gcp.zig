@@ -49,10 +49,11 @@ pub fn begin(client: *Client) void {
 /// the body of the first 2xx response, which lives in `response`. A
 /// refusal that names a key version's state is that state's error.
 pub fn execute(client: *Client, response: *std.heap.ArenaAllocator, call: Call) Error![]const u8 {
-    var error_body: ?[]const u8 = null;
+    var local: ?[]const u8 = null;
     var with_body = call;
-    with_body.error_body_out = &error_body;
-    return engine(client).execute(response, with_body) catch |err| return refined(client, err, error_body);
+    const out = call.error_body_out orelse &local;
+    with_body.error_body_out = out;
+    return engine(client).execute(response, with_body) catch |err| return refined(client, err, out.*);
 }
 
 /// `execute` for calls whose response body is not needed.
@@ -64,15 +65,29 @@ pub fn executeDiscard(client: *Client, call: Call) Error!void {
 
 /// The error for a failed call: `FAILED_PRECONDITION` with a
 /// `PreconditionFailure` naming a version's state becomes that state's
-/// error; everything else stays as the engine mapped it.
+/// error; `INVALID_ARGUMENT` saying decryption failed is
+/// `error.DecryptionFailed`, saying a request checksum did not match,
+/// `error.IntegrityCheckFailed`, and with an `ErrorInfo` of reason
+/// `RESOURCE_DELETED`, a create under a deleted key's id, which is retired
+/// for good, `error.AlreadyExists`; everything else stays as the engine
+/// mapped it.
 fn refined(client: *Client, err: Error, error_body: ?[]const u8) Error {
     if (err == error.ResponseTooLarge) if (client.diagnostics) |d| {
         d.print("the response was larger than max_response_bytes ({d}); ask for a smaller page_size", .{client.max_response_bytes});
     };
-    if (err != error.FailedPrecondition) return err;
+    if (err != error.FailedPrecondition and err != error.InvalidArgument) return err;
     const body = error_body orelse return err;
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
     defer scratch.deinit();
+    if (err == error.InvalidArgument) {
+        const decoded = core.errors.decodeErrorBody(scratch.allocator(), body) catch return err;
+        const message = if (decoded) |e| e.message else return err;
+        if (std.mem.startsWith(u8, message, "Decryption failed")) return error.DecryptionFailed;
+        if (std.mem.startsWith(u8, message, "The checksum in field")) return error.IntegrityCheckFailed;
+        const infos = core.errors.decodeErrorInfos(scratch.allocator(), body) catch return err;
+        for (infos) |info| if (std.mem.eql(u8, info.reason, "RESOURCE_DELETED")) return error.AlreadyExists;
+        return err;
+    }
     const violations = core.errors.decodePreconditionFailures(scratch.allocator(), body) catch return err;
     for (violations) |v| {
         if (stateError(v.type)) |state_err| return state_err;

@@ -37,7 +37,7 @@ test {
     _ = @import("ImpersonatedServiceAccount.zig");
     _ = @import("IamSigner.zig");
     _ = @import("MetadataServer.zig");
-    _ = @import("rsa.zig");
+
     _ = @import("Lookup.zig");
     _ = @import("Credentials.zig");
     _ = @import("Cache.zig");

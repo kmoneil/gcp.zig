@@ -22,7 +22,8 @@
 //! - A refusal of a version that is not enabled carries the
 //!   `PreconditionFailure` production sends, and a state change the
 //!   machine forbids is `FAILED_PRECONDITION` in production's words.
-//! - Deletes answer an operation that is already done.
+//! - Deletes answer an operation that is not done yet, and done when read,
+//!   as production's was (0.2 s later, on 2026-10-18).
 //! - Faults a test asks for, and a call served and then answered with an
 //!   error, as a lost answer is.
 //!
@@ -42,6 +43,11 @@ const core = @import("core");
 const tp = core.transport;
 const types = @import("types.zig");
 const validate = @import("validate.zig");
+const ecdsa = std.crypto.sign.ecdsa;
+const mldsa = std.crypto.sign.mldsa;
+const Ed25519 = std.crypto.sign.Ed25519;
+const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
+const hmac = std.crypto.auth.hmac;
 
 pub const FakeKms = struct {
     gpa: Allocator,
@@ -58,6 +64,7 @@ pub const FakeKms = struct {
     retired: std.ArrayList(Retired) = .empty,
     operations: usize = 0,
     faults: [3]Fault = .{ .{}, .{}, .{} },
+    corruption: struct { n: usize = 0, kind: Corruption = .flip_payload } = .{},
     calls: usize = 0,
 
     const Fault = struct { n: usize = 0, status: u16 = 0 };
@@ -113,7 +120,59 @@ pub const FakeKms = struct {
         destroy_time: ?i96 = null,
         destroy_event_time: ?i96 = null,
         deleted: bool = false,
+        /// The key material, made with the version.
+        material: *const Material,
     };
+
+    /// A version's key, real, so what the fake encrypts it decrypts and
+    /// what it signs verifies. RSA keys come from core.rsa's test keys,
+    /// since std cannot make one: two RSA versions of a size share one.
+    pub const Material = union(enum) {
+        aes: [32]u8,
+        hmac: struct { key: [64]u8, len: u8 },
+        p256: ecdsa.EcdsaP256Sha256.KeyPair,
+        p384: ecdsa.EcdsaP384Sha384.KeyPair,
+        secp256k1: ecdsa.EcdsaSecp256k1Sha256.KeyPair,
+        ed25519: Ed25519.KeyPair,
+        /// The modulus's bits: 2048, 3072 or 4096.
+        rsa: u16,
+        mldsa44: mldsa.MLDSA44.KeyPair,
+        mldsa65: mldsa.MLDSA65.KeyPair,
+        mldsa87: mldsa.MLDSA87.KeyPair,
+        /// An algorithm whose cryptography the fake does not model: raw
+        /// AES, RSA-OAEP, key encapsulation, SLH-DSA.
+        none,
+    };
+
+    /// What the next crypto answers get wrong, for a test of the client's
+    /// checks (the KMS spec, section 7.6).
+    pub const Corruption = enum {
+        /// A byte of the answer's payload flipped, its checksum left as it
+        /// was: ciphertext, plaintext, signature, MAC, key or random bytes.
+        flip_payload,
+        /// The `verified*` flags false, as if the server had not got the
+        /// request's checksums.
+        drop_verified,
+        /// The answer names the version after the one asked for.
+        wrong_name,
+        /// `macVerify`'s `verifiedSuccessIntegrity` not its `success`.
+        success_mismatch,
+        /// The request refused as if a checksum it carried did not match.
+        refuse_checksum,
+    };
+
+    /// The next `n` crypto answers get `kind` wrong.
+    pub fn corruptNext(f: *FakeKms, n: usize, kind: Corruption) void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        f.corruption = .{ .n = n, .kind = kind };
+    }
+
+    fn takeCorruption(f: *FakeKms) ?Corruption {
+        if (f.corruption.n == 0) return null;
+        f.corruption.n -= 1;
+        return f.corruption.kind;
+    }
 
     const Retired = struct { name: []const u8, original: []const u8, delete_time: i96 };
 
@@ -253,6 +312,8 @@ pub const FakeKms = struct {
 
     fn addVersion(f: *FakeKms, k: *Key, at: i96) Allocator.Error!*Version {
         const slow = k.algorithm.generatesSlowly();
+        const material = try f.store.allocator().create(Material);
+        material.* = f.newMaterial(k.algorithm);
         try k.versions.append(f.store.allocator(), .{
             .id = k.versions.items.len + 1,
             .state = if (slow and f.options.generation_delay_ms > 0) .pending_generation else .enabled,
@@ -260,8 +321,42 @@ pub const FakeKms = struct {
             .protection_level = k.protection_level,
             .create_time = at,
             .generate_time = at + if (slow) @as(i96, f.options.generation_delay_ms) * std.time.ns_per_ms else 0,
+            .material = material,
         });
         return &k.versions.items[k.versions.items.len - 1];
+    }
+
+    fn newMaterial(f: *FakeKms, algorithm: types.Algorithm) Material {
+        switch (algorithm) {
+            .google_symmetric_encryption => {
+                var key: [32]u8 = undefined;
+                f.io.random(&key);
+                return .{ .aes = key };
+            },
+            .hmac_sha1, .hmac_sha224, .hmac_sha256, .hmac_sha384, .hmac_sha512 => {
+                var key: [64]u8 = undefined;
+                f.io.random(&key);
+                const len: u8 = switch (algorithm) {
+                    .hmac_sha1 => 20,
+                    .hmac_sha224 => 28,
+                    .hmac_sha256 => 32,
+                    .hmac_sha384 => 48,
+                    else => 64,
+                };
+                return .{ .hmac = .{ .key = key, .len = len } };
+            },
+            .ec_sign_p256_sha256 => return .{ .p256 = .generate(f.io) },
+            .ec_sign_p384_sha384 => return .{ .p384 = .generate(f.io) },
+            .ec_sign_secp256k1_sha256 => return .{ .secp256k1 = .generate(f.io) },
+            .ec_sign_ed25519 => return .{ .ed25519 = .generate(f.io) },
+            .rsa_sign_pss_2048_sha256, .rsa_sign_pkcs1_2048_sha256 => return .{ .rsa = 2048 },
+            .rsa_sign_pss_3072_sha256, .rsa_sign_pkcs1_3072_sha256 => return .{ .rsa = 3072 },
+            .rsa_sign_pss_4096_sha256, .rsa_sign_pss_4096_sha512, .rsa_sign_pkcs1_4096_sha256, .rsa_sign_pkcs1_4096_sha512 => return .{ .rsa = 4096 },
+            .pq_sign_ml_dsa_44 => return .{ .mldsa44 = .generate(f.io) },
+            .pq_sign_ml_dsa_65 => return .{ .mldsa65 = .generate(f.io) },
+            .pq_sign_ml_dsa_87 => return .{ .mldsa87 = .generate(f.io) },
+            else => return .none,
+        }
     }
 
     fn route(f: *FakeKms, req: tp.Request, arena: Allocator, route_text: []const u8, query: []const u8) Allocator.Error!Reply {
@@ -297,6 +392,8 @@ pub const FakeKms = struct {
             .version => f.versionRoute(arena, req.method, target, params, body),
             .retired => if (req.method == .GET) f.listRetired(arena, target, params) else htmlNotFound(arena),
             .operation => if (req.method == .GET) f.getOperation(arena, route_text) else htmlNotFound(arena),
+            .location => if (req.method == .POST and std.mem.eql(u8, target.method, "generateRandomBytes")) f.randomBytes(arena, body) else htmlNotFound(arena),
+            .public_key => if (req.method == .GET) f.publicKey(arena, target, params) else htmlNotFound(arena),
         };
     }
 
@@ -382,7 +479,7 @@ pub const FakeKms = struct {
             return fail(arena, 400, "FAILED_PRECONDITION", try arena.print("fake: KeyRing {s} still holds keys; delete them first", .{target.ring_name}));
         };
         _ = f.rings.orderedRemove(target.ring_name);
-        return f.doneOperation(arena, target, null);
+        return f.startOperation(arena, target, null);
     }
 
     // Keys.
@@ -394,7 +491,8 @@ pub const FakeKms = struct {
         const skip = if (paramOf(params, "skipInitialVersionCreation")) |s| std.mem.eql(u8, s, "true") else false;
         const s = f.store.allocator();
         const name = try std.fmt.allocPrint(s, "{s}/cryptoKeys/{s}", .{ target.ring_name, id });
-        if (f.keys.contains(name) or f.isRetired(name)) return fail(arena, 409, "ALREADY_EXISTS", try arena.print("CryptoKey {s} already exists.", .{name}));
+        if (f.keys.contains(name)) return fail(arena, 409, "ALREADY_EXISTS", try arena.print("CryptoKey {s} already exists.", .{name}));
+        if (f.retiredOf(name)) |retired| return retiredRefusal(arena, name, retired);
 
         const root = parseJson(arena, body) orelse return invalidJson(arena);
         if (root != .object) return invalidJson(arena);
@@ -449,6 +547,11 @@ pub const FakeKms = struct {
         if (std.mem.eql(u8, target.method, "updatePrimaryVersion")) {
             if (method != .POST) return htmlNotFound(arena);
             return f.setPrimary(arena, k, body);
+        }
+        if (std.mem.eql(u8, target.method, "encrypt") or std.mem.eql(u8, target.method, "decrypt")) {
+            if (method != .POST) return htmlNotFound(arena);
+            if (target.method[0] == 'e') return f.encrypt(arena, k, null, body);
+            return f.decrypt(arena, k, body);
         }
         if (target.method.len > 0) return notModelled(arena, "this method on a key");
         return switch (method) {
@@ -526,7 +629,7 @@ pub const FakeKms = struct {
         const retired_name = try std.fmt.allocPrint(f.store.allocator(), "{s}/retiredResources/r{d}", .{ target.location_name, f.retired.items.len + 1 });
         try f.retired.append(f.gpa, .{ .name = retired_name, .original = k.name, .delete_time = f.nowNs() });
         _ = f.keys.orderedRemove(k.name);
-        return f.doneOperation(arena, target, retired_name);
+        return f.startOperation(arena, target, retired_name);
     }
 
     fn listKeys(f: *FakeKms, arena: Allocator, target: Target, params: []const Param) Allocator.Error!Reply {
@@ -540,9 +643,10 @@ pub const FakeKms = struct {
         return .{ .status = 200, .body = out.written() };
     }
 
-    fn isRetired(f: *const FakeKms, key_name: []const u8) bool {
-        for (f.retired.items) |r| if (std.mem.eql(u8, r.original, key_name)) return true;
-        return false;
+    /// The retired resource's name of a deleted key, or null.
+    fn retiredOf(f: *const FakeKms, key_name: []const u8) ?[]const u8 {
+        for (f.retired.items) |r| if (std.mem.eql(u8, r.original, key_name)) return r.name;
+        return null;
     }
 
     // Versions.
@@ -595,6 +699,10 @@ pub const FakeKms = struct {
             v.destroy_time = null;
             return .{ .status = 200, .body = try renderVersion(arena, k, v.*) };
         }
+        if (std.mem.eql(u8, target.method, "encrypt")) return f.encrypt(arena, k, v, body);
+        if (std.mem.eql(u8, target.method, "asymmetricSign")) return f.sign(arena, k, v, target.version_name, body);
+        if (std.mem.eql(u8, target.method, "macSign")) return f.mac(arena, k, v, target.version_name, body, false);
+        if (std.mem.eql(u8, target.method, "macVerify")) return f.mac(arena, k, v, target.version_name, body, true);
         return notModelled(arena, try arena.print("{s} on a key version", .{target.method}));
     }
 
@@ -617,13 +725,264 @@ pub const FakeKms = struct {
             else => return transitionRefused(arena, target.version_name, v.state),
         }
         v.deleted = true;
-        return f.doneOperation(arena, target, null);
+        return f.startOperation(arena, target, null);
     }
 
     fn liveVersion(k: *Key, id: u64) ?*Version {
         if (id == 0 or id > k.versions.items.len) return null;
         const v = &k.versions.items[id - 1];
         return if (v.deleted) null else v;
+    }
+
+    // Cryptography.
+
+    /// The fake's ciphertext: a magic, the version, a nonce, AES-256-GCM
+    /// over the plaintext with the key's name and the AAD as associated
+    /// data, so another key's ciphertext fails as production's does.
+    const ciphertext_magic = "FKC1";
+    const ciphertext_overhead = ciphertext_magic.len + 8 + Aes256Gcm.nonce_length + Aes256Gcm.tag_length;
+
+    fn encrypt(f: *FakeKms, arena: Allocator, k: *Key, pinned: ?*Version, body: []const u8) Allocator.Error!Reply {
+        if (k.purpose != .encrypt_decrypt) return wrongPurpose(arena, k, "encrypt");
+        const o = (try requestObject(arena, body)) orelse return invalidJson(arena);
+        const plaintext = (try checkedBytes(arena, o, "plaintext", "plaintext")).value orelse return invalidJson(arena);
+        const aad = (try checkedBytes(arena, o, "additionalAuthenticatedData", "additional_authenticated_data")).value orelse return invalidJson(arena);
+        if (try checksumRefusal(arena, o, &.{ .{ "plaintext", "plaintext" }, .{ "additionalAuthenticatedData", "additional_authenticated_data" } })) |r| return r;
+        if (plaintext.len > validate.max_payload or aad.len > validate.max_payload) return fail(arena, 400, "INVALID_ARGUMENT", "fake: plaintext and AAD are at most 64 KiB each");
+        const v = pinned orelse (if (k.primary) |p| &k.versions.items[p - 1] else return fail(arena, 400, "FAILED_PRECONDITION", "fake: the key has no primary version"));
+        const name = try versionName(arena, k, v.id);
+        if (v.state != .enabled) return notEnabled(arena, name, v.state);
+        const corruption = f.takeCorruption();
+        if (corruption == .refuse_checksum) return checksumRefused(arena, "plaintext");
+        const out = try arena.alloc(u8, ciphertext_overhead + plaintext.len);
+        @memcpy(out[0..4], ciphertext_magic);
+        std.mem.writeInt(u64, out[4..12], v.id, .big);
+        const nonce = out[12..][0..Aes256Gcm.nonce_length];
+        f.io.random(nonce);
+        const ad = try std.mem.concat(arena, u8, &.{ k.name, "\x00", aad });
+        const ct = out[12 + Aes256Gcm.nonce_length ..][0..plaintext.len];
+        const tag = out[out.len - Aes256Gcm.tag_length ..][0..Aes256Gcm.tag_length];
+        Aes256Gcm.encrypt(ct, tag, plaintext, ad, nonce.*, v.material.aes);
+        return f.cryptoAnswer(arena, corruption, .{
+            .name = name,
+            .payload = .{ "ciphertext", out },
+            .flags = &.{ .{ "verifiedPlaintextCrc32c", o.get("plaintextCrc32c") != null }, .{ "verifiedAdditionalAuthenticatedDataCrc32c", o.get("additionalAuthenticatedDataCrc32c") != null } },
+            .protection_level = v.protection_level,
+        });
+    }
+
+    fn decrypt(f: *FakeKms, arena: Allocator, k: *Key, body: []const u8) Allocator.Error!Reply {
+        if (k.purpose != .encrypt_decrypt) return wrongPurpose(arena, k, "decrypt");
+        const o = (try requestObject(arena, body)) orelse return invalidJson(arena);
+        const ciphertext = (try checkedBytes(arena, o, "ciphertext", "ciphertext")).value orelse return invalidJson(arena);
+        const aad = (try checkedBytes(arena, o, "additionalAuthenticatedData", "additional_authenticated_data")).value orelse return invalidJson(arena);
+        if (try checksumRefusal(arena, o, &.{ .{ "ciphertext", "ciphertext" }, .{ "additionalAuthenticatedData", "additional_authenticated_data" } })) |r| return r;
+        const invalid = "Decryption failed: the ciphertext is invalid.";
+        const wrong_key = "Decryption failed: verify that 'name' refers to the correct CryptoKey.";
+        if (ciphertext.len < ciphertext_overhead or !std.mem.eql(u8, ciphertext[0..4], ciphertext_magic)) return fail(arena, 400, "INVALID_ARGUMENT", invalid);
+        const id = std.mem.readInt(u64, ciphertext[4..12], .big);
+        const v = liveVersion(k, id) orelse return fail(arena, 400, "INVALID_ARGUMENT", wrong_key);
+        if (v.state != .enabled) return notEnabled(arena, try versionName(arena, k, v.id), v.state);
+        if (v.material.* != .aes) return fail(arena, 400, "INVALID_ARGUMENT", wrong_key);
+        const corruption = f.takeCorruption();
+        if (corruption == .refuse_checksum) return checksumRefused(arena, "ciphertext");
+        const nonce = ciphertext[12..][0..Aes256Gcm.nonce_length];
+        const ct = ciphertext[12 + Aes256Gcm.nonce_length .. ciphertext.len - Aes256Gcm.tag_length];
+        const tag = ciphertext[ciphertext.len - Aes256Gcm.tag_length ..][0..Aes256Gcm.tag_length];
+        const plaintext = try arena.alloc(u8, ct.len);
+        const ad = try std.mem.concat(arena, u8, &.{ k.name, "\x00", aad });
+        Aes256Gcm.decrypt(plaintext, ct, tag.*, ad, nonce.*, v.material.aes) catch return fail(arena, 400, "INVALID_ARGUMENT", wrong_key);
+        return f.cryptoAnswer(arena, corruption, .{
+            .payload = .{ "plaintext", plaintext },
+            .flags = &.{.{ "usedPrimary", k.primary == v.id }},
+            .protection_level = v.protection_level,
+        });
+    }
+
+    fn sign(f: *FakeKms, arena: Allocator, k: *Key, v: *Version, name: []const u8, body: []const u8) Allocator.Error!Reply {
+        if (k.purpose != .asymmetric_sign) return wrongPurpose(arena, k, "asymmetricSign");
+        if (v.state != .enabled) return notEnabled(arena, name, v.state);
+        const o = (try requestObject(arena, body)) orelse return invalidJson(arena);
+        const want = v.algorithm.signInput() orelse return notModelled(arena, try arena.print("signing with {s}", .{v.algorithm.wire()}));
+        var input: []const u8 = undefined;
+        var flag: []const u8 = undefined;
+        switch (want) {
+            .digest => |kind| {
+                if (o.get("data") != null) return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("fake: {s} signs a digest, not data", .{v.algorithm.wire()}));
+                const digest = objectField(o, "digest") orelse return fail(arena, 400, "INVALID_ARGUMENT", "fake: a digest is required");
+                if (digest.count() != 1 or !std.mem.eql(u8, digest.keys()[0], @tagName(kind))) return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("fake: {s} signs a {s} digest", .{ v.algorithm.wire(), @tagName(kind) }));
+                input = (try checkedBytes(arena, digest, @tagName(kind), "")).value orelse return invalidJson(arena);
+                if (input.len != kind.length()) return fail(arena, 400, "INVALID_ARGUMENT", "fake: the digest's length is not its algorithm's");
+                if (o.get("digestCrc32c")) |crc| if (crcOf(crc) != core.crc32c.hash(input)) return checksumRefused(arena, "digest");
+                flag = "verifiedDigestCrc32c";
+            },
+            .data => {
+                if (o.get("digest") != null) return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("fake: {s} signs data, not a digest", .{v.algorithm.wire()}));
+                input = (try checkedBytes(arena, o, "data", "data")).value orelse return invalidJson(arena);
+                if (input.len > validate.max_payload) return fail(arena, 400, "INVALID_ARGUMENT", "fake: data is at most 64 KiB");
+                if (try checksumRefusal(arena, o, &.{.{ "data", "data" }})) |r| return r;
+                flag = "verifiedDataCrc32c";
+            },
+        }
+        const corruption = f.takeCorruption();
+        if (corruption == .refuse_checksum) return checksumRefused(arena, if (want == .data) "data" else "digest");
+        const signature = (try f.signWith(arena, v, input)) orelse return notModelled(arena, try arena.print("signing with {s}", .{v.algorithm.wire()}));
+        return f.cryptoAnswer(arena, corruption, .{
+            .name = name,
+            .payload = .{ "signature", signature },
+            .flags = &.{.{ flag, o.get(if (want == .data) "dataCrc32c" else "digestCrc32c") != null }},
+            .protection_level = v.protection_level,
+        });
+    }
+
+    fn signWith(f: *FakeKms, arena: Allocator, v: *const Version, input: []const u8) Allocator.Error!?[]const u8 {
+        switch (v.material.*) {
+            // `sign` checked the digest's length against the algorithm's.
+            .p256 => |kp| return try derOf(arena, kp.signPrehashed(input[0..32].*, null) catch return null),
+            .p384 => |kp| return try derOf(arena, kp.signPrehashed(input[0..48].*, null) catch return null),
+            .secp256k1 => |kp| return try derOf(arena, kp.signPrehashed(input[0..32].*, null) catch return null),
+            .ed25519 => |kp| {
+                const sig = kp.sign(input, null) catch return null;
+                return try arena.dupe(u8, &sig.toBytes());
+            },
+            inline .mldsa44, .mldsa65, .mldsa87 => |kp| {
+                const sig = kp.sign(input, null) catch return null;
+                return try arena.dupe(u8, &sig.toBytes());
+            },
+            .rsa => |bits| {
+                var key = core.rsa.parsePem(rsaPem(bits)) catch return null;
+                defer key.deinit();
+                const hash: core.rsa.Hash = switch (v.algorithm.signInput().?.digest) {
+                    .sha256 => .sha256,
+                    .sha384 => .sha384,
+                    .sha512 => .sha512,
+                };
+                const out = try arena.alloc(u8, key.len);
+                const pss = switch (v.algorithm) {
+                    .rsa_sign_pss_2048_sha256, .rsa_sign_pss_3072_sha256, .rsa_sign_pss_4096_sha256, .rsa_sign_pss_4096_sha512 => true,
+                    else => false,
+                };
+                if (pss) {
+                    var salt: [64]u8 = undefined;
+                    f.io.random(&salt);
+                    return key.signPss(hash, input, salt[0..input.len], out) catch null;
+                }
+                return key.signDigest(hash, input, out) catch null;
+            },
+            else => return null,
+        }
+    }
+
+    fn mac(f: *FakeKms, arena: Allocator, k: *Key, v: *Version, name: []const u8, body: []const u8, verify: bool) Allocator.Error!Reply {
+        if (k.purpose != .mac) return wrongPurpose(arena, k, if (verify) "macVerify" else "macSign");
+        if (v.state != .enabled) return notEnabled(arena, name, v.state);
+        const o = (try requestObject(arena, body)) orelse return invalidJson(arena);
+        const data = (try checkedBytes(arena, o, "data", "data")).value orelse return invalidJson(arena);
+        if (data.len > validate.max_payload) return fail(arena, 400, "INVALID_ARGUMENT", "fake: data is at most 64 KiB");
+        if (try checksumRefusal(arena, o, if (verify) &.{ .{ "data", "data" }, .{ "mac", "mac" } } else &.{.{ "data", "data" }})) |r| return r;
+        const corruption = f.takeCorruption();
+        if (corruption == .refuse_checksum) return checksumRefused(arena, "data");
+        const key = v.material.hmac.key[0..v.material.hmac.len];
+        var buf: [64]u8 = undefined;
+        const computed = macOf(v.algorithm, key, data, &buf);
+        if (!verify) return f.cryptoAnswer(arena, corruption, .{
+            .name = name,
+            .payload = .{ "mac", computed },
+            .flags = &.{.{ "verifiedDataCrc32c", o.get("dataCrc32c") != null }},
+            .protection_level = v.protection_level,
+        });
+        const given = (try checkedBytes(arena, o, "mac", "mac")).value orelse return invalidJson(arena);
+        const success = std.mem.eql(u8, given, computed);
+        const integrity_flag = if (corruption == .success_mismatch) !success else success;
+        return f.cryptoAnswer(arena, corruption, .{
+            .name = name,
+            .flags = &.{
+                .{ "success", success },
+                .{ "verifiedDataCrc32c", o.get("dataCrc32c") != null },
+                .{ "verifiedMacCrc32c", o.get("macCrc32c") != null },
+                .{ "verifiedSuccessIntegrity", integrity_flag },
+            },
+            .protection_level = v.protection_level,
+        });
+    }
+
+    fn publicKey(f: *FakeKms, arena: Allocator, target: Target, params: []const Param) Allocator.Error!Reply {
+        const k = f.keys.get(target.key_name) orelse return notFound(arena, "CryptoKey", target.key_name);
+        const v = liveVersion(k, target.version) orelse return notFound(arena, "CryptoKeyVersion", target.version_name);
+        if (k.purpose != .asymmetric_sign) return wrongPurpose(arena, k, "getPublicKey");
+        if (v.state != .enabled) return notEnabled(arena, target.version_name, v.state);
+        const format = paramOf(params, "publicKeyFormat") orelse "PEM";
+        const pq = v.algorithm.postQuantum();
+        if (pq and !std.mem.eql(u8, format, "NIST_PQC")) return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("fake: Only NIST_PQC format is supported for {s}.", .{v.algorithm.wire()}));
+        if (!pq and !std.mem.eql(u8, format, "PEM")) return notModelled(arena, try arena.print("public key format {s}", .{format}));
+        const key = (try publicKeyOf(arena, v)) orelse return notModelled(arena, try arena.print("a public key for {s}", .{v.algorithm.wire()}));
+        // A public key's request carries no checksum to refuse.
+        const corruption = f.takeCorruption();
+        var shown = key;
+        if (corruption == .flip_payload) {
+            const copy = try arena.dupe(u8, key);
+            copy[copy.len / 2] ^= 1;
+            shown = copy;
+        }
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        writePublicKey(&jw, .{
+            .name = if (corruption == .wrong_name) try versionName(arena, k, v.id + 1) else target.version_name,
+            .algorithm = v.algorithm,
+            .protection_level = v.protection_level,
+            .format = format,
+            .key = shown,
+            .crc = core.crc32c.hash(key),
+            .pem = !pq,
+        }) catch return error.OutOfMemory;
+        return .{ .status = 200, .body = out.written() };
+    }
+
+    fn randomBytes(f: *FakeKms, arena: Allocator, body: []const u8) Allocator.Error!Reply {
+        const o = (try requestObject(arena, body)) orelse return invalidJson(arena);
+        if (!std.mem.eql(u8, stringField(o, "protectionLevel") orelse "", "HSM")) return fail(arena, 400, "INVALID_ARGUMENT", "fake: random bytes come from an HSM");
+        const len_value = o.get("lengthBytes") orelse return invalidJson(arena);
+        const len = crcOf(len_value) orelse return invalidJson(arena);
+        if (len < validate.min_random_bytes or len > validate.max_random_bytes) return fail(arena, 400, "INVALID_ARGUMENT", "fake: lengthBytes is 8 to 1024");
+        const corruption = f.takeCorruption();
+        const data = try arena.alloc(u8, len);
+        f.io.random(data);
+        return f.cryptoAnswer(arena, corruption, .{ .payload = .{ "data", data } });
+    }
+
+    const Answer = struct {
+        name: ?[]const u8 = null,
+        /// The bytes field and its value; its checksum is `<field>Crc32c`.
+        payload: ?struct { []const u8, []const u8 } = null,
+        flags: []const struct { []const u8, bool } = &.{},
+        protection_level: ?types.ProtectionLevel = null,
+        /// The payload's checksum, when not its bytes': after a corruption.
+        payload_crc: ?u32 = null,
+    };
+
+    /// A crypto call's answer, with what `corruption` says to get wrong.
+    fn cryptoAnswer(f: *FakeKms, arena: Allocator, corruption: ?Corruption, answer: Answer) Allocator.Error!Reply {
+        var a = answer;
+        if (corruption) |c| switch (c) {
+            .wrong_name => if (a.name) |n| {
+                const at = std.mem.lastIndexOfScalar(u8, n, '/').?;
+                const id = std.fmt.parseInt(u64, n[at + 1 ..], 10) catch 0;
+                a.name = try arena.print("{s}/{d}", .{ n[0..at], id + 1 });
+            },
+            .flip_payload => if (a.payload) |p| if (p[1].len > 0) {
+                // The checksum stays the original bytes'.
+                a.payload_crc = core.crc32c.hash(p[1]);
+                const copy = try arena.dupe(u8, p[1]);
+                copy[0] ^= 1;
+                a.payload = .{ p[0], copy };
+            },
+            else => {},
+        };
+        _ = f;
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        writeAnswer(&jw, a, corruption) catch return error.OutOfMemory;
+        return .{ .status = 200, .body = out.written() };
     }
 
     // Retired keys and operations.
@@ -638,11 +997,11 @@ pub const FakeKms = struct {
         return .{ .status = 200, .body = out.written() };
     }
 
-    /// An operation that is done the moment it is made, as production's
-    /// deletes may be (milestone 0 measures it).
-    fn doneOperation(f: *FakeKms, arena: Allocator, target: Target, retired: ?[]const u8) Allocator.Error!Reply {
+    /// A delete's operation: the work done, the answer not, as production
+    /// answered; read back, it is done.
+    fn startOperation(f: *FakeKms, arena: Allocator, target: Target, retired: ?[]const u8) Allocator.Error!Reply {
         f.operations += 1;
-        return .{ .status = 200, .body = try renderOperation(arena, target.location_name, f.operations, retired) };
+        return .{ .status = 200, .body = try renderOperation(arena, target.location_name, f.operations, retired, false) };
     }
 
     fn getOperation(f: *FakeKms, arena: Allocator, route_text: []const u8) Allocator.Error!Reply {
@@ -650,7 +1009,7 @@ pub const FakeKms = struct {
         const at = std.mem.lastIndexOf(u8, name, "/operations/op-") orelse return notFound(arena, "Operation", name);
         const n = std.fmt.parseInt(usize, name[at + "/operations/op-".len ..], 10) catch return notFound(arena, "Operation", name);
         if (n == 0 or n > f.operations) return notFound(arena, "Operation", name);
-        return .{ .status = 200, .body = try renderOperation(arena, name[0..at], n, null) };
+        return .{ .status = 200, .body = try renderOperation(arena, name[0..at], n, null, true) };
     }
 
     // Rendering.
@@ -716,6 +1075,208 @@ pub const FakeKms = struct {
     }
 };
 
+fn writeAnswer(jw: *Stringify, a: FakeKms.Answer, corruption: ?FakeKms.Corruption) Stringify.Error!void {
+    try jw.beginObject();
+    if (a.name) |n| {
+        try jw.objectField("name");
+        try jw.write(n);
+    }
+    if (a.payload) |p| {
+        const crc = a.payload_crc orelse core.crc32c.hash(p[1]);
+        if (p[1].len > 0) {
+            try jw.objectField(p[0]);
+            try core.base64.writeJsonString(jw, p[1]);
+        }
+        var name_buf: [64]u8 = undefined;
+        try jw.objectField(std.fmt.bufPrint(&name_buf, "{s}Crc32c", .{p[0]}) catch unreachable);
+        try jw.print("\"{d}\"", .{crc});
+    }
+    for (a.flags) |flag| {
+        const dropped = corruption == .drop_verified and std.mem.startsWith(u8, flag[0], "verified");
+        if (!flag[1] or dropped) continue;
+        try jw.objectField(flag[0]);
+        try jw.write(true);
+    }
+    if (a.protection_level) |p| {
+        try jw.objectField("protectionLevel");
+        try jw.write(p.wire());
+    }
+    try jw.endObject();
+}
+
+fn derOf(arena: Allocator, sig: anytype) Allocator.Error![]const u8 {
+    var buf: [@TypeOf(sig).der_encoded_length_max]u8 = undefined;
+    return arena.dupe(u8, sig.toDer(&buf));
+}
+
+const PublicKeyAnswer = struct {
+    name: []const u8,
+    algorithm: types.Algorithm,
+    protection_level: types.ProtectionLevel,
+    format: []const u8,
+    key: []const u8,
+    crc: u32,
+    /// The key is a PEM, also in `pem` with its checksum.
+    pem: bool,
+};
+
+fn writePublicKey(jw: *Stringify, a: PublicKeyAnswer) Stringify.Error!void {
+    try jw.beginObject();
+    if (a.pem) {
+        try jw.objectField("pem");
+        try jw.write(a.key);
+        try jw.objectField("pemCrc32c");
+        try jw.print("\"{d}\"", .{a.crc});
+    }
+    try jw.objectField("algorithm");
+    try jw.write(a.algorithm.wire());
+    try jw.objectField("name");
+    try jw.write(a.name);
+    try jw.objectField("protectionLevel");
+    try jw.write(a.protection_level.wire());
+    try jw.objectField("publicKeyFormat");
+    try jw.write(a.format);
+    try jw.objectField("publicKey");
+    try jw.beginObject();
+    try jw.objectField("data");
+    try core.base64.writeJsonString(jw, a.key);
+    try jw.objectField("crc32cChecksum");
+    try jw.print("\"{d}\"", .{a.crc});
+    try jw.endObject();
+    try jw.endObject();
+}
+
+fn rsaPem(bits: u16) []const u8 {
+    return switch (bits) {
+        2048 => core.rsa.test_key_2048,
+        3072 => core.rsa.test_key_3072,
+        else => core.rsa.test_key_4096,
+    };
+}
+
+fn macOf(a: types.Algorithm, key: []const u8, data: []const u8, buf: *[64]u8) []const u8 {
+    switch (a) {
+        inline .hmac_sha1, .hmac_sha224, .hmac_sha256, .hmac_sha384, .hmac_sha512 => |t| {
+            const H = switch (t) {
+                .hmac_sha1 => hmac.HmacSha1,
+                .hmac_sha224 => hmac.sha2.HmacSha224,
+                .hmac_sha256 => hmac.sha2.HmacSha256,
+                .hmac_sha384 => hmac.sha2.HmacSha384,
+                else => hmac.sha2.HmacSha512,
+            };
+            H.create(buf[0..H.mac_length], data, key);
+            return buf[0..H.mac_length];
+        },
+        else => unreachable,
+    }
+}
+
+/// A classical version's public key as a PEM SubjectPublicKeyInfo, or a
+/// post-quantum one's NIST encoding; null for one the fake does not model.
+fn publicKeyOf(arena: Allocator, v: *const FakeKms.Version) Allocator.Error!?[]const u8 {
+    var der_buf: [core.rsa.max_spki_len]u8 = undefined;
+    const der: []const u8 = switch (v.material.*) {
+        .p256 => |kp| ecSpki(&der_buf, &.{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 }, &kp.public_key.toUncompressedSec1()),
+        .p384 => |kp| ecSpki(&der_buf, &.{ 0x2b, 0x81, 0x04, 0x00, 0x22 }, &kp.public_key.toUncompressedSec1()),
+        .secp256k1 => |kp| ecSpki(&der_buf, &.{ 0x2b, 0x81, 0x04, 0x00, 0x0a }, &kp.public_key.toUncompressedSec1()),
+        .ed25519 => |kp| ed: {
+            const prefix = [_]u8{ 0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00 };
+            @memcpy(der_buf[0..prefix.len], &prefix);
+            @memcpy(der_buf[prefix.len..][0..32], &kp.public_key.toBytes());
+            break :ed der_buf[0 .. prefix.len + 32];
+        },
+        .rsa => |bits| rsa: {
+            var key = core.rsa.parsePem(rsaPem(bits)) catch return null;
+            defer key.deinit();
+            break :rsa key.publicKey().writeSpki(&der_buf);
+        },
+        inline .mldsa44, .mldsa65, .mldsa87 => |kp| return try arena.dupe(u8, &kp.public_key.toBytes()),
+        else => return null,
+    };
+    return try pemOf(arena, der);
+}
+
+/// SEQUENCE { SEQUENCE { ecPublicKey, curve }, BIT STRING point }, for a
+/// curve whose OID and point are short enough for one-byte lengths.
+fn ecSpki(buf: []u8, curve: []const u8, point: []const u8) []const u8 {
+    const ec_oid = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 };
+    const alg_len = 2 + ec_oid.len + 2 + curve.len;
+    const bits_len = 1 + point.len;
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeAll(&.{ 0x30, @intCast(2 + alg_len + 2 + bits_len), 0x30, @intCast(alg_len), 0x06, ec_oid.len }) catch unreachable;
+    w.writeAll(&ec_oid) catch unreachable;
+    w.writeAll(&.{ 0x06, @intCast(curve.len) }) catch unreachable;
+    w.writeAll(curve) catch unreachable;
+    w.writeAll(&.{ 0x03, @intCast(bits_len), 0x00 }) catch unreachable;
+    w.writeAll(point) catch unreachable;
+    return w.buffered();
+}
+
+fn pemOf(arena: Allocator, der: []const u8) Allocator.Error![]const u8 {
+    const encoder = std.base64.standard.Encoder;
+    const b64 = try arena.alloc(u8, encoder.calcSize(der.len));
+    _ = encoder.encode(b64, der);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    w.writeAll("-----BEGIN PUBLIC KEY-----\n") catch return error.OutOfMemory;
+    var i: usize = 0;
+    while (i < b64.len) : (i += 64) {
+        w.writeAll(b64[i..@min(b64.len, i + 64)]) catch return error.OutOfMemory;
+        w.writeByte('\n') catch return error.OutOfMemory;
+    }
+    w.writeAll("-----END PUBLIC KEY-----\n") catch return error.OutOfMemory;
+    return out.written();
+}
+
+fn requestObject(arena: Allocator, body: []const u8) Allocator.Error!?std.json.ObjectMap {
+    const root = parseJson(arena, body) orelse return null;
+    return if (root == .object) root.object else null;
+}
+
+/// A bytes field of a request, "" when absent; its value null when it is
+/// not base64.
+fn checkedBytes(arena: Allocator, o: std.json.ObjectMap, field: []const u8, _: []const u8) Allocator.Error!struct { value: ?[]const u8 } {
+    const v = o.get(field) orelse return .{ .value = "" };
+    if (v != .string) return .{ .value = null };
+    const bytes = core.base64.decode(arena, v.string) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidBase64 => return .{ .value = null },
+    };
+    return .{ .value = bytes };
+}
+
+/// A checksum, or a length: a string or a number of digits.
+fn crcOf(v: JsonValue) ?u64 {
+    const text = switch (v) {
+        .string, .number_string => |s| s,
+        else => return null,
+    };
+    return std.fmt.parseInt(u64, text, 10) catch null;
+}
+
+/// The refusal production sends when a request checksum does not match its
+/// bytes, for the first of `fields` (JSON name, proto name) whose does not.
+fn checksumRefusal(arena: Allocator, o: std.json.ObjectMap, fields: []const struct { []const u8, []const u8 }) Allocator.Error!?FakeKms.Reply {
+    for (fields) |f| {
+        var name_buf: [64]u8 = undefined;
+        const crc_field = std.fmt.bufPrint(&name_buf, "{s}Crc32c", .{f[0]}) catch unreachable;
+        const crc = o.get(crc_field) orelse continue;
+        const bytes = (try checkedBytes(arena, o, f[0], f[1])).value orelse continue;
+        if (crcOf(crc) != core.crc32c.hash(bytes)) return try checksumRefused(arena, f[1]);
+    }
+    return null;
+}
+
+/// "The checksum in field plaintext_crc32c did not match the data in
+/// field plaintext.", as Google's data-integrity guide quotes it.
+fn checksumRefused(arena: Allocator, field: []const u8) Allocator.Error!FakeKms.Reply {
+    return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("The checksum in field {s}_crc32c did not match the data in field {s}.", .{ field, field }));
+}
+
+fn wrongPurpose(arena: Allocator, k: *const FakeKms.Key, call: []const u8) Allocator.Error!FakeKms.Reply {
+    return fail(arena, 400, "FAILED_PRECONDITION", try arena.print("fake: {s} is not for a key of purpose {s}: {s}", .{ call, k.purpose.wire(), k.name }));
+}
+
 const Target = struct {
     kind: Kind,
     project: []const u8,
@@ -728,7 +1289,7 @@ const Target = struct {
     /// What follows a `:`, such as "destroy"; "" for none.
     method: []const u8 = "",
 
-    const Kind = enum { locations, key_rings, key_ring, keys, key, versions, version, retired, operation };
+    const Kind = enum { locations, location, key_rings, key_ring, keys, key, versions, version, public_key, retired, operation };
 };
 
 /// The resource a path names, from `/v1/projects/P/locations...`; null for
@@ -754,7 +1315,11 @@ fn parseTarget(path: []const u8) ?Target {
     var t: Target = .{ .kind = .locations, .project = parts[1], .location_name = "", .method = method };
     if (n == 3) return if (method.len == 0) t else null;
     t.location_name = full[0 .. "projects/".len + parts[1].len + "/locations/".len + parts[3].len];
-    if (n == 4) return null;
+    if (n == 4) return if (method.len > 0) t: {
+        var loc = t;
+        loc.kind = .location;
+        break :t loc;
+    } else null;
     if (n == 5 and std.mem.eql(u8, parts[4], "keyRings")) return withKind(t, .key_rings);
     if (n == 5 and std.mem.eql(u8, parts[4], "retiredResources")) return withKind(t, .retired);
     if (n == 6 and std.mem.eql(u8, parts[4], "operations")) return withKind(t, .operation);
@@ -767,9 +1332,13 @@ fn parseTarget(path: []const u8) ?Target {
     if (n == 8) return withKind(t, .key);
     if (!std.mem.eql(u8, parts[8], "cryptoKeyVersions")) return null;
     if (n == 9) return withKind(t, .versions);
+    t.version = std.fmt.parseInt(u64, parts[9], 10) catch 0;
+    if (n == 11 and std.mem.eql(u8, parts[10], "publicKey")) {
+        t.version_name = name[0 .. name.len - "/publicKey".len];
+        return withKind(t, .public_key);
+    }
     if (n != 10) return null;
     t.version_name = name;
-    t.version = std.fmt.parseInt(u64, parts[9], 10) catch 0;
     return withKind(t, .version);
 }
 
@@ -854,20 +1423,20 @@ fn writeRetired(jw: *Stringify, r: FakeKms.Retired) Stringify.Error!void {
     try jw.objectField("originalResource");
     try jw.write(r.original);
     try jw.objectField("resourceType");
-    try jw.write("cloudkms.googleapis.com/CryptoKey");
+    try jw.write("CryptoKey");
     try jw.objectField("deleteTime");
     try writeTime(jw, r.delete_time);
     try jw.endObject();
 }
 
-fn renderOperation(arena: Allocator, location_name: []const u8, n: usize, retired: ?[]const u8) Allocator.Error![]const u8 {
+fn renderOperation(arena: Allocator, location_name: []const u8, n: usize, retired: ?[]const u8, done: bool) Allocator.Error![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     var jw: Stringify = .{ .writer = &out.writer };
-    writeOperation(&jw, location_name, n, retired) catch return error.OutOfMemory;
+    writeOperation(&jw, location_name, n, retired, done) catch return error.OutOfMemory;
     return out.written();
 }
 
-fn writeOperation(jw: *Stringify, location_name: []const u8, n: usize, retired: ?[]const u8) Stringify.Error!void {
+fn writeOperation(jw: *Stringify, location_name: []const u8, n: usize, retired: ?[]const u8, done: bool) Stringify.Error!void {
     try jw.beginObject();
     try jw.objectField("name");
     try jw.print("\"{s}/operations/op-{d}\"", .{ location_name, n });
@@ -880,6 +1449,7 @@ fn writeOperation(jw: *Stringify, location_name: []const u8, n: usize, retired: 
         try jw.write(r);
         try jw.endObject();
     }
+    if (!done) return jw.endObject();
     try jw.objectField("done");
     try jw.write(true);
     try jw.objectField("response");
@@ -1057,6 +1627,22 @@ pub fn notEnabled(arena: Allocator, version_name: []const u8, state: types.State
 /// A state change the machine forbids, in production's words.
 fn transitionRefused(arena: Allocator, version_name: []const u8, state: types.State) Allocator.Error!FakeKms.Reply {
     return fail(arena, 400, "FAILED_PRECONDITION", try arena.print("The request cannot be fulfilled. Resource {s} has value {s} in field crypto_key_version.state.", .{ version_name, state.wire() }));
+}
+
+/// A create under a deleted key's id, in production's words.
+fn retiredRefusal(arena: Allocator, name: []const u8, retired: []const u8) Allocator.Error!FakeKms.Reply {
+    const message = try arena.print("CryptoKey {s} has already been deleted and has the following RetiredResource name: {s}.", .{ name, retired });
+    return .{ .status = 400, .body = try Stringify.valueAlloc(arena, .{ .@"error" = .{
+        .code = 400,
+        .message = message,
+        .status = "INVALID_ARGUMENT",
+        .details = .{.{
+            .@"@type" = "type.googleapis.com/google.rpc.ErrorInfo",
+            .reason = "RESOURCE_DELETED",
+            .domain = "cloudkms.googleapis.com",
+            .metadata = .{ .resource_name = name, .retired_resource_name = retired },
+        }},
+    } }, .{}) };
 }
 
 fn notFound(arena: Allocator, kind: []const u8, name: []const u8) Allocator.Error!FakeKms.Reply {
@@ -1458,6 +2044,349 @@ test "routes no client call takes: operations read back, a disabled new version,
     var rotating = try r.client.keyRing("r").key("k2").update(.{ .rotation = .{ .set = .{ .period_s = 86_400, .next = .{ .nanoseconds = test_util.start_ns + 60 * std.time.ns_per_s } } } });
     try testing.expectEqual(86_400, rotating.value.rotation_period_s.?);
     rotating.deinit();
+}
+
+/// A rig with key ring "r" made.
+fn ringRig(r: *Rig, gpa: Allocator, options: Rig.Options) !void {
+    try r.init(gpa, options);
+    errdefer r.deinit();
+    var made = try r.client.keyRing("r").create();
+    made.deinit();
+}
+
+test "encrypt and decrypt: round trips with AAD, the primary and older versions, and each refusal" {
+    var r: Rig = undefined;
+    try ringRig(&r, testing.allocator, .{});
+    defer r.deinit();
+    const key = r.client.keyRing("r").key("k");
+    var info = try key.create(.{ .purpose = .encrypt_decrypt });
+    info.deinit();
+    var c1 = try key.encrypt("attack at dawn", .{ .aad = "ctx" });
+    defer c1.deinit();
+    try testing.expectEqual(1, c1.value.version);
+    var p1 = try key.decrypt(c1.value.bytes, .{ .aad = "ctx" });
+    try testing.expectEqualStrings("attack at dawn", p1.bytes());
+    try testing.expect(p1.used_primary);
+    p1.deinit();
+    // Two encrypts of the same bytes differ.
+    var c1b = try key.encrypt("attack at dawn", .{ .aad = "ctx" });
+    defer c1b.deinit();
+    try testing.expect(!std.mem.eql(u8, c1.value.bytes, c1b.value.bytes));
+    // The wrong AAD, another key's ciphertext, and bytes that are not one.
+    try testing.expectError(error.DecryptionFailed, key.decrypt(c1.value.bytes, .{}));
+    const other = r.client.keyRing("r").key("other");
+    var other_info = try other.create(.{ .purpose = .encrypt_decrypt });
+    other_info.deinit();
+    try testing.expectError(error.DecryptionFailed, other.decrypt(c1.value.bytes, .{ .aad = "ctx" }));
+    try testing.expectError(error.DecryptionFailed, key.decrypt("not a ciphertext at all, not even close to one", .{}));
+    // A second version made primary: old ciphertexts still decrypt, by
+    // version 1, which is not the primary.
+    var v2 = try key.createVersion();
+    v2.deinit();
+    var primary = try key.setPrimary(2);
+    primary.deinit();
+    var c2 = try key.encrypt("", .{});
+    defer c2.deinit();
+    try testing.expectEqual(2, c2.value.version);
+    var empty = try key.decrypt(c2.value.bytes, .{});
+    try testing.expectEqualStrings("", empty.bytes());
+    empty.deinit();
+    var old = try key.decrypt(c1.value.bytes, .{ .aad = "ctx" });
+    try testing.expect(!old.used_primary);
+    old.deinit();
+    var pinned = try key.encrypt("x", .{ .version = 1 });
+    try testing.expectEqual(1, pinned.value.version);
+    pinned.deinit();
+    // Version 1 disabled, then destroyed: its ciphertexts say so.
+    var d = try key.version(1).disable();
+    d.deinit();
+    try testing.expectError(error.KeyVersionDisabled, key.decrypt(c1.value.bytes, .{ .aad = "ctx" }));
+    try testing.expect(std.mem.indexOf(u8, r.diag.message(), "cryptoKeyVersions/1 is not enabled") != null);
+    try testing.expectError(error.KeyVersionDisabled, key.encrypt("x", .{ .version = 1 }));
+    var gone = try key.version(1).destroy();
+    gone.deinit();
+    try testing.expectError(error.KeyVersionDestroyed, key.decrypt(c1.value.bytes, .{ .aad = "ctx" }));
+    // A signing key does not encrypt.
+    const s = r.client.keyRing("r").key("s");
+    var s_info = try s.create(.{ .purpose = .asymmetric_sign, .algorithm = .ec_sign_p256_sha256 });
+    s_info.deinit();
+    try testing.expectError(error.FailedPrecondition, s.encrypt("x", .{}));
+    try testing.expectError(error.FailedPrecondition, s.decrypt(c1.value.bytes, .{}));
+}
+
+test "sign and verify here: every signing algorithm the fake models, by message and by digest" {
+    var r: Rig = undefined;
+    try ringRig(&r, testing.allocator, .{});
+    defer r.deinit();
+    const algorithms = [_]types.Algorithm{
+        .ec_sign_p256_sha256,      .ec_sign_p384_sha384,        .ec_sign_secp256k1_sha256,
+        .ec_sign_ed25519,          .rsa_sign_pkcs1_2048_sha256, .rsa_sign_pss_2048_sha256,
+        .rsa_sign_pss_3072_sha256, .rsa_sign_pkcs1_4096_sha512, .rsa_sign_pss_4096_sha512,
+        .pq_sign_ml_dsa_44,        .pq_sign_ml_dsa_65,          .pq_sign_ml_dsa_87,
+    };
+    var id_buf: [8]u8 = undefined;
+    for (algorithms, 0..) |algorithm, i| {
+        const id = try std.fmt.bufPrint(&id_buf, "s{d}", .{i});
+        const key = r.client.keyRing("r").key(id);
+        var info = try key.create(.{ .purpose = .asymmetric_sign, .algorithm = algorithm });
+        info.deinit();
+        const v = key.version(1);
+        var pk = try v.publicKey();
+        defer pk.deinit();
+        try testing.expectEqual(algorithm, pk.value.algorithm);
+        try testing.expectEqual(algorithm.postQuantum(), pk.value.raw.len > 0);
+        var sig = try v.sign(algorithm, "the message");
+        defer sig.deinit();
+        try pk.value.verify("the message", sig.value);
+        try testing.expectError(error.SignatureInvalid, pk.value.verify("another message", sig.value));
+        const flipped = try testing.allocator.dupe(u8, sig.value);
+        defer testing.allocator.free(flipped);
+        flipped[flipped.len - 1] ^= 1;
+        try testing.expectError(error.SignatureInvalid, pk.value.verify("the message", flipped));
+        if (algorithm.signInput().? == .digest) {
+            var buf: [64]u8 = undefined;
+            const digest = algorithm.signInput().?.digest.digest("by digest", &buf);
+            var pre = try v.signDigest(algorithm, digest);
+            defer pre.deinit();
+            try pk.value.verifyDigest(digest, pre.value);
+            try pk.value.verify("by digest", pre.value);
+        } else {
+            try testing.expectError(error.UnsupportedAlgorithm, pk.value.verifyDigest("0123456789abcdef0123456789abcdef", sig.value));
+        }
+    }
+}
+
+test "local verification refuses a key that is not its algorithm's, and algorithms it cannot check" {
+    var r: Rig = undefined;
+    try ringRig(&r, testing.allocator, .{});
+    defer r.deinit();
+    const key = r.client.keyRing("r").key("ec");
+    var info = try key.create(.{ .purpose = .asymmetric_sign, .algorithm = .ec_sign_p256_sha256 });
+    info.deinit();
+    var pk = try key.version(1).publicKey();
+    defer pk.deinit();
+    var wrong = pk.value;
+    for ([_]types.Algorithm{ .ec_sign_p384_sha384, .ec_sign_ed25519, .rsa_sign_pkcs1_2048_sha256 }) |a| {
+        wrong.algorithm = a;
+        try testing.expectError(error.InvalidPublicKey, wrong.verify("m", "sig"));
+    }
+    wrong.algorithm = .pq_sign_ml_dsa_44;
+    try testing.expectError(error.InvalidPublicKey, wrong.verify("m", "sig"));
+    for ([_]types.Algorithm{ .pq_sign_slh_dsa_sha2_128s, .hmac_sha256, .google_symmetric_encryption }) |a| {
+        wrong.algorithm = a;
+        try testing.expectError(error.UnsupportedAlgorithm, wrong.verify("m", "sig"));
+        try testing.expectError(error.UnsupportedAlgorithm, wrong.verifyDigest("m", "sig"));
+    }
+    wrong = pk.value;
+    wrong.pem = "not a PEM";
+    try testing.expectError(error.InvalidPublicKey, wrong.verify("m", "sig"));
+    wrong.pem = "-----BEGIN PUBLIC KEY-----\n!!!\n-----END PUBLIC KEY-----\n";
+    try testing.expectError(error.InvalidPublicKey, wrong.verify("m", "sig"));
+    // A signature that is not DER, or a digest of another length.
+    try testing.expectError(error.SignatureInvalid, pk.value.verify("m", "not DER"));
+    try testing.expectError(error.SignatureInvalid, pk.value.verifyDigest("short", "not DER"));
+}
+
+test "MACs: every HMAC, a wrong MAC false, and a MAC key does not sign" {
+    var r: Rig = undefined;
+    try ringRig(&r, testing.allocator, .{});
+    defer r.deinit();
+    const algorithms = [_]types.Algorithm{ .hmac_sha1, .hmac_sha224, .hmac_sha256, .hmac_sha384, .hmac_sha512 };
+    const lengths = [_]usize{ 20, 28, 32, 48, 64 };
+    var id_buf: [8]u8 = undefined;
+    for (algorithms, lengths, 0..) |algorithm, len, i| {
+        const key = r.client.keyRing("r").key(try std.fmt.bufPrint(&id_buf, "m{d}", .{i}));
+        var info = try key.create(.{ .purpose = .mac, .algorithm = algorithm });
+        info.deinit();
+        const v = key.version(1);
+        var m = try v.macSign("data");
+        defer m.deinit();
+        try testing.expectEqual(len, m.value.len);
+        try testing.expect(try v.macVerify("data", m.value));
+        try testing.expect(!try v.macVerify("other data", m.value));
+        try testing.expect(!try v.macVerify("data", ""));
+        try testing.expectError(error.FailedPrecondition, v.sign(.ec_sign_p256_sha256, "data"));
+    }
+}
+
+test "the fake's other refusals: a pending version, the wrong input, the wrong format, random bytes" {
+    var r: Rig = undefined;
+    try ringRig(&r, testing.allocator, .{ .fake = .{ .generation_delay_ms = 1000 } });
+    defer r.deinit();
+    const key = r.client.keyRing("r").key("s");
+    var info = try key.create(.{ .purpose = .asymmetric_sign, .algorithm = .ec_sign_p256_sha256 });
+    info.deinit();
+    try testing.expectError(error.KeyVersionPending, key.version(1).sign(.ec_sign_p256_sha256, "m"));
+    try testing.expectError(error.KeyVersionPending, key.version(1).publicKey());
+    r.advance(1);
+    // The algorithm the caller names is what is sent: another one is the
+    // server's refusal.
+    try testing.expectError(error.InvalidArgument, key.version(1).sign(.ec_sign_ed25519, "m"));
+    try testing.expectError(error.InvalidArgument, key.version(1).sign(.ec_sign_p384_sha384, "m"));
+    var random = try r.client.randomBytes(32);
+    try testing.expectEqual(32, random.value.len);
+    random.deinit();
+    var sym = try r.client.keyRing("r").key("e").create(.{ .purpose = .encrypt_decrypt });
+    sym.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = test_util.base;
+    const raw = [_]struct { tp.Method, []const u8, ?[]const u8, u16, []const u8 }{
+        .{ .GET, base ++ "/keyRings/r/cryptoKeys/s/cryptoKeyVersions/1/publicKey?publicKeyFormat=DER", null, 501, "public key format DER" },
+        .{ .POST, base ++ "/keyRings/r/cryptoKeys/s/cryptoKeyVersions/1/publicKey", "{}", 404, "Error 404" },
+        .{ .POST, base ++ ":generateRandomBytes", "{\"lengthBytes\":16}", 400, "from an HSM" },
+        .{ .POST, base ++ ":generateRandomBytes", "{\"lengthBytes\":7,\"protectionLevel\":\"HSM\"}", 400, "8 to 1024" },
+        .{ .POST, base ++ ":generateRandomBytes", "{\"protectionLevel\":\"HSM\"}", 400, "Invalid JSON" },
+        .{ .GET, base ++ ":generateRandomBytes", null, 404, "Error 404" },
+        .{ .POST, base ++ "/keyRings/r/cryptoKeys/s/cryptoKeyVersions/1:asymmetricSign", "{\"digest\":{\"sha256\":\"AAAA\"}}", 400, "length is not" },
+        .{ .POST, base ++ "/keyRings/r/cryptoKeys/s/cryptoKeyVersions/1:asymmetricSign", "{}", 400, "digest is required" },
+        .{ .POST, base ++ "/keyRings/r/cryptoKeys/s/cryptoKeyVersions/1:asymmetricSign", "{\"digest\":{\"sha256\":\"5GsyAWXuyR5jRPoQNA1bMggwTWytKdDVrtGEZtHZ2A4=\"},\"digestCrc32c\":\"1\"}", 400, "The checksum in field digest_crc32c" },
+        .{ .POST, base ++ "/keyRings/r/cryptoKeys/e:encrypt", "{\"plaintext\":\"aGVsbG8=\",\"plaintextCrc32c\":\"1\"}", 400, "The checksum in field plaintext_crc32c did not match the data in field plaintext." },
+        .{ .POST, base ++ "/keyRings/r/cryptoKeys/e:encrypt", "{\"plaintext\":\"aGVsbG8=\",\"plaintextCrc32c\":\"2591144780\",\"additionalAuthenticatedData\":\"eA==\",\"additionalAuthenticatedDataCrc32c\":\"7\"}", 400, "field additional_authenticated_data_crc32c" },
+        .{ .POST, base ++ "/keyRings/r/cryptoKeys/e:encrypt", "{\"plaintext\":\"!!\"}", 400, "Invalid JSON" },
+        .{ .POST, base ++ "/keyRings/r/cryptoKeys/e:encrypt", "[1]", 400, "Invalid JSON" },
+        .{ .POST, base ++ "/keyRings/r/cryptoKeys/s:encrypt", "{}", 400, "not for a key of purpose ASYMMETRIC_SIGN" },
+        .{ .GET, base ++ "/keyRings/r/cryptoKeys/s:encrypt", null, 404, "Error 404" },
+    };
+    for (raw) |case| {
+        const reply = try r.fake.serve(.{ .method = case[0], .url = case[1], .bearer = "t", .body = case[2] }, a);
+        if (reply.status != case[3] or std.mem.indexOf(u8, reply.body, case[4]) == null) {
+            std.debug.print("{s} {s}: {d} {s}\n", .{ @tagName(case[0]), case[1], reply.status, reply.body });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "keys whose cryptography the fake does not model are made and managed, and their use is 501" {
+    var r: Rig = undefined;
+    try ringRig(&r, testing.allocator, .{});
+    defer r.deinit();
+    const slh = r.client.keyRing("r").key("slh");
+    var a = try slh.create(.{ .purpose = .asymmetric_sign, .algorithm = .pq_sign_slh_dsa_sha2_128s });
+    a.deinit();
+    try testing.expectError(error.Unimplemented, slh.version(1).sign(.pq_sign_slh_dsa_sha2_128s, "m"));
+    try testing.expect(std.mem.indexOf(u8, r.diag.message(), "signing with PQ_SIGN_SLH_DSA_SHA2_128S") != null);
+    try testing.expectError(error.Unimplemented, slh.version(1).publicKey());
+    const raw = r.client.keyRing("r").key("raw");
+    var b = try raw.create(.{ .purpose = .raw_encrypt_decrypt, .algorithm = .aes_256_gcm });
+    b.deinit();
+    var v = try raw.version(1).get();
+    try testing.expectEqual(types.State.enabled, v.value.state);
+    v.deinit();
+    try testing.expectEqual(FakeKms.Material.none, r.fake.version("projects/my-project/locations/us-central1/keyRings/r/cryptoKeys/raw", 1).?.material.*);
+}
+
+test "integrity faults: each check catches its fault, once tried again and past the attempts refused" {
+    var r: Rig = undefined;
+    try ringRig(&r, testing.allocator, .{ .retry = .{ .max_attempts = 2, .initial_backoff_ms = 1, .max_backoff_ms = 2 } });
+    defer r.deinit();
+    const sym = r.client.keyRing("r").key("sym");
+    var a = try sym.create(.{ .purpose = .encrypt_decrypt });
+    a.deinit();
+    const sig = r.client.keyRing("r").key("sig");
+    var b = try sig.create(.{ .purpose = .asymmetric_sign, .algorithm = .ec_sign_p256_sha256 });
+    b.deinit();
+    const mac = r.client.keyRing("r").key("mac");
+    var m = try mac.create(.{ .purpose = .mac, .algorithm = .hmac_sha256 });
+    m.deinit();
+    var ct = try sym.encrypt("p", .{});
+    defer ct.deinit();
+    var tag = try mac.version(1).macSign("d");
+    defer tag.deinit();
+
+    // An encrypt by key may be answered by any of its versions, while a
+    // primary change settles, so another version's name is caught only
+    // when the encrypt named one.
+    const Call = enum { encrypt, encrypt_pinned, decrypt, sign, public_key, mac_sign, mac_verify, random };
+    const plan = [_]struct { Call, FakeKms.Corruption }{
+        .{ .encrypt, .flip_payload },     .{ .encrypt, .drop_verified },   .{ .encrypt_pinned, .wrong_name },   .{ .encrypt, .refuse_checksum },
+        .{ .decrypt, .flip_payload },     .{ .decrypt, .refuse_checksum }, .{ .sign, .flip_payload },           .{ .sign, .drop_verified },
+        .{ .sign, .wrong_name },          .{ .sign, .refuse_checksum },    .{ .public_key, .flip_payload },     .{ .public_key, .wrong_name },
+        .{ .mac_sign, .flip_payload },    .{ .mac_sign, .drop_verified },  .{ .mac_sign, .wrong_name },         .{ .mac_sign, .refuse_checksum },
+        .{ .mac_verify, .drop_verified }, .{ .mac_verify, .wrong_name },   .{ .mac_verify, .success_mismatch }, .{ .mac_verify, .refuse_checksum },
+        .{ .random, .flip_payload },
+    };
+    for (plan) |step| {
+        inline for (.{ 1, 2 }) |times| {
+            r.fake.corruptNext(times, step[1]);
+            const outcome: anyerror!void = switch (step[0]) {
+                .encrypt => if (sym.encrypt("p", .{})) |x| {
+                    var y = x;
+                    y.deinit();
+                } else |err| err,
+                .encrypt_pinned => if (sym.encrypt("p", .{ .version = 1 })) |x| {
+                    var y = x;
+                    y.deinit();
+                } else |err| err,
+                .decrypt => if (sym.decrypt(ct.value.bytes, .{})) |x| {
+                    var y = x;
+                    try testing.expectEqualStrings("p", y.bytes());
+                    y.deinit();
+                } else |err| err,
+                .sign => if (sig.version(1).sign(.ec_sign_p256_sha256, "m")) |x| {
+                    var y = x;
+                    y.deinit();
+                } else |err| err,
+                .public_key => if (sig.version(1).publicKey()) |x| {
+                    var y = x;
+                    y.deinit();
+                } else |err| err,
+                .mac_sign => if (mac.version(1).macSign("d")) |x| {
+                    var y = x;
+                    y.deinit();
+                } else |err| err,
+                .mac_verify => if (mac.version(1).macVerify("d", tag.value)) |ok| try testing.expect(ok) else |err| err,
+                .random => if (r.client.randomBytes(16)) |x| {
+                    var y = x;
+                    y.deinit();
+                } else |err| err,
+            };
+            if (times == 1) {
+                outcome catch |err| {
+                    std.debug.print("{t} {t} once: {t} {s}\n", .{ step[0], step[1], err, r.diag.message() });
+                    return err;
+                };
+            } else {
+                testing.expectError(error.IntegrityCheckFailed, outcome) catch |err| {
+                    std.debug.print("{t} {t} twice\n", .{ step[0], step[1] });
+                    return err;
+                };
+            }
+        }
+    }
+}
+
+fn cryptoAllocations(gpa: Allocator) !void {
+    var r: Rig = undefined;
+    try ringRig(&r, gpa, .{});
+    defer r.deinit();
+    const sym = r.client.keyRing("r").key("sym");
+    var a = try sym.create(.{ .purpose = .encrypt_decrypt });
+    a.deinit();
+    var ct = try sym.encrypt("plain", .{ .aad = "x" });
+    defer ct.deinit();
+    var p = try sym.decrypt(ct.value.bytes, .{ .aad = "x" });
+    p.deinit();
+    const sig = r.client.keyRing("r").key("sig");
+    var b = try sig.create(.{ .purpose = .asymmetric_sign, .algorithm = .ec_sign_ed25519 });
+    b.deinit();
+    var s = try sig.version(1).sign(.ec_sign_ed25519, "m");
+    s.deinit();
+    var pk = try sig.version(1).publicKey();
+    pk.deinit();
+    const mac = r.client.keyRing("r").key("mac");
+    var m = try mac.create(.{ .purpose = .mac, .algorithm = .hmac_sha256 });
+    m.deinit();
+    var t = try mac.version(1).macSign("d");
+    defer t.deinit();
+    _ = try mac.version(1).macVerify("d", t.value);
+    var rb = try r.client.randomBytes(8);
+    rb.deinit();
+}
+
+test "crypto calls against the fake: every allocation failure is OutOfMemory without leaks" {
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, cryptoAllocations, .{});
 }
 
 fn lifecycleAllocations(gpa: Allocator) !void {

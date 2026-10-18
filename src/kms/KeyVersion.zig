@@ -7,6 +7,8 @@ const std = @import("std");
 const core = @import("core");
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
+const integrity = @import("integrity.zig");
+const Key = @import("Key.zig");
 const logging = @import("logging.zig");
 const names = @import("names.zig");
 const operations = @import("operations.zig");
@@ -21,6 +23,263 @@ target: names.Target,
 /// The version's number.
 pub fn id(self: KeyVersion) u64 {
     return self.target.version.?;
+}
+
+/// Signs `message` with this version, whose algorithm is `algorithm`: the
+/// caller says it, so no read precedes the signature. Algorithms that sign
+/// a digest (ECDSA, RSA, SLH-DSA's pre-hash form) have it made here; those
+/// that sign data (Ed25519, ML-DSA, SLH-DSA) send the message, at most
+/// 64 KiB. An algorithm of another purpose, or raw PKCS#1 and ML-DSA's
+/// external mu, whose input the caller prepares, is
+/// `error.InvalidOptions`; one that is not the version's, the server's
+/// refusal. A version still `pending_generation` is
+/// `error.KeyVersionPending`. ECDSA signatures are DER, RSA ones the
+/// modulus's length, Ed25519 64 bytes. `PublicKey.verify` checks one here.
+pub fn sign(self: KeyVersion, algorithm: types.Algorithm, message: []const u8) Error!types.Owned([]const u8) {
+    const c = self.client;
+    rpc.begin(c);
+    try c.checkTarget(self.target);
+    const input = try signInput(c, algorithm);
+    var buf: [64]u8 = undefined;
+    switch (input) {
+        .digest => |kind| return self.signWith(input, kind.digest(message, &buf)),
+        .data => {
+            try Key.checkPayload(c, "data to sign", message.len);
+            return self.signWith(input, message);
+        },
+    }
+}
+
+/// Signs a digest made elsewhere, for an algorithm that signs a digest:
+/// 32 bytes for SHA-256, 48 for SHA-384, 64 for SHA-512, or
+/// `error.InvalidDigest`. An algorithm that signs data is
+/// `error.InvalidOptions`.
+pub fn signDigest(self: KeyVersion, algorithm: types.Algorithm, digest: []const u8) Error!types.Owned([]const u8) {
+    const c = self.client;
+    rpc.begin(c);
+    try c.checkTarget(self.target);
+    const input = try signInput(c, algorithm);
+    switch (input) {
+        .digest => |kind| if (digest.len != kind.length()) {
+            if (c.diagnostics) |d| d.print("{s} signs a {s} digest of {d} bytes; this one has {d}", .{ algorithm.wire(), @tagName(kind), kind.length(), digest.len });
+            return error.InvalidDigest;
+        },
+        .data => {
+            if (c.diagnostics) |d| d.print("{s} signs the message itself, not a digest: use sign", .{algorithm.wire()});
+            return error.InvalidOptions;
+        },
+    }
+    return self.signWith(input, digest);
+}
+
+fn signInput(c: *Client, algorithm: types.Algorithm) Error!types.SignInput {
+    return algorithm.signInput() orelse {
+        if (c.diagnostics) |d| d.print("{s} is not an algorithm this library signs with", .{algorithm.wire()});
+        return error.InvalidOptions;
+    };
+}
+
+fn signWith(self: KeyVersion, input: types.SignInput, bytes: []const u8) Error!types.Owned([]const u8) {
+    const c = self.client;
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const path = try self.target.path(a, ":asymmetricSign");
+    const body = try codec.encodeSign(a, input, bytes);
+    const name = try self.target.name(a);
+    var tries: integrity.Attempts = .{ .client = c, .what = "sign" };
+    while (true) {
+        tries.next();
+        var result: types.Owned([]const u8) = try .init(c.gpa);
+        const answer_body = rpc.execute(c, result.arena, .{ .method = .POST, .path = path, .body = body }) catch |err| {
+            result.deinit();
+            if (err != error.IntegrityCheckFailed) return err;
+            try tries.failed(integrity.request_refused);
+            continue;
+        };
+        const answer = codec.decodeSign(result.arena.allocator(), a, answer_body) catch |err| {
+            result.deinit();
+            return rpc.decodeFailed(c, err, "sign");
+        };
+        const verified = switch (input) {
+            .digest => answer.verified_digest,
+            .data => answer.verified_data,
+        };
+        const problem: ?[]const u8 = if (!verified)
+            "the server did not get the checksum of what it signed"
+        else if (!integrity.matches(answer.signature, answer.signature_crc32c))
+            "the signature does not match its checksum"
+        else if (!std.mem.eql(u8, answer.name, name))
+            "the answer names another version"
+        else
+            null;
+        if (problem) |reason| {
+            result.deinit();
+            try tries.failed(reason);
+            continue;
+        }
+        result.value = answer.signature;
+        return result;
+    }
+}
+
+/// The version's public key, for an asymmetric key: a PEM for classical
+/// algorithms, the NIST encoding for post-quantum ones, checked against its
+/// checksum. It never changes, so keep it while the version lives. A
+/// version that is not enabled is that state's error.
+pub fn publicKey(self: KeyVersion) Error!types.Owned(types.PublicKey) {
+    const c = self.client;
+    rpc.begin(c);
+    try c.checkTarget(self.target);
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const name = try self.target.name(a);
+    // PEM unless the server says the key has only the NIST encoding, as a
+    // post-quantum one does: asking which first would cost a read.
+    var format: []const u8 = "PEM";
+    var tries: integrity.Attempts = .{ .client = c, .what = "publicKey" };
+    while (true) {
+        tries.next();
+        const path = try self.target.path(a, if (std.mem.eql(u8, format, "PEM")) "/publicKey?publicKeyFormat=PEM" else "/publicKey?publicKeyFormat=NIST_PQC");
+        var result: types.Owned(types.PublicKey) = try .init(c.gpa);
+        var error_body: ?[]const u8 = null;
+        const answer_body = rpc.execute(c, result.arena, .{ .method = .GET, .path = path, .error_body_out = &error_body }) catch |err| {
+            const only_nist = std.mem.eql(u8, format, "PEM") and (err == error.InvalidArgument or err == error.FailedPrecondition) and
+                if (error_body) |b| std.mem.indexOf(u8, b, "NIST_PQC") != null else false;
+            result.deinit();
+            if (only_nist) {
+                format = "NIST_PQC";
+                tries.attempt -= 1;
+                continue;
+            }
+            return err;
+        };
+        const answer = codec.decodePublicKey(result.arena.allocator(), a, answer_body) catch |err| {
+            result.deinit();
+            return rpc.decodeFailed(c, err, "public key");
+        };
+        const pq = answer.algorithm.postQuantum();
+        const problem: ?[]const u8 = if (answer.pem.len == 0 and answer.data.len == 0)
+            "the answer holds no key"
+        else if (answer.pem.len > 0 and !integrity.matches(answer.pem, answer.pem_crc32c))
+            "the PEM does not match its checksum"
+        else if (answer.data.len > 0 and !integrity.matches(answer.data, answer.data_crc32c))
+            "the key does not match its checksum"
+        else if (answer.name != null and !std.mem.eql(u8, answer.name.?, name))
+            "the answer names another version"
+        else if (pq and answer.data.len == 0)
+            "a post-quantum key came without its encoding"
+        else if (!pq and answer.pem.len == 0)
+            "a classical key came without its PEM"
+        else
+            null;
+        if (problem) |reason| {
+            result.deinit();
+            try tries.failed(reason);
+            continue;
+        }
+        const owned_name = result.arena.allocator().dupe(u8, name) catch |err| {
+            result.deinit();
+            return err;
+        };
+        result.value = .{
+            .name = owned_name,
+            .algorithm = answer.algorithm,
+            .protection_level = answer.protection_level,
+            .pem = if (pq) "" else answer.pem,
+            .raw = if (pq) answer.data else "",
+        };
+        return result;
+    }
+}
+
+/// Signs `data`, at most 64 KiB, with this MAC version.
+pub fn macSign(self: KeyVersion, data: []const u8) Error!types.Owned([]const u8) {
+    const c = self.client;
+    rpc.begin(c);
+    try c.checkTarget(self.target);
+    try Key.checkPayload(c, "data to sign", data.len);
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const path = try self.target.path(a, ":macSign");
+    const body = try codec.encodeMacSign(a, data);
+    const name = try self.target.name(a);
+    var tries: integrity.Attempts = .{ .client = c, .what = "macSign" };
+    while (true) {
+        tries.next();
+        var result: types.Owned([]const u8) = try .init(c.gpa);
+        const answer_body = rpc.execute(c, result.arena, .{ .method = .POST, .path = path, .body = body }) catch |err| {
+            result.deinit();
+            if (err != error.IntegrityCheckFailed) return err;
+            try tries.failed(integrity.request_refused);
+            continue;
+        };
+        const answer = codec.decodeMacSign(result.arena.allocator(), a, answer_body) catch |err| {
+            result.deinit();
+            return rpc.decodeFailed(c, err, "macSign");
+        };
+        const problem: ?[]const u8 = if (!answer.verified_data)
+            "the server did not get the data's checksum"
+        else if (!integrity.matches(answer.mac, answer.mac_crc32c))
+            "the MAC does not match its checksum"
+        else if (!std.mem.eql(u8, answer.name, name))
+            "the answer names another version"
+        else
+            null;
+        if (problem) |reason| {
+            result.deinit();
+            try tries.failed(reason);
+            continue;
+        }
+        result.value = answer.mac;
+        return result;
+    }
+}
+
+/// Whether `mac` is this MAC version's over `data`. One that does not
+/// match is `false`, not an error.
+pub fn macVerify(self: KeyVersion, data: []const u8, mac: []const u8) Error!bool {
+    const c = self.client;
+    rpc.begin(c);
+    try c.checkTarget(self.target);
+    try Key.checkPayload(c, "data to verify", data.len);
+    try Key.checkPayload(c, "MAC", mac.len);
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const path = try self.target.path(a, ":macVerify");
+    const body = try codec.encodeMacVerify(a, data, mac);
+    const name = try self.target.name(a);
+    var tries: integrity.Attempts = .{ .client = c, .what = "macVerify" };
+    while (true) {
+        tries.next();
+        var response: std.heap.ArenaAllocator = .init(c.gpa);
+        defer response.deinit();
+        const answer_body = rpc.execute(c, &response, .{ .method = .POST, .path = path, .body = body }) catch |err| {
+            if (err != error.IntegrityCheckFailed) return err;
+            try tries.failed(integrity.request_refused);
+            continue;
+        };
+        const answer = codec.decodeMacVerify(a, a, answer_body) catch |err|
+            return rpc.decodeFailed(c, err, "macVerify");
+        const problem: ?[]const u8 = if (!answer.verified_data)
+            "the server did not get the data's checksum"
+        else if (!answer.verified_mac)
+            "the server did not get the MAC's checksum"
+        else if (answer.verified_success_integrity != answer.success)
+            "the answer's success and its integrity flag disagree"
+        else if (!std.mem.eql(u8, answer.name, name))
+            "the answer names another version"
+        else
+            null;
+        if (problem) |reason| {
+            try tries.failed(reason);
+            continue;
+        }
+        return answer.success;
+    }
 }
 
 /// The version: its state, algorithm and times.
@@ -249,4 +508,195 @@ test "version 0 is InvalidName, and nothing goes out" {
     try testing.expectError(error.InvalidName, v.destroy());
     try testing.expectError(error.InvalidName, v.delete());
     try h.expectRequestCount(0);
+}
+
+// Checksums the tests below write out, held to core.crc32c by the first.
+const crc_sig = "749997639"; // "sig!"
+const crc_mac = "2164953591"; // "mac!"
+const crc_pem = "705884274"; // "PEMTEXT"
+
+test "the checksums these tests write out are core.crc32c's" {
+    try testing.expect(integrity.matches("sig!", 749997639));
+    try testing.expect(integrity.matches("mac!", 2164953591));
+    try testing.expect(integrity.matches("PEMTEXT", 705884274));
+    try testing.expect(integrity.matches("msg", 2067356545));
+}
+
+fn signAnswer(comptime flag: []const u8, comptime crc: []const u8, comptime name: []const u8) []const u8 {
+    return "{\"name\":\"" ++ name ++ "\",\"signature\":\"c2lnIQ==\",\"signatureCrc32c\":\"" ++ crc ++ "\"" ++ flag ++ ",\"protectionLevel\":\"SOFTWARE\"}";
+}
+
+test "golden: sign hashes for a digest algorithm and sends data for the others" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = signAnswer(",\"verifiedDigestCrc32c\":true", crc_sig, v1) } },
+        .{ .respond = .{ .body = signAnswer(",\"verifiedDataCrc32c\":true", crc_sig, v1) } },
+        .{ .respond = .{ .body = signAnswer(",\"verifiedDigestCrc32c\":true", crc_sig, v1) } },
+    }, .{});
+    defer h.deinit();
+    const v = h.client.keyRing("r").key("k").version(1);
+    var ec = try v.sign(.ec_sign_p256_sha256, "msg");
+    defer ec.deinit();
+    try testing.expectEqualStrings("sig!", ec.value);
+    try h.expectRequest(0, .POST, base ++ "/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1:asymmetricSign", "{\"digest\":{\"sha256\":\"5GsyAWXuyR5jRPoQNA1bMggwTWytKdDVrtGEZtHZ2A4=\"},\"digestCrc32c\":\"3911430446\"}");
+    var ed = try v.sign(.ec_sign_ed25519, "msg");
+    defer ed.deinit();
+    try h.expectRequest(1, .POST, base ++ "/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1:asymmetricSign", "{\"data\":\"bXNn\",\"dataCrc32c\":\"2067356545\"}");
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("msg", &digest, .{});
+    var pre = try v.signDigest(.rsa_sign_pss_2048_sha256, &digest);
+    defer pre.deinit();
+    try h.expectRequest(2, .POST, base ++ "/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1:asymmetricSign", "{\"digest\":{\"sha256\":\"5GsyAWXuyR5jRPoQNA1bMggwTWytKdDVrtGEZtHZ2A4=\"},\"digestCrc32c\":\"3911430446\"}");
+}
+
+test "sign: what this library will not send is refused before sending" {
+    var h: Harness = undefined;
+    try h.init(&.{}, .{});
+    defer h.deinit();
+    const v = h.client.keyRing("r").key("k").version(1);
+    try testing.expectError(error.InvalidOptions, v.sign(.google_symmetric_encryption, "m"));
+    try testing.expectError(error.InvalidOptions, v.sign(.rsa_sign_raw_pkcs1_2048, "m"));
+    try testing.expectError(error.InvalidOptions, v.sign(.pq_sign_ml_dsa_65_external_mu, "m"));
+    try testing.expectError(error.InvalidOptions, v.signDigest(.ec_sign_ed25519, "0123456789abcdef0123456789abcdef"));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "use sign") != null);
+    try testing.expectError(error.InvalidDigest, v.signDigest(.ec_sign_p384_sha384, "0123456789abcdef0123456789abcdef"));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "sha384 digest of 48 bytes") != null);
+    const big = try testing.allocator.alloc(u8, 64 * 1024 + 1);
+    defer testing.allocator.free(big);
+    @memset(big, 0);
+    try testing.expectError(error.TooLarge, v.sign(.ec_sign_ed25519, big));
+    // A message of any size signs by its digest.
+    try testing.expectError(error.InvalidName, h.client.keyRing("r").key("k").version(0).sign(.ec_sign_p256_sha256, big));
+    try h.expectRequestCount(0);
+}
+
+test "sign: each failed check is tried again, and past the attempts is IntegrityCheckFailed" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ signAnswer("", crc_sig, v1), "did not get the checksum" },
+        .{ signAnswer(",\"verifiedDataCrc32c\":true", crc_sig, v1), "did not get the checksum" },
+        .{ signAnswer(",\"verifiedDigestCrc32c\":true", "1", v1), "signature does not match" },
+        .{ signAnswer(",\"verifiedDigestCrc32c\":true", crc_sig, v1 ++ "0"), "names another version" },
+    };
+    for (cases) |case| {
+        var h: Harness = undefined;
+        try h.init(&.{
+            .{ .respond = .{ .body = case[0] } },
+            .{ .respond = .{ .body = case[0] } },
+        }, .{ .retry = .{ .max_attempts = 2, .initial_backoff_ms = 1, .max_backoff_ms = 2 } });
+        defer h.deinit();
+        try testing.expectError(error.IntegrityCheckFailed, h.client.keyRing("r").key("k").version(1).sign(.ec_sign_p256_sha256, "m"));
+        try testing.expect(std.mem.indexOf(u8, h.diag.message(), case[1]) != null);
+        try h.expectRequestCount(2);
+    }
+}
+
+test "golden: publicKey asks for PEM, and for the NIST encoding when the server says that is all it has" {
+    var h: Harness = undefined;
+    const nist_only = "{\"error\":{\"code\":400,\"message\":\"Only NIST_PQC format is supported for this algorithm.\",\"status\":\"INVALID_ARGUMENT\"}}";
+    try h.init(&.{
+        .{ .respond = .{ .body = "{\"pem\":\"PEMTEXT\",\"pemCrc32c\":\"" ++ crc_pem ++ "\",\"algorithm\":\"EC_SIGN_P256_SHA256\",\"name\":\"" ++ v1 ++ "\",\"protectionLevel\":\"SOFTWARE\",\"publicKey\":{\"data\":\"UEVNVEVYVA==\",\"crc32cChecksum\":\"" ++ crc_pem ++ "\"}}" } },
+        .{ .respond = .{ .status = 400, .body = nist_only } },
+        .{ .respond = .{ .body = "{\"algorithm\":\"PQ_SIGN_ML_DSA_65\",\"name\":\"" ++ v1 ++ "\",\"publicKeyFormat\":\"NIST_PQC\",\"publicKey\":{\"data\":\"UEVNVEVYVA==\",\"crc32cChecksum\":\"" ++ crc_pem ++ "\"}}" } },
+    }, .{});
+    defer h.deinit();
+    const v = h.client.keyRing("r").key("k").version(1);
+    var ec = try v.publicKey();
+    defer ec.deinit();
+    try h.expectRequest(0, .GET, base ++ "/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1/publicKey?publicKeyFormat=PEM", null);
+    try testing.expectEqualStrings("PEMTEXT", ec.value.pem);
+    try testing.expectEqualStrings("", ec.value.raw);
+    try testing.expectEqual(types.Algorithm.ec_sign_p256_sha256, ec.value.algorithm);
+    try testing.expectEqualStrings(v1, ec.value.name);
+    var pq = try v.publicKey();
+    defer pq.deinit();
+    try h.expectRequest(2, .GET, base ++ "/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1/publicKey?publicKeyFormat=NIST_PQC", null);
+    try testing.expectEqualStrings("PEMTEXT", pq.value.raw);
+    try testing.expectEqualStrings("", pq.value.pem);
+}
+
+test "publicKey: the NIST encoding is asked for by the server's words, with no Diagnostics to keep them" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Only NIST_PQC format is supported.\",\"status\":\"INVALID_ARGUMENT\"}}" } },
+        // A PEM beside the NIST encoding is not the key's: it is left out.
+        .{ .respond = .{ .body = "{\"pem\":\"PEMTEXT\",\"pemCrc32c\":\"" ++ crc_pem ++ "\",\"algorithm\":\"PQ_SIGN_ML_DSA_44\",\"publicKey\":{\"data\":\"UEVNVEVYVA==\",\"crc32cChecksum\":\"" ++ crc_pem ++ "\"}}" } },
+    }, .{});
+    defer h.deinit();
+    h.client.diagnostics = null;
+    var pq = try h.client.keyRing("r").key("k").version(1).publicKey();
+    defer pq.deinit();
+    try testing.expectEqualStrings("PEMTEXT", pq.value.raw);
+    try testing.expectEqualStrings("", pq.value.pem);
+}
+
+test "publicKey: each failed check is tried again, and past the attempts is IntegrityCheckFailed" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "{\"algorithm\":\"EC_SIGN_P256_SHA256\"}", "holds no key" },
+        .{ "{\"pem\":\"PEMTEXT\",\"pemCrc32c\":\"1\",\"algorithm\":\"EC_SIGN_P256_SHA256\"}", "PEM does not match" },
+        .{ "{\"pem\":\"PEMTEXT\",\"algorithm\":\"EC_SIGN_P256_SHA256\"}", "PEM does not match" },
+        .{ "{\"pem\":\"PEMTEXT\",\"pemCrc32c\":\"" ++ crc_pem ++ "\",\"algorithm\":\"EC_SIGN_P256_SHA256\",\"publicKey\":{\"data\":\"UEVNVEVYVA==\",\"crc32cChecksum\":\"2\"}}", "key does not match" },
+        .{ "{\"pem\":\"PEMTEXT\",\"pemCrc32c\":\"" ++ crc_pem ++ "\",\"algorithm\":\"EC_SIGN_P256_SHA256\",\"name\":\"" ++ v1 ++ "9\"}", "names another version" },
+        .{ "{\"pem\":\"PEMTEXT\",\"pemCrc32c\":\"" ++ crc_pem ++ "\",\"algorithm\":\"PQ_SIGN_ML_DSA_44\"}", "without its encoding" },
+        .{ "{\"algorithm\":\"EC_SIGN_P256_SHA256\",\"publicKey\":{\"data\":\"UEVNVEVYVA==\",\"crc32cChecksum\":\"" ++ crc_pem ++ "\"}}", "without its PEM" },
+    };
+    for (cases) |case| {
+        var h: Harness = undefined;
+        try h.init(&.{ .{ .respond = .{ .body = case[0] } }, .{ .respond = .{ .body = case[0] } } }, .{ .retry = .{ .max_attempts = 2, .initial_backoff_ms = 1, .max_backoff_ms = 2 } });
+        defer h.deinit();
+        try testing.expectError(error.IntegrityCheckFailed, h.client.keyRing("r").key("k").version(1).publicKey());
+        try testing.expect(std.mem.indexOf(u8, h.diag.message(), case[1]) != null);
+    }
+    // A refusal that is not about the format is the caller's at once.
+    var h: Harness = undefined;
+    try h.init(&.{.{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"no\",\"status\":\"INVALID_ARGUMENT\"}}" } }}, .{});
+    defer h.deinit();
+    try testing.expectError(error.InvalidArgument, h.client.keyRing("r").key("k").version(1).publicKey());
+    try h.expectRequestCount(1);
+}
+
+test "golden: macSign and macVerify, a MAC that does not match being false" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "{\"name\":\"" ++ v1 ++ "\",\"mac\":\"bWFjIQ==\",\"macCrc32c\":\"" ++ crc_mac ++ "\",\"verifiedDataCrc32c\":true}" } },
+        .{ .respond = .{ .body = "{\"name\":\"" ++ v1 ++ "\",\"success\":true,\"verifiedDataCrc32c\":true,\"verifiedMacCrc32c\":true,\"verifiedSuccessIntegrity\":true}" } },
+        .{ .respond = .{ .body = "{\"name\":\"" ++ v1 ++ "\",\"verifiedDataCrc32c\":true,\"verifiedMacCrc32c\":true}" } },
+    }, .{});
+    defer h.deinit();
+    const v = h.client.keyRing("r").key("k").version(1);
+    var m = try v.macSign("data");
+    defer m.deinit();
+    try testing.expectEqualStrings("mac!", m.value);
+    try h.expectRequest(0, .POST, base ++ "/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1:macSign", "{\"data\":\"ZGF0YQ==\",\"dataCrc32c\":\"2933423569\"}");
+    try testing.expect(try v.macVerify("data", "mac!"));
+    try h.expectRequest(1, .POST, base ++ "/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1:macVerify", "{\"data\":\"ZGF0YQ==\",\"dataCrc32c\":\"2933423569\",\"mac\":\"bWFjIQ==\",\"macCrc32c\":\"" ++ crc_mac ++ "\"}");
+    try testing.expect(!try v.macVerify("data", "mac!"));
+}
+
+test "macSign and macVerify: each failed check is tried again, and past the attempts is IntegrityCheckFailed" {
+    const sign_cases = [_]struct { []const u8, []const u8 }{
+        .{ "{\"name\":\"" ++ v1 ++ "\",\"mac\":\"bWFjIQ==\",\"macCrc32c\":\"" ++ crc_mac ++ "\"}", "did not get the data's checksum" },
+        .{ "{\"name\":\"" ++ v1 ++ "\",\"mac\":\"bWFjIQ==\",\"macCrc32c\":\"3\",\"verifiedDataCrc32c\":true}", "MAC does not match" },
+        .{ "{\"name\":\"" ++ v1 ++ "1\",\"mac\":\"bWFjIQ==\",\"macCrc32c\":\"" ++ crc_mac ++ "\",\"verifiedDataCrc32c\":true}", "names another version" },
+    };
+    const verify_cases = [_]struct { []const u8, []const u8 }{
+        .{ "{\"name\":\"" ++ v1 ++ "\",\"success\":true,\"verifiedMacCrc32c\":true,\"verifiedSuccessIntegrity\":true}", "did not get the data's checksum" },
+        .{ "{\"name\":\"" ++ v1 ++ "\",\"success\":true,\"verifiedDataCrc32c\":true,\"verifiedSuccessIntegrity\":true}", "did not get the MAC's checksum" },
+        .{ "{\"name\":\"" ++ v1 ++ "\",\"success\":true,\"verifiedDataCrc32c\":true,\"verifiedMacCrc32c\":true}", "success and its integrity flag disagree" },
+        .{ "{\"name\":\"" ++ v1 ++ "\",\"verifiedDataCrc32c\":true,\"verifiedMacCrc32c\":true,\"verifiedSuccessIntegrity\":true}", "success and its integrity flag disagree" },
+        .{ "{\"name\":\"other\",\"verifiedDataCrc32c\":true,\"verifiedMacCrc32c\":true}", "names another version" },
+    };
+    for (sign_cases) |case| {
+        var h: Harness = undefined;
+        try h.init(&.{ .{ .respond = .{ .body = case[0] } }, .{ .respond = .{ .body = case[0] } } }, .{ .retry = .{ .max_attempts = 2, .initial_backoff_ms = 1, .max_backoff_ms = 2 } });
+        defer h.deinit();
+        try testing.expectError(error.IntegrityCheckFailed, h.client.keyRing("r").key("k").version(1).macSign("data"));
+        try testing.expect(std.mem.indexOf(u8, h.diag.message(), case[1]) != null);
+    }
+    for (verify_cases) |case| {
+        var h: Harness = undefined;
+        try h.init(&.{ .{ .respond = .{ .body = case[0] } }, .{ .respond = .{ .body = case[0] } } }, .{ .retry = .{ .max_attempts = 2, .initial_backoff_ms = 1, .max_backoff_ms = 2 } });
+        defer h.deinit();
+        try testing.expectError(error.IntegrityCheckFailed, h.client.keyRing("r").key("k").version(1).macVerify("data", "mac!"));
+        try testing.expect(std.mem.indexOf(u8, h.diag.message(), case[1]) != null);
+    }
 }

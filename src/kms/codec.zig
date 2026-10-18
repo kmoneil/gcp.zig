@@ -209,6 +209,245 @@ pub fn decodeOperation(out: Allocator, scratch: Allocator, body: []const u8) Dec
     return op;
 }
 
+// Crypto calls. Every request carries the CRC-32C of each bytes field it
+// sends, as a decimal string, "0" for an empty one, so the server can say
+// it got them; every answer's checksums and flags are read for the caller
+// to check (integrity.zig).
+
+/// `{"plaintext": ..., "plaintextCrc32c": ..., "additionalAuthenticatedData": ...,
+/// "additionalAuthenticatedDataCrc32c": ...}`, an encrypt's body.
+pub fn encodeEncrypt(arena: Allocator, plaintext: []const u8, aad: []const u8) Allocator.Error![]u8 {
+    return render(arena, BytesBody{ .fields = &.{ .{ "plaintext", plaintext }, .{ "additionalAuthenticatedData", aad } } });
+}
+
+/// A decrypt's body: the ciphertext and the AAD, each with its checksum.
+pub fn encodeDecrypt(arena: Allocator, ciphertext: []const u8, aad: []const u8) Allocator.Error![]u8 {
+    return render(arena, BytesBody{ .fields = &.{ .{ "ciphertext", ciphertext }, .{ "additionalAuthenticatedData", aad } } });
+}
+
+/// A macSign's body.
+pub fn encodeMacSign(arena: Allocator, data: []const u8) Allocator.Error![]u8 {
+    return render(arena, BytesBody{ .fields = &.{.{ "data", data }} });
+}
+
+/// A macVerify's body.
+pub fn encodeMacVerify(arena: Allocator, data: []const u8, mac: []const u8) Allocator.Error![]u8 {
+    return render(arena, BytesBody{ .fields = &.{ .{ "data", data }, .{ "mac", mac } } });
+}
+
+/// An asymmetricSign's body: the message itself, or its digest as
+/// `{"digest": {"sha256": ...}}`, with its checksum.
+pub fn encodeSign(arena: Allocator, input: types.SignInput, bytes: []const u8) Allocator.Error![]u8 {
+    return render(arena, SignBody{ .input = input, .bytes = bytes });
+}
+
+/// A generateRandomBytes body: `len` bytes from an HSM.
+pub fn encodeRandom(arena: Allocator, len: u16) Allocator.Error![]u8 {
+    return std.fmt.allocPrint(arena, "{{\"lengthBytes\":{d},\"protectionLevel\":\"HSM\"}}", .{len});
+}
+
+const BytesBody = struct {
+    /// Field name and bytes; each also gets `<name>Crc32c`.
+    fields: []const struct { []const u8, []const u8 },
+
+    fn write(self: BytesBody, jw: *Stringify) Stringify.Error!void {
+        try jw.beginObject();
+        for (self.fields) |f| try writeChecksummed(jw, f[0], f[1]);
+        try jw.endObject();
+    }
+};
+
+const SignBody = struct {
+    input: types.SignInput,
+    bytes: []const u8,
+
+    fn write(self: SignBody, jw: *Stringify) Stringify.Error!void {
+        try jw.beginObject();
+        switch (self.input) {
+            .digest => |kind| {
+                try jw.objectField("digest");
+                try jw.beginObject();
+                try jw.objectField(@tagName(kind));
+                try core.base64.writeJsonString(jw, self.bytes);
+                try jw.endObject();
+                try jw.objectField("digestCrc32c");
+                try writeChecksum(jw, core.crc32c.hash(self.bytes));
+            },
+            .data => try writeChecksummed(jw, "data", self.bytes),
+        }
+        try jw.endObject();
+    }
+};
+
+/// `name` as base64, when not empty, and `<name>Crc32c` always: the
+/// checksum of nothing is 0, and sent, so the server says it got it.
+fn writeChecksummed(jw: *Stringify, name: []const u8, bytes: []const u8) Stringify.Error!void {
+    if (bytes.len > 0) {
+        try jw.objectField(name);
+        try core.base64.writeJsonString(jw, bytes);
+    }
+    var buf: [64]u8 = undefined;
+    try jw.objectField(std.fmt.bufPrint(&buf, "{s}Crc32c", .{name}) catch unreachable);
+    try writeChecksum(jw, core.crc32c.hash(bytes));
+}
+
+/// A CRC-32C as an `Int64Value`: a decimal string.
+fn writeChecksum(jw: *Stringify, crc: u32) Stringify.Error!void {
+    var buf: [12]u8 = undefined;
+    try jw.write(std.fmt.bufPrint(&buf, "{d}", .{crc}) catch unreachable);
+}
+
+/// An encrypt's answer, every field the checks need.
+pub const EncryptAnswer = struct {
+    name: []const u8,
+    ciphertext: []const u8,
+    ciphertext_crc32c: ?u32,
+    verified_plaintext: bool,
+    verified_aad: bool,
+};
+
+pub fn decodeEncrypt(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!EncryptAnswer {
+    const obj = try object(try parse(scratch, body));
+    return .{
+        .name = try string(out, obj, "name") orelse return error.InvalidResponse,
+        .ciphertext = try bytesField(out, obj, "ciphertext") orelse return error.InvalidResponse,
+        .ciphertext_crc32c = try checksum(obj, "ciphertextCrc32c"),
+        .verified_plaintext = try boolean(obj, "verifiedPlaintextCrc32c"),
+        .verified_aad = try boolean(obj, "verifiedAdditionalAuthenticatedDataCrc32c"),
+    };
+}
+
+pub const DecryptAnswer = struct {
+    /// "" when the plaintext was empty, which proto3 JSON leaves out.
+    plaintext: []const u8,
+    plaintext_crc32c: ?u32,
+    used_primary: bool,
+};
+
+/// `out` and `scratch` should both wipe: the body and the decoded bytes
+/// hold the plaintext.
+pub fn decodeDecrypt(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!DecryptAnswer {
+    const obj = try object(try parse(scratch, body));
+    return .{
+        .plaintext = try bytesField(out, obj, "plaintext") orelse "",
+        .plaintext_crc32c = try checksum(obj, "plaintextCrc32c"),
+        .used_primary = try boolean(obj, "usedPrimary"),
+    };
+}
+
+pub const SignAnswer = struct {
+    name: []const u8,
+    signature: []const u8,
+    signature_crc32c: ?u32,
+    verified_digest: bool,
+    verified_data: bool,
+};
+
+pub fn decodeSign(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!SignAnswer {
+    const obj = try object(try parse(scratch, body));
+    return .{
+        .name = try string(out, obj, "name") orelse return error.InvalidResponse,
+        .signature = try bytesField(out, obj, "signature") orelse return error.InvalidResponse,
+        .signature_crc32c = try checksum(obj, "signatureCrc32c"),
+        .verified_digest = try boolean(obj, "verifiedDigestCrc32c"),
+        .verified_data = try boolean(obj, "verifiedDataCrc32c"),
+    };
+}
+
+pub const PublicKeyAnswer = struct {
+    name: ?[]const u8,
+    algorithm: types.Algorithm,
+    protection_level: types.ProtectionLevel,
+    pem: []const u8,
+    pem_crc32c: ?u32,
+    /// `publicKey.data`, and its checksum.
+    data: []const u8,
+    data_crc32c: ?u32,
+};
+
+pub fn decodePublicKey(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!PublicKeyAnswer {
+    const obj = try object(try parse(scratch, body));
+    var answer: PublicKeyAnswer = .{
+        .name = try string(out, obj, "name"),
+        .algorithm = if (try field(obj, "algorithm", .string)) |a| types.Algorithm.fromWire(a) else .unknown,
+        .protection_level = if (try field(obj, "protectionLevel", .string)) |p| types.ProtectionLevel.fromWire(p) else .unknown,
+        .pem = try string(out, obj, "pem") orelse "",
+        .pem_crc32c = try checksum(obj, "pemCrc32c"),
+        .data = "",
+        .data_crc32c = null,
+    };
+    if (try field(obj, "publicKey", .object)) |k| {
+        answer.data = try bytesField(out, k, "data") orelse "";
+        answer.data_crc32c = try checksum(k, "crc32cChecksum");
+    }
+    return answer;
+}
+
+pub const MacSignAnswer = struct {
+    name: []const u8,
+    mac: []const u8,
+    mac_crc32c: ?u32,
+    verified_data: bool,
+};
+
+pub fn decodeMacSign(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!MacSignAnswer {
+    const obj = try object(try parse(scratch, body));
+    return .{
+        .name = try string(out, obj, "name") orelse return error.InvalidResponse,
+        .mac = try bytesField(out, obj, "mac") orelse return error.InvalidResponse,
+        .mac_crc32c = try checksum(obj, "macCrc32c"),
+        .verified_data = try boolean(obj, "verifiedDataCrc32c"),
+    };
+}
+
+pub const MacVerifyAnswer = struct {
+    name: []const u8,
+    /// Absent, so false, for a MAC that does not match.
+    success: bool,
+    verified_data: bool,
+    verified_mac: bool,
+    verified_success_integrity: bool,
+};
+
+pub fn decodeMacVerify(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!MacVerifyAnswer {
+    const obj = try object(try parse(scratch, body));
+    return .{
+        .name = try string(out, obj, "name") orelse return error.InvalidResponse,
+        .success = try boolean(obj, "success"),
+        .verified_data = try boolean(obj, "verifiedDataCrc32c"),
+        .verified_mac = try boolean(obj, "verifiedMacCrc32c"),
+        .verified_success_integrity = try boolean(obj, "verifiedSuccessIntegrity"),
+    };
+}
+
+pub const RandomAnswer = struct {
+    data: []const u8,
+    data_crc32c: ?u32,
+};
+
+pub fn decodeRandom(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!RandomAnswer {
+    const obj = try object(try parse(scratch, body));
+    return .{
+        .data = try bytesField(out, obj, "data") orelse "",
+        .data_crc32c = try checksum(obj, "dataCrc32c"),
+    };
+}
+
+/// A bytes field, decoded from any base64 form proto3 JSON allows.
+fn bytesField(out: Allocator, obj: std.json.ObjectMap, name: []const u8) DecodeError!?[]const u8 {
+    const text = try field(obj, name, .string) orelse return null;
+    return core.base64.decode(out, text) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidBase64 => error.InvalidResponse,
+    };
+}
+
+/// A CRC-32C, an `Int64Value`: a string or a number, at most 2^32 - 1.
+fn checksum(obj: std.json.ObjectMap, name: []const u8) DecodeError!?u32 {
+    const n = try integer(u64, obj, name) orelse return null;
+    return std.math.cast(u32, n) orelse error.InvalidResponse;
+}
+
 fn keyRingOf(out: Allocator, v: Value) DecodeError!types.KeyRingInfo {
     const obj = try object(v);
     return .{
@@ -493,7 +732,7 @@ test "decode: key rings, locations, retired keys and operations" {
     try testing.expect(locs.locations[0].hsm_available and locs.locations[0].ekm_available);
     try testing.expect(!locs.locations[1].hsm_available);
     const retired = try decodeRetiredKeyPage(a, a,
-        \\{"retiredResources":[{"name":"projects/p/locations/l/retiredResources/abc","originalResource":"projects/p/locations/l/keyRings/r/cryptoKeys/k","resourceType":"cloudkms.googleapis.com/CryptoKey","deleteTime":"2026-10-19T00:00:00Z"}],"totalSize":"1"}
+        \\{"retiredResources":[{"name":"projects/p/locations/l/retiredResources/abc","originalResource":"projects/p/locations/l/keyRings/r/cryptoKeys/k","resourceType":"CryptoKey","deleteTime":"2026-10-19T00:00:00Z"}],"totalSize":"1"}
     );
     try testing.expectEqualStrings("projects/p/locations/l/keyRings/r/cryptoKeys/k", retired.retired_keys[0].original_name);
     const pending = try decodeOperation(a, a, "{\"name\":\"projects/p/locations/l/operations/o1\",\"metadata\":{\"@type\":\"x\"}}");
@@ -558,4 +797,65 @@ fn decodeAllocations(gpa: Allocator) !void {
 
 test "decode: every allocation failure is OutOfMemory without leaks" {
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, decodeAllocations, .{});
+}
+
+test "golden: the crypto bodies, every bytes field with its checksum" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("{\"data\":\"bXNn\",\"dataCrc32c\":\"2067356545\",\"mac\":\"bWFjIQ==\",\"macCrc32c\":\"2164953591\"}", try encodeMacVerify(a, "msg", "mac!"));
+    try testing.expectEqualStrings("{\"dataCrc32c\":\"0\"}", try encodeMacSign(a, ""));
+    try testing.expectEqualStrings("{\"digest\":{\"sha384\":\"AAAA\"},\"digestCrc32c\":\"1617208186\"}", try encodeSign(a, .{ .digest = .sha384 }, &.{ 0, 0, 0 }));
+    try testing.expectEqualStrings("{\"lengthBytes\":1024,\"protectionLevel\":\"HSM\"}", try encodeRandom(a, 1024));
+}
+
+test "decode: crypto answers, checksums as strings or numbers, flags absent as false" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const enc = try decodeEncrypt(a, a, "{\"name\":\"n\",\"ciphertext\":\"YzFwaA==\",\"ciphertextCrc32c\":908558936,\"verifiedPlaintextCrc32c\":true}");
+    try testing.expectEqualStrings("c1ph", enc.ciphertext);
+    try testing.expectEqual(908558936, enc.ciphertext_crc32c.?);
+    try testing.expect(enc.verified_plaintext and !enc.verified_aad);
+    // Both base64 alphabets, padded or not.
+    const url = try decodeEncrypt(a, a, "{\"name\":\"n\",\"ciphertext\":\"-_8\"}");
+    try testing.expectEqualSlices(u8, &.{ 0xfb, 0xff }, url.ciphertext);
+    try testing.expectEqual(null, url.ciphertext_crc32c);
+    const dec = try decodeDecrypt(a, a, "{\"plaintextCrc32c\":\"0\",\"usedPrimary\":true}");
+    try testing.expectEqualStrings("", dec.plaintext);
+    try testing.expect(dec.used_primary);
+    const pk = try decodePublicKey(a, a, "{\"pem\":\"P\",\"algorithm\":\"EC_SIGN_P256_SHA256\",\"protectionLevel\":\"HSM\",\"publicKey\":{\"data\":\"UA==\",\"crc32cChecksum\":\"1\"}}");
+    try testing.expectEqual(null, pk.name);
+    try testing.expectEqual(types.ProtectionLevel.hsm, pk.protection_level);
+    try testing.expectEqualStrings("P", pk.data);
+    const mv = try decodeMacVerify(a, a, "{\"name\":\"n\"}");
+    try testing.expect(!mv.success and !mv.verified_success_integrity);
+    for ([_][]const u8{
+        "{\"name\":\"n\",\"ciphertext\":\"not base64!\"}",
+        "{\"name\":\"n\",\"ciphertext\":\"YQ==\",\"ciphertextCrc32c\":\"4294967296\"}",
+        "{\"name\":\"n\",\"ciphertext\":\"YQ==\",\"ciphertextCrc32c\":\"-1\"}",
+        "{\"name\":\"n\",\"ciphertext\":\"YQ==\",\"ciphertextCrc32c\":true}",
+        "{\"name\":\"n\"}",
+        "{\"ciphertext\":\"YQ==\"}",
+    }) |body| try testing.expectError(error.InvalidResponse, decodeEncrypt(a, a, body));
+    try testing.expectError(error.InvalidResponse, decodeSign(a, a, "{\"name\":\"n\"}"));
+    try testing.expectError(error.InvalidResponse, decodeMacSign(a, a, "{\"name\":\"n\"}"));
+    try testing.expectEqual(4294967295, (try decodeRandom(a, a, "{\"dataCrc32c\":\"4294967295\"}")).data_crc32c.?);
+}
+
+fn cryptoDecodersProperty(_: void, input: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    inline for (.{ decodeEncrypt, decodeDecrypt, decodeSign, decodePublicKey, decodeMacSign, decodeMacVerify, decodeRandom }) |decode| {
+        if (decode(a, a, input)) |_| {} else |err| try testing.expectEqual(error.InvalidResponse, err);
+    }
+}
+
+test "fuzz crypto decoders: arbitrary bodies decode or are InvalidResponse" {
+    try test_util.fuzzBytes({}, cryptoDecodersProperty, .{ .corpus = &.{
+        "{\"name\":\"n\",\"ciphertext\":\"YzFwaA==\",\"ciphertextCrc32c\":\"908558936\",\"verifiedPlaintextCrc32c\":true}",
+        "{\"name\":\"n\",\"signature\":\"c2lnIQ==\",\"signatureCrc32c\":\"749997639\",\"verifiedDigestCrc32c\":true}",
+        "{\"pem\":\"P\",\"publicKey\":{\"data\":\"-_8\",\"crc32cChecksum\":4294967296}}",
+    } });
 }
