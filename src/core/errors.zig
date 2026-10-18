@@ -246,6 +246,58 @@ pub fn decodeErrorInfos(arena: Allocator, body: []const u8) Allocator.Error![]co
     return infos.items;
 }
 
+/// One violation in a `google.rpc.PreconditionFailure` from an error
+/// body's `details`: which precondition a resource broke, in a word a
+/// program can match, such as Cloud KMS's "KEY_DISABLED" for a key version
+/// that is not enabled, and which resource.
+pub const PreconditionViolation = struct {
+    /// Such as "KEY_DISABLED"; "" when absent.
+    type: []const u8,
+    /// The resource, such as a key version's full name; "" when absent.
+    subject: []const u8,
+    /// Words for people; "" when absent.
+    description: []const u8,
+};
+
+const precondition_failure_type = "type.googleapis.com/google.rpc.PreconditionFailure";
+
+/// Every violation of every `google.rpc.PreconditionFailure` in an error
+/// body's `details`, in order, skipping every other kind of detail, and
+/// every violation that is not an object; a streamed answer's error too,
+/// as `decodeErrorBody` reads it. Empty when there is none, or when `body`
+/// is not Google's JSON error shape. Running out of memory is an error, as
+/// it is for `decodeErrorBody`.
+pub fn decodePreconditionFailures(arena: Allocator, body: []const u8) Allocator.Error![]const PreconditionViolation {
+    const wire = (try parseMaybeStreamed(WireDetails, arena, body)) orelse return &.{};
+    const e = wire.@"error" orelse return &.{};
+    const details = e.details orelse return &.{};
+    var out: std.ArrayList(PreconditionViolation) = .empty;
+    for (details) |detail| {
+        const fields = switch (detail) {
+            .object => |o| o,
+            else => continue,
+        };
+        const type_url = stringOf(fields.get("@type")) orelse continue;
+        if (!std.mem.eql(u8, type_url, precondition_failure_type)) continue;
+        const list = switch (fields.get("violations") orelse continue) {
+            .array => |l| l,
+            else => continue,
+        };
+        for (list.items) |item| {
+            const v = switch (item) {
+                .object => |o| o,
+                else => continue,
+            };
+            try out.append(arena, .{
+                .type = stringOf(v.get("type")) orelse "",
+                .subject = stringOf(v.get("subject")) orelse "",
+                .description = stringOf(v.get("description")) orelse "",
+            });
+        }
+    }
+    return out.items;
+}
+
 const retry_info_type = "type.googleapis.com/google.rpc.RetryInfo";
 
 /// The delay a `google.rpc.RetryInfo` in an error body's `details` asks
@@ -763,6 +815,97 @@ test "fuzz decodeErrorInfos: arbitrary bodies never crash" {
         "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfo\",\"metadata\":[1]}]}}",
         "{\"error\":{\"details\":[[],{},null,1,\"x\"]}}",
         "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfo\",\"metadata\":{\"\\ud800\":\"x\"}}]}}",
+    } });
+}
+
+test "decodePreconditionFailures: Cloud KMS's refusal of a disabled key version, as sent over REST" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // As a bank-vaults report quoted it (issue #1750), the project named.
+    const body =
+        \\{"error":{"code":400,"message":"projects/p/locations/global/keyRings/vault/cryptoKeys/vault-unsealer/cryptoKeyVersions/1 is not enabled, current state is: DISABLED.","status":"FAILED_PRECONDITION",
+        \\"details":[{"@type":"type.googleapis.com/google.rpc.PreconditionFailure","violations":[{"subject":"projects/p/locations/global/keyRings/vault/cryptoKeys/vault-unsealer/cryptoKeyVersions/1","type":"KEY_DISABLED"}]}]}}
+    ;
+    const violations = try decodePreconditionFailures(a, body);
+    try testing.expectEqual(1, violations.len);
+    try testing.expectEqualStrings("KEY_DISABLED", violations[0].type);
+    try testing.expectEqualStrings("projects/p/locations/global/keyRings/vault/cryptoKeys/vault-unsealer/cryptoKeyVersions/1", violations[0].subject);
+    try testing.expectEqualStrings("", violations[0].description);
+    // The ErrorInfo decoder finds nothing in it, and the status reads as always.
+    try testing.expectEqual(0, (try decodeErrorInfos(a, body)).len);
+    try testing.expectEqualStrings("FAILED_PRECONDITION", (try decodeErrorBody(a, body)).?.status);
+}
+
+test "decodePreconditionFailures: other details and malformed violations are skipped, the rest kept in order" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const violations = try decodePreconditionFailures(arena.allocator(),
+        \\[{"error":{"code":400,"details":[
+        \\{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"NOT_THIS"},
+        \\{"@type":"type.googleapis.com/google.rpc.PreconditionFailure","violations":[
+        \\{"type":"KEY_DESTROY_SCHEDULED","subject":"v/2","description":"esc\"aped \u00e9"},
+        \\"a string", null, 7,
+        \\{"type":5,"subject":null}]},
+        \\{"@type":"type.googleapis.com/google.rpc.PreconditionFailure","violations":"not a list"},
+        \\{"@type":"type.googleapis.com/google.rpc.PreconditionFailure"},
+        \\{"@type":"type.googleapis.com/google.rpc.PreconditionFailure","violations":[{"type":"KEY_PENDING_GENERATION"}]}
+        \\]}}]
+    );
+    try testing.expectEqual(3, violations.len);
+    try testing.expectEqualStrings("KEY_DESTROY_SCHEDULED", violations[0].type);
+    try testing.expectEqualStrings("v/2", violations[0].subject);
+    try testing.expectEqualStrings("esc\"aped \u{e9}", violations[0].description);
+    // A violation whose fields are not strings counts, with them empty.
+    try testing.expectEqualStrings("", violations[1].type);
+    try testing.expectEqualStrings("", violations[1].subject);
+    try testing.expectEqualStrings("KEY_PENDING_GENERATION", violations[2].type);
+}
+
+test "decodePreconditionFailures: a body without one gives none" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "",
+        "<!DOCTYPE html><html>Error 404 (Not Found)!!1</html>",
+        "{}",
+        "{\"error\":{\"details\":[]}}",
+        "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.PreconditionFailure\",\"violations\":[]}]}}",
+        "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.PreconditionFailureX\",\"violations\":[{\"type\":\"T\"}]}]}}",
+        "{\"error\":{\"details\":[{\"type\":\"type.googleapis.com/google.rpc.PreconditionFailure\",\"violations\":[{\"type\":\"T\"}]}]}}",
+    }) |body| try testing.expectEqual(0, (try decodePreconditionFailures(a, body)).len);
+}
+
+fn decodePreconditionFailuresWith(gpa: Allocator, body: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const violations = try decodePreconditionFailures(arena.allocator(), body);
+    try testing.expectEqual(2, violations.len);
+}
+
+test "decodePreconditionFailures: every allocation failure is OutOfMemory without leaks" {
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, decodePreconditionFailuresWith, .{
+        \\{"error":{"code":400,"status":"FAILED_PRECONDITION","details":[
+        \\{"@type":"type.googleapis.com/google.rpc.PreconditionFailure","violations":[{"type":"KEY_DISABLED","subject":"s\u00e9"},{"type":"KEY_DESTROYED","description":"d"}]},
+        \\{"@type":"type.googleapis.com/google.rpc.DebugInfo"}]}}
+        ,
+    });
+}
+
+fn decodePreconditionFailuresArbitrary(_: void, input: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    // Total, and a body with a violation is an error body.
+    const violations = try decodePreconditionFailures(arena.allocator(), input);
+    if (violations.len > 0) try testing.expect((try decodeErrorBody(arena.allocator(), input)) != null);
+}
+
+test "fuzz decodePreconditionFailures: arbitrary bodies never crash" {
+    try test_util.fuzzBytes({}, decodePreconditionFailuresArbitrary, .{ .corpus = &.{
+        "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.PreconditionFailure\",\"violations\":[{\"type\":\"KEY_DISABLED\"}]}]}}",
+        "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.PreconditionFailure\",\"violations\":{}}]}}",
+        "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.PreconditionFailure\",\"violations\":[[],1,{\"type\":\"\\ud800\"}]}]}}",
     } });
 }
 

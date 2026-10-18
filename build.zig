@@ -90,6 +90,14 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "core", .module = core }},
     });
 
+    // Cloud KMS: keys used and managed. It imports core, never a service.
+    const kms = b.addModule("kms", .{
+        .root_source_file = b.path("src/kms/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core }},
+    });
+
     // Every test build runs under std's test runner with one fix, which
     // keeps std.debug from swallowing a task's cancel (see the top of
     // tools/test_runner.zig).
@@ -118,6 +126,7 @@ pub fn build(b: *std.Build) void {
         .{ "resource_manager", resource_manager },
         .{ "error_reporting", error_reporting },
         .{ "monitoring", monitoring },
+        .{ "kms", kms },
     };
     // The nightly fuzz job runs one module per job, so each gets the whole
     // time budget: `--fuzz=N` fuzzes every property N times, and the
@@ -125,12 +134,12 @@ pub fn build(b: *std.Build) void {
     const only_module = b.option(
         []const u8,
         "module",
-        "Run only this module's unit tests: core, auth, pubsub, secret_manager, storage, firestore, logging, resource_manager, error_reporting or monitoring",
+        "Run only this module's unit tests: core, auth, pubsub, secret_manager, storage, firestore, logging, resource_manager, error_reporting, monitoring or kms",
     );
     if (only_module) |name| {
         for (unit_modules) |entry| {
             if (std.mem.eql(u8, entry[0], name)) break;
-        } else std.process.fatal("-Dmodule={s} names no module; use core, auth, pubsub, secret_manager, storage, firestore, logging, resource_manager, error_reporting or monitoring", .{name});
+        } else std.process.fatal("-Dmodule={s} names no module; use core, auth, pubsub, secret_manager, storage, firestore, logging, resource_manager, error_reporting, monitoring or kms", .{name});
     }
     const test_step = b.step("test", "Run unit, property and fuzz-corpus tests");
     // The same tests without what `test` compiles beside them, the examples

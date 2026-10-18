@@ -31,7 +31,95 @@ pub fn isPubSubId(id: []const u8) bool {
     return true;
 }
 
+/// A Cloud KMS key's full name, `projects/P/locations/L/keyRings/R/cryptoKeys/K`,
+/// or one of its versions', the same with `/cryptoKeyVersions/V` after it,
+/// split into its parts. Cloud Storage and Secret Manager name a key for
+/// their encryption; the `kms` module names keys and versions.
+pub const KmsKeyName = struct {
+    project: []const u8,
+    location: []const u8,
+    key_ring: []const u8,
+    key: []const u8,
+    /// Null for a key's name.
+    version: ?[]const u8 = null,
+
+    /// The parts of `name`, which point into it, or null when it is of
+    /// neither form or a part is empty. What each part may hold is left to
+    /// the caller, each service having its own rule.
+    pub fn parse(name: []const u8) ?KmsKeyName {
+        var parts = std.mem.splitScalar(u8, name, '/');
+        var values: [5][]const u8 = undefined;
+        const fixed = [_][]const u8{ "projects", "locations", "keyRings", "cryptoKeys", "cryptoKeyVersions" };
+        for (fixed, 0..) |literal, i| {
+            const word = parts.next() orelse return if (i == 4) .{
+                .project = values[0],
+                .location = values[1],
+                .key_ring = values[2],
+                .key = values[3],
+            } else null;
+            if (!std.mem.eql(u8, word, literal)) return null;
+            const value = parts.next() orelse return null;
+            if (value.len == 0) return null;
+            values[i] = value;
+        }
+        if (parts.next() != null) return null;
+        return .{ .project = values[0], .location = values[1], .key_ring = values[2], .key = values[3], .version = values[4] };
+    }
+};
+
 const testing = std.testing;
+
+test "KmsKeyName: a key's name and a version's, every part non-empty, nothing after" {
+    const key = KmsKeyName.parse("projects/p/locations/us-central1/keyRings/r-1/cryptoKeys/k_1").?;
+    try testing.expectEqualStrings("p", key.project);
+    try testing.expectEqualStrings("us-central1", key.location);
+    try testing.expectEqualStrings("r-1", key.key_ring);
+    try testing.expectEqualStrings("k_1", key.key);
+    try testing.expectEqual(null, key.version);
+
+    const version = KmsKeyName.parse("projects/p/locations/global/keyRings/r/cryptoKeys/k/cryptoKeyVersions/12").?;
+    try testing.expectEqualStrings("global", version.location);
+    try testing.expectEqualStrings("k", version.key);
+    try testing.expectEqualStrings("12", version.version.?);
+
+    for ([_][]const u8{
+        "",
+        "projects/p/locations/l/keyRings/r/cryptoKeys",
+        "projects/p/locations/l/keyRings/r/cryptoKeys/",
+        "projects/p/locations/l/keyRings/r/cryptoKeys/k/",
+        "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions",
+        "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/",
+        "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1/x",
+        "projects/p/locations/l/keyRings/r/cryptoKeys/k/versions/1",
+        "projects//locations/l/keyRings/r/cryptoKeys/k",
+        "/projects/p/locations/l/keyRings/r/cryptoKeys/k",
+        "Projects/p/locations/l/keyRings/r/cryptoKeys/k",
+        "projects/p/locations/l/keyrings/r/cryptoKeys/k",
+        "projects/p/locations/l/keyRings/r",
+    }) |name| try testing.expectEqual(null, KmsKeyName.parse(name));
+}
+
+fn kmsKeyNameProperty(_: void, input: []const u8) !void {
+    const parsed = KmsKeyName.parse(input) orelse return;
+    // A name that parses is its parts joined again, exactly.
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.print("projects/{s}/locations/{s}/keyRings/{s}/cryptoKeys/{s}", .{ parsed.project, parsed.location, parsed.key_ring, parsed.key }) catch return;
+    if (parsed.version) |v| w.print("/cryptoKeyVersions/{s}", .{v}) catch return;
+    try testing.expectEqualStrings(input, w.buffered());
+    for ([_][]const u8{ parsed.project, parsed.location, parsed.key_ring, parsed.key, parsed.version orelse "v" }) |part| {
+        try testing.expect(part.len > 0);
+        try testing.expect(std.mem.indexOfScalar(u8, part, '/') == null);
+    }
+}
+
+test "fuzz KmsKeyName: a name that parses is its parts, and every part is one segment" {
+    try test_util.fuzzBytes({}, kmsKeyNameProperty, .{ .corpus = &.{
+        "projects/p/locations/l/keyRings/r/cryptoKeys/k",
+        "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1",
+        "projects/p/locations/l/keyRings/r/cryptoKeys//cryptoKeyVersions/1",
+    } });
+}
 
 test "Pub/Sub ids: the documented rules at their boundaries" {
     try testing.expect(isPubSubId("abc"));

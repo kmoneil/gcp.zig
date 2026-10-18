@@ -4,6 +4,38 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.45.0 (unreleased)
+
+- kms: new module, **experimental**: Cloud KMS's v1 API. Key rings,
+  keys and versions are handles that make no call until asked:
+  `Client.keyRing(id).key(id).version(n)`, or `Client.keyNamed` for a
+  key named in full, as a bucket or a secret names one. `KeyRing.create`,
+  `get`, `delete` and `listKeys`; `Key.create` with a purpose, an
+  algorithm of that purpose, a protection level, a destroy delay of 1 to
+  120 days, labels, automatic rotation, and version 1 unless asked not
+  to; `Key.update` (labels, rotation, the algorithm of new versions),
+  `setPrimary`, `createVersion`, `listVersions` and `delete`;
+  `KeyVersion.get`, `enable`, `disable`, `destroy`, `restore` and
+  `delete`; `Client.listKeyRings`, `listLocations` and `listRetiredKeys`.
+  Deletes wait for their operation. A create of a key ring or a key whose
+  answer was lost is read back rather than sent again, so
+  `error.AlreadyExists` always means the id was taken before; a destroy
+  or restore refused because an earlier attempt landed reads the version
+  and answers it; `createVersion` is sent again only when it cannot have
+  left, since each makes a version billed until destroyed. A refusal that
+  names a version's state is `error.KeyVersionPending`,
+  `KeyVersionDisabled` or `KeyVersionDestroyed`, the version in
+  `Diagnostics`. `kms.testing.FakeKms` holds key rings, keys and versions
+  with the state machine Google documents, on the clock: pending
+  asymmetric versions, destroy delays, rotation, retired key ids.
+- core: `errors.decodePreconditionFailures` reads the
+  `google.rpc.PreconditionFailure` details of an error body, and
+  `names.KmsKeyName` parses a Cloud KMS key's or version's full name.
+- storage and secret_manager: their checks of a KMS key's name use
+  `core.names.KmsKeyName`; what they accept is unchanged.
+- auth, error_reporting, firestore, logging, monitoring, pubsub and
+  resource_manager: unchanged.
+
 ## 0.44.0 (2026-10-18)
 
 - monitoring: new module, **experimental**: Cloud Monitoring's v3 API,
