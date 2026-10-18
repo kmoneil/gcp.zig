@@ -364,7 +364,201 @@ pub const ResourceTypePage = struct {
     next_page_token: ?[]const u8 = null,
 };
 
+/// How each series' points are grouped into one per alignment period
+/// before anything else, as `common.proto` names them.
+pub const Aligner = enum {
+    none,
+    delta,
+    rate,
+    interpolate,
+    next_older,
+    min,
+    max,
+    mean,
+    count,
+    sum,
+    stddev,
+    count_true,
+    count_false,
+    fraction_true,
+    percentile_99,
+    percentile_95,
+    percentile_50,
+    percentile_05,
+    percent_change,
+
+    /// "ALIGN_" and the name in capitals.
+    pub fn wire(a: Aligner) []const u8 {
+        return switch (a) {
+            inline else => |tag| "ALIGN_" ++ comptime upper(@tagName(tag)),
+        };
+    }
+};
+
+/// How aligned series are combined into fewer, as `common.proto` names them.
+pub const Reducer = enum {
+    none,
+    mean,
+    min,
+    max,
+    sum,
+    stddev,
+    count,
+    count_true,
+    count_false,
+    fraction_true,
+    percentile_99,
+    percentile_95,
+    percentile_50,
+    percentile_05,
+
+    /// "REDUCE_" and the name in capitals.
+    pub fn wire(r: Reducer) []const u8 {
+        return switch (r) {
+            inline else => |tag| "REDUCE_" ++ comptime upper(@tagName(tag)),
+        };
+    }
+};
+
+fn upper(comptime name: []const u8) []const u8 {
+    comptime {
+        var out: [name.len]u8 = undefined;
+        for (name, &out) |c, *o| o.* = std.ascii.toUpper(c);
+        const final = out;
+        return &final;
+    }
+}
+
+/// One label's condition in a read's filter.
+pub const Match = struct {
+    key: []const u8,
+    op: Op = .equals,
+    value: []const u8,
+
+    pub const Op = enum { equals, not_equals, starts_with, ends_with, has_substring };
+};
+
+/// Which series of the metric a read returns. Every part must hold.
+pub const Filter = struct {
+    metric_labels: []const Match = &.{},
+    resource_type: ?[]const u8 = null,
+    resource_labels: []const Match = &.{},
+    /// Appended with AND as it is, for what the parts above do not say,
+    /// such as `metric.labels.code = one_of("500", "503")`. In Cloud
+    /// Monitoring's filters OR binds tighter than AND.
+    raw: ?[]const u8 = null,
+};
+
+pub const Aggregation = struct {
+    /// Seconds per aligned point; at least 10, which production held to.
+    /// Required with any aligner but `none`.
+    alignment_period_s: u32 = 0,
+    aligner: Aligner = .none,
+    /// Needs an aligner other than `none`.
+    reducer: Reducer = .none,
+    /// What the reducer keeps apart, such as "metric.labels.region" or
+    /// "resource.labels.zone"; `resource.type` always is.
+    group_by: []const []const u8 = &.{},
+};
+
+/// Whether a read returns points, or only which series there are.
+pub const View = enum { full, headers };
+
+pub const ReadOptions = struct {
+    /// A read covers (start, end]. `end` defaults to now, `start` to `end`.
+    start: ?std.Io.Timestamp = null,
+    end: ?std.Io.Timestamp = null,
+    filter: Filter = .{},
+    aggregation: ?Aggregation = null,
+    /// Applied after `aggregation`, which it needs.
+    secondary_aggregation: ?Aggregation = null,
+    view: View = .full,
+    /// Points a page holds with `.full`, series with `.headers`; 0 for the
+    /// server's most, 100,000. With `.full` one series can span pages.
+    page_size: u32 = 0,
+    page_token: ?[]const u8 = null,
+};
+
+/// One point as a read returns it.
+pub const ReadPoint = struct {
+    /// A gauge's is its end.
+    start: ?std.Io.Timestamp = null,
+    end: std.Io.Timestamp,
+    /// Null for a value this library does not read, such as Google's money.
+    value: ?Value,
+};
+
+/// One series as a read returns it. The resource comes back as its type and
+/// labels, `project_id` among them, since a read can see any resource type.
+pub const Series = struct {
+    metric_type: []const u8,
+    metric_labels: []const Label = &.{},
+    resource_type: []const u8,
+    resource_labels: []const Label = &.{},
+    /// After alignment or reduction these can differ from the descriptor's.
+    kind: Kind,
+    value_type: ValueType,
+    unit: []const u8 = "",
+    /// Newest first, as the server sends them. Empty with `.headers`.
+    points: []const ReadPoint = &.{},
+
+    /// The metric label named `key`, or null.
+    pub fn label(self: Series, key: []const u8) ?[]const u8 {
+        for (self.metric_labels) |l| if (std.mem.eql(u8, l.key, key)) return l.value;
+        return null;
+    }
+
+    /// The resource label named `key`, or null.
+    pub fn resourceLabel(self: Series, key: []const u8) ?[]const u8 {
+        for (self.resource_labels) |l| if (std.mem.eql(u8, l.key, key)) return l.value;
+        return null;
+    }
+};
+
+/// Why part of a read may be missing.
+pub const ExecutionError = struct {
+    reason: core.ApiError,
+    message: []const u8 = "",
+};
+
+pub const SeriesPage = struct {
+    series: []const Series,
+    /// Null on the last page.
+    next_page_token: ?[]const u8 = null,
+    /// The answer may be incomplete when this or `unreachable_regions` is
+    /// not empty, though it came with HTTP 200.
+    execution_errors: []const ExecutionError = &.{},
+    unreachable_regions: []const []const u8 = &.{},
+    /// The series' unit, or "{not_a_unit}" when they differ.
+    unit: []const u8 = "",
+
+    /// Whether the server said part of the answer may be missing.
+    pub fn incomplete(self: SeriesPage) bool {
+        return self.execution_errors.len > 0 or self.unreachable_regions.len > 0;
+    }
+};
+
 const testing = std.testing;
+
+test "Aligner and Reducer: the proto's names" {
+    try testing.expectEqualStrings("ALIGN_NONE", Aligner.none.wire());
+    try testing.expectEqualStrings("ALIGN_NEXT_OLDER", Aligner.next_older.wire());
+    try testing.expectEqualStrings("ALIGN_PERCENTILE_05", Aligner.percentile_05.wire());
+    try testing.expectEqualStrings("ALIGN_PERCENT_CHANGE", Aligner.percent_change.wire());
+    try testing.expectEqualStrings("REDUCE_FRACTION_TRUE", Reducer.fraction_true.wire());
+    try testing.expectEqualStrings("REDUCE_SUM", Reducer.sum.wire());
+}
+
+test "Series.label, resourceLabel and SeriesPage.incomplete" {
+    const s: Series = .{ .metric_type = "t", .metric_labels = &.{.{ .key = "a", .value = "1" }}, .resource_type = "global", .resource_labels = &.{.{ .key = "project_id", .value = "p" }}, .kind = .gauge, .value_type = .int64 };
+    try testing.expectEqualStrings("1", s.label("a").?);
+    try testing.expectEqual(null, s.label("b"));
+    try testing.expectEqualStrings("p", s.resourceLabel("project_id").?);
+    try testing.expectEqual(null, s.resourceLabel("zone"));
+    try testing.expect(!(SeriesPage{ .series = &.{} }).incomplete());
+    try testing.expect((SeriesPage{ .series = &.{}, .unreachable_regions = &.{"asia"} }).incomplete());
+    try testing.expect((SeriesPage{ .series = &.{}, .execution_errors = &.{.{ .reason = error.Unavailable }} }).incomplete());
+}
 
 test "Kind and ValueType: wire names both ways, unknown for the rest" {
     inline for (.{ .gauge, .delta, .cumulative }) |k| try testing.expectEqual(k, Kind.fromWire(Kind.wire(k)));

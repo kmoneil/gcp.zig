@@ -254,6 +254,23 @@ pub fn configProblem(metric_type: []const u8, config: types.MetricConfig) ?Probl
     return null;
 }
 
+/// Production refused an alignment period of 9 s ("must be greater than or
+/// equal to 10s") and took 10 s; Google documents 60.
+pub const min_alignment_period_s = 10;
+
+/// Why an aggregation is always wrong, or null. Which aligner suits which
+/// kind of metric is the server's to say.
+pub fn aggregationProblem(a: types.Aggregation) ?[]const u8 {
+    if (a.reducer != .none and a.aligner == .none) return "a reducer needs an aligner other than none";
+    if (a.aligner != .none and a.alignment_period_s == 0) return "an aligner other than none needs an alignment period";
+    if (a.alignment_period_s != 0 and a.alignment_period_s < min_alignment_period_s) return "an alignment period is at least 10 s";
+    for (a.group_by) |field| {
+        if (field.len == 0) return "a group-by field is not empty";
+        for (field) |c| if (c <= ' ' or c >= 0x7f or c == '"') return "a group-by field is printable ASCII without spaces or quotes, such as metric.labels.region";
+    }
+    return null;
+}
+
 /// A page token as production writes them: printable ASCII.
 pub fn isPageToken(token: []const u8) bool {
     if (token.len == 0) return false;
@@ -463,6 +480,19 @@ test "configProblem: what a descriptor create refuses" {
     try testing.expectEqual(.point, configProblem("custom.googleapis.com/g", .{ .kind = .unknown, .value_type = .int64 }).?.err);
     try testing.expectEqual(.point, configProblem("custom.googleapis.com/g", .{ .kind = .gauge, .value_type = .money }).?.err);
     try testing.expectEqual(.point, configProblem("custom.googleapis.com/g", .{ .kind = .gauge, .value_type = .int64, .unit = "a b" }).?.err);
+}
+
+test "aggregationProblem: what production refused, and group-by fields" {
+    try testing.expectEqual(null, aggregationProblem(.{}));
+    try testing.expectEqual(null, aggregationProblem(.{ .alignment_period_s = 10, .aligner = .max, .reducer = .sum, .group_by = &.{ "metric.labels.region", "resource.labels.zone" } }));
+    try testing.expect(std.mem.indexOf(u8, aggregationProblem(.{ .reducer = .sum }).?, "needs an aligner") != null);
+    try testing.expect(std.mem.indexOf(u8, aggregationProblem(.{ .aligner = .max }).?, "needs an alignment period") != null);
+    try testing.expect(std.mem.indexOf(u8, aggregationProblem(.{ .alignment_period_s = 9, .aligner = .max }).?, "at least 10 s") != null);
+    try testing.expect(aggregationProblem(.{ .alignment_period_s = 60, .aligner = .max, .group_by = &.{""} }) != null);
+    try testing.expect(aggregationProblem(.{ .alignment_period_s = 60, .aligner = .max, .group_by = &.{"a b"} }) != null);
+    try testing.expect(aggregationProblem(.{ .alignment_period_s = 60, .aligner = .max, .group_by = &.{"a\"b"} }) != null);
+    // A period alone, with no aligner, is the server's to judge.
+    try testing.expectEqual(null, aggregationProblem(.{ .alignment_period_s = 60 }));
 }
 
 test "isProject, isResourceType, isUnit, isPageToken and isUserAgent" {

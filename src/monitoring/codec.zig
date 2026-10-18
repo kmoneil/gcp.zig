@@ -348,6 +348,164 @@ fn labelDescriptors(out: Allocator, obj: std.json.ObjectMap) DecodeError![]const
     return labels;
 }
 
+/// A page of `timeSeries.list`: `{}` is an empty last page. Points stay
+/// newest first, as the server sends them.
+pub fn decodeSeriesPage(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.SeriesPage {
+    const obj = try object(try parse(scratch, body));
+    const list = try field(obj, "timeSeries", .array);
+    const series = try out.alloc(types.Series, if (list) |l| l.items.len else 0);
+    if (list) |l| for (l.items, series) |v, *s| {
+        s.* = try seriesOf(out, v);
+    };
+    var execution_errors: []const types.ExecutionError = &.{};
+    if (try field(obj, "executionErrors", .array)) |errs| {
+        const items = try out.alloc(types.ExecutionError, errs.items.len);
+        for (errs.items, items) |e, *x| {
+            const eo = try object(e);
+            x.* = .{
+                .reason = core.errors.fromRpcCode(try integer(i64, eo, "code") orelse 0),
+                .message = try string(out, eo, "message") orelse "",
+            };
+        }
+        execution_errors = items;
+    }
+    var unreachable_regions: []const []const u8 = &.{};
+    if (try field(obj, "unreachable", .array)) |regions| {
+        const items = try out.alloc([]const u8, regions.items.len);
+        for (regions.items, items) |r, *x| x.* = switch (r) {
+            .string => |text| try out.dupe(u8, text),
+            else => return error.InvalidResponse,
+        };
+        unreachable_regions = items;
+    }
+    return .{
+        .series = series,
+        .next_page_token = try token(out, obj),
+        .execution_errors = execution_errors,
+        .unreachable_regions = unreachable_regions,
+        .unit = try string(out, obj, "unit") orelse "",
+    };
+}
+
+fn seriesOf(out: Allocator, v: Value) DecodeError!types.Series {
+    const obj = try object(v);
+    const metric = try field(obj, "metric", .object) orelse return error.InvalidResponse;
+    const resource = try field(obj, "resource", .object) orelse return error.InvalidResponse;
+    var points: []const types.ReadPoint = &.{};
+    if (try field(obj, "points", .array)) |list| {
+        const items = try out.alloc(types.ReadPoint, list.items.len);
+        for (list.items, items) |p, *x| x.* = try pointOf(out, p);
+        points = items;
+    }
+    return .{
+        .metric_type = try string(out, metric, "type") orelse return error.InvalidResponse,
+        .metric_labels = try labelMap(out, metric),
+        .resource_type = try string(out, resource, "type") orelse return error.InvalidResponse,
+        .resource_labels = try labelMap(out, resource),
+        .kind = if (try field(obj, "metricKind", .string)) |k| types.Kind.fromWire(k) else .unknown,
+        .value_type = if (try field(obj, "valueType", .string)) |t| types.ValueType.fromWire(t) else .unknown,
+        .unit = try string(out, obj, "unit") orelse "",
+        .points = points,
+    };
+}
+
+/// `labels` as pairs, in the order the server wrote them.
+fn labelMap(out: Allocator, obj: std.json.ObjectMap) DecodeError![]const types.Label {
+    const labels = try field(obj, "labels", .object) orelse return &.{};
+    const items = try out.alloc(types.Label, labels.count());
+    for (labels.keys(), labels.values(), items) |k, v, *l| l.* = .{
+        .key = try out.dupe(u8, k),
+        .value = switch (v) {
+            .string => |s| try out.dupe(u8, s),
+            else => return error.InvalidResponse,
+        },
+    };
+    return items;
+}
+
+fn pointOf(out: Allocator, v: Value) DecodeError!types.ReadPoint {
+    const obj = try object(v);
+    const interval = try field(obj, "interval", .object) orelse return error.InvalidResponse;
+    const value = try field(obj, "value", .object) orelse return error.InvalidResponse;
+    return .{
+        .start = try time(interval, "startTime"),
+        .end = try time(interval, "endTime") orelse return error.InvalidResponse,
+        .value = try valueOf(out, value),
+    };
+}
+
+fn time(obj: std.json.ObjectMap, name: []const u8) DecodeError!?std.Io.Timestamp {
+    const text = try field(obj, name, .string) orelse return null;
+    return core.timestamp.parse(text) catch error.InvalidResponse;
+}
+
+/// A point's value, or null for one this library does not read.
+fn valueOf(out: Allocator, obj: std.json.ObjectMap) DecodeError!?types.Value {
+    if (obj.get("boolValue")) |v| return .{ .bool = switch (v) {
+        .bool => |b| b,
+        else => return error.InvalidResponse,
+    } };
+    if (try integer(i64, obj, "int64Value")) |n| return .{ .int64 = n };
+    if (obj.get("doubleValue")) |v| return .{ .double = try doubleOf(v) };
+    if (try string(out, obj, "stringValue")) |s| return .{ .string = s };
+    if (try field(obj, "distributionValue", .object)) |d| return .{ .distribution = try distributionOf(out, d) };
+    return null;
+}
+
+/// A double: a number, or one of the strings proto3 JSON uses for what JSON
+/// has no number for.
+fn doubleOf(v: Value) DecodeError!f64 {
+    switch (v) {
+        .string => |s| {
+            if (std.mem.eql(u8, s, "NaN")) return std.math.nan(f64);
+            if (std.mem.eql(u8, s, "Infinity")) return std.math.inf(f64);
+            if (std.mem.eql(u8, s, "-Infinity")) return -std.math.inf(f64);
+            return error.InvalidResponse;
+        },
+        // A JSON number's own text, so never "inf" or hex.
+        .number_string => |s| return std.fmt.parseFloat(f64, s) catch error.InvalidResponse,
+        else => return error.InvalidResponse,
+    }
+}
+
+fn optionalDouble(obj: std.json.ObjectMap, name: []const u8) DecodeError!f64 {
+    const v = obj.get(name) orelse return 0;
+    if (v == .null) return 0;
+    return doubleOf(v);
+}
+
+/// A distribution. One without `bucketOptions` has no buckets, which reads
+/// as an explicit layout with no bounds.
+fn distributionOf(out: Allocator, obj: std.json.ObjectMap) DecodeError!types.Distribution {
+    var d: types.Distribution = .{
+        .count = try integer(u64, obj, "count") orelse 0,
+        .mean = try optionalDouble(obj, "mean"),
+        .sum_of_squared_deviation = try optionalDouble(obj, "sumOfSquaredDeviation"),
+        .buckets = .{ .explicit = &.{} },
+    };
+    if (try field(obj, "bucketOptions", .object)) |options| {
+        if (try field(options, "linearBuckets", .object)) |l| {
+            d.buckets = .{ .linear = .{ .num_finite = try integer(u32, l, "numFiniteBuckets") orelse 0, .width = try optionalDouble(l, "width"), .offset = try optionalDouble(l, "offset") } };
+        } else if (try field(options, "exponentialBuckets", .object)) |e| {
+            d.buckets = .{ .exponential = .{ .num_finite = try integer(u32, e, "numFiniteBuckets") orelse 0, .growth_factor = try optionalDouble(e, "growthFactor"), .scale = try optionalDouble(e, "scale") } };
+        } else if (try field(options, "explicitBuckets", .object)) |e| {
+            const bounds_v = try field(e, "bounds", .array) orelse return error.InvalidResponse;
+            const bounds = try out.alloc(f64, bounds_v.items.len);
+            for (bounds_v.items, bounds) |b, *x| x.* = try doubleOf(b);
+            d.buckets = .{ .explicit = bounds };
+        } else return error.InvalidResponse;
+    }
+    if (try field(obj, "bucketCounts", .array)) |counts_v| {
+        const counts = try out.alloc(u64, counts_v.items.len);
+        for (counts_v.items, counts) |c, *x| x.* = switch (c) {
+            .number_string, .string => |s| std.fmt.parseInt(u64, s, 10) catch return error.InvalidResponse,
+            else => return error.InvalidResponse,
+        };
+        d.bucket_counts = counts;
+    }
+    return d;
+}
+
 /// What a write's error said about its points: the `CreateTimeSeriesSummary`
 /// production puts in the error's `details` whenever it judged the points
 /// one by one, at HTTP 400 when measured, whatever else the request held.
@@ -649,7 +807,7 @@ fn decodersProperty(_: void, input: []const u8) !void {
     if (decodeSummary(a, s, input)) |summary| {
         if (summary) |sum| try testing.expect(sum.written <= sum.total);
     } else |err| try testing.expectEqual(error.InvalidResponse, err);
-    inline for (.{ decodeMetricInfo, decodeMetricPage, decodeResourceType, decodeResourceTypePage }) |decode| {
+    inline for (.{ decodeMetricInfo, decodeMetricPage, decodeResourceType, decodeResourceTypePage, decodeSeriesPage }) |decode| {
         if (decode(a, s, input)) |_| {} else |err| try testing.expectEqual(error.InvalidResponse, err);
     }
 }
@@ -661,8 +819,123 @@ test "fuzz decoders: any body decodes or is InvalidResponse, never a crash or a 
         production.write_mixed,
         production.write_too_frequent,
         production.write_201_series,
+        production.read_full,
+        production.read_aligned,
         "{\"metricDescriptors\":[{\"type\":\"t\"}],\"nextPageToken\":\"x\"}",
         "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.monitoring.v3.CreateTimeSeriesSummary\",\"totalPointCount\":\"x\"}]}}",
         "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.monitoring.v3.CreateTimeSeriesSummary\",\"totalPointCount\":\"3\",\"errors\":[{\"status\":{\"code\":9},\"pointCount\":3}]}]}}",
     } });
+}
+
+test "decodeSeriesPage: production's reads, points newest first, project_id among the resource labels" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = out.allocator();
+    const s = scratch.allocator();
+
+    const full = try decodeSeriesPage(a, s, production.read_full);
+    try testing.expectEqual(1, full.series.len);
+    const one = full.series[0];
+    try testing.expectEqualStrings("custom.googleapis.com/zigps-m0-62b2c8/gauge", one.metric_type);
+    try testing.expectEqualStrings("mix1", one.label("k").?);
+    try testing.expectEqualStrings("generic_task", one.resource_type);
+    try testing.expectEqualStrings("extractctl", one.resourceLabel("project_id").?);
+    try testing.expectEqual(types.Kind.gauge, one.kind);
+    try testing.expectEqual(types.ValueType.int64, one.value_type);
+    try testing.expectEqual(2, one.points.len);
+    try testing.expectEqual(2, one.points[0].value.?.int64);
+    try testing.expectEqual(1, one.points[1].value.?.int64);
+    try testing.expect(one.points[0].end.nanoseconds > one.points[1].end.nanoseconds);
+    // A gauge's start comes back as its end.
+    try testing.expectEqual(one.points[0].end.nanoseconds, one.points[0].start.?.nanoseconds);
+    try testing.expectEqualStrings("1", full.unit);
+    try testing.expectEqual(null, full.next_page_token);
+    try testing.expect(!full.incomplete());
+
+    // A series spans pages: the same series on each, a point at a time.
+    const p1 = try decodeSeriesPage(a, s, production.read_page_1);
+    const p2 = try decodeSeriesPage(a, s, production.read_page_2);
+    try testing.expectEqual(1, p1.series[0].points.len);
+    try testing.expect(p1.next_page_token != null);
+    try testing.expectEqual(1, p2.series[0].points.len);
+    try testing.expectEqual(null, p2.next_page_token);
+    try testing.expectEqual(2, p1.series[0].points[0].value.?.int64);
+    try testing.expectEqual(1, p2.series[0].points[0].value.?.int64);
+
+    const headers = try decodeSeriesPage(a, s, production.read_headers);
+    try testing.expectEqual(0, headers.series[0].points.len);
+    try testing.expectEqualStrings("", headers.series[0].resourceLabel("namespace").?);
+
+    const aligned = try decodeSeriesPage(a, s, production.read_aligned);
+    try testing.expectEqual(0, aligned.series[0].metric_labels.len);
+    try testing.expectEqual(71, aligned.series[0].points[0].value.?.int64);
+
+    const escaped = try decodeSeriesPage(a, s, production.read_escaped);
+    try testing.expectEqualStrings("a\"b\\c", escaped.series[0].label("k").?);
+}
+
+test "decodeSeriesPage: every value type, incomplete answers, and what it refuses" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = out.allocator();
+    const s = scratch.allocator();
+    const page = try decodeSeriesPage(a, s,
+        \\{"timeSeries":[{"metric":{"type":"m"},"resource":{"type":"global"},"metricKind":"CUMULATIVE","valueType":"DISTRIBUTION","unit":"ms","points":[
+        \\ {"interval":{"startTime":"2026-10-18T13:00:00Z","endTime":"2026-10-18T13:01:00Z"},"value":{"distributionValue":{"count":"3","mean":2,"sumOfSquaredDeviation":0.5,"bucketOptions":{"explicitBuckets":{"bounds":[1,"Infinity"]}},"bucketCounts":["0","3"]}}},
+        \\ {"interval":{"endTime":"2026-10-18T13:00:30Z"},"value":{"distributionValue":{"count":1,"bucketOptions":{"linearBuckets":{"numFiniteBuckets":2,"width":1.5}}}}},
+        \\ {"interval":{"endTime":"2026-10-18T13:00:20Z"},"value":{"distributionValue":{"bucketOptions":{"exponentialBuckets":{"numFiniteBuckets":3,"growthFactor":2,"scale":0.5}},"mean":null}}},
+        \\ {"interval":{"endTime":"2026-10-18T13:00:10Z"},"value":{"distributionValue":{}}},
+        \\ {"interval":{"endTime":"2026-10-18T13:00:09Z"},"value":{"boolValue":true}},
+        \\ {"interval":{"endTime":"2026-10-18T13:00:08Z"},"value":{"int64Value":-7}},
+        \\ {"interval":{"endTime":"2026-10-18T13:00:07Z"},"value":{"doubleValue":"-Infinity"}},
+        \\ {"interval":{"endTime":"2026-10-18T13:00:06Z"},"value":{"doubleValue":1e-7}},
+        \\ {"interval":{"endTime":"2026-10-18T13:00:05Z"},"value":{"stringValue":"s"}},
+        \\ {"interval":{"endTime":"2026-10-18T13:00:04Z"},"value":{"moneyValue":{"currencyCode":"USD"}}}
+        \\]}],"executionErrors":[{"code":14,"message":"region down"},{}],"unreachable":["asia-east1"],"nextPageToken":"n"}
+    );
+    const p = page.series[0].points;
+    try testing.expectEqualStrings("ms", page.series[0].unit);
+    try testing.expectEqual(3, p[0].value.?.distribution.count);
+    try testing.expect(std.math.isInf(p[0].value.?.distribution.buckets.explicit[1]));
+    try testing.expectEqual(1.5, p[1].value.?.distribution.buckets.linear.width);
+    try testing.expectEqual(0, p[1].value.?.distribution.buckets.linear.offset);
+    try testing.expectEqual(2, p[2].value.?.distribution.buckets.exponential.growth_factor);
+    try testing.expectEqual(0, p[3].value.?.distribution.buckets.explicit.len);
+    try testing.expect(p[4].value.?.bool);
+    try testing.expectEqual(-7, p[5].value.?.int64);
+    try testing.expect(std.math.isNegativeInf(p[6].value.?.double));
+    try testing.expectEqual(1e-7, p[7].value.?.double);
+    try testing.expectEqualStrings("s", p[8].value.?.string);
+    try testing.expectEqual(null, p[9].value);
+    try testing.expectEqual(null, p[9].start);
+    try testing.expect(page.incomplete());
+    try testing.expectEqual(error.Unavailable, page.execution_errors[0].reason);
+    try testing.expectEqualStrings("region down", page.execution_errors[0].message);
+    try testing.expectEqual(error.Unknown, page.execution_errors[1].reason);
+    try testing.expectEqualStrings("asia-east1", page.unreachable_regions[0]);
+
+    for ([_][]const u8{
+        "[]",
+        "{\"timeSeries\":{}}",
+        "{\"timeSeries\":[{\"resource\":{\"type\":\"g\"}}]}",
+        "{\"timeSeries\":[{\"metric\":{\"type\":\"m\"}}]}",
+        "{\"timeSeries\":[{\"metric\":{},\"resource\":{\"type\":\"g\"}}]}",
+        "{\"timeSeries\":[{\"metric\":{\"type\":\"m\",\"labels\":{\"k\":1}},\"resource\":{\"type\":\"g\"}}]}",
+        "{\"timeSeries\":[{\"metric\":{\"type\":\"m\"},\"resource\":{\"type\":\"g\"},\"points\":[{\"value\":{}}]}]}",
+        "{\"timeSeries\":[{\"metric\":{\"type\":\"m\"},\"resource\":{\"type\":\"g\"},\"points\":[{\"interval\":{}}]}]}",
+        "{\"timeSeries\":[{\"metric\":{\"type\":\"m\"},\"resource\":{\"type\":\"g\"},\"points\":[{\"interval\":{\"endTime\":\"x\"},\"value\":{}}]}]}",
+        "{\"timeSeries\":[{\"metric\":{\"type\":\"m\"},\"resource\":{\"type\":\"g\"},\"points\":[{\"interval\":{\"endTime\":\"2026-10-18T13:00:04Z\"},\"value\":{\"boolValue\":1}}]}]}",
+        "{\"timeSeries\":[{\"metric\":{\"type\":\"m\"},\"resource\":{\"type\":\"g\"},\"points\":[{\"interval\":{\"endTime\":\"2026-10-18T13:00:04Z\"},\"value\":{\"doubleValue\":\"inf\"}}]}]}",
+        "{\"timeSeries\":[{\"metric\":{\"type\":\"m\"},\"resource\":{\"type\":\"g\"},\"points\":[{\"interval\":{\"endTime\":\"2026-10-18T13:00:04Z\"},\"value\":{\"doubleValue\":true}}]}]}",
+        "{\"timeSeries\":[{\"metric\":{\"type\":\"m\"},\"resource\":{\"type\":\"g\"},\"points\":[{\"interval\":{\"endTime\":\"2026-10-18T13:00:04Z\"},\"value\":{\"distributionValue\":{\"bucketOptions\":{}}}}]}]}",
+        "{\"timeSeries\":[{\"metric\":{\"type\":\"m\"},\"resource\":{\"type\":\"g\"},\"points\":[{\"interval\":{\"endTime\":\"2026-10-18T13:00:04Z\"},\"value\":{\"distributionValue\":{\"bucketOptions\":{\"explicitBuckets\":{}}}}}]}]}",
+        "{\"timeSeries\":[{\"metric\":{\"type\":\"m\"},\"resource\":{\"type\":\"g\"},\"points\":[{\"interval\":{\"endTime\":\"2026-10-18T13:00:04Z\"},\"value\":{\"distributionValue\":{\"bucketCounts\":[true]}}}]}]}",
+        "{\"timeSeries\":[{\"metric\":{\"type\":\"m\"},\"resource\":{\"type\":\"g\"},\"points\":[{\"interval\":{\"endTime\":\"2026-10-18T13:00:04Z\"},\"value\":{\"distributionValue\":{\"bucketCounts\":[\"-1\"]}}}]}]}",
+        "{\"executionErrors\":[1]}",
+        "{\"unreachable\":[1]}",
+    }) |bad| try testing.expectError(error.InvalidResponse, decodeSeriesPage(a, s, bad));
 }

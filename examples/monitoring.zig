@@ -1,14 +1,15 @@
 //! Writes a program's own metrics to Cloud Monitoring: a gauge, a queue's
 //! depth now, and a counter, the orders taken since the program started,
-//! then says what the server did with them and lists the metrics written.
+//! then says what the server did with them, reads the gauge back, and lists
+//! the metrics written.
 //!
 //!     GOOGLE_CLOUD_PROJECT=my-project zig build example-monitoring
 //!     zig build example-monitoring -- --fake     # no network
 //!
 //! Credentials come from `auth.findDefault`. Writing needs
-//! `monitoring.timeSeries.create` and listing
-//! `monitoring.metricDescriptors.list` (Monitoring Metric Writer and
-//! Monitoring Viewer). `--fake` writes to
+//! `monitoring.timeSeries.create`, reading `monitoring.timeSeries.list` and
+//! listing `monitoring.metricDescriptors.list` (Monitoring Metric Writer
+//! and Monitoring Viewer). `--fake` writes to
 //! `monitoring.testing.FakeMonitoring` instead.
 //!
 //! Each run starts its own series: its task id is new every time, so the
@@ -102,6 +103,19 @@ pub fn main(init: std.process.Init) !void {
     try out.print("wrote {d} of {d} points as task {s}\n", .{ result.value.written, result.value.points, &task_id });
     for (result.value.refused) |r| try out.print("  {d} refused: {t}\n", .{ r.points, r.reason });
     if (!result.value.ok()) try out.print("  {s}\n", .{result.value.message});
+
+    // This task's queue depth over the last minute. Production showed a
+    // point 0.2 s after its write when measured; a few seconds is safe.
+    var depth = client.metric(prefix ++ "queue_depth").read(.{
+        .start = .{ .nanoseconds = later.nanoseconds - std.time.ns_per_min },
+        .end = later,
+        .filter = .{ .resource_labels = &.{.{ .key = "task_id", .value = &task_id }} },
+    }) catch |err| return fail(err, &diag);
+    defer depth.deinit();
+    for (depth.value.series) |s| for (s.points) |p| {
+        try out.print("read back queue_depth{{queue={s}}} = {d}\n", .{ s.label("queue") orelse "", p.value.?.int64 });
+    };
+    if (depth.value.series.len == 0) try out.writeAll("queue_depth not readable yet: try again in a few seconds\n");
 
     var page = client.listMetrics(.{ .prefix = prefix }) catch |err| return fail(err, &diag);
     defer page.deinit();
