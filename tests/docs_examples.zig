@@ -1655,3 +1655,145 @@ test "the Error Reporting guides' code, against a fake" {
     try resolve(&client, id);
     try std.testing.expectEqual(.resolved, fake.status(id).?);
 }
+
+const monitoring = @import("monitoring");
+
+// snippet: mon-write
+/// Writes a queue's depth now. A write whose points the server refused is
+/// still a result, so its counts are the check that matters.
+fn writeDepth(client: *monitoring.Client, task_id: []const u8, depth: i64, now: std.Io.Timestamp) !void {
+    var result = try client.write(&.{.{
+        .metric_type = "custom.googleapis.com/shop/queue_depth",
+        .metric_labels = &.{.{ .key = "queue", .value = "orders" }},
+        .resource = .{ .generic_task = .{ .location = "us-central1", .namespace = "shop", .job = "api", .task_id = task_id } },
+        .kind = .gauge,
+        .unit = "{message}",
+        .end = now,
+        .value = .{ .int64 = depth },
+    }});
+    defer result.deinit();
+    if (!result.value.ok()) {
+        std.log.warn("{d} of {d} points refused: {s}", .{ result.value.points - result.value.written, result.value.points, result.value.message });
+    }
+}
+// end snippet
+
+// snippet: mon-read
+/// The busiest queue's highest depth in each minute of the last hour,
+/// summed over every task: one point per minute, newest first.
+fn depthByMinute(client: *monitoring.Client, now: std.Io.Timestamp) !monitoring.Owned(monitoring.SeriesPage) {
+    return client.metric("custom.googleapis.com/shop/queue_depth").read(.{
+        .start = .{ .nanoseconds = now.nanoseconds - std.time.ns_per_hour },
+        .end = now,
+        .filter = .{ .metric_labels = &.{.{ .key = "queue", .value = "orders" }} },
+        .aggregation = .{ .alignment_period_s = 60, .aligner = .max, .reducer = .sum },
+    });
+}
+// end snippet
+
+// snippet: mon-recorder
+/// What a shop's API records: orders by region, the queue's depth, and
+/// how long each request took.
+const ShopMetrics = struct {
+    orders: monitoring.Recorder.Counter,
+    depth: monitoring.Recorder.Gauge,
+    latency: monitoring.Recorder.Histogram,
+
+    fn declare(recorder: *monitoring.Recorder) !ShopMetrics {
+        return .{
+            .orders = try recorder.counter(.{ .name = "shop/orders", .label_keys = &.{"region"}, .unit = "{order}", .description = "Orders taken" }),
+            .depth = try recorder.gauge(.{ .name = "shop/queue_depth", .unit = "{message}" }, .int64),
+            .latency = try recorder.histogram(.{ .name = "shop/latency", .unit = "ms" }, .{ .exponential = .{ .num_finite = 16, .growth_factor = 2, .scale = 1 } }),
+        };
+    }
+
+    /// From any task, as each order is taken. Never fails or waits.
+    fn taken(self: ShopMetrics, region: []const u8, ms: f64) void {
+        self.orders.add(&.{region}, 1);
+        self.latency.record(&.{}, ms);
+    }
+};
+// end snippet
+
+// snippet: mon-observer
+/// Counts another part of the program already keeps, read at each write.
+const Totals = struct {
+    sent: std.atomic.Value(u64) = .init(0),
+
+    fn observer(self: *Totals) monitoring.Recorder.Observer {
+        return .{ .context = self, .report = report };
+    }
+
+    fn report(context: *anyopaque, into: *monitoring.Recorder.Report) void {
+        const self: *Totals = @ptrCast(@alignCast(context));
+        into.int64(&.{}, @intCast(self.sent.load(.monotonic)));
+    }
+};
+// end snippet
+
+// snippet: mon-fake
+test "a write, held by the in-memory Cloud Monitoring" {
+    var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_331_195 * std.time.ns_per_s };
+    var fake: monitoring.testing.FakeMonitoring = .init(std.testing.allocator, clock.io(), .{ .project_id = "my-project" });
+    defer fake.deinit();
+    var token: monitoring.StaticToken = .{ .token = "none" };
+    var client = try monitoring.Client.init(std.testing.allocator, clock.io(), .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+
+    const now = std.Io.Clock.real.now(clock.io());
+    try writeDepth(&client, "7", 3, now);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const kept = try fake.points(arena.allocator(), "custom.googleapis.com/shop/queue_depth", &.{.{ .key = "queue", .value = "orders" }});
+    try std.testing.expectEqual(3, kept[0].value.int64);
+
+    // Too soon after the last point: refused, as production refuses it.
+    clock.now_ns += std.time.ns_per_s;
+    var again = try client.write(&.{.{ .metric_type = "custom.googleapis.com/shop/queue_depth", .metric_labels = &.{.{ .key = "queue", .value = "orders" }}, .resource = .{ .generic_task = .{ .location = "us-central1", .namespace = "shop", .job = "api", .task_id = "7" } }, .kind = .gauge, .end = std.Io.Clock.real.now(clock.io()), .value = .{ .int64 = 4 } }});
+    defer again.deinit();
+    try std.testing.expectEqual(error.FailedPrecondition, again.value.refused[0].reason);
+}
+// end snippet
+
+test "the Monitoring guides' code, against the in-memory Cloud Monitoring" {
+    const gpa = std.testing.allocator;
+    var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_331_195 * std.time.ns_per_s };
+    const io = clock.io();
+    var fake: monitoring.testing.FakeMonitoring = .init(gpa, io, .{ .project_id = "my-project" });
+    defer fake.deinit();
+    var token: monitoring.StaticToken = .{ .token = "none" };
+    var client = try monitoring.Client.init(gpa, io, .{ .project_id = "my-project", .token_provider = token.provider(), .transport = fake.transport() });
+    defer client.deinit();
+    const t0 = std.Io.Clock.real.now(io);
+    try writeDepth(&client, "1", 5, .{ .nanoseconds = t0.nanoseconds - 30 * std.time.ns_per_s });
+    try writeDepth(&client, "2", 7, .{ .nanoseconds = t0.nanoseconds - 20 * std.time.ns_per_s });
+    var page = try depthByMinute(&client, t0);
+    defer page.deinit();
+    try std.testing.expectEqual(12, page.value.series[0].points[0].value.?.int64);
+
+    var recorder = try monitoring.Recorder.init(gpa, io, .{
+        .client = .{ .project_id = "my-project", .token_provider = token.provider(), .transport = fake.transport() },
+        .resource = .{ .generic_task = .{ .location = "us-central1", .namespace = "shop", .job = "api", .task_id = "3" } },
+    });
+    defer recorder.deinit();
+    const shop = try ShopMetrics.declare(&recorder);
+    shop.taken("eu", 12.5);
+    shop.taken("eu", 3);
+    shop.depth.set(&.{}, .{ .int64 = 9 });
+    var totals: Totals = .{};
+    totals.sent.store(41, .monotonic);
+    try recorder.observe(.{ .name = "shop/sent", .unit = "{message}" }, .cumulative, null, totals.observer());
+    clock.now_ns += std.time.ns_per_s;
+    try recorder.flush();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqual(2, (try fake.points(a, "custom.googleapis.com/shop/orders", &.{.{ .key = "region", .value = "eu" }}))[0].value.int64);
+    try std.testing.expectEqual(2, (try fake.points(a, "custom.googleapis.com/shop/latency", &.{}))[0].value.distribution.count);
+    try std.testing.expectEqual(41, (try fake.points(a, "custom.googleapis.com/shop/sent", &.{}))[0].value.int64);
+    try std.testing.expectEqual(0, recorder.stats().points_refused);
+}

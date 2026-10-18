@@ -466,7 +466,7 @@ pub const write_cumulative_earlier =
     \\}
 ;
 
-/// A cumulative total lower than the last, under the same start. HTTP 400.
+/// A cumulative point under the start of the earlier-start probe, 30 s before the series' start, with a lower total: refused for its start. (A total that falls under the series' own start was taken, measured later.) HTTP 400.
 pub const write_cumulative_falls_status = 400;
 pub const write_cumulative_falls =
     \\{

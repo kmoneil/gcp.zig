@@ -293,16 +293,19 @@ pub const WriteResult = struct {
     }
 };
 
-/// Which failed writes are tried again. A write can be stored in part
-/// before it fails, and a stored point sent again is refused as out of
-/// order or too frequent, so Google's own clients never retry one.
+/// Which failed writes are tried again. A write can be stored, in whole or
+/// in part, before it fails, so Google's own clients never retry one. When
+/// measured, production kept a point sent twice once and answered 200, so
+/// a retry of the same request is harmless to what was stored; a point
+/// that changed meanwhile would be refused as too frequent.
 pub const WriteRetries = enum {
     /// Only a failure before the request left: a refused connection, or a
     /// name lookup that failed.
     unsent_only,
     /// Also 429, 500, 503 and 504, and a timed-out or dropped connection,
-    /// as Cloud Monitoring's troubleshooting page suggests. A point already
-    /// stored then comes back in the result as refused.
+    /// as Cloud Monitoring's troubleshooting page suggests. In five runs
+    /// of the production suite, production once answered a write with a
+    /// bare 500 where the other runs gave its summary.
     transient,
 };
 

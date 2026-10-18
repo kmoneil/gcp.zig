@@ -56,15 +56,16 @@ Pub/Sub, Cloud Storage, Secret Manager and Firestore, with credentials that find
 | 📜 | [`logging`](docs/logging/README.md) | Cloud Logging v2, the read side: entries a page at a time under the read quota, a tail by polling, log names, buckets and views for a picker; an in-memory Cloud Logging for your own tests | experimental |
 | 🗂️ | [`resource_manager`](docs/resource_manager/README.md) | Cloud Resource Manager v3: every project a credential can see, in one list for a project switcher; one project as it is now; the folders and organizations above them, by name; an in-memory Resource Manager for your own tests | experimental |
 | 🚨 | [`error_reporting`](docs/error_reporting/README.md) | Cloud Error Reporting, the read side: what each error group came to over a period, in buckets for a trend chart; a group's errors with their stack traces; resolving, acknowledging and muting a group; the per-user quota counted; an in-memory Error Reporting for your own tests | experimental |
+| 📈 | [`monitoring`](docs/monitoring/README.md) | Cloud Monitoring v3, for a program's own metrics: points written with what the server stored and refused; series read filtered, aligned and reduced; descriptors; a recorder of counters, gauges, histograms and observers written every interval; an in-memory Cloud Monitoring for your own tests | experimental |
 | 🪪 | [`auth`](docs/auth.md) | Credentials for the other modules: the metadata server, gcloud's login, service account keys, workload identity federation and impersonation; signing on this machine or through IAM | experimental |
 | ⚙️ | [`core`](docs/essentials.md) | What the service modules share: the HTTP transport, retries, `Diagnostics`, CRC-32C at the CPU's speed, IAM policies, the `TokenProvider` and `Signer` seams, and test fakes. Each service re-exports what its callers need. | beta |
 
 ```mermaid
 flowchart LR
-    app(["your program"]) --> pubsub & storage & secret_manager & firestore & logging & resource_manager & error_reporting
+    app(["your program"]) --> pubsub & storage & secret_manager & firestore & logging & resource_manager & error_reporting & monitoring
     app --> auth
-    auth -. credentials .-> pubsub & storage & secret_manager & firestore & logging & resource_manager & error_reporting
-    pubsub & storage & secret_manager & firestore & logging & resource_manager & error_reporting & auth --> core
+    auth -. credentials .-> pubsub & storage & secret_manager & firestore & logging & resource_manager & error_reporting & monitoring
+    pubsub & storage & secret_manager & firestore & logging & resource_manager & error_reporting & monitoring & auth --> core
 ```
 
 The service modules never import one another, or `auth`: credentials
@@ -91,6 +92,7 @@ exe.root_module.addImport("firestore", gcp.module("firestore"));
 exe.root_module.addImport("logging", gcp.module("logging"));
 exe.root_module.addImport("resource_manager", gcp.module("resource_manager"));
 exe.root_module.addImport("error_reporting", gcp.module("error_reporting"));
+exe.root_module.addImport("monitoring", gcp.module("monitoring"));
 ```
 
 ## Quick start

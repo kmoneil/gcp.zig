@@ -93,6 +93,16 @@ Google, not only what Google documents, and where the emulators differ.
 | [Overview](error_reporting/README.md) | A dashboard's first program, periods and buckets, statuses and muted groups, the quota, locations, and what production showed when measured (experimental) |
 | [Testing](error_reporting/testing.md) | An in-memory Error Reporting for your own tests, held to production's answers (experimental) |
 
+## 📈 Monitoring
+
+| Guide | What's in it |
+| --- | --- |
+| [Overview](monitoring/README.md) | A program's first write, the calls, who is writing, errors, and what production showed when measured (experimental) |
+| [Writing](monitoring/writing.md) | A write and its result, the rules production holds each series to, kinds and values, descriptors, retries, limits |
+| [Reading](monitoring/reading.md) | Filters, aligning and reducing, pages of points, incomplete answers, cost |
+| [The Recorder](monitoring/recorder.md) | Counters, gauges, histograms and observers written every interval from a task of their own; stopping, descriptors, stats |
+| [Testing](monitoring/testing.md) | An in-memory Cloud Monitoring for your own tests, held to production's answers (experimental) |
+
 ## 🛠️ Working on zig-gcp
 
 | Guide | What's in it |
