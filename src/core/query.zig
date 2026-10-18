@@ -39,6 +39,20 @@ pub fn writeSegment(w: *Writer, text: []const u8) Writer.Error!void {
     return std.Uri.Component.percentEncode(w, text, isPathChar);
 }
 
+/// Writes `text` as a path of segments, its `/` literal and each segment
+/// encoded as `writeSegment` encodes one. For a name an API binds with
+/// `**`, as Cloud Monitoring binds a metric type: measured on 2026-10-18,
+/// `metricDescriptors/custom.googleapis.com/shop/orders` with literal
+/// slashes names the descriptor, and with `%2F` is refused as an invalid
+/// metric name.
+pub fn writePath(w: *Writer, text: []const u8) Writer.Error!void {
+    return std.Uri.Component.percentEncode(w, text, isPathCharOrSlash);
+}
+
+fn isPathCharOrSlash(c: u8) bool {
+    return c == '/' or isPathChar(c);
+}
+
 /// Writes `text` as a query name or value: bytes outside the unreserved set
 /// become `%XX`.
 pub fn writeValue(w: *Writer, text: []const u8) Writer.Error!void {
@@ -206,6 +220,29 @@ test "writeStrictSegment encodes an object name as one segment" {
     }
 }
 
+test "writePath keeps the slashes and encodes the rest as a segment" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "custom.googleapis.com/shop/orders", "custom.googleapis.com/shop/orders" },
+        .{ "workload.googleapis.com/a:b/c-d_e.f", "workload.googleapis.com/a:b/c-d_e.f" },
+        .{ "a b/100%", "a%20b/100%25" },
+        .{ "q?/x#1", "q%3F/x%231" },
+        .{ "caf\xc3\xa9/x", "caf%C3%A9/x" },
+        .{ "//", "//" },
+    };
+    for (cases) |c| {
+        var buf: [64]u8 = undefined;
+        var w: Writer = .fixed(&buf);
+        try writePath(&w, c[0]);
+        try testing.expectEqualStrings(c[1], w.buffered());
+    }
+    // Every character a metric type may hold stays literal.
+    const allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-/";
+    var buf: [allowed.len]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    try writePath(&w, allowed);
+    try testing.expectEqualStrings(allowed, w.buffered());
+}
+
 fn expectEncoding(encoded: []const u8, input: []const u8, comptime isAllowed: fn (u8) bool) !void {
     // Only allowed bytes and well-formed %XX escapes...
     var i: usize = 0;
@@ -235,6 +272,13 @@ fn encodeProperty(_: void, input: []const u8) !void {
     w = .fixed(&buf);
     try writeValue(&w, input);
     try expectEncoding(w.buffered(), input, isUnreserved);
+
+    // A path splits on its own slashes and nowhere else.
+    w = .fixed(&buf);
+    try writePath(&w, input);
+    try expectEncoding(w.buffered(), input, isPathCharOrSlash);
+    try testing.expectEqual(std.mem.count(u8, input, "/"), std.mem.count(u8, w.buffered(), "/"));
+    try testing.expect(std.mem.indexOfAny(u8, w.buffered(), "?#") == null);
 }
 
 test "fuzz percent-encoding round-trips and emits only safe bytes" {
