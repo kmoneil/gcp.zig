@@ -72,8 +72,25 @@ including the ones that did not change.
   keys as SubjectPublicKeyInfo; auth signs as it did.
 - storage and secret_manager: their checks of a KMS key's name use
   `core.names.KmsKeyName`; what they accept is unchanged.
-- auth, error_reporting, firestore, logging, monitoring, pubsub and
-  resource_manager: unchanged.
+- monitoring: `FakeMonitoring` holds Google's own metrics, for tests of
+  code that reads them (#239). `FakeMonitoring.put` puts in a series no
+  program could write: Google's metrics, or points closer together or
+  older than a write may send. It checks what production would check
+  besides time, and is `error.InvalidEntry`, with nothing kept,
+  otherwise. Pub/Sub's nine metrics a console reads (the backlog, the
+  oldest unacked age, the sent, ack, expired, dead-letter, push and
+  publish counts, the topic's byte cost) are there from the start, with
+  their kinds, units, labels and resource types `pubsub_subscription` and
+  `pubsub_topic`. They read and list as production's do, and cannot be
+  created, written or deleted. Reads filter on those resources' labels,
+  and a filter on a resource label the metric's resource types lack is
+  the 400 production gave. On a DELTA metric, `ALIGN_DELTA` gives each
+  period's total over the period, still DELTA, and `ALIGN_RATE` gives
+  each period's total a second as GAUGE DOUBLE. Both work with the
+  reducers and group-by fields the fake already had. A metric with
+  nothing in the read answers no series, not zeros.
+- auth, error_reporting, firestore, logging, pubsub and resource_manager:
+  unchanged.
 
 ## 0.44.0 (2026-10-18)
 

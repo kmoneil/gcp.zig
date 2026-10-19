@@ -40,6 +40,91 @@ The fake's clock is the `Io` it is given: a `FakeClock` moves when a test
 says, and the real clock suits a test of a `Recorder` that runs on its
 own task.
 
+## Google's own metrics
+
+No program can write Google's own metrics, such as Pub/Sub's backlog and
+delivery counts. A test of code that reads them puts them in with
+`FakeMonitoring.put`, giving a metric type and labels, a resource type and
+labels, the kind, the value type, and the points, oldest first:
+
+<!-- snippet: tests/docs_examples.zig#mon-google -->
+```zig
+test "Pub/Sub's own counts, put in the in-memory Cloud Monitoring and read back" {
+    var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_331_195 * std.time.ns_per_s };
+    var fake: monitoring.testing.FakeMonitoring = .init(std.testing.allocator, clock.io(), .{ .project_id = "my-project" });
+    defer fake.deinit();
+
+    // No program can write Google's own metrics, so the test puts them in:
+    // a minute a point, as Pub/Sub reports them.
+    const t = std.Io.Clock.real.now(clock.io()).nanoseconds;
+    const minute: i96 = 60 * std.time.ns_per_s;
+    const points = [_]monitoring.testing.FakeMonitoring.Point{
+        .{ .start = .{ .nanoseconds = t - 2 * minute }, .end = .{ .nanoseconds = t - minute }, .value = .{ .int64 = 60 } },
+        .{ .start = .{ .nanoseconds = t - minute }, .end = .{ .nanoseconds = t }, .value = .{ .int64 = 90 } },
+    };
+    try fake.put(.{
+        .metric_type = "pubsub.googleapis.com/subscription/sent_message_count",
+        .metric_labels = &.{.{ .key = "delivery_type", .value = "pull" }},
+        .resource_type = "pubsub_subscription",
+        .resource_labels = &.{.{ .key = "subscription_id", .value = "orders" }},
+        .kind = .delta,
+        .value_type = .int64,
+        .points = &points,
+    });
+
+    var token: monitoring.StaticToken = .{ .token = "none" };
+    var client = try monitoring.Client.init(std.testing.allocator, clock.io(), .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    // Messages sent a second, minute by minute, newest first.
+    var page = try client.metric("pubsub.googleapis.com/subscription/sent_message_count").read(.{
+        .start = .{ .nanoseconds = t - 2 * minute },
+        .end = .{ .nanoseconds = t },
+        .filter = .{ .resource_labels = &.{.{ .key = "subscription_id", .value = "orders" }} },
+        .aggregation = .{ .alignment_period_s = 60, .aligner = .rate, .reducer = .sum },
+    });
+    defer page.deinit();
+    try std.testing.expectEqual(1.5, page.value.series[0].points[0].value.?.double);
+    try std.testing.expectEqual(1.0, page.value.series[0].points[1].value.?.double);
+}
+```
+
+`put` skips the write path's rules of time: the 2.5 s floor, 25 hours
+back and 5 minutes ahead. So a test can lay out a day of history at once.
+It keeps the other rules: the metric's kind, value type and labels, the
+resource's labels, and points in order. Anything production could not
+hold is `error.InvalidEntry`, and nothing is kept.
+
+The fake knows the Pub/Sub metrics a console reads, as production
+described them on 18 October 2026. Every value is INT64:
+
+| Metric, after `pubsub.googleapis.com/` | Kind | Unit | Labels |
+| --- | --- | --- | --- |
+| `subscription/num_undelivered_messages` | GAUGE | `1` | none |
+| `subscription/oldest_unacked_message_age` | GAUGE | `s` | none |
+| `subscription/sent_message_count` | DELTA | `1` | `delivery_type` |
+| `subscription/ack_message_count` | DELTA | `1` | `delivery_type` |
+| `subscription/expired_ack_deadlines_count` | DELTA | `1` | `delivery_type` |
+| `subscription/dead_letter_message_count` | DELTA | `1` | `response_code` |
+| `subscription/push_request_count` | DELTA | `1` | `response_class`, `response_code`, `delivery_type` |
+| `topic/send_message_operation_count` | DELTA | `1` | `response_code` |
+| `topic/byte_cost` | DELTA | `By` | `operation_type`, `response_code` |
+
+The subscription metrics are on the resource type `pubsub_subscription`
+(label `subscription_id`), and the topic metrics on `pubsub_topic`
+(label `topic_id`). Their descriptors read and list from the start, as
+production's do. A read of one with nothing put in answers no series:
+production answered that way for a metric with nothing to count, rather
+than with zeros. None of them can be created, written or deleted: each
+is a 501.
+
+Google marks `topic/send_message_operation_count` as deprecated, and
+suggests counting `topic/message_sizes` instead. The fake does not hold
+that metric yet.
+
 ## What it models
 
 Each as production answered when measured, refusals in its words:
@@ -62,12 +147,15 @@ Each as production answered when measured, refusals in its words:
 - **Descriptors**: created (again with the same shape, or 409 with
   another), read, listed by prefix and in pages, deleted with their
   points. A first write creates one; a write with a new label adds it.
+  Pub/Sub's own are there from the start.
 - **Reads**:
-  - its own reading of the filter the client writes, labels it does not know refused as production refused them;
+  - its own reading of the filter the client writes, labels it does not know refused as production refused them, by the resource types the metric can be on;
   - (start, end], newest first;
   - the gauge aligners and reducers min, max, mean, sum and count with group-by fields, periods ending at the read's end;
+  - on DELTA metrics, `ALIGN_DELTA` (each period's total over the period, DELTA) and `ALIGN_RATE` (each period's total a second, GAUGE DOUBLE), with the same reducers;
   - pages by points with series split across them, and HEADERS.
-- **The resource types** the `Resource` union names.
+- **The resource types** the `Resource` union names, and Pub/Sub's two,
+  which carry only Google's metrics.
 - **Faults**: `refuseNext`, `refuseNextWithDelay`, `dropNext`, and
   `loseNext`, which serves a call and answers it with an error, as a 504
   that stored a write.
@@ -81,6 +169,12 @@ and the fake, and holds the fake to every outcome.
 - A descriptor just created reads back at once, where production
   answered 404 for about 2 s.
 - Only generic_task's resource type text is production's.
+- Pub/Sub's metrics have Google's display names but no descriptions.
+- Nothing arrives late. Production's DELTA points each covered a minute
+  and could be read about 130 s after their end, and a new
+  subscription's first backlog point about 400 s after it was made. A
+  test puts in what it wants, when it wants.
+- A DELTA point counts whole in the period its end falls in.
 
 ## What it does not model
 
@@ -89,8 +183,10 @@ It says so: 501, `error.Unimplemented`, with a message that begins
 
 - a cumulative start moved later but inside the series' last interval
   (production took one, and the earlier point vanished from reads);
-- the rate, delta and percentile aligners, aligning a cumulative
-  metric, a second aggregation;
+- the percentile aligners; `ALIGN_DELTA` and `ALIGN_RATE` on a gauge,
+  and any other aligner on a DELTA metric; aligning a cumulative metric
+  or a distribution; a second aggregation;
 - filters of another shape (OR, `one_of`), other projects, and the
-  resource types `.other` names;
+  resource types `.other` names, Pub/Sub's aside;
+- Google's metrics other than Pub/Sub's nine above;
 - distribution rules production was not asked about.
