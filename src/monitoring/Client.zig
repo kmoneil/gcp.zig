@@ -79,7 +79,7 @@ pub const Options = struct {
     /// passed in keeps its own limit.
     max_response_bytes: usize = core.transport.default_max_response_bytes,
     /// Printable ASCII.
-    user_agent: []const u8 = "zig-gcp-monitoring/0.46",
+    user_agent: []const u8 = "zig-gcp-monitoring/0.47",
     /// Filled with details of every failed call, and of a write's refused
     /// points; cleared by each new call.
     diagnostics: ?*Diagnostics = null,
