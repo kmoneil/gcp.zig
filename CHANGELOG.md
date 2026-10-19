@@ -28,7 +28,17 @@ including the ones that did not change.
   revision). Revisions of a service nobody has are an empty page, not a
   404, as production answered. The OAuth scope is `run.readonly`, the
   narrowest every read takes. Writes (deploys, traffic, deletes, IAM)
-  are out on purpose.
+  are out on purpose. `run.testing.FakeRun` holds locations, services
+  and revisions a test puts in (`putLocation`, `putService`,
+  `putRevision` and `setUnreachable` standing in for whoever deployed),
+  read back as production answered, refusals in its words; a gated suite
+  deploys a real `zigps-` hello service, breaks it with an image tag
+  nobody has, seeds the fake with everything production lists and holds
+  it to production's answer for every read (its first run agreed on all
+  of them, and settled milestone 0's open question: the `-` location
+  lists deployed services, so one call reads every region). Guides in
+  docs/run/, and `examples/run_revisions.zig`, which draws the
+  recent-revisions widget offline with `--fake`.
 - auth, core, error_reporting, firestore, kms, logging, monitoring,
   pubsub, resource_manager, scheduler, secret_manager and storage:
   unchanged.
