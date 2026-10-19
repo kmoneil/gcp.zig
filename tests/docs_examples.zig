@@ -1803,6 +1803,44 @@ test "Pub/Sub's own counts, put in the in-memory Cloud Monitoring and read back"
 }
 // end snippet
 
+// snippet: mon-alerts
+test "the open incidents, as a console draws them" {
+    var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_331_195 * std.time.ns_per_s };
+    var fake: monitoring.testing.FakeMonitoring = .init(std.testing.allocator, clock.io(), .{ .project_id = "my-project" });
+    defer fake.deinit();
+    // Alerts come from policies, which no program makes through this
+    // API, so the test puts one in.
+    const id = try fake.putAlert(.{
+        .open_time = std.Io.Clock.real.now(clock.io()),
+        .policy = .{ .display_name = "Pub/Sub backlog too deep", .severity = .warning, .user_labels = &.{.{ .key = "team", .value = "ingest" }} },
+        .metric_type = "pubsub.googleapis.com/subscription/num_undelivered_messages",
+        .resource_type = "pubsub_subscription",
+        .resource_labels = &.{ .{ .key = "project_id", .value = "my-project" }, .{ .key = "subscription_id", .value = "orders" } },
+    });
+
+    var token: monitoring.StaticToken = .{ .token = "none" };
+    var client = try monitoring.Client.init(std.testing.allocator, clock.io(), .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    // The widget's read: the alerts still firing, newest first.
+    var open = try client.listAlerts(.{ .open_only = true });
+    defer open.deinit();
+    try std.testing.expectEqual(1, open.value.alerts.len);
+    try std.testing.expectEqualStrings("Pub/Sub backlog too deep", open.value.alerts[0].policy.display_name);
+    try std.testing.expectEqual(monitoring.Severity.warning, open.value.alerts[0].policy.severity);
+
+    // The incident resolves: production closes alerts itself; the fake
+    // takes the test's word for it.
+    try fake.closeAlert(id, std.Io.Clock.real.now(clock.io()));
+    var after = try client.listAlerts(.{ .open_only = true });
+    defer after.deinit();
+    try std.testing.expectEqual(0, after.value.alerts.len);
+}
+// end snippet
+
 // snippet: mon-quota
 test "quota usage against its limit, put in the in-memory Cloud Monitoring" {
     var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_331_195 * std.time.ns_per_s };
