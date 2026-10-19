@@ -299,6 +299,9 @@ test "decodeJobPage and decodeLocationPage: production's pages" {
     const empty = try decodeJobPage(a, s, "{}");
     try testing.expectEqual(0, empty.jobs.len);
     try testing.expectEqual(null, empty.next_page_token);
+    // proto3 JSON may send the default explicitly: "" is still the end.
+    const explicit = try decodeJobPage(a, s, "{\"jobs\":[],\"nextPageToken\":\"\"}");
+    try testing.expectEqual(null, explicit.next_page_token);
 
     const locations = try decodeLocationPage(a, s, production.locations_page);
     try testing.expectEqual(2, locations.locations.len);
