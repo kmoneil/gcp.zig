@@ -102,7 +102,7 @@ pub const Options = struct {
     /// this client.
     budget: ?*Budget = null,
     /// Printable ASCII.
-    user_agent: []const u8 = "zig-gcp-error_reporting/0.46",
+    user_agent: []const u8 = "zig-gcp-error_reporting/0.47",
     /// Filled with details of every failed call; cleared by each new call.
     diagnostics: ?*Diagnostics = null,
     /// Sends requests through this instead of `std.http.Client`. Useful for
