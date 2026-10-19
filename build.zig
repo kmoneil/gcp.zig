@@ -211,6 +211,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "storage", .module = storage },
                 .{ .name = "logging", .module = logging },
                 .{ .name = "resource_manager", .module = resource_manager },
+                .{ .name = "scheduler", .module = scheduler },
                 .{ .name = "core", .module = core },
             },
         }),
@@ -485,6 +486,26 @@ pub fn build(b: *std.Build) void {
     });
     gcp_step.dependOn(&streamed(b, monitoring_gcp_tests).step);
     test_step.dependOn(&monitoring_gcp_tests.step);
+    // Cloud Scheduler against a real project with the API on, gated on
+    // SCHEDULER_TEST=1 beside the usual two variables: the suite makes,
+    // runs, pauses and deletes two zigps- jobs raw, since the client
+    // reads only, and holds the fake to production's answers.
+    const scheduler_gcp_tests = b.addTest(.{
+        .name = "scheduler-gcp-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/scheduler_gcp_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "scheduler", .module = scheduler },
+                .{ .name = "core", .module = core },
+            },
+        }),
+        .filters = test_filters,
+        .test_runner = test_runner,
+    });
+    gcp_step.dependOn(&streamed(b, scheduler_gcp_tests).step);
+    test_step.dependOn(&scheduler_gcp_tests.step);
     // Error Reporting against a real project with the API on:
     // GCP_TEST_PROJECT and GCP_TEST_TOKEN, a token that may report errors
     // and read and update groups. Each run reports a few errors of its own.
@@ -564,11 +585,11 @@ pub fn build(b: *std.Build) void {
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "pubsub_metrics", "kms" }) |name| {
+    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "pubsub_metrics", "kms", "scheduler_jobs" }) |name| {
         // whoami, secret, gcs_cp, gcs_sign, gcs_notify, quickstart, iam,
         // secret_rotation, firestore, logs_read, logs_tail, projects_list,
-        // error_dashboard, monitoring, monitoring_alerts, pubsub_metrics
-        // and kms pick their own credentials.
+        // error_dashboard, monitoring, monitoring_alerts, pubsub_metrics,
+        // kms and scheduler_jobs pick their own credentials.
         const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "secret"))
@@ -593,6 +614,8 @@ pub fn build(b: *std.Build) void {
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "monitoring", .module = monitoring }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "kms"))
             &.{ .{ .name = "kms", .module = kms }, .{ .name = "auth", .module = auth } }
+        else if (std.mem.eql(u8, name, "scheduler_jobs"))
+            &.{ .{ .name = "scheduler", .module = scheduler }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "gcs_notify") or std.mem.eql(u8, name, "quickstart"))
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else

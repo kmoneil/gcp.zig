@@ -28,9 +28,17 @@ including the ones that did not change.
   pausing removes the next run's `scheduleTime`; an empty list is `{}`;
   `pageSize` 501 is refused, not coerced. The one OAuth scope the API
   takes is `cloud-platform`: it defines no narrower one. Writes (create,
-  update, delete, run, pause, resume) are out on purpose; an in-memory
-  fake, the gated production suite, docs and an example come in the next
-  milestone.
+  update, delete, run, pause, resume) are out on purpose.
+  `scheduler.testing.FakeScheduler` holds locations and jobs a test puts
+  in (`putLocation`, `putJob`, `setLastAttempt` standing in for whoever
+  made and ran them), read back as production answered, refusals in its
+  words; a gated suite makes real `zigps-` jobs, runs them for real
+  failed attempts, seeds the fake with everything production lists and
+  holds it to production's answer for every read (its first run agreed
+  on all of them; attempts landed 5 and 11 s after `:run`, and pausing
+  a job cleared its next run and its last attempt). Guides in
+  docs/scheduler/, and `examples/scheduler_jobs.zig`, which draws the
+  failing-jobs widget offline with `--fake`.
 - auth, core, error_reporting, firestore, kms, logging, monitoring,
   pubsub, resource_manager, secret_manager and storage: unchanged.
 

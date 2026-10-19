@@ -2202,3 +2202,37 @@ test "an envelope carries more than Cloud KMS takes in one call" {
     tampered.tag[0] ^= 1;
     try std.testing.expectError(error.AuthenticationFailed, envelopeOpen(a, key, tampered));
 }
+
+const scheduler = @import("scheduler");
+
+// snippet: sched-fake
+test "the failing jobs, as a health view draws them" {
+    var fake: scheduler.testing.FakeScheduler = .init(std.testing.allocator, std.testing.io, .{ .project_id = "my-project" });
+    defer fake.deinit();
+    try fake.putLocation("us-central1");
+    // The nightly export, standing in for whoever created it; the fake
+    // assigns the attempt as Scheduler running it would.
+    const name = try fake.putJob(.{
+        .location = "us-central1",
+        .id = "nightly-export",
+        .schedule = "0 3 * * *",
+        .target = .{ .http = .{ .uri = "https://example.com/export", .method = .post } },
+    });
+    try fake.setLastAttempt(name, 14, "", .{ .nanoseconds = 1_792_436_660 * std.time.ns_per_s });
+
+    var token: scheduler.StaticToken = .{ .token = "none" };
+    var client = try scheduler.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    var jobs = try client.listJobs("us-central1", .{});
+    defer jobs.deinit();
+    try std.testing.expectEqual(1, jobs.value.jobs.len);
+    const job = jobs.value.jobs[0];
+    // The widget's question, answered in one place.
+    try std.testing.expect(job.failing());
+    try std.testing.expectEqual(14, job.last_attempt.?.code);
+}
+// end snippet
