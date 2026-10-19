@@ -129,6 +129,82 @@ Google marks `topic/send_message_operation_count` as deprecated, and
 suggests counting `topic/message_sizes` instead. The fake does not hold
 that metric yet.
 
+### Cloud's quota metrics
+
+Quota usage and limits are Google's own metrics too, on the resource
+type `consumer_quota` (labels `service` and `location`: a region, a
+zone, or `global`). The fake knows the four a console reads for quota
+warnings, as the metrics list described them on 19 October 2026 (issue
+#247). Every unit is `1`:
+
+| Metric, after `serviceruntime.googleapis.com/` | Kind | Value | Labels |
+| --- | --- | --- | --- |
+| `quota/allocation/usage` | GAUGE | INT64 | `quota_metric` |
+| `quota/exceeded` | GAUGE | BOOL | `limit_name`, `quota_metric` |
+| `quota/limit` | GAUGE | INT64 | `limit_name`, `quota_metric` |
+| `quota/rate/net_usage` | DELTA | INT64 | `method`, `quota_metric` |
+
+A test puts them in with `put`, as Pub/Sub's above, and they read, list
+and refuse creates, writes and deletes the same way. The descriptors of
+all but `quota/exceeded` name `producer_quota` too, which the fake does
+not hold: a `put` on it, or a filter naming it, is a 501. The BOOL
+gauge reads raw and counts (`ALIGN_COUNT`); the other bool aligners are
+not modelled.
+
+<!-- snippet: tests/docs_examples.zig#mon-quota -->
+```zig
+test "quota usage against its limit, put in the in-memory Cloud Monitoring" {
+    var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_331_195 * std.time.ns_per_s };
+    var fake: monitoring.testing.FakeMonitoring = .init(std.testing.allocator, clock.io(), .{ .project_id = "my-project" });
+    defer fake.deinit();
+
+    // Quota usage and limits are Google's own metrics on the resource
+    // type consumer_quota, so the test puts them in.
+    const t = std.Io.Clock.real.now(clock.io()).nanoseconds;
+    const quota: []const monitoring.Label = &.{ .{ .key = "service", .value = "pubsub.googleapis.com" }, .{ .key = "location", .value = "global" } };
+    try fake.put(.{
+        .metric_type = "serviceruntime.googleapis.com/quota/allocation/usage",
+        .metric_labels = &.{.{ .key = "quota_metric", .value = "pubsub.googleapis.com/topics" }},
+        .resource_type = "consumer_quota",
+        .resource_labels = quota,
+        .kind = .gauge,
+        .value_type = .int64,
+        .points = &.{.{ .start = null, .end = .{ .nanoseconds = t }, .value = .{ .int64 = 9_950 } }},
+    });
+    try fake.put(.{
+        .metric_type = "serviceruntime.googleapis.com/quota/limit",
+        .metric_labels = &.{ .{ .key = "limit_name", .value = "Topics" }, .{ .key = "quota_metric", .value = "pubsub.googleapis.com/topics" } },
+        .resource_type = "consumer_quota",
+        .resource_labels = quota,
+        .kind = .gauge,
+        .value_type = .int64,
+        .points = &.{.{ .start = null, .end = .{ .nanoseconds = t }, .value = .{ .int64 = 10_000 } }},
+    });
+
+    var token: monitoring.StaticToken = .{ .token = "none" };
+    var client = try monitoring.Client.init(std.testing.allocator, clock.io(), .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    // The widget's read: usage and limit for one quota metric, paired.
+    const window: monitoring.ReadOptions = .{
+        .start = .{ .nanoseconds = t - 60 * std.time.ns_per_s },
+        .end = .{ .nanoseconds = t },
+        .filter = .{ .metric_labels = &.{.{ .key = "quota_metric", .value = "pubsub.googleapis.com/topics" }} },
+    };
+    var usage = try client.metric("serviceruntime.googleapis.com/quota/allocation/usage").read(window);
+    defer usage.deinit();
+    var limit = try client.metric("serviceruntime.googleapis.com/quota/limit").read(window);
+    defer limit.deinit();
+    const used = usage.value.series[0].points[0].value.?.int64;
+    const cap = limit.value.series[0].points[0].value.?.int64;
+    // Near its limit: the widget warns.
+    try std.testing.expect(used * 100 >= cap * 95);
+}
+```
+
 ## What it models
 
 Each as production answered when measured, refusals in its words:
@@ -163,8 +239,8 @@ Each as production answered when measured, refusals in its words:
   - the aligners production refused on a kind, refused in its words: `ALIGN_DELTA` and `ALIGN_RATE` on a gauge; interpolate, next older, the true and false counts and the percentiles on a DELTA metric;
   - the unit production gave: `1` for a count, aligned or reduced, the metric's unit a second for a rate (`1/s`, `By/s`), and `{not_a_unit}` for a metric without one;
   - pages by points with series split across them, and HEADERS.
-- **The resource types** the `Resource` union names, and Pub/Sub's two,
-  which carry only Google's metrics.
+- **The resource types** the `Resource` union names, Pub/Sub's two and
+  `consumer_quota`, which carry only Google's metrics.
 - **Faults**: `refuseNext`, `refuseNextWithDelay`, `dropNext`, and
   `loseNext`, which serves a call and answers it with an error, as a 504
   that stored a write.
@@ -173,7 +249,8 @@ A production suite runs one script of 60 operations against production
 and the fake, and holds the fake to every outcome. Another sends Pub/Sub
 traffic, puts production's points for it into the fake, and holds the
 fake to production's answers to about 90 reads, its descriptors and its
-resource types.
+resource types. A third reads the project's own quota series, puts them
+into the fake, and holds it to production's answers the same way.
 
 ## Where it differs
 
@@ -181,6 +258,9 @@ resource types.
 - A descriptor just created reads back at once, where production
   answered 404 for about 2 s, and once for more than 15 s.
 - Only generic_task's and Pub/Sub's resource type text is production's.
+- The quota descriptors' and consumer_quota's text is the metrics and
+  resource lists' of 19 October 2026, not measured against production
+  yet.
 - Nothing arrives late. Production's DELTA points each covered a minute
   and could be read about 130 s after their end, and a new
   subscription's first backlog point about 400 s after it was made. A
@@ -200,5 +280,7 @@ It says so: 501, `error.Unimplemented`, with a message that begins
 - filters of another shape (OR, `one_of`), other projects, and the
   resource types `.other` names, Pub/Sub's aside, in a write or a
   filter;
-- Google's metrics other than Pub/Sub's nine above, and deleting one;
+- Google's metrics other than Pub/Sub's nine and the quota four above,
+  and deleting any; the quota metrics' producer side (`producer_quota`),
+  in a put or a filter;
 - distribution rules production was not asked about.
