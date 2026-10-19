@@ -278,6 +278,32 @@ pub fn isPageToken(token: []const u8) bool {
     return true;
 }
 
+/// An alert id goes into the path as one segment: visible ASCII without
+/// `/`, as the system-assigned ids are.
+pub fn isAlertId(id: []const u8) bool {
+    if (id.len == 0 or id.len > 256) return false;
+    for (id) |c| if (c <= ' ' or c >= 0x7f or c == '/') return false;
+    return true;
+}
+
+/// An alerts filter is sent as written, since production matches it
+/// against the alert's fields: any text short of control characters.
+pub fn isAlertFilter(filter: []const u8) bool {
+    if (filter.len == 0 or filter.len > 4096) return false;
+    for (filter) |c| if (c < ' ' or c == 0x7f) return false;
+    return true;
+}
+
+test "alert ids and filters" {
+    try @import("std").testing.expect(isAlertId("12861813965583532163"));
+    try @import("std").testing.expect(!isAlertId(""));
+    try @import("std").testing.expect(!isAlertId("a/b"));
+    try @import("std").testing.expect(!isAlertId("a b"));
+    try @import("std").testing.expect(isAlertFilter("state=\"OPEN\" or zigps"));
+    try @import("std").testing.expect(!isAlertFilter(""));
+    try @import("std").testing.expect(!isAlertFilter("a\nb"));
+}
+
 /// A user agent goes into a header, so it must be printable ASCII.
 pub fn isUserAgent(agent: []const u8) bool {
     if (agent.len == 0) return false;

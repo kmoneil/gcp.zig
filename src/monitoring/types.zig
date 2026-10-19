@@ -541,7 +541,173 @@ pub const SeriesPage = struct {
     }
 };
 
+// Alerts (issue #246): the violations of alert policies, read only. The
+// API itself cannot make, change or close one.
+
+/// Whether an alert is still firing.
+pub const AlertState = enum {
+    /// The proto's default, never seen in an answer when measured.
+    unspecified,
+    open,
+    closed,
+    /// A state this library does not know, read back from the server.
+    unknown,
+
+    pub fn fromWire(name: []const u8) AlertState {
+        if (std.mem.eql(u8, name, "OPEN")) return .open;
+        if (std.mem.eql(u8, name, "CLOSED")) return .closed;
+        if (std.mem.eql(u8, name, "STATE_UNSPECIFIED")) return .unspecified;
+        return .unknown;
+    }
+};
+
+/// An alert policy's severity, as its snapshot carries it.
+pub const Severity = enum {
+    /// The default: the policy set none.
+    unspecified,
+    critical,
+    @"error",
+    warning,
+    /// A severity this library does not know, read back from the server.
+    unknown,
+
+    pub fn fromWire(name: []const u8) Severity {
+        if (std.mem.eql(u8, name, "CRITICAL")) return .critical;
+        if (std.mem.eql(u8, name, "ERROR")) return .@"error";
+        if (std.mem.eql(u8, name, "WARNING")) return .warning;
+        if (std.mem.eql(u8, name, "SEVERITY_UNSPECIFIED")) return .unspecified;
+        return .unknown;
+    }
+};
+
+/// The state of the alert's policy at the time the alert was generated.
+pub const PolicySnapshot = struct {
+    /// `projects/P/alertPolicies/ID`.
+    name: []const u8 = "",
+    display_name: []const u8 = "",
+    severity: Severity = .unspecified,
+    user_labels: []const Label = &.{},
+
+    /// The user label named `key`, or null.
+    pub fn userLabel(self: PolicySnapshot, key: []const u8) ?[]const u8 {
+        for (self.user_labels) |l| if (std.mem.eql(u8, l.key, key)) return l.value;
+        return null;
+    }
+};
+
+/// A violation of an alert policy, as the server holds it: only Cloud
+/// Monitoring itself opens and closes one.
+pub const Alert = struct {
+    /// `projects/P/alerts/ID`, the id system-assigned.
+    name: []const u8,
+    /// The trailing segment of `name`, for display.
+    id: []const u8,
+    state: AlertState = .unknown,
+    open_time: std.Io.Timestamp,
+    /// Null while the alert is open.
+    close_time: ?std.Io.Timestamp = null,
+    policy: PolicySnapshot = .{},
+    /// The metric and resource preserved from the condition that fired;
+    /// empty when the answer named none.
+    metric_type: []const u8 = "",
+    metric_labels: []const Label = &.{},
+    resource_type: []const u8 = "",
+    resource_labels: []const Label = &.{},
+    /// The monitored resource metadata's user labels.
+    metadata_user_labels: []const Label = &.{},
+    /// The metadata's system labels as they came: Google defines the
+    /// values as strings, booleans or lists of strings, so they stay
+    /// JSON. `.null` when the answer had none.
+    system_labels: std.json.Value = .null,
+    /// The labels a log-based alert extracted; empty otherwise.
+    log_labels: []const Label = &.{},
+
+    /// The metric label named `key`, or null.
+    pub fn metricLabel(self: Alert, key: []const u8) ?[]const u8 {
+        for (self.metric_labels) |l| if (std.mem.eql(u8, l.key, key)) return l.value;
+        return null;
+    }
+
+    /// The resource label named `key`, or null.
+    pub fn resourceLabel(self: Alert, key: []const u8) ?[]const u8 {
+        for (self.resource_labels) |l| if (std.mem.eql(u8, l.key, key)) return l.value;
+        return null;
+    }
+};
+
+/// How a list of alerts orders its pages.
+pub const AlertOrder = enum {
+    open_time,
+    open_time_desc,
+    close_time,
+    close_time_desc,
+
+    pub fn wire(o: AlertOrder) []const u8 {
+        return switch (o) {
+            .open_time => "open_time",
+            .open_time_desc => "open_time desc",
+            .close_time => "close_time",
+            .close_time_desc => "close_time desc",
+        };
+    }
+};
+
+pub const ListAlertsOptions = struct {
+    /// Only the alerts still firing: sends `state="OPEN"`, the filter
+    /// production honors (measured 2026-10-19). Not beside `filter`,
+    /// which says what it wants itself.
+    open_only: bool = false,
+    /// Sent as `filter`, as written. Production parses it as the
+    /// structured filter language, despite the discovery document's
+    /// "match on any fields" wording: `state="OPEN"`,
+    /// `severity="WARNING"` and `policy.display_name="x"` each matched,
+    /// and a bare word was 400 "Restriction must have a left-hand side
+    /// and a right-hand side". Null lists them all.
+    filter: ?[]const u8 = null,
+    /// Null sends nothing: production sorts by open_time, newest first.
+    order_by: ?AlertOrder = null,
+    /// 0 for the server's default of 50; production caps a page at 1,000.
+    page_size: u32 = 0,
+    page_token: ?[]const u8 = null,
+};
+
+pub const AlertPage = struct {
+    alerts: []const Alert,
+    /// Null on the last page.
+    next_page_token: ?[]const u8 = null,
+    /// The server's estimate of every match, when it sends one.
+    total_size: ?i64 = null,
+};
+
 const testing = std.testing;
+
+test "Alert: states, severities and orders on the wire, and the label helpers" {
+    try testing.expectEqual(AlertState.open, AlertState.fromWire("OPEN"));
+    try testing.expectEqual(AlertState.closed, AlertState.fromWire("CLOSED"));
+    try testing.expectEqual(AlertState.unspecified, AlertState.fromWire("STATE_UNSPECIFIED"));
+    try testing.expectEqual(AlertState.unknown, AlertState.fromWire("SNOOZED"));
+    try testing.expectEqual(Severity.critical, Severity.fromWire("CRITICAL"));
+    try testing.expectEqual(Severity.@"error", Severity.fromWire("ERROR"));
+    try testing.expectEqual(Severity.warning, Severity.fromWire("WARNING"));
+    try testing.expectEqual(Severity.unspecified, Severity.fromWire("SEVERITY_UNSPECIFIED"));
+    try testing.expectEqual(Severity.unknown, Severity.fromWire("FATAL"));
+    try testing.expectEqualStrings("open_time", AlertOrder.open_time.wire());
+    try testing.expectEqualStrings("close_time desc", AlertOrder.close_time_desc.wire());
+    const alert: Alert = .{
+        .name = "projects/p/alerts/9",
+        .id = "9",
+        .open_time = .{ .nanoseconds = 0 },
+        .metric_labels = &.{.{ .key = "k", .value = "v" }},
+        .resource_labels = &.{.{ .key = "r", .value = "w" }},
+        .policy = .{ .user_labels = &.{.{ .key = "team", .value = "ingest" }} },
+    };
+    try testing.expectEqualStrings("v", alert.metricLabel("k").?);
+    try testing.expectEqual(null, alert.metricLabel("r"));
+    try testing.expectEqualStrings("w", alert.resourceLabel("r").?);
+    try testing.expectEqual(null, alert.resourceLabel("k"));
+    try testing.expectEqualStrings("ingest", alert.policy.userLabel("team").?);
+    try testing.expectEqual(null, alert.policy.userLabel("x"));
+}
 
 test "Aligner and Reducer: the proto's names" {
     try testing.expectEqualStrings("ALIGN_NONE", Aligner.none.wire());

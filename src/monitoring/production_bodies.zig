@@ -1226,3 +1226,135 @@ pub const create_string_workload =
     \\  }
     \\}
 ;
+
+// Alerts, measured 2026-10-19 in milestone 0 of the alerts spec
+// (`_tmp/alerts-m0/`, issue #246): a threshold policy the probe made
+// fired on a metric it wrote, and the alert was read open, then closed
+// 91 s after the policy's delete, its metric and resource kept.
+
+/// `alerts.get` of the open alert. HTTP 200. No closeTime, no metadata,
+/// no log; the id is no number.
+pub const alert_open_status = 200;
+pub const alert_open =
+    \\{
+    \\  "name": "projects/extractctl/alerts/0.oe0ehmpm95z2",
+    \\  "state": "OPEN",
+    \\  "openTime": "2026-10-19T17:14:00Z",
+    \\  "resource": {
+    \\    "type": "global",
+    \\    "labels": {
+    \\      "project_id": "extractctl"
+    \\    }
+    \\  },
+    \\  "metric": {
+    \\    "type": "custom.googleapis.com/zigps-alerts-0ea66e/level"
+    \\  },
+    \\  "policy": {
+    \\    "name": "projects/extractctl/alertPolicies/9108504683352368943",
+    \\    "displayName": "zigps-alerts-0ea66e",
+    \\    "severity": "WARNING",
+    \\    "userLabels": {
+    \\      "team": "zigps"
+    \\    }
+    \\  }
+    \\}
+;
+
+/// The same alert after its policy's delete. HTTP 200.
+pub const alert_closed_status = 200;
+pub const alert_closed =
+    \\{
+    \\  "name": "projects/extractctl/alerts/0.oe0ehmpm95z2",
+    \\  "state": "CLOSED",
+    \\  "openTime": "2026-10-19T17:14:00Z",
+    \\  "closeTime": "2026-10-19T17:15:47Z",
+    \\  "resource": {
+    \\    "type": "global",
+    \\    "labels": {
+    \\      "project_id": "extractctl"
+    \\    }
+    \\  },
+    \\  "metric": {
+    \\    "type": "custom.googleapis.com/zigps-alerts-0ea66e/level"
+    \\  },
+    \\  "policy": {
+    \\    "name": "projects/extractctl/alertPolicies/9108504683352368943",
+    \\    "displayName": "zigps-alerts-0ea66e",
+    \\    "severity": "WARNING",
+    \\    "userLabels": {
+    \\      "team": "zigps"
+    \\    }
+    \\  }
+    \\}
+;
+
+/// `alerts.list` while the alert was open: `totalSize`, no page token.
+pub const alerts_list_status = 200;
+pub const alerts_list =
+    \\{
+    \\  "alerts": [
+    \\    {
+    \\      "name": "projects/extractctl/alerts/0.oe0ehmpm95z2",
+    \\      "state": "OPEN",
+    \\      "openTime": "2026-10-19T17:14:00Z",
+    \\      "resource": {
+    \\        "type": "global",
+    \\        "labels": {
+    \\          "project_id": "extractctl"
+    \\        }
+    \\      },
+    \\      "metric": {
+    \\        "type": "custom.googleapis.com/zigps-alerts-0ea66e/level"
+    \\      },
+    \\      "policy": {
+    \\        "name": "projects/extractctl/alertPolicies/9108504683352368943",
+    \\        "displayName": "zigps-alerts-0ea66e",
+    \\        "severity": "WARNING",
+    \\        "userLabels": {
+    \\          "team": "zigps"
+    \\        }
+    \\      }
+    \\    }
+    \\  ],
+    \\  "totalSize": 1
+    \\}
+;
+
+/// `alerts.get` of an id nobody has. HTTP 404.
+pub const alert_unknown_status = 404;
+pub const alert_unknown =
+    \\{
+    \\  "error": {
+    \\    "code": 404,
+    \\    "message": "Requested entity was not found.",
+    \\    "status": "NOT_FOUND"
+    \\  }
+    \\}
+;
+
+/// `alerts.list` with `filter=zigps-alerts-0ea66e`, a bare word: the
+/// filter is the structured language, not a search, whatever the
+/// discovery document's wording says. HTTP 400.
+pub const alerts_filter_word_status = 400;
+pub const alerts_filter_word =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "Field filter had an invalid value of \"comparator: \t GLOBAL\nrhs {\n  value: \"zigps-alerts-0ea66e\"\n}\n\": Restriction must have a left-hand side and a right-hand side.",
+    \\    "status": "INVALID_ARGUMENT"
+    \\  }
+    \\}
+;
+
+/// `alerts.list` with `orderBy=severity`, a field it does not sort by.
+/// HTTP 400.
+pub const alerts_order_bogus_status = 400;
+pub const alerts_order_bogus =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "Request contains an invalid argument.",
+    \\    "status": "INVALID_ARGUMENT"
+    \\  }
+    \\}
+;

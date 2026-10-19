@@ -56,6 +56,13 @@ pub const ReadPoint = @import("types.zig").ReadPoint;
 pub const Series = @import("types.zig").Series;
 pub const ExecutionError = @import("types.zig").ExecutionError;
 pub const SeriesPage = @import("types.zig").SeriesPage;
+pub const AlertState = @import("types.zig").AlertState;
+pub const Severity = @import("types.zig").Severity;
+pub const PolicySnapshot = @import("types.zig").PolicySnapshot;
+pub const Alert = @import("types.zig").Alert;
+pub const AlertOrder = @import("types.zig").AlertOrder;
+pub const ListAlertsOptions = @import("types.zig").ListAlertsOptions;
+pub const AlertPage = @import("types.zig").AlertPage;
 
 /// The fixed limits and naming rules the client checks before sending.
 pub const limits = @import("validate.zig");
