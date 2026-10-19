@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.45.0 (unreleased)
+## 0.45.0 (2026-10-19)
 
 - kms: new module, **experimental**: Cloud KMS's v1 API. Key rings,
   keys and versions are handles that make no call until asked:
