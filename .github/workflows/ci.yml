@@ -538,7 +538,11 @@ jobs:
         # three fuzz properties took 0.57 ms a run together on the Mac
         # (1M in 568 s), so 2M; its model property, the client against
         # the fake with checksum faults, 2.6 ms (30K in 77 s), so 300K,
-        # about 52 minutes at four times the Mac. The nightlies of 10-16
+        # about 52 minutes at four times the Mac. scheduler (0.47.0)
+        # starts the same way: its one decoder property took about
+        # 0.01 ms a run on the Mac (2M in 10 s of fuzzing), so 10M,
+        # minutes even at several times the Mac, to be priced by its
+        # first nights as its corpus grows. The nightlies of 10-16
         # to 10-19 (runs 38871479649, 39014731663, 39109651208 and
         # 39225264813) price three jobs over the aim. fake-pubsub,
         # dropped to 800K on 10-18, took 108 minutes at that count on its
@@ -579,6 +583,7 @@ jobs:
           - { job: slow-monitoring, module: monitoring, filter: slow property, iterations: 2M }
           - { job: kms, module: kms, filter: fuzz, iterations: 2M }
           - { job: slow-kms, module: kms, filter: slow property, iterations: 300K }
+          - { job: scheduler, module: scheduler, filter: fuzz, iterations: 10M }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     # actions: read finds and downloads the corpus an earlier run kept.

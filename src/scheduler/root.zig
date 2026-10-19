@@ -52,6 +52,8 @@ pub const transport = core.transport;
 const core = @import("core");
 
 test {
+    _ = @import("production_bodies.zig");
+    _ = @import("test_util.zig");
     @import("std").testing.refAllDecls(@This());
     _ = @import("Client.zig");
     _ = @import("codec.zig");

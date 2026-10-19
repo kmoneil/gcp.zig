@@ -4,6 +4,36 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.47.0 (unreleased)
+
+- scheduler: new module, **experimental**: the read side of Cloud
+  Scheduler's v1 API, for a health view that shows the failing jobs
+  (#245). `Client.listLocations` (jobs live under one location, so a
+  reader starts there), `Client.listJobs` per location (the server's
+  page maximum and default are both 500; more is refused before
+  sending, as the server refuses it; a token is valid for 2 hours, and
+  fewer jobs than requested can come back even when more exist),
+  `Client.getJob` by location and id, and `getJobNamed` by this
+  project's full name. A `Job` carries its schedule and time zone,
+  state (enabled, paused, disabled, update_failed), the last attempt's
+  `google.rpc.Status` and time, the next run, the retry settings, and
+  its target: HTTP (uri, method, headers, body, OAuth or OIDC auth
+  config), Pub/Sub (topic, data, attributes) or App Engine, bodies
+  decoded from the wire's base64. `Job.failing` answers the view's
+  question: the job could not be updated, or its last attempt failed.
+  Measured in production on 2026-10-19 and held to since: a job is born
+  with status code -1, a sentinel no gRPC code names, which decodes as
+  no attempt rather than a failure; a run on a host that did not
+  resolve was code 2 six seconds later, and a missing topic code 5;
+  pausing removes the next run's `scheduleTime`; an empty list is `{}`;
+  `pageSize` 501 is refused, not coerced. The one OAuth scope the API
+  takes is `cloud-platform`: it defines no narrower one. Writes (create,
+  update, delete, run, pause, resume) are out on purpose; an in-memory
+  fake, the gated production suite, docs and an example come in the next
+  milestone.
+- auth, core, error_reporting, firestore, kms, logging, monitoring,
+  pubsub, resource_manager, secret_manager and storage: unchanged.
+
 ## 0.46.0 (2026-10-19)
 
 - auth: `Credentials.bindsScopes` says whether a token from the found
