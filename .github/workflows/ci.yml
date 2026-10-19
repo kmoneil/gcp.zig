@@ -538,7 +538,20 @@ jobs:
         # three fuzz properties took 0.57 ms a run together on the Mac
         # (1M in 568 s), so 2M; its model property, the client against
         # the fake with checksum faults, 2.6 ms (30K in 77 s), so 300K,
-        # about 52 minutes at four times the Mac.
+        # about 52 minutes at four times the Mac. The nightlies of 10-16
+        # to 10-19 (runs 38871479649, 39014731663, 39109651208 and
+        # 39225264813) price three jobs over the aim. fake-pubsub,
+        # dropped to 800K on 10-18, took 108 minutes at that count on its
+        # first night, 10-19: its corpus keeps raising the run, 0.135
+        # minutes a thousand that night, so it drops to 650K, about 88
+        # minutes at that price. secret_manager took 94, 96, 91 and 92 at
+        # 5500K across the four nights, steady but every one over the
+        # aim, and drops to 5100K, about 89 minutes at its worst night's
+        # price. fault-storage took 86, 45, 61 and then 95 at 60K: one
+        # night costs twice another, as slow-auth's do, and it drops to
+        # 55K, about 87 minutes at 10-19's price. The first night with
+        # kms ran both its jobs well under (kms 2M in 8 minutes,
+        # slow-kms 300K in 58) and both stay, to be priced by more nights.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 630K }
           - { job: auth, module: auth, filter: fuzz, iterations: 850K }
@@ -547,13 +560,13 @@ jobs:
           - { job: slow-pubsub, module: pubsub, filter: slow property Publisher, iterations: 1900K }
           - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 44K }
           - { job: heavy-pubsub, module: pubsub, filter: heavy property, iterations: 9M }
-          - { job: fake-pubsub, module: pubsub, filter: fake property, iterations: 800K }
-          - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 5500K }
+          - { job: fake-pubsub, module: pubsub, filter: fake property, iterations: 650K }
+          - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 5100K }
           - { job: heavy-secret_manager, module: secret_manager, filter: heavy property, iterations: 110K }
           - { job: storage, module: storage, filter: fuzz, iterations: 1100K }
           - { job: slow-storage, module: storage, filter: slow property, iterations: 4200K }
           - { job: heavy-storage, module: storage, filter: heavy property, iterations: 20K }
-          - { job: fault-storage, module: storage, filter: fault property parallel|fault property uploadFile resume, iterations: 60K }
+          - { job: fault-storage, module: storage, filter: fault property parallel|fault property uploadFile resume, iterations: 55K }
           - { job: fault-gzip, module: storage, filter: fault property gzip|fault property compressed, iterations: 150 }
           - { job: firestore, module: firestore, filter: fuzz, iterations: 3200K }
           - { job: heavy-firestore, module: firestore, filter: heavy property, iterations: 1300K }
