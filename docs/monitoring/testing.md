@@ -116,10 +116,14 @@ described them on 18 October 2026. Every value is INT64:
 The subscription metrics are on the resource type `pubsub_subscription`
 (label `subscription_id`), and the topic metrics on `pubsub_topic`
 (label `topic_id`). Their descriptors read and list from the start, as
-production's do. A read of one with nothing put in answers no series:
-production answered that way for a metric with nothing to count, rather
-than with zeros. None of them can be created, written or deleted: each
-is a 501.
+production's do, with production's descriptions. A read of one with
+nothing put in answers no series: production answered that way for a
+metric with nothing to count, rather than with zeros. None of them can
+be created or written: each is production's 403,
+`error.PermissionDenied`. A delete is a 501. A program's own metric
+written to Pub/Sub's resource types is refused in the summary, as
+production refused it, and its descriptor is made all the same, as
+production made it.
 
 Google marks `topic/send_message_operation_count` as deprecated, and
 suggests counting `topic/message_sizes` instead. The fake does not hold
@@ -138,21 +142,26 @@ Each as production answered when measured, refusals in its words:
   - a kind or value type its descriptor does not take;
   - missing resource labels, or a location that is not a region or zone;
   - label and string limits, and a distribution that does not add up;
-  - a cumulative start moved earlier.
+  - a cumulative start moved earlier;
+  - a program's metric on one of Pub/Sub's resource types.
 
   A reset, the last point sent again, and a falling total are taken.
   Times are kept to the microsecond.
 - **Requests refused whole**: no series or more than 200, another
-  project's `project_id`, a descriptor production would not create.
+  project's `project_id`, a descriptor production would not create
+  (DELTA or STRING for any metric a program makes), one of Google's
+  metrics (403).
 - **Descriptors**: created (again with the same shape, or 409 with
   another), read, listed by prefix and in pages, deleted with their
   points. A first write creates one; a write with a new label adds it.
   Pub/Sub's own are there from the start.
 - **Reads**:
-  - its own reading of the filter the client writes, labels it does not know refused as production refused them, by the resource types the metric can be on;
+  - its own reading of the filter the client writes, labels it does not know refused as production refused them, by the resource types the metric can be on, and a resource type it cannot be on;
   - (start, end], newest first;
   - the gauge aligners and reducers min, max, mean, sum and count with group-by fields, periods ending at the read's end;
-  - on DELTA metrics, `ALIGN_DELTA` (each period's total over the period, DELTA) and `ALIGN_RATE` (each period's total a second, GAUGE DOUBLE), with the same reducers;
+  - on DELTA metrics, `ALIGN_DELTA` and `ALIGN_SUM` (each period's total over the period, DELTA), `ALIGN_RATE` (each period's total a second, GAUGE DOUBLE), and min, max, mean and count (a gauge at the period's end), with the same reducers; a point counts whole in the period its end falls in, as production counted it;
+  - the aligners production refused on a kind, refused in its words: `ALIGN_DELTA` and `ALIGN_RATE` on a gauge; interpolate, next older, the true and false counts and the percentiles on a DELTA metric;
+  - the unit production gave: `1` for a count, aligned or reduced, the metric's unit a second for a rate (`1/s`, `By/s`), and `{not_a_unit}` for a metric without one;
   - pages by points with series split across them, and HEADERS.
 - **The resource types** the `Resource` union names, and Pub/Sub's two,
   which carry only Google's metrics.
@@ -161,20 +170,21 @@ Each as production answered when measured, refusals in its words:
   that stored a write.
 
 A production suite runs one script of 60 operations against production
-and the fake, and holds the fake to every outcome.
+and the fake, and holds the fake to every outcome. Another sends Pub/Sub
+traffic, puts production's points for it into the fake, and holds the
+fake to production's answers to about 90 reads, its descriptors and its
+resource types.
 
 ## Where it differs
 
 - Its messages give times in UTC, where production wrote US Pacific.
 - A descriptor just created reads back at once, where production
-  answered 404 for about 2 s.
-- Only generic_task's resource type text is production's.
-- Pub/Sub's metrics have Google's display names but no descriptions.
+  answered 404 for about 2 s, and once for more than 15 s.
+- Only generic_task's and Pub/Sub's resource type text is production's.
 - Nothing arrives late. Production's DELTA points each covered a minute
   and could be read about 130 s after their end, and a new
   subscription's first backlog point about 400 s after it was made. A
   test puts in what it wants, when it wants.
-- A DELTA point counts whole in the period its end falls in.
 
 ## What it does not model
 
@@ -183,10 +193,12 @@ It says so: 501, `error.Unimplemented`, with a message that begins
 
 - a cumulative start moved later but inside the series' last interval
   (production took one, and the earlier point vanished from reads);
-- the percentile aligners; `ALIGN_DELTA` and `ALIGN_RATE` on a gauge,
-  and any other aligner on a DELTA metric; aligning a cumulative metric
-  or a distribution; a second aggregation;
+- the aligners interpolate, next older, stddev, the true and false
+  counts, percent change and the percentiles on a gauge; stddev and
+  percent change on a DELTA metric; aligning a cumulative metric or a
+  distribution; a second aggregation;
 - filters of another shape (OR, `one_of`), other projects, and the
-  resource types `.other` names, Pub/Sub's aside;
-- Google's metrics other than Pub/Sub's nine above;
+  resource types `.other` names, Pub/Sub's aside, in a write or a
+  filter;
+- Google's metrics other than Pub/Sub's nine above, and deleting one;
 - distribution rules production was not asked about.

@@ -49,8 +49,10 @@ stored (`written`) and why it refused the rest (`refused`, by status):
 Production answers any refused point with HTTP 400 and keeps the others,
 so a 400 is a result, `ok()` is the check, and `message` names the first
 series refused. A refusal of the whole request is an error: a DELTA or
-STRING metric under `custom.googleapis.com/`, which production will not
-create, or credentials, or the network.
+STRING metric under `custom.googleapis.com/`, `workload.googleapis.com/`
+or `external.googleapis.com/`, which production will not create; one of
+Google's own metrics, which production refuses with 403; credentials; or
+the network.
 
 ## The rules for each series
 
@@ -109,8 +111,9 @@ defer made.deinit();
 
 A create of an existing descriptor with the same kind and value type
 answers it; with another, `error.AlreadyExists`. A descriptor just
-created read back 404 for about 2 s when measured, and once 404 again
-after a 200; a write straight after the create was taken. Deleting a
+created read back 404 for about 2 s when measured, once for more than
+15 s, and once 404 again after a 200; a write straight after the create
+was taken. Deleting a
 descriptor makes its data unreadable, and a later write creates it
 again.
 

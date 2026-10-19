@@ -17,9 +17,15 @@
 //! One more test reads Pub/Sub's own metrics, and takes about ten minutes,
 //! so it runs only with MONITORING_TEST_PUBSUB=1 as well. It makes a topic
 //! and two subscriptions named `zigps-mon-<run>`, sends traffic for four
-//! minutes, waits until Monitoring shows it, and deletes them as it ends.
+//! minutes, waits until Monitoring shows it and its reads end five minutes
+//! in the past, and deletes them as it ends.
 //! It puts production's raw points into `FakeMonitoring` and holds every
-//! aligned answer of the fake to production's (issue #239).
+//! aligned answer of the fake to production's, and its refusals of
+//! filters, aligners and writes, its descriptors and resource types
+//! (issue #239). Production refuses the writes it tries: one of Google's
+//! metrics, a create under Google's domain, and a user metric on
+//! `pubsub_subscription`, whose descriptor it makes all the same, under
+//! the run's prefix.
 
 const std = @import("std");
 const core = @import("core");
@@ -101,9 +107,10 @@ const Fixture = struct {
     }
 
     /// Reads a descriptor until it reads back: production answered 404 for
-    /// about 2 s after a create.
+    /// about 2 s after a create, and once, on 2026-10-19, for more than
+    /// 15 s.
     fn awaitDescriptor(f: *Fixture, metric_type: []const u8) !monitoring.Owned(monitoring.MetricInfo) {
-        for (0..30) |_| {
+        for (0..120) |_| {
             if (f.client.metric(metric_type).get()) |info| return info else |err| switch (err) {
                 error.NotFound => try testing.io.sleep(.fromMilliseconds(500), .awake),
                 else => return err,
@@ -732,8 +739,11 @@ test "monitoring: Pub/Sub's own metrics, and the fake given production's points 
     const traffic_end = nowMs();
     fact("traffic sent", .{});
 
-    // Production showed a minute's counts about 130 s after it ended, and a
-    // new subscription's first backlog point about 400 s after it was made.
+    // Production showed a minute's counts about 130 s after it ended (a
+    // topic's once later, Google says up to 240 s), and a new
+    // subscription's first backlog point about 400 s after it was made.
+    // The reads end five minutes in the past, past both subscriptions'
+    // first backlog points, so nothing arrives while they run.
     const window_start: std.Io.Timestamp = .{ .nanoseconds = floorMinute(created) - 2 * std.time.ns_per_min };
     const prefix_match = [_]monitoring.Match{.{ .key = "subscription_id", .op = .starts_with, .value = try a.print("{s}-", .{topic_id}) }};
     const by_subs: monitoring.Filter = .{ .resource_labels = &prefix_match };
@@ -751,12 +761,12 @@ test "monitoring: Pub/Sub's own metrics, and the fake given production's points 
         for (sent.value.series) |s| for (s.points) |p| {
             latest = @max(latest, p.end.nanoseconds);
         };
-        if (latest >= floorMinute(traffic_end) and backlog.value.series.len > 0 and now.nanoseconds - created > 7 * std.time.ns_per_min) break;
+        if (latest >= floorMinute(traffic_end) and backlog.value.series.len > 0 and now.nanoseconds - floorMinute(traffic_end) >= 8 * std.time.ns_per_min) break;
     }
     fact("points readable {d} s after the subscriptions were made", .{@divFloor(nowMs() - created, std.time.ns_per_s)});
 
     // Production's raw points, put into the fake.
-    const end: std.Io.Timestamp = .{ .nanoseconds = floorMinute(nowMs()) };
+    const end: std.Io.Timestamp = .{ .nanoseconds = floorMinute(nowMs()) - 5 * std.time.ns_per_min };
     const mid: std.Io.Timestamp = .{ .nanoseconds = end.nanoseconds - 30 * std.time.ns_per_s };
     var fake: monitoring.testing.FakeMonitoring = .init(testing.allocator, testing.io, .{ .project_id = f.project });
     defer fake.deinit();
@@ -789,10 +799,22 @@ test "monitoring: Pub/Sub's own metrics, and the fake given production's points 
         const aggregations: []const monitoring.Aggregation = if (counted) &.{
             .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum },
             .{ .alignment_period_s = 60, .aligner = .rate, .reducer = .sum },
+            .{ .alignment_period_s = 120, .aligner = .sum },
+            .{ .alignment_period_s = 120, .aligner = .count, .reducer = .sum },
+            .{ .alignment_period_s = 120, .aligner = .max, .reducer = .max },
+            .{ .alignment_period_s = 120, .aligner = .mean },
+            .{ .alignment_period_s = 60, .aligner = .min, .reducer = .count },
+            .{ .alignment_period_s = 60, .aligner = .rate, .reducer = .mean },
+            .{ .alignment_period_s = 60, .aligner = .next_older },
         } else &.{
             .{ .alignment_period_s = 60, .aligner = .max },
             .{ .alignment_period_s = 60, .aligner = .max, .reducer = .sum },
             .{ .alignment_period_s = 120, .aligner = .mean, .reducer = .max, .group_by = by_sub },
+            .{ .alignment_period_s = 60, .aligner = .count },
+            .{ .alignment_period_s = 60, .aligner = .max, .reducer = .count },
+            .{ .alignment_period_s = 60, .aligner = .sum },
+            .{ .alignment_period_s = 60, .aligner = .delta },
+            .{ .alignment_period_s = 60, .aligner = .rate },
         };
         for (aggregations, 0..) |agg, i| try reads.append(a, .{ .label = try a.print("{s} #{d}", .{ m, i }), .metric = m, .start = window_start, .end = end, .filter = if (topic_metric) by_topic else by_subs, .aggregation = agg });
     }
@@ -815,6 +837,12 @@ test "monitoring: Pub/Sub's own metrics, and the fake given production's points 
         .{ "rate 60 sum by delivery type", end, .{ .alignment_period_s = 60, .aligner = .rate, .reducer = .sum, .group_by = by_type } },
         .{ "rate 120", end, .{ .alignment_period_s = 120, .aligner = .rate } },
         .{ "rate 30", end, .{ .alignment_period_s = 30, .aligner = .rate } },
+        .{ "sum 90", end, .{ .alignment_period_s = 90, .aligner = .sum } },
+        .{ "sum 60 mid", mid, .{ .alignment_period_s = 60, .aligner = .sum, .reducer = .sum } },
+        .{ "min 120 by delivery type", end, .{ .alignment_period_s = 120, .aligner = .min, .reducer = .min, .group_by = by_type } },
+        .{ "interpolate", end, .{ .alignment_period_s = 60, .aligner = .interpolate } },
+        .{ "percentile 99", end, .{ .alignment_period_s = 60, .aligner = .percentile_99 } },
+        .{ "count true", end, .{ .alignment_period_s = 60, .aligner = .count_true } },
     }) |c| try reads.append(a, .{ .label = c[0], .metric = sent_metric, .start = window_start, .end = c[1], .filter = by_subs, .aggregation = c[2] });
     try reads.append(a, .{ .label = "raw sent mid", .metric = sent_metric, .start = window_start, .end = mid, .filter = by_subs });
     try reads.append(a, .{ .label = "delta 60 sum instant", .metric = sent_metric, .start = null, .end = end, .filter = by_subs, .aggregation = .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum } });
@@ -852,6 +880,10 @@ test "monitoring: Pub/Sub's own metrics, and the fake given production's points 
         .{ "filter: a topic metric on subscription_id", "topic/send_message_operation_count", .{ .resource_labels = &.{.{ .key = "subscription_id", .value = "x" }} } },
         .{ "filter: a metric label the metric lacks", sent_metric, .{ .metric_labels = &.{.{ .key = "nope", .value = "x" }} } },
         .{ "filter: another resource type", sent_metric, .{ .resource_type = "pubsub_topic" } },
+        .{ "filter: its own resource type", sent_metric, .{ .resource_type = "pubsub_subscription", .resource_labels = &prefix_match } },
+        .{ "filter: resource type global", sent_metric, .{ .resource_type = "global" } },
+        .{ "filter: resource type gce_instance", sent_metric, .{ .resource_type = "gce_instance" } },
+        .{ "filter: a topic metric on its own type and topic_id", "topic/byte_cost", .{ .resource_type = "pubsub_topic", .resource_labels = &.{.{ .key = "topic_id", .value = topic_id }} } },
         .{ "filter: a backlog with a metric label", "subscription/num_undelivered_messages", .{ .metric_labels = &.{.{ .key = "delivery_type", .value = "pull" }} } },
     }) |c| try reads.append(a, .{ .label = c[0], .metric = c[1], .start = window_start, .end = end, .filter = c[2] });
 
@@ -862,7 +894,8 @@ test "monitoring: Pub/Sub's own metrics, and the fake given production's points 
         agree(&differences, r.label, production, in_memory);
     }
 
-    // A user metric filtered on a label only Pub/Sub's resources have.
+    // A user metric, empty, filtered on Pub/Sub's resources and others,
+    // and aligned.
     {
         const g = try f.name("g");
         for ([_]*monitoring.Client{ &f.client, &fake_client }) |client| {
@@ -871,15 +904,61 @@ test "monitoring: Pub/Sub's own metrics, and the fake given production's points 
         }
         var info = try f.awaitDescriptor(g);
         info.deinit();
+        for ([_]struct { []const u8, monitoring.Filter, ?monitoring.Aggregation }{
+            .{ "a user metric on subscription_id", .{ .resource_labels = &.{.{ .key = "subscription_id", .value = "x" }} }, null },
+            .{ "a user metric on resource type pubsub_subscription", .{ .resource_type = "pubsub_subscription" }, null },
+            .{ "a user metric on resource type global", .{ .resource_type = "global" }, null },
+            .{ "a user metric on resource type global and zone", .{ .resource_type = "global", .resource_labels = &.{.{ .key = "zone", .value = "x" }} }, null },
+            .{ "a user metric on resource type gce_instance and zone", .{ .resource_type = "gce_instance", .resource_labels = &.{.{ .key = "zone", .value = "x" }} }, null },
+            .{ "a user metric, its points counted", .{}, .{ .alignment_period_s = 60, .aligner = .count } },
+            .{ "a user metric, its rate", .{}, .{ .alignment_period_s = 60, .aligner = .rate } },
+        }) |c| {
+            var lines: [2][]const u8 = undefined;
+            for ([_]*monitoring.Client{ &f.client, &fake_client }, [_]*monitoring.Diagnostics{ &f.diag, &fake_diag }, &lines) |client, diag, *line| {
+                if (client.metric(g).read(.{ .start = window_start, .end = end, .filter = c[1], .aggregation = c[2] })) |page| {
+                    var owned = page;
+                    defer owned.deinit();
+                    line.* = try a.print("unit {s}, {d} series", .{ owned.value.unit, owned.value.series.len });
+                } else |err| line.* = try a.print("{t}: {s}", .{ err, diag.message() });
+            }
+            agree(&differences, c[0], lines[0], lines[1]);
+        }
+    }
+
+    // Writes production refused: one of Google's metrics; a user metric on
+    // Pub/Sub's resource type, its descriptor made all the same; a create
+    // under Google's domain.
+    {
+        const on_sub = try f.name("on_sub");
+        const sub_resource: monitoring.Resource = .{ .other = .{ .type = "pubsub_subscription", .labels = &.{.{ .key = "subscription_id", .value = subs[0] }} } };
+        const google_type = try a.print("{s}subscription/zigps_mon_{s}", .{ pubsub_prefix, f.run });
         var lines: [2][]const u8 = undefined;
         for ([_]*monitoring.Client{ &f.client, &fake_client }, [_]*monitoring.Diagnostics{ &f.diag, &fake_diag }, &lines) |client, diag, *line| {
-            if (client.metric(g).read(.{ .end = end, .filter = .{ .resource_labels = &.{.{ .key = "subscription_id", .value = "x" }} } })) |page| {
-                var owned = page;
+            var out: std.Io.Writer.Allocating = .init(a);
+            const now: std.Io.Timestamp = .{ .nanoseconds = nowMs() };
+            if (client.write(&.{.{ .metric_type = pubsub_prefix ++ "subscription/num_undelivered_messages", .resource = sub_resource, .kind = .gauge, .end = now, .value = .{ .int64 = 1 } }})) |r| {
+                var owned = r;
+                owned.deinit();
+                try out.writer.writeAll("Google's: written");
+            } else |err| try out.writer.print("Google's: {t}: {s}", .{ err, diag.message() });
+            if (client.write(&.{.{ .metric_type = on_sub, .resource = sub_resource, .kind = .gauge, .end = now, .value = .{ .int64 = 1 } }})) |r| {
+                var owned = r;
                 defer owned.deinit();
-                line.* = try a.print("{d} series", .{owned.value.series.len});
-            } else |err| line.* = try a.print("{t}: {s}", .{ err, diag.message() });
+                try out.writer.print(" | a user metric: {d} written, {s}", .{ owned.value.written, owned.value.message });
+            } else |err| try out.writer.print(" | a user metric: {t}: {s}", .{ err, diag.message() });
+            if (client.metric(google_type).create(.{ .kind = .gauge, .value_type = .int64 })) |d| {
+                var owned = d;
+                owned.deinit();
+                try out.writer.writeAll(" | a create: made");
+            } else |err| try out.writer.print(" | a create: {t}: {s}", .{ err, diag.message() });
+            line.* = out.written();
         }
-        agree(&differences, "filter: a user metric on subscription_id", lines[0], lines[1]);
+        agree(&differences, "writes production refused", lines[0], lines[1]);
+        var on_sub_info = try f.awaitDescriptor(on_sub);
+        on_sub_info.deinit();
+        var fake_made = try fake_client.metric(on_sub).get();
+        fake_made.deinit();
+        fact("the user metric's descriptor was made by both", .{});
     }
 
     // Descriptors and resource types, as production gives them.
@@ -890,8 +969,8 @@ test "monitoring: Pub/Sub's own metrics, and the fake given production's points 
             var info = try client.metric(t).get();
             defer info.deinit();
             var out: std.Io.Writer.Allocating = .init(a);
-            try out.writer.print("{t} {t} unit {s}, \"{s}\", labels", .{ info.value.kind, info.value.value_type, info.value.unit, info.value.display_name });
-            for (info.value.labels) |l| try out.writer.print(" {s}", .{l.key});
+            try out.writer.print("{t} {t} unit {s}, \"{s}\", \"{s}\", labels", .{ info.value.kind, info.value.value_type, info.value.unit, info.value.display_name, info.value.description });
+            for (info.value.labels) |l| try out.writer.print(" {s} \"{s}\"", .{ l.key, l.description });
             try out.writer.writeAll(", on");
             for (info.value.resource_types) |rt| try out.writer.print(" {s}", .{rt});
             line.* = out.written();
@@ -904,8 +983,8 @@ test "monitoring: Pub/Sub's own metrics, and the fake given production's points 
             var info = try client.resourceType(rt);
             defer info.deinit();
             var out: std.Io.Writer.Allocating = .init(a);
-            try out.writer.print("\"{s}\", labels", .{info.value.display_name});
-            for (info.value.labels) |l| try out.writer.print(" {s}", .{l.key});
+            try out.writer.print("\"{s}\", \"{s}\", labels", .{ info.value.display_name, info.value.description });
+            for (info.value.labels) |l| try out.writer.print(" {s} \"{s}\"", .{ l.key, l.description });
             line.* = out.written();
         }
         agree(&differences, rt, lines[0], lines[1]);

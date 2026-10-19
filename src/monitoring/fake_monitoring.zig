@@ -13,8 +13,10 @@
 //!   existing type with the same kind and value type answers it, with
 //!   another is 409. A first write creates one, GAUGE and its value's type
 //!   unless the write says otherwise, its labels strings; a write with a
-//!   label the descriptor lacks adds it. DELTA and STRING are refused
-//!   under `custom.googleapis.com/`.
+//!   label the descriptor lacks adds it. DELTA and STRING are refused for
+//!   any metric a program makes, as production refused them under
+//!   `custom.googleapis.com/`, `workload.googleapis.com/` and
+//!   `external.googleapis.com/`.
 //! - Writes judged point by point, the refused ones in a
 //!   `CreateTimeSeriesSummary` at HTTP 400 with the first one's reason, as
 //!   production answered: out of order; under 2.5 s after the series' last
@@ -25,37 +27,44 @@
 //!   location that is not a region or zone; label keys, label values and
 //!   strings past their limits, more than 30 labels; a distribution whose
 //!   counts do not add up, or of linear width 0; a cumulative start moved
-//!   earlier. A reset, a start 1 ms or more after the series' last end, is
-//!   taken, and so is a total that falls under the same start, and the
-//!   series' last point sent again as it was, kept once; with another
-//!   value it is too soon after itself.
+//!   earlier; a user metric on one of Pub/Sub's resource types, though
+//!   its descriptor is made. A reset, a start 1 ms or more after the
+//!   series' last end, is taken, and so is a total that falls under the
+//!   same start, and the series' last point sent again as it was, kept
+//!   once; with another value it is too soon after itself.
 //! - Requests refused whole, as production refused them: none or more than
 //!   200 series, a resource `project_id` naming another project, a
-//!   descriptor production would not create.
+//!   descriptor production would not create, one of Google's metrics
+//!   (403, as is a create of one).
 //! - Times kept to the microsecond, as production keeps them.
 //! - Reads: its own reading of the filter the client writes, (start, end],
-//!   the gauge aligners and, on DELTA metrics, ALIGN_DELTA and ALIGN_RATE,
-//!   with the reducers min, max, mean, sum and count and group-by fields.
+//!   a resource type or label the metric cannot be on refused; the gauge
+//!   aligners, and on DELTA metrics ALIGN_DELTA and ALIGN_SUM (a period's
+//!   total over the period), ALIGN_RATE (a second) and min, max, mean and
+//!   count, the aligners production refused on each kind refused in its
+//!   words; the reducers min, max, mean, sum and count and group-by fields;
+//!   the unit as production gave it, `1` for a count and a second for a
+//!   rate.
 //! - Google's own metrics: the nine of Pub/Sub's a console reads (issue
-//!   #239), their descriptors there from the start, on the resource types
-//!   `pubsub_subscription` and `pubsub_topic`. No program writes, creates
-//!   or deletes one; `put` puts their points in, as it does any series a
-//!   program could not write.
+//!   #239), their descriptors as production gave them, there from the
+//!   start, on the resource types `pubsub_subscription` and `pubsub_topic`.
+//!   No program writes or creates one, as production answered; `put` puts
+//!   their points in, as it does any series a program could not write.
 //! - Faults a test asks for, and a write served and then answered with an
 //!   error, as a 504 that stored the points is.
 //!
 //! Where it differs: times in its messages are UTC, where production wrote
 //! US Pacific; a descriptor just made reads back at once, where production
-//! answered 404 for about 2 s; its resource types are the seven
-//! `Resource` names and Pub/Sub's two, only generic_task's text
-//! production's; Pub/Sub's metrics have no descriptions, and nothing put
-//! in arrives late, where production showed a minute's counts about 130 s
-//! after it. Not modelled,
-//! each answered 501 with the reason: another project, a cumulative start
+//! answered 404 for about 2 s, once for more than 15 s; its resource
+//! types are the seven `Resource` names and Pub/Sub's two, only
+//! generic_task's and Pub/Sub's text production's; nothing put in
+//! arrives late, where production showed a minute's counts about 130 s
+//! after it. Not modelled, each
+//! answered 501 with the reason: another project, a cumulative start
 //! moved later but inside the series' last interval (production took one,
 //! and the earlier point vanished), distribution rules production was not
-//! asked about, more than one point in a series, and filters other than a
-//! type prefix.
+//! asked about, more than one point in a series, deleting one of Google's
+//! metrics, and filters other than a type prefix.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -290,8 +299,8 @@ pub const FakeMonitoring = struct {
     ///   resource type, or a label it lacks; a user metric on a resource
     ///   type only Google's metrics are on;
     /// - another kind or value type than the metric's descriptor, or one
-    ///   production would not create: DELTA or STRING under
-    ///   `custom.googleapis.com/`;
+    ///   production would not create: DELTA or STRING for a metric not
+    ///   Google's;
     /// - a metric type or label the write path refuses, a label twice;
     /// - an unknown kind; no points, a value of another type than
     ///   `value_type` (so never `.money` or `.unknown`), a gauge
@@ -361,8 +370,9 @@ pub const FakeMonitoring = struct {
         }
         for (s.points) |p| {
             if (p.value.valueType() != s.value_type) return false;
+            // None is a string: production makes no STRING metric for a
+            // program, and Google's here are numbers.
             switch (p.value) {
-                .string => |text| if (text.len > validate.max_string_value_len) return false,
                 .distribution => |dist| if (validate.distributionProblem(dist) != null) return false,
                 else => {},
             }
@@ -474,7 +484,7 @@ pub const FakeMonitoring = struct {
         const metric_type = stringField(o, "type") orelse return notModelled(arena, "a descriptor without a type");
         if (metric_type.len > validate.max_metric_type_len) return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Field metricDescriptor.type had an invalid value of \"{s}\": the metric type is more than 512 characters long.", .{metric_type}));
         if (validate.metricTypeProblem(metric_type) != null) return notModelled(arena, "a metric type with characters production was not asked about");
-        if (googleDomain(metric_type)) return notModelled(arena, "creating a descriptor under one of Google's own domains");
+        if (googleDomain(metric_type)) return noPermission(arena, metric_type);
         const kind = types.Kind.fromWire(stringField(o, "metricKind") orelse "");
         const value_type = types.ValueType.fromWire(stringField(o, "valueType") orelse "");
         if (kind == .unknown or value_type == .unknown or value_type == .money) return notModelled(arena, "a descriptor without a kind and a value type");
@@ -667,8 +677,10 @@ pub const FakeMonitoring = struct {
     };
 
     /// `same`: the series' last point again, end, start and value, which
-    /// production took and kept once.
-    const Verdict = union(enum) { ok, same, refused: struct { code: u8, reason: []const u8 } };
+    /// production took and kept once. `described`: the descriptor made or
+    /// widened all the same, as production made one for a user metric it
+    /// would not write to Pub/Sub's resource types.
+    const Verdict = union(enum) { ok, same, refused: struct { code: u8, reason: []const u8, described: bool = false } };
 
     fn write(f: *FakeMonitoring, arena: Allocator, body: []const u8) Allocator.Error!Reply {
         const root = parseJson(arena, body) orelse return invalidJson(arena);
@@ -691,9 +703,8 @@ pub const FakeMonitoring = struct {
             for (s.resource_labels) |l| if (std.mem.eql(u8, l.key, "project_id") and !std.mem.eql(u8, l.value, f.options.project_id)) {
                 return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Field resource.labels.project_id had an invalid value of \"{s}\": if present, must be the project number or ID in the request name (projects/{s}).", .{ l.value, f.options.project_id }));
             };
-            if (googleDomain(s.metric_type)) return notModelled(arena, "a write of one of Google's own metrics, which FakeMonitoring.put puts in,");
-            const known = catalogType(s.resource_type) orelse return notModelled(arena, "a resource type the fake does not know");
-            if (!known.writable) return notModelled(arena, "a user metric on a resource type only Google's metrics are on");
+            if (googleDomain(s.metric_type)) return noPermission(arena, s.metric_type);
+            if (catalogType(s.resource_type) == null) return notModelled(arena, "a resource type the fake does not know");
             if (f.descriptors.get(s.metric_type) == null) {
                 for (s.metric_labels, 0..) |l, i| if (l.key.len > validate.max_label_key_len) {
                     return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Field labels[{d}].key had an invalid value of \"{s}\": When creating metric {s}:  the label key is more than 100 characters long.", .{ i, l.key, s.metric_type }));
@@ -716,7 +727,13 @@ pub const FakeMonitoring = struct {
         const now = f.nowNs();
         for (sent, verdicts, 0..) |s, *v, i| {
             v.* = try f.judge(arena, s, sent[0..i], now);
-            if (v.* == .ok) try f.keep(s);
+            switch (v.*) {
+                .ok => try f.keep(s),
+                .same => {},
+                .refused => |r| if (r.described) {
+                    _ = try f.describe(s);
+                },
+            }
         }
 
         var written: u32 = 0;
@@ -821,6 +838,7 @@ pub const FakeMonitoring = struct {
             .width => try arena.print("Field points[0].distributionValue had an invalid value: Distribution |bucket_options.linear_buckets| has a |width| of {d} which is not greater than 0.0.", .{s.value.distribution.buckets.linear.width}),
         });
         const r = catalogType(s.resource_type).?;
+        if (!r.writable) return .{ .refused = .{ .code = 3, .reason = try arena.print("metrics cannot be written to {s}, see https://cloud.google.com/monitoring/custom-metrics/creating-metrics#which-resource for a list of writable resource types", .{r.type}), .described = true } };
         var missing: std.ArrayList(u8) = .empty;
         for (r.labels) |l| {
             if (std.mem.eql(u8, l[0], "project_id")) continue;
@@ -929,7 +947,16 @@ pub const FakeMonitoring = struct {
 
         const d = f.descriptors.get(metric_type) orelse return fail(arena, 404, "NOT_FOUND", try arena.print("Cannot find metric(s) that match type = \"{s}\". If a metric was created recently, it could take up to 10 minutes to become available. Please try again soon.", .{metric_type}));
         // A label the metric has no descriptor for, as production answered
-        // on 2026-10-18; a resource label no resource type has.
+        // on 2026-10-18; a resource type the metric cannot be on, or a
+        // resource label none it can be on has, on 2026-10-19. A type
+        // named narrows the labels to its own.
+        var named: ?*const CatalogType = null;
+        for (parsed.conditions) |c| if (c.field == .resource_type) {
+            if (c.op != .equals) return notModelled(arena, "a resource type matched other than by equals");
+            const r = catalogType(c.value) orelse return notModelled(arena, "a resource type the fake does not know");
+            if (!canBeOn(d, r)) return fail(arena, 400, "INVALID_ARGUMENT", invalid_combination);
+            named = r;
+        };
         for (parsed.conditions) |c| switch (c.field) {
             .metric_label => {
                 for (d.labels.items) |l| {
@@ -937,22 +964,27 @@ pub const FakeMonitoring = struct {
                 } else return fail(arena, 404, "NOT_FOUND", try arena.print("Cannot find metric(s) that match type = \"{s}\" label = \"{s}\". If a metric was created recently, it could take up to 10 minutes to become available. Please try again soon.", .{ metric_type, c.key }));
             },
             .resource_label => {
-                if (!resourceLabelKnown(d, c.key)) return fail(arena, 400, "INVALID_ARGUMENT", "The supplied filter does not specify a valid combination of metric and monitored resource descriptors. The query will not return any time series.");
+                if (!resourceLabelKnown(d, named, c.key)) return fail(arena, 400, "INVALID_ARGUMENT", invalid_combination);
             },
             .resource_type => {},
         };
+        // The aligners production took on each kind, and those it refused
+        // in its words, on 2026-10-19.
         if (aligner != .none) switch (d.kind) {
-            .gauge => {
-                if (aligner == .delta or aligner == .rate) return notModelled(arena, "ALIGN_DELTA or ALIGN_RATE on a gauge");
-                switch (d.value_type) {
-                    .int64, .double => {},
-                    .bool => if (aligner != .count) return notModelled(arena, "this aligner on a bool metric"),
-                    else => return notModelled(arena, "aligning this value type"),
-                }
+            .gauge => switch (d.value_type) {
+                .int64, .double => switch (aligner) {
+                    .min, .max, .mean, .sum, .count => {},
+                    .delta, .rate => return misaligned(arena, aligner, d),
+                    else => return notModelled(arena, try arena.print("the aligner {s} on a gauge", .{aligner.wire()})),
+                },
+                .bool => if (aligner != .count) return notModelled(arena, "this aligner on a bool metric"),
+                else => return notModelled(arena, "aligning this value type"),
             },
-            .delta => {
-                if (aligner != .delta and aligner != .rate) return notModelled(arena, "an aligner other than ALIGN_DELTA or ALIGN_RATE on a DELTA metric");
-                if (d.value_type != .int64 and d.value_type != .double) return notModelled(arena, "aligning this value type");
+            // Only Google's, every one INT64.
+            .delta => switch (aligner) {
+                .delta, .rate, .sum, .min, .max, .mean, .count => {},
+                .interpolate, .next_older, .count_true, .count_false, .fraction_true, .percentile_99, .percentile_95, .percentile_50, .percentile_05 => return misaligned(arena, aligner, d),
+                else => return notModelled(arena, try arena.print("the aligner {s} on a DELTA metric", .{aligner.wire()})),
             },
             else => return notModelled(arena, "aligning a cumulative metric"),
         };
@@ -987,7 +1019,10 @@ pub const FakeMonitoring = struct {
             for (out) |*s| s.* = try alignSeries(arena, s.*, aligner, start, end, period_ns);
             if (reducer != .none) out = try f.reduce(arena, out, reducer, paramsOf(arena, params, "aggregation.groupByFields") catch return error.OutOfMemory);
         }
-        return f.renderRead(arena, out, params, headers, d.unit);
+        // The unit production gave: `1` for a count, the metric's a second
+        // for a rate, `{not_a_unit}` for a metric without one.
+        const unit: []const u8 = if (aligner == .count or reducer == .count) "1" else if (aligner == .rate) try arena.print("{s}/s", .{d.unit}) else if (d.unit.len == 0) "{not_a_unit}" else d.unit;
+        return f.renderRead(arena, out, params, headers, unit);
     }
 
     /// The resource's labels with `project_id` first, as a read shows them.
@@ -1103,14 +1138,21 @@ pub const FakeMonitoring = struct {
     /// made, the point added.
     fn keep(f: *FakeMonitoring, s: Sent) Allocator.Error!void {
         const st = f.store.allocator();
-        const d = f.descriptors.get(s.metric_type) orelse try f.addDescriptor(s.metric_type, s.kind orelse .gauge, s.value_type orelse s.value.valueType(), s.unit);
-        try f.addLabels(d, s.metric_labels);
+        const d = try f.describe(s);
         const series = try f.seriesOf(d, s.metric_labels, s.resource_type, s.resource_labels);
         try series.points.append(st, .{
             .start = if (d.kind == .gauge) null else .{ .nanoseconds = truncated(s.start.?) },
             .end = .{ .nanoseconds = truncated(s.end) },
             .value = try copyValue(st, s.value),
         });
+    }
+
+    /// The descriptor of a written series, made or widened as a write
+    /// makes or widens it.
+    fn describe(f: *FakeMonitoring, s: Sent) Allocator.Error!*Descriptor {
+        const d = f.descriptors.get(s.metric_type) orelse try f.addDescriptor(s.metric_type, s.kind orelse .gauge, s.value_type orelse s.value.valueType(), s.unit);
+        try f.addLabels(d, s.metric_labels);
+        return d;
     }
 
     /// Adds to a user metric's descriptor the labels it lacks, as strings,
@@ -1220,6 +1262,7 @@ pub const FakeMonitoring = struct {
 };
 
 const read_no_type = "The provided filter matches more than one metric. TimeSeries data are limited to a single metric per request.";
+const invalid_combination = "The supplied filter does not specify a valid combination of metric and monitored resource descriptors. The query will not return any time series.";
 
 const Condition = struct {
     field: enum { resource_type, metric_label, resource_label },
@@ -1335,10 +1378,9 @@ fn periodSeconds(text: []const u8) ?u64 {
     return std.fmt.parseInt(u64, text[0 .. text.len - 1], 10) catch null;
 }
 
-/// The aligners the fake models: none; on gauges, those that turn a
-/// period's points into one; on DELTA metrics, delta and rate.
+/// An aligner by the name a request gives it.
 fn alignerOf(name: []const u8) ?types.Aligner {
-    inline for (.{ .none, .min, .max, .mean, .sum, .count, .delta, .rate }) |a| {
+    inline for (comptime std.meta.tags(types.Aligner)) |a| {
         if (std.mem.eql(u8, name, comptime types.Aligner.wire(a))) return a;
     }
     return null;
@@ -1356,6 +1398,9 @@ fn reducerOf(name: []const u8) ?types.Reducer {
 /// end minus the period, its end]; a period with none has no point.
 /// Newest first.
 fn alignSeries(arena: Allocator, s: FakeMonitoring.OutSeries, aligner: types.Aligner, start: i96, end: i96, period_ns: i96) Allocator.Error!FakeMonitoring.OutSeries {
+    // ALIGN_DELTA's points span their period, and so do ALIGN_SUM's on a
+    // DELTA metric; the others' are at the period's end.
+    const spans = aligner == .delta or (aligner == .sum and s.kind == .delta);
     var pts: std.ArrayList(FakeMonitoring.Point) = .empty;
     var window_end = end;
     while (window_end > start or (start == end and window_end == end)) : (window_end -= period_ns) {
@@ -1363,31 +1408,34 @@ fn alignSeries(arena: Allocator, s: FakeMonitoring.OutSeries, aligner: types.Ali
         for (s.points) |p| {
             if (p.end.nanoseconds > window_end - period_ns and p.end.nanoseconds <= window_end) try values.append(arena, p.value);
         }
-        if (values.items.len > 0) try pts.append(arena, alignedPoint(aligner, values.items, window_end, period_ns));
+        if (values.items.len > 0) try pts.append(arena, alignedPoint(aligner, spans, values.items, window_end, period_ns));
         if (start == end) break;
     }
     var out = s;
     out.points = pts.items;
-    out.kind = if (aligner == .delta) .delta else .gauge;
+    out.kind = if (spans) .delta else .gauge;
     // Every series read has a point in (start, end], so in a period.
     out.value_type = pts.items[0].value.valueType();
     return out;
 }
 
-/// One period's values as an aligner makes them a point: ALIGN_DELTA's
-/// total over the period; ALIGN_RATE's total a second, at the period's
-/// end; the others' gauge at the period's end.
-fn alignedPoint(aligner: types.Aligner, values: []const types.Value, window_end: i96, period_ns: i96) FakeMonitoring.Point {
+/// One period's values as an aligner makes them a point: a total for
+/// ALIGN_DELTA and ALIGN_SUM, a total a second for ALIGN_RATE, the others'
+/// value; over the period if it `spans` it, else at the period's end.
+fn alignedPoint(aligner: types.Aligner, spans: bool, values: []const types.Value, window_end: i96, period_ns: i96) FakeMonitoring.Point {
     const at: std.Io.Timestamp = .{ .nanoseconds = window_end };
-    return switch (aligner) {
-        .delta => .{ .start = .{ .nanoseconds = window_end - period_ns }, .end = at, .value = combine(.sum, values) },
-        .rate => .{ .start = at, .end = at, .value = .{ .double = asDouble(combine(.sum, values)) / @as(f64, @floatFromInt(@divExact(period_ns, std.time.ns_per_s))) } },
-        .min => .{ .start = at, .end = at, .value = combine(.min, values) },
-        .max => .{ .start = at, .end = at, .value = combine(.max, values) },
-        .mean => .{ .start = at, .end = at, .value = combine(.mean, values) },
-        .sum => .{ .start = at, .end = at, .value = combine(.sum, values) },
-        .count => .{ .start = at, .end = at, .value = combine(.count, values) },
-        else => unreachable,
+    return .{
+        .start = if (spans) .{ .nanoseconds = window_end - period_ns } else at,
+        .end = at,
+        .value = switch (aligner) {
+            .delta, .sum => combine(.sum, values),
+            .rate => .{ .double = asDouble(combine(.sum, values)) / @as(f64, @floatFromInt(@divExact(period_ns, std.time.ns_per_s))) },
+            .min => combine(.min, values),
+            .max => combine(.max, values),
+            .mean => combine(.mean, values),
+            .count => combine(.count, values),
+            else => unreachable,
+        },
     };
 }
 
@@ -1535,10 +1583,8 @@ fn writeRead(jw: *Stringify, series: []const FakeMonitoring.OutSeries, params: [
         try jw.objectField("nextPageToken");
         try jw.print("\"p{d}\"", .{to});
     }
-    if (unit.len > 0) {
-        try jw.objectField("unit");
-        try jw.write(unit);
-    }
+    try jw.objectField("unit");
+    try jw.write(unit);
     try jw.endObject();
 }
 
@@ -1776,8 +1822,9 @@ const CatalogType = struct {
 
 const project_label = .{ "project_id", "The identifier of the GCP project associated with this resource, such as \"my-project\"." };
 
-/// generic_task's text is production's, measured 2026-10-18; the others'
-/// labels are the ones `Resource` names, with no descriptions.
+/// generic_task's and Pub/Sub's text is production's, measured 2026-10-18
+/// and 2026-10-19; the others' labels are the ones `Resource` names, with
+/// no descriptions.
 const catalog = [_]CatalogType{
     .{ .type = "gce_instance", .display_name = "VM Instance", .labels = &.{ project_label, .{ "instance_id", "" }, .{ "zone", "" } }, .location_labels = &.{"zone"} },
     .{ .type = "generic_node", .display_name = "Generic Node", .labels = &.{ project_label, .{ "location", "" }, .{ "namespace", "" }, .{ "node_id", "" } }, .location_labels = &.{"location"} },
@@ -1798,19 +1845,36 @@ const catalog = [_]CatalogType{
     .{ .type = "k8s_container", .display_name = "Kubernetes Container", .labels = &.{ project_label, .{ "location", "" }, .{ "cluster_name", "" }, .{ "namespace_name", "" }, .{ "pod_name", "" }, .{ "container_name", "" } }, .location_labels = &.{"location"} },
     .{ .type = "k8s_node", .display_name = "Kubernetes Node", .labels = &.{ project_label, .{ "location", "" }, .{ "cluster_name", "" }, .{ "node_name", "" } }, .location_labels = &.{"location"} },
     .{ .type = "k8s_pod", .display_name = "Kubernetes Pod", .labels = &.{ project_label, .{ "location", "" }, .{ "cluster_name", "" }, .{ "namespace_name", "" }, .{ "pod_name", "" } }, .location_labels = &.{"location"} },
-    .{ .type = "pubsub_subscription", .display_name = "Cloud Pub/Sub Subscription", .labels = &.{ project_label, .{ "subscription_id", "" } }, .location_labels = &.{}, .writable = false },
-    .{ .type = "pubsub_topic", .display_name = "Cloud Pub/Sub Topic", .labels = &.{ project_label, .{ "topic_id", "" } }, .location_labels = &.{}, .writable = false },
+    .{
+        .type = "pubsub_subscription",
+        .display_name = "Cloud Pub/Sub Subscription",
+        .description = "A subscription in Google Cloud Pub/Sub.",
+        .labels = &.{ project_label, .{ "subscription_id", "The identifier of the subscription, such as \"my-subscription\"." } },
+        .location_labels = &.{},
+        .writable = false,
+    },
+    .{
+        .type = "pubsub_topic",
+        .display_name = "Cloud Pub/Sub Topic",
+        .description = "A topic in Google Cloud Pub/Sub.",
+        .labels = &.{ project_label, .{ "topic_id", "The identifier of the topic, such as \"my-topic\"." } },
+        .location_labels = &.{},
+        .writable = false,
+    },
 };
 
-/// Whether a resource the metric can be on has a label `key`: Google's
-/// metric's one type, or every type a user metric may be written to.
-fn resourceLabelKnown(d: *const FakeMonitoring.Descriptor, key: []const u8) bool {
-    for (&catalog) |*r| {
-        if (d.google) |g| {
-            if (!std.mem.eql(u8, r.type, g.resource_type)) continue;
-        } else if (!r.writable) continue;
-        if (r.hasLabel(key)) return true;
-    }
+/// Whether the metric can be on `r`: Google's metric on its one type, a
+/// user metric on any it may be written to.
+fn canBeOn(d: *const FakeMonitoring.Descriptor, r: *const CatalogType) bool {
+    if (d.google) |g| return std.mem.eql(u8, r.type, g.resource_type);
+    return r.writable;
+}
+
+/// Whether a resource the metric can be on has a label `key`: the type
+/// the filter names, or any.
+fn resourceLabelKnown(d: *const FakeMonitoring.Descriptor, named: ?*const CatalogType, key: []const u8) bool {
+    if (named) |r| return r.hasLabel(key);
+    for (&catalog) |*r| if (canBeOn(d, r) and r.hasLabel(key)) return true;
     return false;
 }
 
@@ -1834,22 +1898,111 @@ const GoogleMetric = struct {
     }
 };
 
-const delivery_type = .{ "delivery_type", "" };
-const response_code = .{ "response_code", "" };
+const delivery_type = .{ "delivery_type", "Delivery mechanism: push, pull or streaming pull." };
+const response_code = .{ "response_code", "Operation response code string, derived as a string representation of a status code (e.g., 'success', 'not_found', 'unavailable')." };
 
-/// Pub/Sub's metrics a console reads, as production listed them on
-/// 2026-10-18 (issue #239), with the display names Google documents.
+/// Pub/Sub's metrics a console reads, as production described them on
+/// 2026-10-19 (issue #239).
 const google_metrics = [_]GoogleMetric{
-    .{ .type = "pubsub.googleapis.com/subscription/num_undelivered_messages", .kind = .gauge, .value_type = .int64, .unit = "1", .display_name = "Unacked messages", .resource_type = "pubsub_subscription" },
-    .{ .type = "pubsub.googleapis.com/subscription/oldest_unacked_message_age", .kind = .gauge, .value_type = .int64, .unit = "s", .display_name = "Oldest unacked message age", .resource_type = "pubsub_subscription" },
-    .{ .type = "pubsub.googleapis.com/subscription/sent_message_count", .kind = .delta, .value_type = .int64, .unit = "1", .display_name = "Sent message count", .labels = &.{delivery_type}, .resource_type = "pubsub_subscription" },
-    .{ .type = "pubsub.googleapis.com/subscription/ack_message_count", .kind = .delta, .value_type = .int64, .unit = "1", .display_name = "Ack message count", .labels = &.{delivery_type}, .resource_type = "pubsub_subscription" },
-    .{ .type = "pubsub.googleapis.com/subscription/expired_ack_deadlines_count", .kind = .delta, .value_type = .int64, .unit = "1", .display_name = "Expired ack deadlines count", .labels = &.{delivery_type}, .resource_type = "pubsub_subscription" },
-    .{ .type = "pubsub.googleapis.com/subscription/dead_letter_message_count", .kind = .delta, .value_type = .int64, .unit = "1", .display_name = "Dead letter message count", .labels = &.{response_code}, .resource_type = "pubsub_subscription" },
-    .{ .type = "pubsub.googleapis.com/subscription/push_request_count", .kind = .delta, .value_type = .int64, .unit = "1", .display_name = "Push requests", .labels = &.{ .{ "response_class", "" }, response_code, delivery_type }, .resource_type = "pubsub_subscription" },
-    .{ .type = "pubsub.googleapis.com/topic/send_message_operation_count", .kind = .delta, .value_type = .int64, .unit = "1", .display_name = "Publish message operations", .labels = &.{response_code}, .resource_type = "pubsub_topic" },
-    .{ .type = "pubsub.googleapis.com/topic/byte_cost", .kind = .delta, .value_type = .int64, .unit = "By", .display_name = "Topic byte cost", .labels = &.{ .{ "operation_type", "" }, response_code }, .resource_type = "pubsub_topic" },
+    .{
+        .type = "pubsub.googleapis.com/subscription/num_undelivered_messages",
+        .kind = .gauge,
+        .value_type = .int64,
+        .unit = "1",
+        .display_name = "Unacked messages",
+        .description = "Number of unacknowledged messages (a.k.a. backlog messages) in a subscription.",
+        .resource_type = "pubsub_subscription",
+    },
+    .{
+        .type = "pubsub.googleapis.com/subscription/oldest_unacked_message_age",
+        .kind = .gauge,
+        .value_type = .int64,
+        .unit = "s",
+        .display_name = "Oldest unacked message age",
+        .description = "Age (in seconds) of the oldest unacknowledged message (a.k.a. backlog message) in a subscription.",
+        .resource_type = "pubsub_subscription",
+    },
+    .{
+        .type = "pubsub.googleapis.com/subscription/sent_message_count",
+        .kind = .delta,
+        .value_type = .int64,
+        .unit = "1",
+        .display_name = "Sent message count",
+        .description = "Cumulative count of messages sent by Cloud Pub/Sub to subscriber clients, grouped by delivery type.",
+        .labels = &.{delivery_type},
+        .resource_type = "pubsub_subscription",
+    },
+    .{
+        .type = "pubsub.googleapis.com/subscription/ack_message_count",
+        .kind = .delta,
+        .value_type = .int64,
+        .unit = "1",
+        .display_name = "Ack message count",
+        .description = "Cumulative count of messages acknowledged by Acknowledge requests, grouped by delivery type. Dead-lettered messages may show up as pull acks.",
+        .labels = &.{.{ "delivery_type", "Delivery mechanism: push, pull, streaming pull, or filter." }},
+        .resource_type = "pubsub_subscription",
+    },
+    .{
+        .type = "pubsub.googleapis.com/subscription/expired_ack_deadlines_count",
+        .kind = .delta,
+        .value_type = .int64,
+        .unit = "1",
+        .display_name = "Expired ack deadlines count",
+        .description = "Cumulative count of messages whose ack deadline expired while the message was outstanding to a subscriber client.",
+        .labels = &.{delivery_type},
+        .resource_type = "pubsub_subscription",
+    },
+    .{
+        .type = "pubsub.googleapis.com/subscription/dead_letter_message_count",
+        .kind = .delta,
+        .value_type = .int64,
+        .unit = "1",
+        .display_name = "Dead letter message count",
+        .description = "Cumulative count of messages published to dead letter topic, grouped by result.",
+        .labels = &.{response_code},
+        .resource_type = "pubsub_subscription",
+    },
+    .{
+        .type = "pubsub.googleapis.com/subscription/push_request_count",
+        .kind = .delta,
+        .value_type = .int64,
+        .unit = "1",
+        .display_name = "Push requests",
+        .description = "Cumulative count of push attempts, grouped by result. Unlike pulls, the push server implementation does not batch user messages. So each request only contains one user message. The push server retries on errors, so a given user message can appear multiple times.",
+        .labels = &.{
+            .{ "response_class", "A classification group for the response code. It can be one of ['ack', 'deadline_exceeded', 'internal', 'invalid', 'remote_server_4xx', 'remote_server_5xx', 'unreachable']." },
+            response_code,
+            .{ "delivery_type", "Push delivery mechanism." },
+        },
+        .resource_type = "pubsub_subscription",
+    },
+    .{
+        .type = "pubsub.googleapis.com/topic/send_message_operation_count",
+        .kind = .delta,
+        .value_type = .int64,
+        .unit = "1",
+        .display_name = "Publish message operations",
+        .description = "Cumulative count of publish message operations, grouped by result. This metric is deprecated. Apply a count aggregator on topic/message_sizes instead.",
+        .labels = &.{response_code},
+        .resource_type = "pubsub_topic",
+    },
+    .{
+        .type = "pubsub.googleapis.com/topic/byte_cost",
+        .kind = .delta,
+        .value_type = .int64,
+        .unit = "By",
+        .display_name = "Topic byte cost",
+        .description = "Cost of operations, measured in bytes. This is used to measure utilization for quotas.",
+        .labels = &.{ .{ "operation_type", "Type of operation performed." }, response_code },
+        .resource_type = "pubsub_topic",
+    },
 };
+
+comptime {
+    // A read aligns a DELTA metric's values as numbers, and its 400s name
+    // the value type.
+    for (google_metrics) |g| if (g.kind == .delta and g.value_type != .int64) @compileError(g.type ++ ": the fake aligns only INT64 DELTA metrics");
+}
 
 /// Whether `metric_type` is under a domain of Google's the fake holds
 /// metrics of, which no program writes or creates.
@@ -2006,11 +2159,14 @@ fn unmodelledDistribution(d: types.Distribution) ?[]const u8 {
 // Answers.
 
 /// What makes production refuse to create a descriptor, in its words.
+/// Never called for one of Google's.
 fn creationRefusal(arena: Allocator, metric_type: []const u8, kind: types.Kind, value_type: types.ValueType, labels: []const types.LabelDescriptor) Allocator.Error!?FakeMonitoring.Reply {
-    if (std.mem.startsWith(u8, metric_type, validate.custom_domain)) {
-        if (kind == .delta) return try fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Field metricDescriptor.metricKind had an invalid value of \"DELTA\": When creating metric {s}: the DELTA metric kind is not supported for custom metrics.", .{metric_type}));
-        if (value_type == .string) return try fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Field metricDescriptor.valueType had an invalid value of \"STRING\": When creating metric {s}: the value type is not supported for custom metrics.", .{metric_type}));
-    }
+    // DELTA and STRING, refused as custom metrics under
+    // custom.googleapis.com/ and workload.googleapis.com/, and as external
+    // ones under external.googleapis.com/, on 2026-10-19.
+    const what = if (std.mem.startsWith(u8, metric_type, "external.googleapis.com/")) "external" else "custom";
+    if (kind == .delta) return try fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Field metricDescriptor.metricKind had an invalid value of \"DELTA\": When creating metric {s}: the DELTA metric kind is not supported for {s} metrics.", .{ metric_type, what }));
+    if (value_type == .string) return try fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Field metricDescriptor.valueType had an invalid value of \"STRING\": When creating metric {s}: the value type is not supported for {s} metrics.", .{ metric_type, what }));
     for (labels, 0..) |l, i| {
         if (l.key.len > validate.max_label_key_len) return try fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Field labels[{d}].key had an invalid value of \"{s}\": When creating metric {s}:  the label key is more than 100 characters long.", .{ i, l.key, metric_type }));
         if (!validate.isLabelKey(l.key)) return try notModelled(arena, "a label key production was not asked about in a create");
@@ -2024,6 +2180,17 @@ fn fail(arena: Allocator, code: u16, status: []const u8, message: []const u8) Al
         .message = message,
         .status = status,
     } }, .{}) };
+}
+
+/// Production's answer to a write or a create of one of Google's metrics.
+fn noPermission(arena: Allocator, metric_type: []const u8) Allocator.Error!FakeMonitoring.Reply {
+    return fail(arena, 403, "PERMISSION_DENIED", try arena.print("User does not have permission to write to metric {s}.", .{metric_type}));
+}
+
+/// Production's answer to an aligner the metric's kind and value type do
+/// not take.
+fn misaligned(arena: Allocator, aligner: types.Aligner, d: *const FakeMonitoring.Descriptor) Allocator.Error!FakeMonitoring.Reply {
+    return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Field aggregation.perSeriesAligner had an invalid value of \"{s}\": The aligner cannot be applied to metrics with kind {s} and value type {s}.", .{ aligner.wire(), d.kind.wire(), d.value_type.wire() }));
 }
 
 fn descriptorNotFound(arena: Allocator, metric_type: []const u8) Allocator.Error!FakeMonitoring.Reply {
@@ -3117,8 +3284,10 @@ test "reads: aligned and reduced as production answered, the fake's own reading 
     defer means.deinit();
     try testing.expectEqual(71.0 / 3.0, means.value.series[0].points[0].value.?.double);
 
-    // Not modelled: other aligners, cumulative metrics, a second aggregation.
-    try testing.expectError(error.Unimplemented, m.read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .rate } }));
+    // ALIGN_RATE on a gauge is refused, as production refused it. Not
+    // modelled: other aligners, cumulative metrics, a second aggregation.
+    try testing.expectError(error.InvalidArgument, m.read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .rate } }));
+    try testing.expectError(error.Unimplemented, m.read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .stddev } }));
     try testing.expectError(error.Unimplemented, m.read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .max, .reducer = .percentile_99 } }));
     try testing.expectError(error.Unimplemented, m.read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .max }, .secondary_aggregation = .{ .alignment_period_s = 120, .aligner = .max } }));
     try testing.expectError(error.Unimplemented, m.read(.{ .end = b.at(0), .filter = .{ .raw = "metric.labels.region = one_of(\"eu\")" } }));
@@ -3152,6 +3321,8 @@ test "reads refused in production's words" {
         .{ base ++ "&aggregation.perSeriesAligner=ALIGN_MAX&aggregation.alignmentPeriod=9s", production.read_period_9s },
         .{ base ++ "&aggregation.crossSeriesReducer=REDUCE_SUM", production.read_no_aligner },
         .{ base ++ "&interval.startTime=2026-10-18T13%3A46%3A36Z", production.read_start_after_end },
+        .{ base ++ "&aggregation.perSeriesAligner=ALIGN_DELTA&aggregation.alignmentPeriod=60s", production.read_delta_on_gauge },
+        .{ base ++ "&aggregation.perSeriesAligner=ALIGN_RATE&aggregation.alignmentPeriod=60s", production.read_rate_on_gauge },
     };
     for (cases) |c| {
         const reply = try b.raw(a, .GET, c[0], null);
@@ -3163,9 +3334,10 @@ test "reads refused in production's words" {
         base ++ "&interval.startTime=yesterday",
         "timeSeries?filter=metric.type%20%3D%20%22x%22&interval.endTime=never",
         base ++ "&aggregation.perSeriesAligner=ALIGN_MAX&aggregation.alignmentPeriod=1m",
-        base ++ "&aggregation.perSeriesAligner=ALIGN_DELTA&aggregation.alignmentPeriod=60s",
+        base ++ "&aggregation.perSeriesAligner=ALIGN_STDDEV&aggregation.alignmentPeriod=60s",
         "timeSeries?filter=metric.type%20%3D%20%22x%22%20OR%20metric.type%20%3D%20%22y%22&interval.endTime=2026-10-18T13%3A46%3A35Z",
         "timeSeries?filter=metric.type%20!%3D%20%22x%22&interval.endTime=2026-10-18T13%3A46%3A35Z",
+        "timeSeries?filter=metric.type%20%3D%20%22custom.googleapis.com%2Fzigps-m0-62b2c8%2Fgauge%22%20AND%20resource.type%20!%3D%20%22global%22&interval.endTime=2026-10-18T13%3A46%3A35Z",
     }) |path| try testing.expectEqual(501, (try b.raw(a, .GET, path, null)).status);
     try testing.expectEqual(400, (try b.raw(a, .GET, base ++ "&pageSize=x", null)).status);
 }
@@ -3262,24 +3434,23 @@ test "reads: a point on a period's start belongs to the period before, (start, e
     try testing.expectEqual(1, pts[1].value.?.int64);
 }
 
-test "the same point twice, of every value type: kept once; changed, refused as too soon" {
+test "the same point twice, of each value type a program's metric has: kept once; changed, refused as too soon" {
     var b: Bench = undefined;
     try b.init(.{});
     defer b.deinit();
     const values = [_]types.Value{
         .{ .bool = true },
         .{ .double = 0.5 },
-        .{ .string = "s" },
         .{ .distribution = .{ .count = 1, .mean = 2, .buckets = .{ .explicit = &.{1} }, .bucket_counts = &.{ 0, 1 } } },
     };
     const changed = [_]types.Value{
         .{ .bool = false },
         .{ .double = 0.25 },
-        .{ .string = "t" },
         .{ .distribution = .{ .count = 2, .mean = 2, .buckets = .{ .explicit = &.{1} }, .bucket_counts = &.{ 0, 2 } } },
     };
     for (values, changed, 0..) |v, c, i| {
-        // A metric of each value type.
+        // A metric of each value type but STRING, which production makes
+        // for no program.
         var name: [40]u8 = undefined;
         const s: types.TimeSeries = .{ .metric_type = try std.fmt.bufPrint(&name, "external.googleapis.com/twice{d}", .{i}), .resource = .global, .kind = .gauge, .end = b.at(0), .value = v };
         for (0..2) |_| {
@@ -3293,7 +3464,7 @@ test "the same point twice, of every value type: kept once; changed, refused as 
         defer r.deinit();
         try testing.expectEqual(error.FailedPrecondition, r.value.refused[0].reason);
     }
-    try testing.expectEqual(4, b.fake.pointCount());
+    try testing.expectEqual(3, b.fake.pointCount());
 }
 
 // Google's own metrics, put in by a test (issue #239).
@@ -3319,12 +3490,14 @@ test "put: Pub/Sub's own metrics, read back as production answers them" {
     var b: Bench = undefined;
     try b.init(.{ .project_id = "atlas-prod" });
     defer b.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
     // The issue's repro: a program cannot write Google's metrics, and nor
-    // can a test.
+    // can a test. Production's 403, in its words.
     const desktop: []const types.Label = &.{.{ .key = "subscription_id", .value = "orders-desktop" }};
     const desktop_match: []const types.Match = &.{.{ .key = "subscription_id", .value = "orders-desktop" }};
-    try testing.expectError(error.Unimplemented, b.client.write(&.{.{ .metric_type = backlog_type, .resource = .{ .other = .{ .type = "pubsub_subscription", .labels = desktop } }, .kind = .gauge, .end = b.at(0), .value = .{ .int64 = 14 } }}));
-    try testing.expect(std.mem.indexOf(u8, b.diag.message(), "FakeMonitoring.put") != null);
+    try testing.expectError(error.PermissionDenied, b.client.write(&.{.{ .metric_type = backlog_type, .resource = .{ .other = .{ .type = "pubsub_subscription", .labels = desktop } }, .kind = .gauge, .end = b.at(0), .value = .{ .int64 = 14 } }}));
+    try testing.expectEqualStrings(try messageOf(arena.allocator(), production.write_google_metric), b.diag.message());
 
     const desktop_backlog = [_]FakeMonitoring.Point{ gaugePoint(&b, -120_000, 9), gaugePoint(&b, -60_000, 14), gaugePoint(&b, -1_000, 12) };
     try b.fake.put(.{ .metric_type = backlog_type, .resource_type = "pubsub_subscription", .resource_labels = desktop, .kind = .gauge, .value_type = .int64, .points = &desktop_backlog });
@@ -3394,6 +3567,9 @@ test "put: Pub/Sub's own metrics, read back as production answers them" {
     try testing.expectEqual(types.ValueType.double, r.value_type);
     try testing.expectEqual(77.0 / 60.0, r.points[0].value.?.double);
     try testing.expectEqual(r.points[0].end.nanoseconds, r.points[0].start.?.nanoseconds);
+    // Its unit a second, as production gave it.
+    try testing.expectEqualStrings("1/s", rates.value.unit);
+    try testing.expectEqualStrings("1", deltas.value.unit);
     // By delivery type: one series each, with its label.
     var by_type = try sent.read(.{ .start = b.at(-180_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum, .group_by = &.{"metric.labels.delivery_type"} } });
     defer by_type.deinit();
@@ -3463,6 +3639,7 @@ test "Pub/Sub's descriptors and resource types: read and listed, never created, 
     try testing.expectEqual(types.ValueType.int64, backlog.value.value_type);
     try testing.expectEqualStrings("1", backlog.value.unit);
     try testing.expectEqualStrings("Unacked messages", backlog.value.display_name);
+    try testing.expectEqualStrings("Number of unacknowledged messages (a.k.a. backlog messages) in a subscription.", backlog.value.description);
     try testing.expectEqual(0, backlog.value.labels.len);
     try testing.expectEqual(1, backlog.value.resource_types.len);
     try testing.expectEqualStrings("pubsub_subscription", backlog.value.resource_types[0]);
@@ -3471,6 +3648,7 @@ test "Pub/Sub's descriptors and resource types: read and listed, never created, 
     try testing.expectEqual(types.Kind.delta, push.value.kind);
     try testing.expectEqual(3, push.value.labels.len);
     try testing.expect(push.value.label("response_class") != null);
+    try testing.expectEqualStrings("Push delivery mechanism.", push.value.label("delivery_type").?.description);
     var age = try b.client.metric("pubsub.googleapis.com/subscription/oldest_unacked_message_age").get();
     defer age.deinit();
     try testing.expectEqualStrings("s", age.value.unit);
@@ -3497,13 +3675,29 @@ test "Pub/Sub's descriptors and resource types: read and listed, never created, 
     defer active.deinit();
     try testing.expectEqual(1, active.value.metrics.len);
 
-    // Never created, deleted or written.
-    try testing.expectEqual(501, (try b.raw(a, .POST, "metricDescriptors", "{\"type\":\"pubsub.googleapis.com/subscription/mine\",\"metricKind\":\"GAUGE\",\"valueType\":\"INT64\"}")).status);
+    // Never created or written, as production answered: 403, in its
+    // words. A delete is not modelled.
+    const created = try b.raw(a, .POST, "metricDescriptors", "{\"type\":\"pubsub.googleapis.com/subscription/zigps_mon_517da9\",\"metricKind\":\"GAUGE\",\"valueType\":\"INT64\"}");
+    try testing.expectEqual(production.create_google_descriptor_status, created.status);
+    try testing.expectEqualStrings(try messageOf(a, production.create_google_descriptor), try messageOf(a, created.body));
+    try testing.expectEqual(null, try b.fake.descriptor(a, "pubsub.googleapis.com/subscription/zigps_mon_517da9"));
     try testing.expectEqual(501, (try b.raw(a, .DELETE, "metricDescriptors/" ++ backlog_type, null)).status);
     var still = try b.client.metric(backlog_type).get();
     still.deinit();
-    try testing.expectError(error.Unimplemented, b.client.write(&.{.{ .metric_type = "pubsub.googleapis.com/subscription/mine", .resource = .global, .kind = .gauge, .end = b.at(0), .value = .{ .int64 = 1 } }}));
-    try testing.expectError(error.Unimplemented, b.client.write(&.{.{ .metric_type = "custom.googleapis.com/mine", .resource = .{ .other = .{ .type = "pubsub_subscription", .labels = &.{.{ .key = "subscription_id", .value = "s" }} } }, .kind = .gauge, .end = b.at(0), .value = .{ .int64 = 1 } }}));
+    try testing.expectError(error.PermissionDenied, b.client.write(&.{
+        .{ .metric_type = "custom.googleapis.com/mine", .resource = .global, .kind = .gauge, .end = b.at(0), .value = .{ .int64 = 1 } },
+        .{ .metric_type = "pubsub.googleapis.com/subscription/mine", .resource = .global, .kind = .gauge, .end = b.at(0), .value = .{ .int64 = 1 } },
+    }));
+    try testing.expectEqualStrings("User does not have permission to write to metric pubsub.googleapis.com/subscription/mine.", b.diag.message());
+    try testing.expectEqual(1, b.fake.pointCount());
+    // A user metric on Pub/Sub's resource type: refused in the summary, in
+    // production's words, its descriptor made all the same.
+    var on_sub = try b.client.write(&.{.{ .metric_type = "custom.googleapis.com/zigps-mon-517da9/on_sub", .resource = .{ .other = .{ .type = "pubsub_subscription", .labels = &.{.{ .key = "subscription_id", .value = "zigps-mon-517da9-a" }} } }, .kind = .gauge, .end = b.at(0), .value = .{ .int64 = 1 } }});
+    defer on_sub.deinit();
+    try testing.expectEqual(0, on_sub.value.written);
+    try testing.expectEqual(error.InvalidArgument, on_sub.value.refused[0].reason);
+    try testing.expectEqualStrings(try messageOf(a, production.write_on_pubsub_subscription), on_sub.value.message);
+    try testing.expectEqual(types.Kind.gauge, (try b.fake.descriptor(a, "custom.googleapis.com/zigps-mon-517da9/on_sub")).?.kind);
     try testing.expectEqual(1, b.fake.pointCount());
 
     var sub = try b.client.resourceType("pubsub_subscription");
@@ -3511,6 +3705,8 @@ test "Pub/Sub's descriptors and resource types: read and listed, never created, 
     try testing.expectEqualStrings("Cloud Pub/Sub Subscription", sub.value.display_name);
     try testing.expectEqual(2, sub.value.labels.len);
     try testing.expectEqualStrings("subscription_id", sub.value.labels[1].key);
+    try testing.expectEqualStrings("A subscription in Google Cloud Pub/Sub.", sub.value.description);
+    try testing.expectEqualStrings("The identifier of the subscription, such as \"my-subscription\".", sub.value.labels[1].description);
     var topic = try b.client.resourceType("pubsub_topic");
     defer topic.deinit();
     try testing.expectEqualStrings("topic_id", topic.value.labels[1].key);
@@ -3529,6 +3725,29 @@ test "Pub/Sub's descriptors and resource types: read and listed, never created, 
     try testing.expectEqual(1, by_project.value.series.len);
     // A metric label it lacks is 404.
     try testing.expectError(error.NotFound, m.read(.{ .end = b.at(0), .filter = .{ .metric_labels = &.{.{ .key = "delivery_type", .value = "pull" }} } }));
+
+    // A resource type the metric cannot be on is 400, in production's
+    // words; its own selects; one the fake does not know is not modelled.
+    // A type named narrows the labels to its own.
+    for ([_][]const u8{ "pubsub_topic", "global", "gce_instance" }) |t| {
+        try testing.expectError(error.InvalidArgument, m.read(.{ .end = b.at(0), .filter = .{ .resource_type = t } }));
+        try testing.expectEqualStrings(try messageOf(a, production.read_other_resource_type), b.diag.message());
+    }
+    var own = try m.read(.{ .end = b.at(0), .filter = .{ .resource_type = "pubsub_subscription", .resource_labels = &.{.{ .key = "subscription_id", .value = "s" }} } });
+    defer own.deinit();
+    try testing.expectEqual(1, own.value.series.len);
+    try testing.expectError(error.Unimplemented, m.read(.{ .end = b.at(0), .filter = .{ .resource_type = "cloud_run_revision" } }));
+    const mine = b.client.metric("custom.googleapis.com/mine");
+    try testing.expectError(error.InvalidArgument, mine.read(.{ .end = b.at(0), .filter = .{ .resource_type = "pubsub_subscription" } }));
+    for ([_][]const u8{ "global", "gce_instance" }) |t| {
+        var page = try mine.read(.{ .end = b.at(0), .filter = .{ .resource_type = t } });
+        defer page.deinit();
+        // A metric without a unit, as production read one.
+        try testing.expectEqualStrings("{not_a_unit}", page.value.unit);
+    }
+    try testing.expectError(error.InvalidArgument, mine.read(.{ .end = b.at(0), .filter = .{ .resource_type = "global", .resource_labels = &.{.{ .key = "zone", .value = "x" }} } }));
+    var zoned = try mine.read(.{ .end = b.at(0), .filter = .{ .resource_type = "gce_instance", .resource_labels = &.{.{ .key = "zone", .value = "x" }} } });
+    zoned.deinit();
 }
 
 test "put: refused whole for what production could not hold" {
@@ -3556,7 +3775,6 @@ test "put: refused whole for what production could not hold" {
 
     // Points the cases below share, named so they outlive each case.
     const string = [_]FakeMonitoring.Point{.{ .start = null, .end = b.at(0), .value = .{ .string = "s" } }};
-    const long_string = [_]FakeMonitoring.Point{.{ .start = null, .end = b.at(0), .value = .{ .string = test_util.repeat("s", 1025) } }};
     const uneven = [_]FakeMonitoring.Point{.{ .start = null, .end = b.at(0), .value = .{ .distribution = .{ .count = 2, .buckets = .{ .explicit = &.{1} }, .bucket_counts = &.{ 0, 1 } } } }};
     const gauge_started = [_]FakeMonitoring.Point{.{ .start = b.at(-1), .end = b.at(0), .value = .{ .int64 = 1 } }};
     const unstarted = [_]FakeMonitoring.Point{.{ .start = null, .end = b.at(0), .value = .{ .int64 = 1 } }};
@@ -3589,6 +3807,8 @@ test "put: refused whole for what production could not hold" {
     try cases.append(a, with(base, .{ .metric_type = "custom.googleapis.com/made" }));
     try cases.append(a, with(global_base, .{ .kind = .delta, .points = &delta }));
     try cases.append(a, with(global_base, .{ .value_type = .string, .points = &string }));
+    try cases.append(a, with(global_base, .{ .metric_type = "workload.googleapis.com/new", .kind = .delta, .points = &delta }));
+    try cases.append(a, with(global_base, .{ .metric_type = "external.googleapis.com/new", .value_type = .string, .points = &string }));
     try cases.append(a, with(global_base, .{ .metric_type = "custom.googleapis.com/made", .value_type = .double, .points = &gauge_double }));
     try cases.append(a, with(global_base, .{ .metric_type = "no-path" }));
     // Labels.
@@ -3601,7 +3821,6 @@ test "put: refused whole for what production could not hold" {
     try cases.append(a, with(global_base, .{ .metric_type = "external.googleapis.com/money", .value_type = .money }));
     try cases.append(a, with(global_base, .{ .points = &.{} }));
     try cases.append(a, with(global_base, .{ .points = &gauge_double }));
-    try cases.append(a, with(global_base, .{ .metric_type = "external.googleapis.com/long", .value_type = .string, .points = &long_string }));
     try cases.append(a, with(global_base, .{ .metric_type = "external.googleapis.com/dist", .value_type = .distribution, .points = &uneven }));
     // Intervals.
     try cases.append(a, with(global_base, .{ .points = &gauge_started }));
@@ -3624,7 +3843,7 @@ test "put: refused whole for what production could not hold" {
     // Nothing kept: no series, no point, no descriptor.
     try testing.expectEqual(1, b.fake.seriesCount());
     try testing.expectEqual(1, b.fake.pointCount());
-    for ([_][]const u8{ "custom.googleapis.com/new", "custom.googleapis.com/total", "external.googleapis.com/long", "pubsub.googleapis.com/subscription/num_outstanding_messages" }) |t| {
+    for ([_][]const u8{ "custom.googleapis.com/new", "custom.googleapis.com/total", "workload.googleapis.com/new", "external.googleapis.com/new", "pubsub.googleapis.com/subscription/num_outstanding_messages" }) |t| {
         try testing.expectEqual(null, try b.fake.descriptor(a, t));
     }
     try testing.expectEqual(types.Kind.gauge, (try b.fake.descriptor(a, "custom.googleapis.com/made")).?.kind);
@@ -3647,13 +3866,40 @@ test "put: refused whole for what production could not hold" {
     try b.fake.put(with(global_base, .{ .metric_type = "custom.googleapis.com/fine", .points = &.{.{ .start = null, .end = .{ .nanoseconds = now_ns + 1_500 }, .value = .{ .int64 = 1 } }} }));
     try testing.expectEqual(now_ns + 1_000, (try b.fake.points(a, "custom.googleapis.com/fine", &.{}))[0].end.nanoseconds);
     const fine_delta = [_]FakeMonitoring.Point{.{ .start = .{ .nanoseconds = now_ns - 59_999_998_500 }, .end = .{ .nanoseconds = now_ns + 1_999 }, .value = .{ .int64 = 1 } }};
-    try b.fake.put(with(global_base, .{ .metric_type = "external.googleapis.com/fine", .kind = .delta, .points = &fine_delta }));
-    const fine = (try b.fake.points(a, "external.googleapis.com/fine", &.{}))[0];
+    const streaming: []const types.Label = &.{.{ .key = "delivery_type", .value = "streaming pull" }};
+    try b.fake.put(with(sent_base, .{ .metric_labels = streaming, .points = &fine_delta }));
+    const fine = (try b.fake.points(a, sent_type, streaming))[0];
     try testing.expectEqual(now_ns - 59_999_999_000, fine.start.?.nanoseconds);
     try testing.expectEqual(now_ns + 1_000, fine.end.nanoseconds);
     // A put adds a user metric's label, as a write does.
     try b.fake.put(with(global_base, .{ .metric_type = "custom.googleapis.com/made", .metric_labels = &.{.{ .key = "region", .value = "eu" }} }));
     try testing.expectEqualStrings("region", (try b.fake.descriptor(a, "custom.googleapis.com/made")).?.labels[0].key);
+}
+
+test "DELTA and STRING: refused for any metric a program makes, in production's words" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]struct { []const u8, types.Kind, types.ValueType, []const u8 }{
+        .{ "workload.googleapis.com/zigps-mon3-2b2a2a/delta_int64", .delta, .int64, production.create_delta_workload },
+        .{ "external.googleapis.com/zigps-mon3-2b2a2a/delta_int64", .delta, .int64, production.create_delta_external },
+        .{ "external.googleapis.com/zigps-mon3-2b2a2a/gauge_string", .gauge, .string, production.create_string_external },
+        .{ "workload.googleapis.com/zigps-mon3-2b2a2a/gauge_string", .gauge, .string, production.create_string_workload },
+    }) |c| {
+        try testing.expectError(error.InvalidArgument, b.client.metric(c[0]).create(.{ .kind = c[1], .value_type = c[2] }));
+        try testing.expectEqualStrings(try messageOf(a, c[3]), b.diag.message());
+        try testing.expectEqual(null, try b.fake.descriptor(a, c[0]));
+    }
+    // A write that would make one is refused whole, nothing made.
+    try testing.expectError(error.InvalidArgument, b.client.write(&.{
+        .{ .metric_type = "workload.googleapis.com/fine", .resource = .global, .kind = .gauge, .end = b.at(0), .value = .{ .int64 = 1 } },
+        .{ .metric_type = "external.googleapis.com/d", .resource = .global, .kind = .delta, .start = b.at(-60_000), .end = b.at(0), .value = .{ .int64 = 1 } },
+    }));
+    try testing.expectEqual(null, try b.fake.descriptor(a, "external.googleapis.com/d"));
+    try testing.expectEqual(0, b.fake.pointCount());
 }
 
 /// What `with` changes: each field that is not null.
@@ -3712,29 +3958,96 @@ test "reads of a DELTA metric: what is modelled, and what is not" {
     try testing.expectEqual(1, short.value.series[0].points.len);
     try testing.expectEqual(9.0 / 20.0, short.value.series[0].points[0].value.?.double);
 
-    // A DELTA double, under a domain that may hold one.
-    const doubles = [_]FakeMonitoring.Point{ .{ .start = b.at(-60_000), .end = b.at(-30_000), .value = .{ .double = 1.5 } }, .{ .start = b.at(-30_000), .end = b.at(0), .value = .{ .double = 0.25 } } };
-    try b.fake.put(.{ .metric_type = "external.googleapis.com/seconds", .resource_type = "global", .kind = .delta, .value_type = .double, .points = &doubles });
-    var seconds = try b.client.metric("external.googleapis.com/seconds").read(.{ .start = b.at(-60_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .delta } });
-    defer seconds.deinit();
-    try testing.expectEqual(types.ValueType.double, seconds.value.series[0].value_type);
-    try testing.expectEqual(1.75, seconds.value.series[0].points[0].value.?.double);
-    // Nothing in the read: no series.
-    var empty_rate = try b.client.metric("external.googleapis.com/seconds").read(.{ .start = b.at(-60_000), .end = b.at(-50_000), .aggregation = .{ .alignment_period_s = 60, .aligner = .rate } });
+    // Nothing in the read: no series, and the unit all the same.
+    var empty_rate = try m.read(.{ .start = b.at(-200_000), .end = b.at(-190_000), .aggregation = .{ .alignment_period_s = 60, .aligner = .rate } });
     defer empty_rate.deinit();
     try testing.expectEqual(0, empty_rate.value.series.len);
+    try testing.expectEqualStrings("1/s", empty_rate.value.unit);
 
-    // Not modelled: other aligners on a DELTA metric, ALIGN_DELTA and
-    // ALIGN_RATE on a gauge or a cumulative metric, a DELTA distribution.
-    try testing.expectError(error.Unimplemented, m.read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .max } }));
-    try testing.expectError(error.Unimplemented, m.read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .sum } }));
-    try testing.expectError(error.Unimplemented, b.client.metric(backlog_type).read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .delta } }));
-    try testing.expectError(error.Unimplemented, b.client.metric(backlog_type).read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .rate } }));
+    // ALIGN_SUM, as ALIGN_DELTA: a total over the period. (-120 s, 0]
+    // holds pull's 0 and 5 and push's 4.
+    var sums = try m.read(.{ .start = b.at(-120_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 120, .aligner = .sum, .reducer = .sum } });
+    defer sums.deinit();
+    try testing.expectEqual(types.Kind.delta, sums.value.series[0].kind);
+    try testing.expectEqual(b.at(-120_000).nanoseconds, sums.value.series[0].points[0].start.?.nanoseconds);
+    try testing.expectEqual(9, sums.value.series[0].points[0].value.?.int64);
+    // The others: a gauge at the period's end, of pull's 0 and 5.
+    const pull: []const types.Match = &.{.{ .key = "delivery_type", .value = "pull" }};
+    for ([_]types.Aligner{ .min, .max, .mean, .count }, [_]types.Value{ .{ .int64 = 0 }, .{ .int64 = 5 }, .{ .double = 2.5 }, .{ .int64 = 2 } }) |aligner, want| {
+        var page = try m.read(.{ .start = b.at(-120_000), .end = b.at(0), .filter = .{ .metric_labels = pull }, .aggregation = .{ .alignment_period_s = 120, .aligner = aligner } });
+        defer page.deinit();
+        const s = page.value.series[0];
+        try testing.expectEqual(types.Kind.gauge, s.kind);
+        try testing.expectEqual(s.points[0].end.nanoseconds, s.points[0].start.?.nanoseconds);
+        try testing.expect(sameValue(want, s.points[0].value.?));
+    }
+
+    // The unit, as production gave it: `1` for a count, a second for a
+    // rate, the metric's otherwise.
+    const bytes_type = "pubsub.googleapis.com/topic/byte_cost";
+    try b.fake.put(.{ .metric_type = bytes_type, .metric_labels = &.{ .{ .key = "operation_type", .value = "publish" }, .{ .key = "response_code", .value = "success" } }, .resource_type = "pubsub_topic", .resource_labels = &.{.{ .key = "topic_id", .value = "t" }}, .kind = .delta, .value_type = .int64, .points = &.{minute(&b, 0, 2048)} });
+    for ([_]types.Aggregation{
+        .{ .alignment_period_s = 60, .aligner = .delta },
+        .{ .alignment_period_s = 60, .aligner = .sum },
+        .{ .alignment_period_s = 60, .aligner = .mean },
+        .{ .alignment_period_s = 60, .aligner = .max },
+        .{ .alignment_period_s = 60, .aligner = .rate, .reducer = .mean },
+        .{ .alignment_period_s = 60, .aligner = .count },
+        .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .count },
+        .{ .alignment_period_s = 60, .aligner = .rate, .reducer = .count },
+    }, [_][]const u8{ "By", "By", "By", "By", "By/s", "1", "1", "1" }) |agg, want| {
+        var page = try b.client.metric(bytes_type).read(.{ .start = b.at(-60_000), .end = b.at(0), .aggregation = agg });
+        defer page.deinit();
+        try testing.expectEqualStrings(want, page.value.unit);
+    }
+    const age_type = "pubsub.googleapis.com/subscription/oldest_unacked_message_age";
+    try b.fake.put(.{ .metric_type = age_type, .resource_type = "pubsub_subscription", .resource_labels = sub, .kind = .gauge, .value_type = .int64, .points = &.{gaugePoint(&b, 0, 38)} });
+    for ([_]types.Aggregation{
+        .{ .alignment_period_s = 60, .aligner = .mean },
+        .{ .alignment_period_s = 60, .aligner = .count },
+        .{ .alignment_period_s = 60, .aligner = .max, .reducer = .count },
+        .{ .alignment_period_s = 60, .aligner = .max, .reducer = .mean },
+    }, [_][]const u8{ "s", "1", "1", "s" }) |agg, want| {
+        var page = try b.client.metric(age_type).read(.{ .start = b.at(-60_000), .end = b.at(0), .aggregation = agg });
+        defer page.deinit();
+        try testing.expectEqualStrings(want, page.value.unit);
+    }
+    // ALIGN_SUM on a gauge stays a gauge at the period's end, as
+    // production answered.
+    var gauge_sum = try b.client.metric(age_type).read(.{ .start = b.at(-60_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .sum } });
+    defer gauge_sum.deinit();
+    try testing.expectEqual(types.Kind.gauge, gauge_sum.value.series[0].kind);
+    try testing.expectEqual(b.at(0).nanoseconds, gauge_sum.value.series[0].points[0].start.?.nanoseconds);
+    try testing.expectEqual(38, gauge_sum.value.series[0].points[0].value.?.int64);
+
+    // Refused as production refused them, in its words: the aligners a
+    // DELTA metric does not take, and ALIGN_DELTA and ALIGN_RATE on a
+    // gauge.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const next_older = try messageOf(a, production.read_next_older_on_delta);
+    for ([_]types.Aligner{ .next_older, .interpolate, .count_true, .count_false, .fraction_true, .percentile_99, .percentile_95, .percentile_50, .percentile_05 }) |aligner| {
+        try testing.expectError(error.InvalidArgument, m.read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = aligner } }));
+        try testing.expectEqualStrings(try std.mem.replaceOwned(u8, a, next_older, "ALIGN_NEXT_OLDER", aligner.wire()), b.diag.message());
+    }
+    try testing.expectError(error.InvalidArgument, m.read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .percentile_99 } }));
+    try testing.expectEqualStrings(try messageOf(a, production.read_percentile_on_delta), b.diag.message());
+    for ([_]types.Aligner{ .delta, .rate }, [_][]const u8{ production.read_delta_on_gauge, production.read_rate_on_gauge }) |aligner, body| {
+        try testing.expectError(error.InvalidArgument, b.client.metric(backlog_type).read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = aligner } }));
+        try testing.expectEqualStrings(try messageOf(a, body), b.diag.message());
+    }
+    var ratio = try b.client.metric("custom.googleapis.com/ratio").create(.{ .kind = .gauge, .value_type = .double });
+    ratio.deinit();
+    try testing.expectError(error.InvalidArgument, b.client.metric("custom.googleapis.com/ratio").read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .rate } }));
+    try testing.expectEqualStrings(try messageOf(a, production.read_rate_on_double_gauge), b.diag.message());
+
+    // Not modelled: ALIGN_STDDEV and ALIGN_PERCENT_CHANGE on a DELTA
+    // metric, and aligning a cumulative metric.
+    try testing.expectError(error.Unimplemented, m.read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .stddev } }));
+    try testing.expectError(error.Unimplemented, m.read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .percent_change } }));
     try b.fake.put(.{ .metric_type = "custom.googleapis.com/total", .resource_type = "global", .kind = .cumulative, .value_type = .int64, .points = &.{minute(&b, 0, 1)} });
     try testing.expectError(error.Unimplemented, b.client.metric("custom.googleapis.com/total").read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .delta } }));
-    const dist: types.Value = .{ .distribution = .{ .count = 1, .mean = 1, .buckets = .{ .explicit = &.{1} }, .bucket_counts = &.{ 0, 1 } } };
-    try b.fake.put(.{ .metric_type = "external.googleapis.com/sizes", .resource_type = "global", .kind = .delta, .value_type = .distribution, .points = &.{.{ .start = b.at(-60_000), .end = b.at(0), .value = dist }} });
-    try testing.expectError(error.Unimplemented, b.client.metric("external.googleapis.com/sizes").read(.{ .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .delta } }));
 }
 
 /// One DELTA point of the property's model: its series, its end in seconds
@@ -3749,9 +4062,9 @@ const delta_series = [_]struct { sub: []const u8, delivery: []const u8 }{
 };
 
 /// DELTA series put in with gaps and widths on a 10 s grid, then read with
-/// ALIGN_DELTA and ALIGN_RATE, reduced or not, grouped or not: every
-/// answer agrees with a sum over the points put in, and the answers with
-/// each other.
+/// ALIGN_DELTA, ALIGN_SUM, ALIGN_RATE, ALIGN_COUNT and ALIGN_MAX, reduced
+/// or not, grouped or not: every answer agrees with the points put in,
+/// and the answers with each other.
 fn deltaReadProperty(_: void, input: []const u8) !void {
     const gpa = test_util.propertyAllocator();
     var g: test_util.ByteGen = .init(input);
@@ -3794,12 +4107,12 @@ fn deltaReadProperty(_: void, input: []const u8) !void {
 
     // The model: each period's total and how many series have a point in
     // it, newest first, for the points in (start, end].
-    const Period = struct { end_s: i64, total: i64, series: usize };
+    const Period = struct { end_s: i64, total: i64, series: usize, points: usize, max: i64 };
     var periods: std.ArrayList(Period) = .empty;
     var total: i64 = 0;
     var window_end = end_s;
     while (window_end > start_s) : (window_end -= period) {
-        var p: Period = .{ .end_s = window_end, .total = 0, .series = 0 };
+        var p: Period = .{ .end_s = window_end, .total = 0, .series = 0, .points = 0, .max = 0 };
         var seen: [delta_series.len]bool = @splat(false);
         var any = false;
         for (model.items) |dp| {
@@ -3807,6 +4120,8 @@ fn deltaReadProperty(_: void, input: []const u8) !void {
             if (dp.end_s <= window_end - period or dp.end_s > window_end) continue;
             any = true;
             p.total += dp.value;
+            p.points += 1;
+            p.max = @max(p.max, dp.value);
             if (!seen[dp.series]) p.series += 1;
             seen[dp.series] = true;
         }
@@ -3820,10 +4135,21 @@ fn deltaReadProperty(_: void, input: []const u8) !void {
     defer rated.deinit();
     var counted = try m.read(.{ .start = start, .end = end, .aggregation = .{ .alignment_period_s = @intCast(period), .aligner = .delta, .reducer = .count } });
     defer counted.deinit();
+    var sum_aligned = try m.read(.{ .start = start, .end = end, .aggregation = .{ .alignment_period_s = @intCast(period), .aligner = .sum, .reducer = .sum } });
+    defer sum_aligned.deinit();
+    var point_counts = try m.read(.{ .start = start, .end = end, .aggregation = .{ .alignment_period_s = @intCast(period), .aligner = .count, .reducer = .sum } });
+    defer point_counts.deinit();
+    var maxes = try m.read(.{ .start = start, .end = end, .aggregation = .{ .alignment_period_s = @intCast(period), .aligner = .max, .reducer = .max } });
+    defer maxes.deinit();
+    try testing.expectEqualStrings("1", summed.value.unit);
+    try testing.expectEqualStrings("1/s", rated.value.unit);
+    try testing.expectEqualStrings("1", counted.value.unit);
+    try testing.expectEqualStrings("1", point_counts.value.unit);
     if (periods.items.len == 0) {
         // Nothing to count: no series, not zeros.
-        try testing.expectEqual(0, summed.value.series.len);
-        try testing.expectEqual(0, rated.value.series.len);
+        for ([_][]const types.Series{ summed.value.series, rated.value.series, sum_aligned.value.series, point_counts.value.series, maxes.value.series }) |list| {
+            try testing.expectEqual(0, list.len);
+        }
         return;
     }
     try testing.expectEqual(1, summed.value.series.len);
@@ -3833,7 +4159,16 @@ fn deltaReadProperty(_: void, input: []const u8) !void {
     const r = rated.value.series[0];
     try testing.expectEqual(types.Kind.gauge, r.kind);
     try testing.expectEqual(types.ValueType.double, r.value_type);
-    for (periods.items, s.points, r.points, counted.value.series[0].points) |want, sp, rp, cp| {
+    try testing.expectEqual(types.Kind.delta, sum_aligned.value.series[0].kind);
+    try testing.expectEqual(types.Kind.gauge, point_counts.value.series[0].kind);
+    try testing.expectEqual(types.Kind.gauge, maxes.value.series[0].kind);
+    for (periods.items, s.points, r.points, counted.value.series[0].points, sum_aligned.value.series[0].points, point_counts.value.series[0].points, maxes.value.series[0].points) |want, sp, rp, cp, ap, pp, mp| {
+        try testing.expectEqual(sp.start.?.nanoseconds, ap.start.?.nanoseconds);
+        try testing.expectEqual(sp.end.nanoseconds, ap.end.nanoseconds);
+        try testing.expectEqual(want.total, ap.value.?.int64);
+        try testing.expectEqual(sp.end.nanoseconds, pp.start.?.nanoseconds);
+        try testing.expectEqual(@as(i64, @intCast(want.points)), pp.value.?.int64);
+        try testing.expectEqual(want.max, mp.value.?.int64);
         const at = now_ns + @as(i96, want.end_s) * std.time.ns_per_s;
         try testing.expectEqual(at, sp.end.nanoseconds);
         try testing.expectEqual(at - @as(i96, period) * std.time.ns_per_s, sp.start.?.nanoseconds);
@@ -3859,7 +4194,7 @@ fn deltaReadProperty(_: void, input: []const u8) !void {
     for (grouped.value.series) |series| try testing.expect(series.label("delivery_type") != null);
 }
 
-test "fuzz DELTA reads: ALIGN_DELTA and ALIGN_RATE agree with a sum over the points put in" {
+test "fuzz DELTA reads: each aligner a DELTA metric takes agrees with the points put in" {
     try test_util.fuzzBytes({}, deltaReadProperty, .{ .corpus = &.{
         "",
         "\x01\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x08",

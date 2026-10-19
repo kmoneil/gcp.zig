@@ -129,14 +129,17 @@ that changed from Google's documents:
   stored ones kept: partial writes are the normal way writes fail.
 - **NaN and the infinities are taken** as doubles.
 - **Times are kept to the microsecond.**
-- **A descriptor just created reads back 404 for about 2 s**, once 404
-  again after a 200; a write straight after the create was taken.
+- **A descriptor just created reads back 404 for about 2 s**, once for
+  more than 15 s, and once 404 again after a 200; a write straight after
+  the create was taken.
 - **A point was readable 0.2 s after its write**, where Google says 3 to
   7 s.
 - **A point sent twice is kept once**, and a cumulative total that falls
   under the same start is taken.
 - **A filter's value escapes `"` and `\` with a backslash**; single
   quotes are refused.
+- **A read of a metric without a unit gives the unit `{not_a_unit}`**;
+  counted, `1`.
 
 ## Not here
 
