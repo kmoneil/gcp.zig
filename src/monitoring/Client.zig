@@ -757,6 +757,15 @@ fn writeRoundTripProperty(_: void, input: []const u8) !void {
             try testing.expectEqual(0, fake.callCount());
             return;
         },
+        // A DELTA or STRING metric under external.googleapis.com/, which
+        // production makes for no program, refuses the whole request.
+        error.InvalidArgument => {
+            for (series) |s| {
+                if (std.mem.startsWith(u8, s.metric_type, "external.googleapis.com/") and (s.kind == .delta or s.value == .string)) break;
+            } else return err;
+            try testing.expectEqual(0, fake.pointCount());
+            return;
+        },
         else => return err,
     };
     defer result.deinit();

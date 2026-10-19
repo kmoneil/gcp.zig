@@ -80,15 +80,25 @@ including the ones that did not change.
   otherwise. Pub/Sub's nine metrics a console reads (the backlog, the
   oldest unacked age, the sent, ack, expired, dead-letter, push and
   publish counts, the topic's byte cost) are there from the start, with
-  their kinds, units, labels and resource types `pubsub_subscription` and
-  `pubsub_topic`. They read and list as production's do, and cannot be
-  created, written or deleted. Reads filter on those resources' labels,
-  and a filter on a resource label the metric's resource types lack is
-  the 400 production gave. On a DELTA metric, `ALIGN_DELTA` gives each
-  period's total over the period, still DELTA, and `ALIGN_RATE` gives
-  each period's total a second as GAUGE DOUBLE. Both work with the
-  reducers and group-by fields the fake already had. A metric with
-  nothing in the read answers no series, not zeros.
+  production's descriptors and the resource types `pubsub_subscription`
+  and `pubsub_topic`. Writing or creating one is production's 403, and a
+  program's metric written to those resource types is refused in the
+  summary, its descriptor made, as production did. Reads filter on those
+  resources' labels and types, and a label or type the metric cannot be
+  on is production's 400. On a DELTA metric, `ALIGN_DELTA` and
+  `ALIGN_SUM` give each period's total over the period, still DELTA,
+  `ALIGN_RATE` each period's total a second as GAUGE DOUBLE, and min,
+  max, mean and count a gauge at the period's end, with the reducers and
+  group-by fields the fake already had. The aligners production refused
+  on a kind are its 400. A metric with nothing in the read answers no
+  series, not zeros. A production suite gives the fake production's
+  points and holds it to production's answers.
+- monitoring: `FakeMonitoring` gives a read's unit as production does:
+  `1` for a count, aligned or reduced, where it gave the metric's own,
+  the unit a second for a rate, and `{not_a_unit}` for a metric without
+  one, where it gave none. It refuses DELTA and STRING
+  descriptors under `workload.googleapis.com/` and
+  `external.googleapis.com/`, as production does, where it made them.
 - auth, error_reporting, firestore, logging, pubsub and resource_manager:
   unchanged.
 

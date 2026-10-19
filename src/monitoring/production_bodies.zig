@@ -1,7 +1,7 @@
 //! Answers production gave on 2026-10-18, measured in milestone 0 of the
 //! Monitoring spec (`_tmp/monitoring-m0/`), for tests: the probes' own
-//! `zigps-m0*` metrics and refusals, verbatim but for a final line break.
-//! Test code only.
+//! `zigps-m0*` metrics and refusals, verbatim but for a final line break;
+//! and on 2026-10-19, for issue #239, at the end. Test code only.
 
 /// A descriptor the probe made: GAUGE INT64, unit 1, one string label. HTTP 200.
 pub const descriptor_get_status = 200;
@@ -1042,5 +1042,187 @@ pub const read_escaped =
     \\    }
     \\  ],
     \\  "unit": "1"
+    \\}
+;
+
+// Answers production gave on 2026-10-19 for issue #239, measured by
+// `_tmp/monitoring-pubsub/probe*.py`: Pub/Sub's own metrics and the
+// refusals around them. Re-indented; tests compare their messages.
+
+/// A write of Pub/Sub's backlog to pubsub_subscription zigps-mon-517da9-a.
+/// HTTP 403.
+pub const write_google_metric_status = 403;
+pub const write_google_metric =
+    \\{
+    \\  "error": {
+    \\    "code": 403,
+    \\    "message": "User does not have permission to write to metric pubsub.googleapis.com/subscription/num_undelivered_messages.",
+    \\    "status": "PERMISSION_DENIED"
+    \\  }
+    \\}
+;
+
+/// A create of pubsub.googleapis.com/subscription/zigps_mon_517da9, GAUGE
+/// INT64. HTTP 403.
+pub const create_google_descriptor_status = 403;
+pub const create_google_descriptor =
+    \\{
+    \\  "error": {
+    \\    "code": 403,
+    \\    "message": "User does not have permission to write to metric pubsub.googleapis.com/subscription/zigps_mon_517da9.",
+    \\    "status": "PERMISSION_DENIED"
+    \\  }
+    \\}
+;
+
+/// A write of a new GAUGE INT64 custom.googleapis.com/zigps-mon-517da9/on_sub
+/// to pubsub_subscription zigps-mon-517da9-a. Its descriptor was made all the
+/// same: deleting it answered 200. HTTP 400.
+pub const write_on_pubsub_subscription_status = 400;
+pub const write_on_pubsub_subscription =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "One or more TimeSeries could not be written: timeSeries[0] (metric.type=\"custom.googleapis.com/zigps-mon-517da9/on_sub\", metric.labels={}, resource.type=\"pubsub_subscription\", resource.labels={\"subscription_id\": \"zigps-mon-517da9-a\"}): metrics cannot be written to pubsub_subscription, see https://cloud.google.com/monitoring/custom-metrics/creating-metrics#which-resource for a list of writable resource types",
+    \\    "status": "INVALID_ARGUMENT",
+    \\    "details": [
+    \\      {
+    \\        "@type": "type.googleapis.com/google.monitoring.v3.CreateTimeSeriesSummary",
+    \\        "totalPointCount": 1,
+    \\        "errors": [
+    \\          {
+    \\            "status": {
+    \\              "code": 3
+    \\            },
+    \\            "pointCount": 1
+    \\          }
+    \\        ]
+    \\      }
+    \\    ]
+    \\  }
+    \\}
+;
+
+/// ALIGN_DELTA on Pub/Sub's backlog, a GAUGE INT64. HTTP 400.
+pub const read_delta_on_gauge_status = 400;
+pub const read_delta_on_gauge =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "Field aggregation.perSeriesAligner had an invalid value of \"ALIGN_DELTA\": The aligner cannot be applied to metrics with kind GAUGE and value type INT64.",
+    \\    "status": "INVALID_ARGUMENT"
+    \\  }
+    \\}
+;
+
+/// ALIGN_RATE on Pub/Sub's backlog. HTTP 400.
+pub const read_rate_on_gauge_status = 400;
+pub const read_rate_on_gauge =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "Field aggregation.perSeriesAligner had an invalid value of \"ALIGN_RATE\": The aligner cannot be applied to metrics with kind GAUGE and value type INT64.",
+    \\    "status": "INVALID_ARGUMENT"
+    \\  }
+    \\}
+;
+
+/// ALIGN_RATE on a GAUGE DOUBLE custom metric. HTTP 400.
+pub const read_rate_on_double_gauge_status = 400;
+pub const read_rate_on_double_gauge =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "Field aggregation.perSeriesAligner had an invalid value of \"ALIGN_RATE\": The aligner cannot be applied to metrics with kind GAUGE and value type DOUBLE.",
+    \\    "status": "INVALID_ARGUMENT"
+    \\  }
+    \\}
+;
+
+/// ALIGN_NEXT_OLDER on Pub/Sub's sent count, a DELTA INT64. HTTP 400.
+pub const read_next_older_on_delta_status = 400;
+pub const read_next_older_on_delta =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "Field aggregation.perSeriesAligner had an invalid value of \"ALIGN_NEXT_OLDER\": The aligner cannot be applied to metrics with kind DELTA and value type INT64.",
+    \\    "status": "INVALID_ARGUMENT"
+    \\  }
+    \\}
+;
+
+/// ALIGN_PERCENTILE_99 on Pub/Sub's sent count. HTTP 400.
+pub const read_percentile_on_delta_status = 400;
+pub const read_percentile_on_delta =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "Field aggregation.perSeriesAligner had an invalid value of \"ALIGN_PERCENTILE_99\": The aligner cannot be applied to metrics with kind DELTA and value type INT64.",
+    \\    "status": "INVALID_ARGUMENT"
+    \\  }
+    \\}
+;
+
+/// Pub/Sub's sent count, filtered on resource.type pubsub_topic. HTTP 400.
+pub const read_other_resource_type_status = 400;
+pub const read_other_resource_type =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "The supplied filter does not specify a valid combination of metric and monitored resource descriptors. The query will not return any time series.",
+    \\    "status": "INVALID_ARGUMENT"
+    \\  }
+    \\}
+;
+
+/// A create of workload.googleapis.com/zigps-mon3-2b2a2a/delta_int64, DELTA
+/// INT64. HTTP 400.
+pub const create_delta_workload_status = 400;
+pub const create_delta_workload =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "Field metricDescriptor.metricKind had an invalid value of \"DELTA\": When creating metric workload.googleapis.com/zigps-mon3-2b2a2a/delta_int64: the DELTA metric kind is not supported for custom metrics.",
+    \\    "status": "INVALID_ARGUMENT"
+    \\  }
+    \\}
+;
+
+/// A create of external.googleapis.com/zigps-mon3-2b2a2a/delta_int64, DELTA
+/// INT64. HTTP 400.
+pub const create_delta_external_status = 400;
+pub const create_delta_external =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "Field metricDescriptor.metricKind had an invalid value of \"DELTA\": When creating metric external.googleapis.com/zigps-mon3-2b2a2a/delta_int64: the DELTA metric kind is not supported for external metrics.",
+    \\    "status": "INVALID_ARGUMENT"
+    \\  }
+    \\}
+;
+
+/// A create of external.googleapis.com/zigps-mon3-2b2a2a/gauge_string, GAUGE
+/// STRING. HTTP 400.
+pub const create_string_external_status = 400;
+pub const create_string_external =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "Field metricDescriptor.valueType had an invalid value of \"STRING\": When creating metric external.googleapis.com/zigps-mon3-2b2a2a/gauge_string: the value type is not supported for external metrics.",
+    \\    "status": "INVALID_ARGUMENT"
+    \\  }
+    \\}
+;
+
+/// A create of workload.googleapis.com/zigps-mon3-2b2a2a/gauge_string, GAUGE
+/// STRING. HTTP 400.
+pub const create_string_workload_status = 400;
+pub const create_string_workload =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "Field metricDescriptor.valueType had an invalid value of \"STRING\": When creating metric workload.googleapis.com/zigps-mon3-2b2a2a/gauge_string: the value type is not supported for custom metrics.",
+    \\    "status": "INVALID_ARGUMENT"
+    \\  }
     \\}
 ;
