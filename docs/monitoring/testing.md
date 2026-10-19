@@ -134,8 +134,8 @@ that metric yet.
 Quota usage and limits are Google's own metrics too, on the resource
 type `consumer_quota` (labels `service` and `location`: a region, a
 zone, or `global`). The fake knows the four a console reads for quota
-warnings, as the metrics list described them on 19 October 2026 (issue
-#247). Every unit is `1`:
+warnings, as production described them on 19 October 2026 (issue #247).
+Every unit is `1`:
 
 | Metric, after `serviceruntime.googleapis.com/` | Kind | Value | Labels |
 | --- | --- | --- | --- |
@@ -234,7 +234,7 @@ Each as production answered when measured, refusals in its words:
 - **Reads**:
   - its own reading of the filter the client writes, labels it does not know refused as production refused them, by the resource types the metric can be on, and a resource type it cannot be on;
   - (start, end], newest first;
-  - the gauge aligners and reducers min, max, mean, sum and count with group-by fields, periods ending at the read's end;
+  - the gauge aligners and reducers min, max, mean, sum and count with group-by fields, periods ending at the read's end; a period that reaches back before the read's start holds the series' earlier points, as production held them;
   - on DELTA metrics, `ALIGN_DELTA` and `ALIGN_SUM` (each period's total over the period, DELTA), `ALIGN_RATE` (each period's total a second, GAUGE DOUBLE), and min, max, mean and count (a gauge at the period's end), with the same reducers; a point counts whole in the period its end falls in, as production counted it;
   - the aligners production refused on a kind, refused in its words: `ALIGN_DELTA` and `ALIGN_RATE` on a gauge; interpolate, next older, the true and false counts and the percentiles on a DELTA metric;
   - the unit production gave: `1` for a count, aligned or reduced, the metric's unit a second for a rate (`1/s`, `By/s`), and `{not_a_unit}` for a metric without one;
@@ -257,10 +257,13 @@ into the fake, and holds it to production's answers the same way.
 - Its messages give times in UTC, where production wrote US Pacific.
 - A descriptor just created reads back at once, where production
   answered 404 for about 2 s, and once for more than 15 s.
-- Only generic_task's and Pub/Sub's resource type text is production's.
-- The quota descriptors' and consumer_quota's text is the metrics and
-  resource lists' of 19 October 2026, not measured against production
-  yet.
+- Only generic_task's, Pub/Sub's and consumer_quota's resource type
+  text is production's.
+- A write summary prints the resource's labels in one order, where
+  production's order varies call to call.
+- A reduced double can differ from production's in its last bits, since
+  the sums run in another order; the production suite compares 12
+  significant digits.
 - Nothing arrives late. Production's DELTA points each covered a minute
   and could be read about 130 s after their end, and a new
   subscription's first backlog point about 400 s after it was made. A
