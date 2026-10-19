@@ -99,6 +99,18 @@ including the ones that did not change.
   one, where it gave none. It refuses DELTA and STRING
   descriptors under `workload.googleapis.com/` and
   `external.googleapis.com/`, as production does, where it made them.
+- monitoring: `FakeMonitoring` holds Cloud's quota metrics, for tests of
+  code that reads usage against limits (#247): on the new resource type
+  `consumer_quota` (labels `service` and `location`), the four metrics
+  under `serviceruntime.googleapis.com/quota/`: `allocation/usage` and
+  `limit` (GAUGE INT64), `exceeded` (GAUGE BOOL, read raw or counted),
+  and `rate/net_usage` (DELTA INT64, aligned as the other DELTA metrics
+  are). A test puts them in with `put`; writing or creating one is
+  production's 403, and a program's metric written to `consumer_quota`
+  is refused in the summary, its descriptor made. Their descriptors name
+  `producer_quota` too, which the fake does not hold: a put or a filter
+  naming it is a 501. Their text is the metrics list's of 2026-10-19,
+  not yet measured against production.
 - auth, error_reporting, firestore, logging, pubsub and resource_manager:
   unchanged.
 

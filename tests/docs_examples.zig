@@ -1803,6 +1803,59 @@ test "Pub/Sub's own counts, put in the in-memory Cloud Monitoring and read back"
 }
 // end snippet
 
+// snippet: mon-quota
+test "quota usage against its limit, put in the in-memory Cloud Monitoring" {
+    var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_331_195 * std.time.ns_per_s };
+    var fake: monitoring.testing.FakeMonitoring = .init(std.testing.allocator, clock.io(), .{ .project_id = "my-project" });
+    defer fake.deinit();
+
+    // Quota usage and limits are Google's own metrics on the resource
+    // type consumer_quota, so the test puts them in.
+    const t = std.Io.Clock.real.now(clock.io()).nanoseconds;
+    const quota: []const monitoring.Label = &.{ .{ .key = "service", .value = "pubsub.googleapis.com" }, .{ .key = "location", .value = "global" } };
+    try fake.put(.{
+        .metric_type = "serviceruntime.googleapis.com/quota/allocation/usage",
+        .metric_labels = &.{.{ .key = "quota_metric", .value = "pubsub.googleapis.com/topics" }},
+        .resource_type = "consumer_quota",
+        .resource_labels = quota,
+        .kind = .gauge,
+        .value_type = .int64,
+        .points = &.{.{ .start = null, .end = .{ .nanoseconds = t }, .value = .{ .int64 = 9_950 } }},
+    });
+    try fake.put(.{
+        .metric_type = "serviceruntime.googleapis.com/quota/limit",
+        .metric_labels = &.{ .{ .key = "limit_name", .value = "Topics" }, .{ .key = "quota_metric", .value = "pubsub.googleapis.com/topics" } },
+        .resource_type = "consumer_quota",
+        .resource_labels = quota,
+        .kind = .gauge,
+        .value_type = .int64,
+        .points = &.{.{ .start = null, .end = .{ .nanoseconds = t }, .value = .{ .int64 = 10_000 } }},
+    });
+
+    var token: monitoring.StaticToken = .{ .token = "none" };
+    var client = try monitoring.Client.init(std.testing.allocator, clock.io(), .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    // The widget's read: usage and limit for one quota metric, paired.
+    const window: monitoring.ReadOptions = .{
+        .start = .{ .nanoseconds = t - 60 * std.time.ns_per_s },
+        .end = .{ .nanoseconds = t },
+        .filter = .{ .metric_labels = &.{.{ .key = "quota_metric", .value = "pubsub.googleapis.com/topics" }} },
+    };
+    var usage = try client.metric("serviceruntime.googleapis.com/quota/allocation/usage").read(window);
+    defer usage.deinit();
+    var limit = try client.metric("serviceruntime.googleapis.com/quota/limit").read(window);
+    defer limit.deinit();
+    const used = usage.value.series[0].points[0].value.?.int64;
+    const cap = limit.value.series[0].points[0].value.?.int64;
+    // Near its limit: the widget warns.
+    try std.testing.expect(used * 100 >= cap * 95);
+}
+// end snippet
+
 test "the Monitoring guides' code, against the in-memory Cloud Monitoring" {
     const gpa = std.testing.allocator;
     var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_331_195 * std.time.ns_per_s };

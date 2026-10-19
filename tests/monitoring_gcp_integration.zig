@@ -26,6 +26,14 @@
 //! metrics, a create under Google's domain, and a user metric on
 //! `pubsub_subscription`, whose descriptor it makes all the same, under
 //! the run's prefix.
+//!
+//! A quota test (MONITORING_TEST_QUOTA=1, about seven minutes) does the
+//! same for Cloud's quota metrics (issue #247): it sends Pub/Sub topic
+//! lists to consume rate quota, waits until Monitoring shows their
+//! minute, puts the project's own quota series for two services over 26
+//! hours into the fake, and holds the fake to production's answers,
+//! refusals, descriptors and the `consumer_quota` resource type. It
+//! creates and deletes nothing but the run's own user descriptor.
 
 const std = @import("std");
 const core = @import("core");
@@ -642,11 +650,13 @@ const pubsub_metrics = [_][]const u8{
     "topic/byte_cost",
 };
 
-/// One read of the Pub/Sub test, made of production and of the fake.
+/// One read of the Pub/Sub and quota tests, made of production and of
+/// the fake.
 const PubsubRead = struct {
     label: []const u8,
-    /// After `pubsub_prefix`.
+    /// After `prefix`.
     metric: []const u8,
+    prefix: []const u8 = pubsub_prefix,
     start: ?std.Io.Timestamp,
     end: std.Io.Timestamp,
     filter: monitoring.Filter,
@@ -655,7 +665,7 @@ const PubsubRead = struct {
 
 /// A read's outcome as text: its error, or its unit and its series, sorted.
 fn pubsubOutcome(a: Allocator, client: *monitoring.Client, diag: *monitoring.Diagnostics, base: i96, r: PubsubRead) ![]const u8 {
-    var page = client.metric(try a.print("{s}{s}", .{ pubsub_prefix, r.metric })).read(.{
+    var page = client.metric(try a.print("{s}{s}", .{ r.prefix, r.metric })).read(.{
         .start = r.start,
         .end = r.end,
         .filter = r.filter,
@@ -988,6 +998,222 @@ test "monitoring: Pub/Sub's own metrics, and the fake given production's points 
             line.* = out.written();
         }
         agree(&differences, rt, lines[0], lines[1]);
+    }
+    try testing.expectEqual(0, differences);
+}
+
+const quota_prefix = "serviceruntime.googleapis.com/quota/";
+
+/// The four quota metrics `FakeMonitoring` holds, after `quota_prefix`.
+const quota_metrics = [_][]const u8{
+    "allocation/usage",
+    "exceeded",
+    "limit",
+    "rate/net_usage",
+};
+
+test "monitoring: Cloud's quota metrics, and the fake given production's points answers as production did" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    if (f.env.get("MONITORING_TEST_QUOTA") == null) return error.SkipZigTest;
+    const a = f.arena.allocator();
+
+    // Rate quota is consumed by requests, so make some: topic lists are
+    // Pub/Sub administrator operations.
+    var ps_diag: pubsub.Diagnostics = .{};
+    var ps = try pubsub.Client.init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = f.token.provider(), .diagnostics = &ps_diag });
+    defer ps.deinit();
+    for (0..20) |_| {
+        var topics = try ps.listTopics(.{});
+        topics.deinit();
+    }
+    const called = nowMs();
+    fact("20 topic lists sent", .{});
+
+    // Wait until the calls' minute shows in the rate quota (sampled every
+    // 60 s, Google says visible within 240 s), and is at least a minute
+    // older than the window's end, so nothing arrives while the reads
+    // below run.
+    const by_pubsub: monitoring.Filter = .{ .resource_labels = &.{.{ .key = "service", .value = "pubsub.googleapis.com" }} };
+    var waited: usize = 0;
+    while (true) : (waited += 1) {
+        if (waited == 32) return error.TestPointsNeverReadable;
+        try testing.io.sleep(.fromSeconds(30), .awake);
+        const now: std.Io.Timestamp = .{ .nanoseconds = nowMs() };
+        var net = try f.client.metric(quota_prefix ++ "rate/net_usage").read(.{ .start = .{ .nanoseconds = floorMinute(called) - std.time.ns_per_min }, .end = now, .filter = by_pubsub });
+        defer net.deinit();
+        var latest: i96 = 0;
+        for (net.value.series) |s| for (s.points) |p| {
+            latest = @max(latest, p.end.nanoseconds);
+        };
+        if (latest > floorMinute(called) and now.nanoseconds - floorMinute(called) >= 6 * std.time.ns_per_min) break;
+    }
+    fact("rate points readable {d} s after the calls", .{@divFloor(nowMs() - called, std.time.ns_per_s)});
+
+    // Production's raw points over 26 hours, put into the fake. The limit
+    // is sampled daily and usage repeats at least daily, so the window
+    // holds each series the project has; it ends five minutes back, past
+    // the calls above.
+    const end: std.Io.Timestamp = .{ .nanoseconds = floorMinute(nowMs()) - 5 * std.time.ns_per_min };
+    const window_start: std.Io.Timestamp = .{ .nanoseconds = end.nanoseconds - 26 * std.time.ns_per_hour };
+    var fake: monitoring.testing.FakeMonitoring = .init(testing.allocator, testing.io, .{ .project_id = f.project });
+    defer fake.deinit();
+    var fake_diag: monitoring.Diagnostics = .{};
+    var fake_client = try monitoring.Client.init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = f.token.provider(), .transport = fake.transport(), .diagnostics = &fake_diag });
+    defer fake_client.deinit();
+    const services = [_][]const u8{ "pubsub.googleapis.com", "monitoring.googleapis.com" };
+    var put_series: usize = 0;
+    var put_points: usize = 0;
+    for (quota_metrics) |m| for (services) |svc| {
+        var raw = try f.client.metric(try a.print("{s}{s}", .{ quota_prefix, m })).read(.{ .start = window_start, .end = end, .filter = .{ .resource_labels = &.{.{ .key = "service", .value = svc }} } });
+        defer raw.deinit();
+        try testing.expectEqual(null, raw.value.next_page_token);
+        for (raw.value.series) |s| {
+            const pts = try a.alloc(monitoring.testing.FakeMonitoring.Point, s.points.len);
+            // Newest first in a read; oldest first in a put.
+            for (s.points, 0..) |p, i| pts[pts.len - 1 - i] = .{ .start = if (s.kind == .gauge) null else p.start, .end = p.end, .value = p.value.? };
+            try fake.put(.{ .metric_type = s.metric_type, .metric_labels = s.metric_labels, .resource_type = s.resource_type, .resource_labels = s.resource_labels, .kind = s.kind, .value_type = s.value_type, .points = pts });
+            put_series += 1;
+            put_points += pts.len;
+        }
+    };
+    fact("{d} series put into the fake, {d} points", .{ put_series, put_points });
+
+    // The reads a console makes: raw by service, and the aligners each
+    // kind takes, with the refusals production answers on the rest.
+    const by_monitoring: monitoring.Filter = .{ .resource_labels = &.{.{ .key = "service", .value = "monitoring.googleapis.com" }} };
+    const by_quota_metric: []const []const u8 = &.{"metric.labels.quota_metric"};
+    var reads: std.ArrayList(PubsubRead) = .empty;
+    for (quota_metrics) |m| {
+        try reads.append(a, .{ .label = try a.print("raw {s} pubsub", .{m}), .metric = m, .prefix = quota_prefix, .start = window_start, .end = end, .filter = by_pubsub });
+        try reads.append(a, .{ .label = try a.print("raw {s} monitoring", .{m}), .metric = m, .prefix = quota_prefix, .start = window_start, .end = end, .filter = by_monitoring });
+        const aggregations: []const monitoring.Aggregation = if (std.mem.eql(u8, m, "rate/net_usage")) &.{
+            .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum },
+            .{ .alignment_period_s = 300, .aligner = .delta, .reducer = .sum, .group_by = &.{"metric.labels.method"} },
+            .{ .alignment_period_s = 60, .aligner = .rate, .reducer = .sum },
+            .{ .alignment_period_s = 3600, .aligner = .delta },
+            .{ .alignment_period_s = 3600, .aligner = .sum, .reducer = .sum },
+            .{ .alignment_period_s = 300, .aligner = .max, .reducer = .max },
+            .{ .alignment_period_s = 300, .aligner = .count, .reducer = .sum },
+        } else if (std.mem.eql(u8, m, "exceeded")) &.{
+            .{ .alignment_period_s = 3600, .aligner = .count },
+            .{ .alignment_period_s = 3600, .aligner = .count, .reducer = .sum },
+        } else &.{
+            .{ .alignment_period_s = 3600, .aligner = .max },
+            .{ .alignment_period_s = 3600, .aligner = .max, .reducer = .sum, .group_by = by_quota_metric },
+            .{ .alignment_period_s = 3600, .aligner = .mean, .reducer = .max },
+            .{ .alignment_period_s = 86400, .aligner = .max },
+            .{ .alignment_period_s = 3600, .aligner = .min },
+            .{ .alignment_period_s = 3600, .aligner = .sum },
+            .{ .alignment_period_s = 3600, .aligner = .count, .reducer = .count },
+            .{ .alignment_period_s = 3600, .aligner = .delta },
+            .{ .alignment_period_s = 3600, .aligner = .rate },
+        };
+        for (aggregations, 0..) |agg, i| try reads.append(a, .{ .label = try a.print("{s} #{d}", .{ m, i }), .metric = m, .prefix = quota_prefix, .start = window_start, .end = end, .filter = by_pubsub, .aggregation = agg });
+    }
+    // Around one quota metric of the limit: both metrics filtered on its
+    // label.
+    {
+        var raw = try f.client.metric(quota_prefix ++ "limit").read(.{ .start = window_start, .end = end, .filter = by_pubsub });
+        defer raw.deinit();
+        if (raw.value.series.len > 0) {
+            const labels = try a.alloc(monitoring.Match, 1);
+            labels[0] = .{ .key = "quota_metric", .value = try a.dupe(u8, raw.value.series[0].label("quota_metric").?) };
+            try reads.append(a, .{ .label = "limit by quota_metric", .metric = "limit", .prefix = quota_prefix, .start = window_start, .end = end, .filter = .{ .metric_labels = labels } });
+            try reads.append(a, .{ .label = "usage by quota_metric", .metric = "allocation/usage", .prefix = quota_prefix, .start = window_start, .end = end, .filter = .{ .metric_labels = labels } });
+        } else fact("no limit series for pubsub: no quota_metric reads", .{});
+    }
+    // Filters production refused, or did not.
+    for ([_]struct { []const u8, []const u8, monitoring.Filter }{
+        .{ "filter: a quota metric on subscription_id", "allocation/usage", .{ .resource_labels = &.{.{ .key = "subscription_id", .value = "x" }} } },
+        .{ "filter: a quota metric on zone", "allocation/usage", .{ .resource_labels = &.{.{ .key = "zone", .value = "x" }} } },
+        .{ "filter: a metric label the metric lacks", "allocation/usage", .{ .metric_labels = &.{.{ .key = "limit_name", .value = "x" }} } },
+        .{ "filter: its own resource type and service", "allocation/usage", .{ .resource_type = "consumer_quota", .resource_labels = &.{.{ .key = "service", .value = "pubsub.googleapis.com" }} } },
+        .{ "filter: resource type global", "allocation/usage", .{ .resource_type = "global" } },
+        .{ "filter: resource type pubsub_topic", "allocation/usage", .{ .resource_type = "pubsub_topic" } },
+        .{ "filter: a quota_metric prefix", "limit", .{ .metric_labels = &.{.{ .key = "quota_metric", .op = .starts_with, .value = "pubsub.googleapis.com/" }} } },
+        .{ "filter: location global", "limit", .{ .resource_labels = &.{ .{ .key = "service", .value = "pubsub.googleapis.com" }, .{ .key = "location", .value = "global" } } } },
+    }) |c| try reads.append(a, .{ .label = c[0], .metric = c[1], .prefix = quota_prefix, .start = window_start, .end = end, .filter = c[2] });
+
+    var differences: usize = 0;
+    for (reads.items) |r| {
+        const in_memory = try pubsubOutcome(a, &fake_client, &fake_diag, window_start.nanoseconds, r);
+        const production = try pubsubOutcome(a, &f.client, &f.diag, window_start.nanoseconds, r);
+        agree(&differences, r.label, production, in_memory);
+    }
+
+    // producer_quota, which the fake does not hold: production's answer
+    // on the record, the fake's 501 checked by its unit tests.
+    if (f.client.metric(quota_prefix ++ "limit").read(.{ .start = window_start, .end = end, .filter = .{ .resource_type = "producer_quota" } })) |page| {
+        var owned = page;
+        defer owned.deinit();
+        fact("producer_quota filter: production answered {d} series", .{owned.value.series.len});
+    } else |err| fact("producer_quota filter: production refused {t}: {s}", .{ err, f.diag.message() });
+
+    // Writes production refused: one of the quota metrics; a user metric
+    // on consumer_quota, its descriptor made all the same; a create under
+    // serviceruntime's domain.
+    {
+        const on_quota = try f.name("on_quota");
+        const quota_resource: monitoring.Resource = .{ .other = .{ .type = "consumer_quota", .labels = &.{ .{ .key = "service", .value = "pubsub.googleapis.com" }, .{ .key = "location", .value = "global" } } } };
+        const google_type = try a.print("{s}zigps_mon_{s}", .{ quota_prefix, f.run });
+        var lines: [2][]const u8 = undefined;
+        for ([_]*monitoring.Client{ &f.client, &fake_client }, [_]*monitoring.Diagnostics{ &f.diag, &fake_diag }, &lines) |client, diag, *line| {
+            var out: std.Io.Writer.Allocating = .init(a);
+            const now: std.Io.Timestamp = .{ .nanoseconds = nowMs() };
+            if (client.write(&.{.{ .metric_type = quota_prefix ++ "allocation/usage", .resource = quota_resource, .kind = .gauge, .end = now, .value = .{ .int64 = 1 } }})) |r| {
+                var owned = r;
+                owned.deinit();
+                try out.writer.writeAll("Google's: written");
+            } else |err| try out.writer.print("Google's: {t}: {s}", .{ err, diag.message() });
+            if (client.write(&.{.{ .metric_type = on_quota, .resource = quota_resource, .kind = .gauge, .end = now, .value = .{ .int64 = 1 } }})) |r| {
+                var owned = r;
+                defer owned.deinit();
+                try out.writer.print(" | a user metric: {d} written, {s}", .{ owned.value.written, owned.value.message });
+            } else |err| try out.writer.print(" | a user metric: {t}: {s}", .{ err, diag.message() });
+            if (client.metric(google_type).create(.{ .kind = .gauge, .value_type = .int64 })) |d| {
+                var owned = d;
+                owned.deinit();
+                try out.writer.writeAll(" | a create: made");
+            } else |err| try out.writer.print(" | a create: {t}: {s}", .{ err, diag.message() });
+            line.* = out.written();
+        }
+        agree(&differences, "writes production refused", lines[0], lines[1]);
+        var on_quota_info = try f.awaitDescriptor(on_quota);
+        on_quota_info.deinit();
+        var fake_made = try fake_client.metric(on_quota).get();
+        fake_made.deinit();
+        fact("the user metric's descriptor was made by both", .{});
+    }
+
+    // Descriptors and the resource type, as production gives them.
+    for (quota_metrics) |m| {
+        const t = try a.print("{s}{s}", .{ quota_prefix, m });
+        var lines: [2][]const u8 = undefined;
+        for ([_]*monitoring.Client{ &f.client, &fake_client }, &lines) |client, *line| {
+            var info = try client.metric(t).get();
+            defer info.deinit();
+            var out: std.Io.Writer.Allocating = .init(a);
+            try out.writer.print("{t} {t} unit {s}, \"{s}\", \"{s}\", labels", .{ info.value.kind, info.value.value_type, info.value.unit, info.value.display_name, info.value.description });
+            for (info.value.labels) |l| try out.writer.print(" {s} \"{s}\"", .{ l.key, l.description });
+            try out.writer.writeAll(", on");
+            for (info.value.resource_types) |rt| try out.writer.print(" {s}", .{rt});
+            line.* = out.written();
+        }
+        agree(&differences, m, lines[0], lines[1]);
+    }
+    {
+        var lines: [2][]const u8 = undefined;
+        for ([_]*monitoring.Client{ &f.client, &fake_client }, &lines) |client, *line| {
+            var info = try client.resourceType("consumer_quota");
+            defer info.deinit();
+            var out: std.Io.Writer.Allocating = .init(a);
+            try out.writer.print("\"{s}\", \"{s}\", labels", .{ info.value.display_name, info.value.description });
+            for (info.value.labels) |l| try out.writer.print(" {s} \"{s}\"", .{ l.key, l.description });
+            line.* = out.written();
+        }
+        agree(&differences, "consumer_quota", lines[0], lines[1]);
     }
     try testing.expectEqual(0, differences);
 }

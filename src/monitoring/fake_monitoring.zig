@@ -46,8 +46,11 @@
 //!   the unit as production gave it, `1` for a count and a second for a
 //!   rate.
 //! - Google's own metrics: the nine of Pub/Sub's a console reads (issue
-//!   #239), their descriptors as production gave them, there from the
-//!   start, on the resource types `pubsub_subscription` and `pubsub_topic`.
+//!   #239), their descriptors as production gave them, and the four quota
+//!   metrics under `serviceruntime.googleapis.com/quota/` a console reads
+//!   for quota warnings (issue #247), their descriptors the metrics
+//!   list's of 2026-10-19, all there from the start, on the resource
+//!   types `pubsub_subscription`, `pubsub_topic` and `consumer_quota`.
 //!   No program writes or creates one, as production answered; `put` puts
 //!   their points in, as it does any series a program could not write.
 //! - Faults a test asks for, and a write served and then answered with an
@@ -56,8 +59,9 @@
 //! Where it differs: times in its messages are UTC, where production wrote
 //! US Pacific; a descriptor just made reads back at once, where production
 //! answered 404 for about 2 s, once for more than 15 s; its resource
-//! types are the seven `Resource` names and Pub/Sub's two, only
-//! generic_task's and Pub/Sub's text production's; nothing put in
+//! types are the seven `Resource` names, Pub/Sub's two and
+//! `consumer_quota`, only generic_task's and Pub/Sub's text production's
+//! and consumer_quota's the resource list's; nothing put in
 //! arrives late, where production showed a minute's counts about 130 s
 //! after it. Not modelled, each
 //! answered 501 with the reason: another project, a cumulative start
@@ -612,6 +616,7 @@ pub const FakeMonitoring = struct {
         try jw.beginArray();
         if (d.google) |g| {
             try jw.write(g.resource_type);
+            for (g.also_on) |t| try jw.write(t);
         } else for (catalog) |r| if (r.writable) try jw.write(r.type);
         try jw.endArray();
         try jw.endObject();
@@ -1823,9 +1828,22 @@ const CatalogType = struct {
 const project_label = .{ "project_id", "The identifier of the GCP project associated with this resource, such as \"my-project\"." };
 
 /// generic_task's and Pub/Sub's text is production's, measured 2026-10-18
-/// and 2026-10-19; the others' labels are the ones `Resource` names, with
-/// no descriptions.
+/// and 2026-10-19, and consumer_quota's is the resource list's, read
+/// 2026-10-19 (issue #247); the others' labels are the ones `Resource`
+/// names, with no descriptions.
 const catalog = [_]CatalogType{
+    .{
+        .type = "consumer_quota",
+        .display_name = "Consumer Quota",
+        .description = "Quota used by consumers.",
+        .labels = &.{
+            project_label,
+            .{ "service", "The name of the used service, such as 'cloudsql.googleapis.com'." },
+            .{ "location", "The location where the quota are consumed. It is a region for regional quota, or a zone for zonal quota, or 'global' otherwise." },
+        },
+        .location_labels = &.{"location"},
+        .writable = false,
+    },
     .{ .type = "gce_instance", .display_name = "VM Instance", .labels = &.{ project_label, .{ "instance_id", "" }, .{ "zone", "" } }, .location_labels = &.{"zone"} },
     .{ .type = "generic_node", .display_name = "Generic Node", .labels = &.{ project_label, .{ "location", "" }, .{ "namespace", "" }, .{ "node_id", "" } }, .location_labels = &.{"location"} },
     .{
@@ -1878,7 +1896,7 @@ fn resourceLabelKnown(d: *const FakeMonitoring.Descriptor, named: ?*const Catalo
     return false;
 }
 
-// Google's own metrics it knows: Pub/Sub's.
+// Google's own metrics it knows: Pub/Sub's, and the quota metrics.
 
 /// One of Google's own metrics, on one resource type.
 const GoogleMetric = struct {
@@ -1890,7 +1908,11 @@ const GoogleMetric = struct {
     description: []const u8 = "",
     /// Key and description.
     labels: []const [2][]const u8 = &.{},
+    /// The one resource type the fake holds its points on.
     resource_type: []const u8,
+    /// Resource types its descriptor also names, which the fake does not
+    /// hold: the quota metrics' producer side.
+    also_on: []const []const u8 = &.{},
 
     fn hasLabel(g: *const GoogleMetric, key: []const u8) bool {
         for (g.labels) |l| if (std.mem.eql(u8, l[0], key)) return true;
@@ -1901,8 +1923,14 @@ const GoogleMetric = struct {
 const delivery_type = .{ "delivery_type", "Delivery mechanism: push, pull or streaming pull." };
 const response_code = .{ "response_code", "Operation response code string, derived as a string representation of a status code (e.g., 'success', 'not_found', 'unavailable')." };
 
+const quota_metric_label = .{ "quota_metric", "The name of quota metric or quota group." };
+const limit_name_label = .{ "limit_name", "The quota limit name, such as \"Requests per day\" or \"In-use IP addresses\"." };
+
 /// Pub/Sub's metrics a console reads, as production described them on
-/// 2026-10-19 (issue #239).
+/// 2026-10-19 (issue #239), and the four quota metrics a console reads
+/// for quota warnings, as the metrics list described them on 2026-10-19
+/// (issue #247): usage and limits on `consumer_quota`, the producer side
+/// named in their descriptors but not held.
 const google_metrics = [_]GoogleMetric{
     .{
         .type = "pubsub.googleapis.com/subscription/num_undelivered_messages",
@@ -1996,6 +2024,49 @@ const google_metrics = [_]GoogleMetric{
         .labels = &.{ .{ "operation_type", "Type of operation performed." }, response_code },
         .resource_type = "pubsub_topic",
     },
+    .{
+        .type = "serviceruntime.googleapis.com/quota/allocation/usage",
+        .kind = .gauge,
+        .value_type = .int64,
+        .unit = "1",
+        .display_name = "Allocation quota usage",
+        .description = "The total consumed allocation quota. Values reported more than 1/min are dropped. If no changes are received in quota usage, the last value is repeated at least every 24 hours.",
+        .labels = &.{quota_metric_label},
+        .resource_type = "consumer_quota",
+        .also_on = &.{"producer_quota"},
+    },
+    .{
+        .type = "serviceruntime.googleapis.com/quota/exceeded",
+        .kind = .gauge,
+        .value_type = .bool,
+        .unit = "1",
+        .display_name = "Quota exceeded error",
+        .description = "The error happened when the quota limit was exceeded.",
+        .labels = &.{ limit_name_label, quota_metric_label },
+        .resource_type = "consumer_quota",
+    },
+    .{
+        .type = "serviceruntime.googleapis.com/quota/limit",
+        .kind = .gauge,
+        .value_type = .int64,
+        .unit = "1",
+        .display_name = "Quota limit",
+        .description = "The limit for the quota.",
+        .labels = &.{ limit_name_label, quota_metric_label },
+        .resource_type = "consumer_quota",
+        .also_on = &.{"producer_quota"},
+    },
+    .{
+        .type = "serviceruntime.googleapis.com/quota/rate/net_usage",
+        .kind = .delta,
+        .value_type = .int64,
+        .unit = "1",
+        .display_name = "Rate quota usage",
+        .description = "The total consumed rate quota.",
+        .labels = &.{ .{ "method", "The API method name, such as \"disks.list\"." }, quota_metric_label },
+        .resource_type = "consumer_quota",
+        .also_on = &.{"producer_quota"},
+    },
 };
 
 comptime {
@@ -2007,7 +2078,8 @@ comptime {
 /// Whether `metric_type` is under a domain of Google's the fake holds
 /// metrics of, which no program writes or creates.
 fn googleDomain(metric_type: []const u8) bool {
-    return std.mem.startsWith(u8, metric_type, "pubsub.googleapis.com/");
+    return std.mem.startsWith(u8, metric_type, "pubsub.googleapis.com/") or
+        std.mem.startsWith(u8, metric_type, "serviceruntime.googleapis.com/");
 }
 
 fn catalogType(name: []const u8) ?*const CatalogType {
@@ -2898,7 +2970,7 @@ test "resource types: generic_task as production wrote it, the others, and one t
     try testing.expectEqual(3, page.value.types.len);
     var rest = try b.client.listResourceTypes(.{ .page_token = page.value.next_page_token });
     defer rest.deinit();
-    try testing.expectEqual(6, rest.value.types.len);
+    try testing.expectEqual(7, rest.value.types.len);
     try testing.expectEqual(null, rest.value.next_page_token);
     // Every named resource writes; .other's types are not modelled.
     const resources = [_]types.Resource{
@@ -3748,6 +3820,217 @@ test "Pub/Sub's descriptors and resource types: read and listed, never created, 
     try testing.expectError(error.InvalidArgument, mine.read(.{ .end = b.at(0), .filter = .{ .resource_type = "global", .resource_labels = &.{.{ .key = "zone", .value = "x" }} } }));
     var zoned = try mine.read(.{ .end = b.at(0), .filter = .{ .resource_type = "gce_instance", .resource_labels = &.{.{ .key = "zone", .value = "x" }} } });
     zoned.deinit();
+}
+
+// Cloud's quota metrics, put in by a test (issue #247).
+
+const usage_type = "serviceruntime.googleapis.com/quota/allocation/usage";
+const exceeded_type = "serviceruntime.googleapis.com/quota/exceeded";
+const limit_type = "serviceruntime.googleapis.com/quota/limit";
+const net_usage_type = "serviceruntime.googleapis.com/quota/rate/net_usage";
+
+/// Pub/Sub's quota on the consumer_quota resource, global as allocation
+/// quotas are.
+const pubsub_quota: []const types.Label = &.{ .{ .key = "service", .value = "pubsub.googleapis.com" }, .{ .key = "location", .value = "global" } };
+const topics_quota = [_]types.Label{.{ .key = "quota_metric", .value = "pubsub.googleapis.com/topics" }};
+
+test "put: Cloud's quota metrics, read back as production answers them" {
+    var b: Bench = undefined;
+    try b.init(.{ .project_id = "atlas-prod" });
+    defer b.deinit();
+
+    // No program writes them, as production answered for Pub/Sub's.
+    try testing.expectError(error.PermissionDenied, b.client.write(&.{.{ .metric_type = usage_type, .resource = .{ .other = .{ .type = "consumer_quota", .labels = pubsub_quota } }, .kind = .gauge, .end = b.at(0), .value = .{ .int64 = 1 } }}));
+    try testing.expectEqualStrings("User does not have permission to write to metric serviceruntime.googleapis.com/quota/allocation/usage.", b.diag.message());
+
+    // The widget's pair: usage against its limit, by quota metric, and
+    // another service's usage to filter away.
+    const usage_points = [_]FakeMonitoring.Point{ gaugePoint(&b, -120_000, 9_800), gaugePoint(&b, -60_000, 9_950) };
+    try b.fake.put(.{ .metric_type = usage_type, .metric_labels = &topics_quota, .resource_type = "consumer_quota", .resource_labels = pubsub_quota, .kind = .gauge, .value_type = .int64, .points = &usage_points });
+    const limit_points = [_]FakeMonitoring.Point{gaugePoint(&b, -60_000, 10_000)};
+    try b.fake.put(.{ .metric_type = limit_type, .metric_labels = &.{ .{ .key = "limit_name", .value = "Topics" }, .{ .key = "quota_metric", .value = "pubsub.googleapis.com/topics" } }, .resource_type = "consumer_quota", .resource_labels = pubsub_quota, .kind = .gauge, .value_type = .int64, .points = &limit_points });
+    const other_points = [_]FakeMonitoring.Point{gaugePoint(&b, -60_000, 3)};
+    try b.fake.put(.{ .metric_type = usage_type, .metric_labels = &.{.{ .key = "quota_metric", .value = "secretmanager.googleapis.com/secrets" }}, .resource_type = "consumer_quota", .resource_labels = &.{ .{ .key = "service", .value = "secretmanager.googleapis.com" }, .{ .key = "location", .value = "us-central1" } }, .kind = .gauge, .value_type = .int64, .points = &other_points });
+
+    // Raw, filtered on the service, the resource as production gives it.
+    var usage = try b.client.metric(usage_type).read(.{ .start = b.at(-180_000), .end = b.at(0), .filter = .{ .resource_labels = &.{.{ .key = "service", .value = "pubsub.googleapis.com" }} } });
+    defer usage.deinit();
+    try testing.expectEqual(1, usage.value.series.len);
+    const s = usage.value.series[0];
+    try testing.expectEqualStrings("consumer_quota", s.resource_type);
+    try testing.expectEqualStrings("atlas-prod", s.resourceLabel("project_id").?);
+    try testing.expectEqualStrings("global", s.resourceLabel("location").?);
+    try testing.expectEqualStrings("pubsub.googleapis.com/topics", s.label("quota_metric").?);
+    try testing.expectEqual(2, s.points.len);
+    try testing.expectEqual(9_950, s.points[0].value.?.int64);
+    try testing.expectEqualStrings("1", usage.value.unit);
+
+    // The limit by the quota metric's label, as the widget pairs them.
+    var limit = try b.client.metric(limit_type).read(.{ .start = b.at(-180_000), .end = b.at(0), .filter = .{ .metric_labels = &.{.{ .key = "quota_metric", .value = "pubsub.googleapis.com/topics" }} } });
+    defer limit.deinit();
+    try testing.expectEqual(1, limit.value.series.len);
+    try testing.expectEqualStrings("Topics", limit.value.series[0].label("limit_name").?);
+    try testing.expectEqual(10_000, limit.value.series[0].points[0].value.?.int64);
+
+    // The gauges align as the other gauges do: (-60 s, 0] is empty, and
+    // (-120 s, -60 s] holds both services' points.
+    var max = try b.client.metric(usage_type).read(.{ .start = b.at(-120_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .max, .reducer = .sum } });
+    defer max.deinit();
+    try testing.expectEqual(1, max.value.series.len);
+    try testing.expectEqual(1, max.value.series[0].points.len);
+    try testing.expectEqual(9_953, max.value.series[0].points[0].value.?.int64);
+
+    // quota/exceeded is a BOOL gauge: raw and counted; another aligner on
+    // a bool is not modelled.
+    const exceeded_points = [_]FakeMonitoring.Point{
+        .{ .start = null, .end = b.at(-60_000), .value = .{ .bool = false } },
+        .{ .start = null, .end = b.at(-1_000), .value = .{ .bool = true } },
+    };
+    try b.fake.put(.{ .metric_type = exceeded_type, .metric_labels = &.{ .{ .key = "limit_name", .value = "Topics" }, .{ .key = "quota_metric", .value = "pubsub.googleapis.com/topics" } }, .resource_type = "consumer_quota", .resource_labels = pubsub_quota, .kind = .gauge, .value_type = .bool, .points = &exceeded_points });
+    var exceeded = try b.client.metric(exceeded_type).read(.{ .start = b.at(-180_000), .end = b.at(0) });
+    defer exceeded.deinit();
+    try testing.expectEqual(types.ValueType.bool, exceeded.value.series[0].value_type);
+    try testing.expectEqual(true, exceeded.value.series[0].points[0].value.?.bool);
+    try testing.expectEqual(false, exceeded.value.series[0].points[1].value.?.bool);
+    var counted = try b.client.metric(exceeded_type).read(.{ .start = b.at(-120_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 120, .aligner = .count } });
+    defer counted.deinit();
+    try testing.expectEqual(2, counted.value.series[0].points[0].value.?.int64);
+    try testing.expectEqualStrings("1", counted.value.unit);
+    try testing.expectError(error.Unimplemented, b.client.metric(exceeded_type).read(.{ .start = b.at(-120_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .max } }));
+
+    // Rate quota is DELTA, aligned as the other DELTA metrics are.
+    const calls = [_]FakeMonitoring.Point{ minute(&b, -60_000, 30), minute(&b, 0, 90) };
+    try b.fake.put(.{ .metric_type = net_usage_type, .metric_labels = &.{ .{ .key = "method", .value = "google.pubsub.v1.Publisher.CreateTopic" }, .{ .key = "quota_metric", .value = "pubsub.googleapis.com/administrator_per_minute" } }, .resource_type = "consumer_quota", .resource_labels = pubsub_quota, .kind = .delta, .value_type = .int64, .points = &calls });
+    var rate = try b.client.metric(net_usage_type).read(.{ .start = b.at(-120_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .rate, .reducer = .sum } });
+    defer rate.deinit();
+    try testing.expectEqual(1.5, rate.value.series[0].points[0].value.?.double);
+    try testing.expectEqual(0.5, rate.value.series[0].points[1].value.?.double);
+    try testing.expectEqualStrings("1/s", rate.value.unit);
+    var by_method = try b.client.metric(net_usage_type).read(.{ .start = b.at(-60_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum, .group_by = &.{"metric.labels.method"} } });
+    defer by_method.deinit();
+    try testing.expectEqual(1, by_method.value.series.len);
+    try testing.expectEqualStrings("google.pubsub.v1.Publisher.CreateTopic", by_method.value.series[0].label("method").?);
+    try testing.expectEqual(90, by_method.value.series[0].points[0].value.?.int64);
+
+    // Nothing for a quota with nothing put in: no series, not zeros.
+    var none = try b.client.metric(exceeded_type).read(.{ .start = b.at(-180_000), .end = b.at(0), .filter = .{ .metric_labels = &.{.{ .key = "quota_metric", .value = "pubsub.googleapis.com/subscriber" }} } });
+    defer none.deinit();
+    try testing.expectEqual(0, none.value.series.len);
+}
+
+test "put: a quota series production could not hold is refused" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    const gauge = [_]FakeMonitoring.Point{gaugePoint(&b, 0, 1)};
+    const base: FakeMonitoring.PutSeries = .{ .metric_type = usage_type, .metric_labels = &topics_quota, .resource_type = "consumer_quota", .resource_labels = pubsub_quota, .kind = .gauge, .value_type = .int64, .points = &gauge };
+
+    // Another resource type than the metric's.
+    var bad = base;
+    bad.resource_type = "pubsub_subscription";
+    bad.resource_labels = &.{.{ .key = "subscription_id", .value = "s" }};
+    try testing.expectError(error.InvalidEntry, b.fake.put(bad));
+    // A metric label the metric lacks.
+    bad = base;
+    bad.metric_labels = &.{.{ .key = "limit_name", .value = "Topics" }};
+    try testing.expectError(error.InvalidEntry, b.fake.put(bad));
+    // A resource label missing.
+    bad = base;
+    bad.resource_labels = &.{.{ .key = "service", .value = "pubsub.googleapis.com" }};
+    try testing.expectError(error.InvalidEntry, b.fake.put(bad));
+    // Another kind or value type than the descriptor's.
+    bad = base;
+    bad.kind = .delta;
+    const delta_point = [_]FakeMonitoring.Point{minute(&b, 0, 1)};
+    bad.points = &delta_point;
+    try testing.expectError(error.InvalidEntry, b.fake.put(bad));
+    bad = base;
+    bad.value_type = .bool;
+    const flag = [_]FakeMonitoring.Point{.{ .start = null, .end = b.at(0), .value = .{ .bool = true } }};
+    bad.points = &flag;
+    try testing.expectError(error.InvalidEntry, b.fake.put(bad));
+    try testing.expectError(error.InvalidEntry, b.fake.put(.{ .metric_type = exceeded_type, .resource_type = "consumer_quota", .resource_labels = pubsub_quota, .kind = .gauge, .value_type = .int64, .points = &gauge }));
+    // A metric a program makes goes neither under Google's domain nor on
+    // consumer_quota.
+    try testing.expectError(error.InvalidEntry, b.fake.put(.{ .metric_type = "serviceruntime.googleapis.com/quota/mine", .resource_type = "consumer_quota", .resource_labels = pubsub_quota, .kind = .gauge, .value_type = .int64, .points = &gauge }));
+    try testing.expectError(error.InvalidEntry, b.fake.put(.{ .metric_type = "custom.googleapis.com/mine", .resource_type = "consumer_quota", .resource_labels = pubsub_quota, .kind = .gauge, .value_type = .int64, .points = &gauge }));
+    try testing.expectEqual(0, b.fake.pointCount());
+}
+
+test "the quota descriptors and consumer_quota: read and listed, never created, written or deleted" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var limit = try b.client.metric(limit_type).get();
+    defer limit.deinit();
+    try testing.expectEqual(types.Kind.gauge, limit.value.kind);
+    try testing.expectEqual(types.ValueType.int64, limit.value.value_type);
+    try testing.expectEqualStrings("1", limit.value.unit);
+    try testing.expectEqualStrings("Quota limit", limit.value.display_name);
+    try testing.expectEqualStrings("The limit for the quota.", limit.value.description);
+    try testing.expectEqual(2, limit.value.labels.len);
+    try testing.expectEqualStrings("The quota limit name, such as \"Requests per day\" or \"In-use IP addresses\".", limit.value.label("limit_name").?.description);
+    // Its descriptor names the producer side too, which the fake does
+    // not hold.
+    try testing.expectEqual(2, limit.value.resource_types.len);
+    try testing.expectEqualStrings("consumer_quota", limit.value.resource_types[0]);
+    try testing.expectEqualStrings("producer_quota", limit.value.resource_types[1]);
+    var exceeded = try b.client.metric(exceeded_type).get();
+    defer exceeded.deinit();
+    try testing.expectEqual(types.ValueType.bool, exceeded.value.value_type);
+    try testing.expectEqual(1, exceeded.value.resource_types.len);
+    var net = try b.client.metric(net_usage_type).get();
+    defer net.deinit();
+    try testing.expectEqual(types.Kind.delta, net.value.kind);
+    try testing.expectEqualStrings("The API method name, such as \"disks.list\".", net.value.label("method").?.description);
+
+    var listed = try b.client.listMetrics(.{ .prefix = "serviceruntime.googleapis.com/quota/" });
+    defer listed.deinit();
+    try testing.expectEqual(4, listed.value.metrics.len);
+    try testing.expectEqualStrings(usage_type, listed.value.metrics[0].type);
+    try testing.expectEqualStrings(net_usage_type, listed.value.metrics[3].type);
+
+    // Never created, written or deleted, as production answers for
+    // Google's own.
+    const created = try b.raw(a, .POST, "metricDescriptors", "{\"type\":\"serviceruntime.googleapis.com/quota/zigps\",\"metricKind\":\"GAUGE\",\"valueType\":\"INT64\"}");
+    try testing.expectEqual(403, created.status);
+    try testing.expectEqualStrings("User does not have permission to write to metric serviceruntime.googleapis.com/quota/zigps.", try messageOf(a, created.body));
+    try testing.expectEqual(null, try b.fake.descriptor(a, "serviceruntime.googleapis.com/quota/zigps"));
+    try testing.expectEqual(501, (try b.raw(a, .DELETE, "metricDescriptors/" ++ limit_type, null)).status);
+    // A user metric on consumer_quota: refused in the summary, its
+    // descriptor made, as a write on Pub/Sub's types is.
+    var on_quota = try b.client.write(&.{.{ .metric_type = "custom.googleapis.com/zigps/on_quota", .resource = .{ .other = .{ .type = "consumer_quota", .labels = pubsub_quota } }, .kind = .gauge, .end = b.at(0), .value = .{ .int64 = 1 } }});
+    defer on_quota.deinit();
+    try testing.expectEqual(0, on_quota.value.written);
+    try testing.expectEqual(error.InvalidArgument, on_quota.value.refused[0].reason);
+    try testing.expect(std.mem.indexOf(u8, on_quota.value.message, "metrics cannot be written to consumer_quota") != null);
+    try testing.expectEqual(types.Kind.gauge, (try b.fake.descriptor(a, "custom.googleapis.com/zigps/on_quota")).?.kind);
+
+    var rt = try b.client.resourceType("consumer_quota");
+    defer rt.deinit();
+    try testing.expectEqualStrings("Consumer Quota", rt.value.display_name);
+    try testing.expectEqualStrings("Quota used by consumers.", rt.value.description);
+    try testing.expectEqual(3, rt.value.labels.len);
+    try testing.expectEqualStrings("service", rt.value.labels[1].key);
+    try testing.expectEqualStrings("The location where the quota are consumed. It is a region for regional quota, or a zone for zonal quota, or 'global' otherwise.", rt.value.labels[2].description);
+
+    // Filters: a resource label the type lacks is 400, a metric label the
+    // metric lacks 404, another resource type 400; its own selects, and
+    // producer_quota, named by the descriptor, is not modelled.
+    const m = b.client.metric(usage_type);
+    try testing.expectError(error.InvalidArgument, m.read(.{ .end = b.at(0), .filter = .{ .resource_labels = &.{.{ .key = "subscription_id", .value = "x" }} } }));
+    try testing.expectError(error.NotFound, m.read(.{ .end = b.at(0), .filter = .{ .metric_labels = &.{.{ .key = "limit_name", .value = "x" }} } }));
+    try testing.expectError(error.InvalidArgument, m.read(.{ .end = b.at(0), .filter = .{ .resource_type = "global" } }));
+    const one = [_]FakeMonitoring.Point{gaugePoint(&b, 0, 1)};
+    try b.fake.put(.{ .metric_type = usage_type, .metric_labels = &topics_quota, .resource_type = "consumer_quota", .resource_labels = pubsub_quota, .kind = .gauge, .value_type = .int64, .points = &one });
+    var own = try m.read(.{ .end = b.at(0), .filter = .{ .resource_type = "consumer_quota", .resource_labels = &.{.{ .key = "service", .value = "pubsub.googleapis.com" }} } });
+    defer own.deinit();
+    try testing.expectEqual(1, own.value.series.len);
+    try testing.expectError(error.Unimplemented, m.read(.{ .end = b.at(0), .filter = .{ .resource_type = "producer_quota" } }));
 }
 
 test "put: refused whole for what production could not hold" {
