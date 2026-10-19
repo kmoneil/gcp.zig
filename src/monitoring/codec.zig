@@ -299,6 +299,60 @@ pub fn decodeResourceTypePage(out: Allocator, scratch: Allocator, body: []const 
     return .{ .types = items, .next_page_token = try token(out, obj) };
 }
 
+/// An alert, as get answers.
+pub fn decodeAlert(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.Alert {
+    return alertOf(out, scratch, try parse(scratch, body));
+}
+
+/// A page of `alerts.list`: `{}` is an empty last page.
+pub fn decodeAlertPage(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.AlertPage {
+    const obj = try object(try parse(scratch, body));
+    const list = try field(obj, "alerts", .array);
+    const alerts = try out.alloc(types.Alert, if (list) |l| l.items.len else 0);
+    if (list) |l| for (l.items, alerts) |v, *a| {
+        a.* = try alertOf(out, scratch, v);
+    };
+    return .{
+        .alerts = alerts,
+        .next_page_token = try token(out, obj),
+        .total_size = try integer(i64, obj, "totalSize"),
+    };
+}
+
+fn alertOf(out: Allocator, scratch: Allocator, v: Value) DecodeError!types.Alert {
+    const obj = try object(v);
+    const name = try string(out, obj, "name") orelse return error.InvalidResponse;
+    var alert: types.Alert = .{
+        .name = name,
+        .id = if (std.mem.lastIndexOfScalar(u8, name, '/')) |i| name[i + 1 ..] else name,
+        .state = if (try field(obj, "state", .string)) |s| types.AlertState.fromWire(s) else .unknown,
+        .open_time = try time(obj, "openTime") orelse return error.InvalidResponse,
+        .close_time = try time(obj, "closeTime"),
+    };
+    if (try field(obj, "policy", .object)) |p| alert.policy = .{
+        .name = try string(out, p, "name") orelse "",
+        .display_name = try string(out, p, "displayName") orelse "",
+        .severity = if (try field(p, "severity", .string)) |s| types.Severity.fromWire(s) else .unspecified,
+        .user_labels = try labelMapNamed(out, p, "userLabels"),
+    };
+    if (try field(obj, "metric", .object)) |m| {
+        alert.metric_type = try string(out, m, "type") orelse "";
+        alert.metric_labels = try labelMapNamed(out, m, "labels");
+    }
+    if (try field(obj, "resource", .object)) |r| {
+        alert.resource_type = try string(out, r, "type") orelse "";
+        alert.resource_labels = try labelMapNamed(out, r, "labels");
+    }
+    if (try field(obj, "metadata", .object)) |m| {
+        alert.metadata_user_labels = try labelMapNamed(out, m, "userLabels");
+        if (m.get("systemLabels")) |sl| alert.system_labels = try jsonCopy(out, scratch, sl);
+    }
+    if (try field(obj, "log", .object)) |l| {
+        alert.log_labels = try labelMapNamed(out, l, "extractedLabels");
+    }
+    return alert;
+}
+
 fn metricInfo(out: Allocator, v: Value) DecodeError!types.MetricInfo {
     const obj = try object(v);
     const type_name = try string(out, obj, "type") orelse return error.InvalidResponse;
@@ -411,7 +465,12 @@ fn seriesOf(out: Allocator, v: Value) DecodeError!types.Series {
 
 /// `labels` as pairs, in the order the server wrote them.
 fn labelMap(out: Allocator, obj: std.json.ObjectMap) DecodeError![]const types.Label {
-    const labels = try field(obj, "labels", .object) orelse return &.{};
+    return labelMapNamed(out, obj, "labels");
+}
+
+/// A map field's pairs, in the order the server wrote them.
+fn labelMapNamed(out: Allocator, obj: std.json.ObjectMap, name: []const u8) DecodeError![]const types.Label {
+    const labels = try field(obj, name, .object) orelse return &.{};
     const items = try out.alloc(types.Label, labels.count());
     for (labels.keys(), labels.values(), items) |k, v, *l| l.* = .{
         .key = try out.dupe(u8, k),
@@ -421,6 +480,17 @@ fn labelMap(out: Allocator, obj: std.json.ObjectMap) DecodeError![]const types.L
         },
     };
     return items;
+}
+
+/// A deep copy of `v` into `out`, for a subtree kept as it came.
+fn jsonCopy(out: Allocator, scratch: Allocator, v: Value) DecodeError!Value {
+    var w: std.Io.Writer.Allocating = .init(scratch);
+    var jw: Stringify = .{ .writer = &w.writer };
+    jw.write(v) catch return error.OutOfMemory;
+    return std.json.parseFromSliceLeaky(Value, out, w.written(), .{ .parse_numbers = false }) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidResponse,
+    };
 }
 
 fn pointOf(out: Allocator, v: Value) DecodeError!types.ReadPoint {
@@ -807,7 +877,7 @@ fn decodersProperty(_: void, input: []const u8) !void {
     if (decodeSummary(a, s, input)) |summary| {
         if (summary) |sum| try testing.expect(sum.written <= sum.total);
     } else |err| try testing.expectEqual(error.InvalidResponse, err);
-    inline for (.{ decodeMetricInfo, decodeMetricPage, decodeResourceType, decodeResourceTypePage, decodeSeriesPage }) |decode| {
+    inline for (.{ decodeMetricInfo, decodeMetricPage, decodeResourceType, decodeResourceTypePage, decodeSeriesPage, decodeAlert, decodeAlertPage }) |decode| {
         if (decode(a, s, input)) |_| {} else |err| try testing.expectEqual(error.InvalidResponse, err);
     }
 }
@@ -822,9 +892,120 @@ test "fuzz decoders: any body decodes or is InvalidResponse, never a crash or a 
         production.read_full,
         production.read_aligned,
         "{\"metricDescriptors\":[{\"type\":\"t\"}],\"nextPageToken\":\"x\"}",
+        production.alerts_list,
+        "{\"alerts\":[{\"name\":\"projects/p/alerts/9\",\"state\":\"OPEN\",\"openTime\":\"2026-10-19T14:02:11.311Z\",\"policy\":{\"severity\":\"WARNING\",\"userLabels\":{\"team\":\"ingest\"}},\"metadata\":{\"systemLabels\":{\"spot\":false,\"groups\":[\"a\"]}}}],\"totalSize\":7}",
         "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.monitoring.v3.CreateTimeSeriesSummary\",\"totalPointCount\":\"x\"}]}}",
         "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.monitoring.v3.CreateTimeSeriesSummary\",\"totalPointCount\":\"3\",\"errors\":[{\"status\":{\"code\":9},\"pointCount\":3}]}]}}",
     } });
+}
+
+test "decodeAlert: every field as the discovery document shapes them" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const alert = try decodeAlert(out.allocator(), scratch.allocator(),
+        \\{"name":"projects/my-project/alerts/12861813965583532163","state":"OPEN",
+        \\ "openTime":"2026-10-19T14:02:11.311Z",
+        \\ "policy":{"name":"projects/my-project/alertPolicies/5308","displayName":"Backlog too deep","severity":"WARNING","userLabels":{"team":"ingest"}},
+        \\ "metric":{"type":"pubsub.googleapis.com/subscription/num_undelivered_messages","labels":{"delivery_type":"pull"}},
+        \\ "resource":{"type":"pubsub_subscription","labels":{"project_id":"my-project","subscription_id":"orders"}},
+        \\ "metadata":{"userLabels":{"env":"prod"},"systemLabels":{"name":"inst","spot_instance":false,"security_group":["a","b"]}},
+        \\ "log":{"extractedLabels":{"path":"/checkout"}},
+        \\ "unknownField":1}
+    );
+    try testing.expectEqualStrings("12861813965583532163", alert.id);
+    try testing.expectEqual(types.AlertState.open, alert.state);
+    try testing.expectEqual(null, alert.close_time);
+    try testing.expect(alert.open_time.nanoseconds > 0);
+    try testing.expectEqualStrings("Backlog too deep", alert.policy.display_name);
+    try testing.expectEqual(types.Severity.warning, alert.policy.severity);
+    try testing.expectEqualStrings("ingest", alert.policy.userLabel("team").?);
+    try testing.expectEqualStrings("pubsub.googleapis.com/subscription/num_undelivered_messages", alert.metric_type);
+    try testing.expectEqualStrings("pull", alert.metricLabel("delivery_type").?);
+    try testing.expectEqualStrings("pubsub_subscription", alert.resource_type);
+    try testing.expectEqualStrings("orders", alert.resourceLabel("subscription_id").?);
+    try testing.expectEqualStrings("prod", alert.metadata_user_labels[0].value);
+    try testing.expectEqualStrings("inst", alert.system_labels.object.get("name").?.string);
+    try testing.expectEqual(false, alert.system_labels.object.get("spot_instance").?.bool);
+    try testing.expectEqual(2, alert.system_labels.object.get("security_group").?.array.items.len);
+    try testing.expectEqualStrings("/checkout", alert.log_labels[0].value);
+
+    // A closed alert keeps its close time; unknown enum values decode.
+    const closed = try decodeAlert(out.allocator(), scratch.allocator(),
+        \\{"name":"projects/p/alerts/9","state":"CLOSED","openTime":"2026-10-19T14:02:11Z","closeTime":"2026-10-19T15:00:00Z","policy":{"severity":"FATAL"}}
+    );
+    try testing.expectEqual(types.AlertState.closed, closed.state);
+    try testing.expect(closed.close_time != null);
+    try testing.expectEqual(types.Severity.unknown, closed.policy.severity);
+    const strange = try decodeAlert(out.allocator(), scratch.allocator(),
+        \\{"name":"9","state":"SNOOZED","openTime":"2026-10-19T14:02:11Z"}
+    );
+    try testing.expectEqual(types.AlertState.unknown, strange.state);
+    try testing.expectEqualStrings("9", strange.id);
+    // No policy in the answer: the snapshot stays at its defaults.
+    try testing.expectEqual(types.Severity.unspecified, strange.policy.severity);
+    try testing.expectEqual(0, strange.policy.user_labels.len);
+}
+
+test "decodeAlert and decodeAlertPage: production's own bodies, open and closed" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const open = try decodeAlert(out.allocator(), scratch.allocator(), production.alert_open);
+    try testing.expectEqualStrings("0.oe0ehmpm95z2", open.id);
+    try testing.expectEqual(types.AlertState.open, open.state);
+    try testing.expectEqual(null, open.close_time);
+    try testing.expectEqual(types.Severity.warning, open.policy.severity);
+    try testing.expectEqualStrings("zigps-alerts-0ea66e", open.policy.display_name);
+    try testing.expectEqualStrings("zigps", open.policy.userLabel("team").?);
+    try testing.expectEqualStrings("global", open.resource_type);
+    try testing.expectEqualStrings("extractctl", open.resourceLabel("project_id").?);
+    try testing.expectEqual(0, open.metric_labels.len);
+    const closed = try decodeAlert(out.allocator(), scratch.allocator(), production.alert_closed);
+    try testing.expectEqual(types.AlertState.closed, closed.state);
+    try testing.expect(closed.close_time.?.nanoseconds > closed.open_time.nanoseconds);
+    try testing.expectEqualStrings(closed.metric_type, open.metric_type);
+    const page = try decodeAlertPage(out.allocator(), scratch.allocator(), production.alerts_list);
+    try testing.expectEqual(1, page.alerts.len);
+    try testing.expectEqual(1, page.total_size.?);
+    try testing.expectEqual(null, page.next_page_token);
+}
+
+test "decodeAlertPage: pages, totals, and what neither decoder takes" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = out.allocator();
+    const s = scratch.allocator();
+    const page = try decodeAlertPage(a, s,
+        \\{"alerts":[{"name":"projects/p/alerts/1","state":"OPEN","openTime":"2026-10-19T14:02:11Z","policy":{"displayName":"d"}}],"nextPageToken":"n","totalSize":7}
+    );
+    try testing.expectEqual(1, page.alerts.len);
+    try testing.expectEqualStrings("n", page.next_page_token.?);
+    try testing.expectEqual(7, page.total_size.?);
+    // A policy without a severity is the proto's default, not unknown.
+    try testing.expectEqual(types.Severity.unspecified, page.alerts[0].policy.severity);
+    try testing.expectEqualStrings("d", page.alerts[0].policy.display_name);
+    const empty = try decodeAlertPage(a, s, "{}");
+    try testing.expectEqual(0, empty.alerts.len);
+    try testing.expectEqual(null, empty.next_page_token);
+    try testing.expectEqual(null, empty.total_size);
+
+    // Without a name or an open time there is no alert to hold.
+    for ([_][]const u8{
+        "[]",
+        "{\"alerts\":1}",
+        "{\"alerts\":[{\"state\":\"OPEN\",\"openTime\":\"2026-10-19T14:02:11Z\"}]}",
+        "{\"alerts\":[{\"name\":\"projects/p/alerts/1\"}]}",
+        "{\"alerts\":[{\"name\":\"projects/p/alerts/1\",\"openTime\":\"yesterday\"}]}",
+        "{\"alerts\":[{\"name\":\"projects/p/alerts/1\",\"openTime\":\"2026-10-19T14:02:11Z\",\"policy\":1}]}",
+        "{\"alerts\":[{\"name\":\"projects/p/alerts/1\",\"openTime\":\"2026-10-19T14:02:11Z\",\"policy\":{\"userLabels\":{\"k\":1}}}]}",
+    }) |body| {
+        try testing.expectError(error.InvalidResponse, decodeAlertPage(a, s, body));
+    }
 }
 
 test "decodeSeriesPage: production's reads, points newest first, project_id among the resource labels" {

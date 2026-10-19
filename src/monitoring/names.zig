@@ -11,12 +11,14 @@ pub const Collection = enum {
     metric_descriptors,
     resource_descriptors,
     time_series,
+    alerts,
 
     fn segment(c: Collection) []const u8 {
         return switch (c) {
             .metric_descriptors => "metricDescriptors",
             .resource_descriptors => "monitoredResourceDescriptors",
             .time_series => "timeSeries",
+            .alerts => "alerts",
         };
     }
 };
@@ -51,6 +53,43 @@ pub fn resourceType(arena: Allocator, project: []const u8, type_name: []const u8
     w.writer.writeByte('/') catch return error.OutOfMemory;
     core.query.writeSegment(&w.writer, type_name) catch return error.OutOfMemory;
     return w.written();
+}
+
+/// `/v3/projects/P/alerts/<id>`.
+pub fn alert(arena: Allocator, project: []const u8, id: []const u8) Allocator.Error![]const u8 {
+    var w: Writer.Allocating = .init(arena);
+    writeCollection(&w.writer, project, .alerts) catch return error.OutOfMemory;
+    w.writer.writeByte('/') catch return error.OutOfMemory;
+    core.query.writeSegment(&w.writer, id) catch return error.OutOfMemory;
+    return w.written();
+}
+
+/// The id in `id_or_name`: the trailing segment when it is exactly
+/// `projects/<project>/alerts/<id>`, the input itself when it is no full
+/// name at all. Null for another project's name or a malformed one.
+pub fn alertId(id_or_name: []const u8, project: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, id_or_name, "projects/")) return id_or_name;
+    var parts = std.mem.splitScalar(u8, id_or_name, '/');
+    _ = parts.next();
+    const p = parts.next() orelse return null;
+    if (!std.mem.eql(u8, parts.next() orelse return null, "alerts")) return null;
+    const id = parts.next() orelse return null;
+    if (parts.next() != null) return null;
+    if (!std.mem.eql(u8, p, project) or id.len == 0) return null;
+    return id;
+}
+
+test "alert paths and names: a bare id, this project's full name, nobody else's" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings("/v3/projects/p/alerts/9", try alert(arena.allocator(), "p", "9"));
+    try std.testing.expectEqualStrings("9", alertId("9", "p").?);
+    try std.testing.expectEqualStrings("9", alertId("projects/p/alerts/9", "p").?);
+    try std.testing.expectEqual(null, alertId("projects/q/alerts/9", "p"));
+    try std.testing.expectEqual(null, alertId("projects/p/alerts/", "p"));
+    try std.testing.expectEqual(null, alertId("projects/p/alerts/9/x", "p"));
+    try std.testing.expectEqual(null, alertId("projects/p/alertPolicies/9", "p"));
+    try std.testing.expectEqual(null, alertId("projects/p", "p"));
 }
 
 const testing = std.testing;

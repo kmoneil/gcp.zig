@@ -297,6 +297,61 @@ pub fn listResourceTypes(self: *Client, options: types.ListOptions) Error!types.
     return result;
 }
 
+/// One page of the project's alerts: the violations of its alert
+/// policies, which only Cloud Monitoring itself opens and closes (#246).
+/// Without `order_by`, production answers newest-opened first.
+pub fn listAlerts(self: *Client, options: types.ListAlertsOptions) Error!types.Owned(types.AlertPage) {
+    rpc.begin(self);
+    if (options.filter) |f| if (!validate.isAlertFilter(f)) {
+        if (self.diagnostics) |d| d.print("invalid filter: text without control characters, at most 4096 bytes", .{});
+        return error.InvalidFilter;
+    };
+    if (options.open_only and options.filter != null) {
+        if (self.diagnostics) |d| d.print("open_only writes its own filter; give one or the other", .{});
+        return error.InvalidOptions;
+    }
+    try self.checkToken(options.page_token);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var w: std.Io.Writer.Allocating = .init(a);
+    names.writeCollection(&w.writer, self.project, .alerts) catch return error.OutOfMemory;
+    var params: core.query.Params = .init(&w.writer);
+    const open_filter: ?[]const u8 = if (options.open_only) "state=\"OPEN\"" else null;
+    params.addOptional("filter", options.filter orelse open_filter) catch return error.OutOfMemory;
+    if (options.order_by) |o| params.add("orderBy", o.wire()) catch return error.OutOfMemory;
+    params.addNonZero("pageSize", options.page_size) catch return error.OutOfMemory;
+    params.addOptional("pageToken", options.page_token) catch return error.OutOfMemory;
+
+    var result: types.Owned(types.AlertPage) = try .init(self.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(self, result.arena, .{ .method = .GET, .path = w.written() });
+    result.value = codec.decodeAlertPage(result.arena.allocator(), a, body) catch |err|
+        return rpc.decodeFailed(self, err, "alert list");
+    return result;
+}
+
+/// One alert, by its id or its full `projects/P/alerts/ID` name. Another
+/// project's name is refused before sending.
+pub fn getAlert(self: *Client, id_or_name: []const u8) Error!types.Owned(types.Alert) {
+    rpc.begin(self);
+    const id = names.alertId(id_or_name, self.project) orelse "";
+    if (!validate.isAlertId(id)) {
+        if (self.diagnostics) |d| d.print("invalid alert: expected its id, or projects/{s}/alerts/<id>", .{self.project});
+        return error.InvalidName;
+    }
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const path = try names.alert(a, self.project, id);
+    var result: types.Owned(types.Alert) = try .init(self.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(self, result.arena, .{ .method = .GET, .path = path });
+    result.value = codec.decodeAlert(result.arena.allocator(), a, body) catch |err|
+        return rpc.decodeFailed(self, err, "alert");
+    return result;
+}
+
 fn checkToken(self: *Client, token: ?[]const u8) Error!void {
     if (token) |t| if (!validate.isPageToken(t)) {
         if (self.diagnostics) |d| d.print("invalid page token: expected printable ASCII", .{});
@@ -551,6 +606,73 @@ test "golden: resource types read and listed" {
     defer page.deinit();
     try h.expectRequest(1, .GET, "https://monitoring.googleapis.com/v3/projects/my-project/monitoredResourceDescriptors?pageSize=5&pageToken=t", null);
     try testing.expectEqual(null, page.value.next_page_token);
+}
+
+test "golden: alerts listed with every option, and one got by id or by name" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "{\"alerts\":[{\"name\":\"projects/my-project/alerts/0.oe0ehmpm95z2\",\"state\":\"OPEN\",\"openTime\":\"2026-10-19T14:02:11.311Z\"}],\"totalSize\":7,\"nextPageToken\":\"n\"}" } },
+        .{ .respond = .{ .body = "{}" } },
+        .{ .respond = .{ .body = "{\"alerts\":[],\"totalSize\":0}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/my-project/alerts/0.oe0ehmpm95z2\",\"state\":\"CLOSED\",\"openTime\":\"2026-10-19T14:02:11.311Z\",\"closeTime\":\"2026-10-19T15:00:00Z\"}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/my-project/alerts/0.oe0ehmpm95z2\",\"state\":\"OPEN\",\"openTime\":\"2026-10-19T14:02:11.311Z\"}" } },
+    }, .{});
+    defer h.deinit();
+    var page = try h.client.listAlerts(.{ .filter = "state=\"OPEN\"", .order_by = .close_time_desc, .page_size = 2, .page_token = "t" });
+    defer page.deinit();
+    try h.expectRequest(0, .GET, "https://monitoring.googleapis.com/v3/projects/my-project/alerts?filter=state%3D%22OPEN%22&orderBy=close_time%20desc&pageSize=2&pageToken=t", null);
+    try testing.expectEqual(1, page.value.alerts.len);
+    try testing.expectEqualStrings("0.oe0ehmpm95z2", page.value.alerts[0].id);
+    try testing.expectEqual(types.AlertState.open, page.value.alerts[0].state);
+    try testing.expectEqual(7, page.value.total_size.?);
+    try testing.expectEqualStrings("n", page.value.next_page_token.?);
+    var empty = try h.client.listAlerts(.{});
+    defer empty.deinit();
+    try h.expectRequest(1, .GET, "https://monitoring.googleapis.com/v3/projects/my-project/alerts", null);
+    try testing.expectEqual(0, empty.value.alerts.len);
+    try testing.expectEqual(null, empty.value.total_size);
+    var open = try h.client.listAlerts(.{ .open_only = true });
+    defer open.deinit();
+    try h.expectRequest(2, .GET, "https://monitoring.googleapis.com/v3/projects/my-project/alerts?filter=state%3D%22OPEN%22", null);
+    var got = try h.client.getAlert("0.oe0ehmpm95z2");
+    defer got.deinit();
+    try h.expectRequest(3, .GET, "https://monitoring.googleapis.com/v3/projects/my-project/alerts/0.oe0ehmpm95z2", null);
+    try testing.expectEqual(types.AlertState.closed, got.value.state);
+    try testing.expect(got.value.close_time != null);
+    var by_name = try h.client.getAlert("projects/my-project/alerts/0.oe0ehmpm95z2");
+    defer by_name.deinit();
+    try h.expectRequest(4, .GET, "https://monitoring.googleapis.com/v3/projects/my-project/alerts/0.oe0ehmpm95z2", null);
+    try testing.expectEqualStrings("0.oe0ehmpm95z2", by_name.value.id);
+}
+
+test "alert calls refuse what they will not send" {
+    var h: Harness = undefined;
+    try h.init(&.{}, .{});
+    defer h.deinit();
+    try testing.expectError(error.InvalidFilter, h.client.listAlerts(.{ .filter = "a\nb" }));
+    try testing.expectError(error.InvalidFilter, h.client.listAlerts(.{ .filter = "" }));
+    try testing.expectError(error.InvalidOptions, h.client.listAlerts(.{ .open_only = true, .filter = "state=\"OPEN\"" }));
+    try testing.expectEqualStrings("open_only writes its own filter; give one or the other", h.diag.message());
+    try testing.expectError(error.InvalidName, h.client.listAlerts(.{ .page_token = "a b" }));
+    try testing.expectError(error.InvalidName, h.client.getAlert(""));
+    try testing.expectError(error.InvalidName, h.client.getAlert("a/b"));
+    try testing.expectError(error.InvalidName, h.client.getAlert("a b"));
+    try testing.expectError(error.InvalidName, h.client.getAlert("projects/other/alerts/9"));
+    try testing.expectEqualStrings("invalid alert: expected its id, or projects/my-project/alerts/<id>", h.diag.message());
+    try h.expectRequestCount(0);
+}
+
+test "an alert response that cannot be decoded is InvalidResponse, named in Diagnostics" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "{\"alerts\":1}" } },
+        .{ .respond = .{ .body = "{\"state\":\"OPEN\"}" } },
+    }, .{});
+    defer h.deinit();
+    try testing.expectError(error.InvalidResponse, h.client.listAlerts(.{}));
+    try testing.expectEqualStrings("the alert list response could not be decoded", h.diag.message());
+    try testing.expectError(error.InvalidResponse, h.client.getAlert("9"));
+    try testing.expectEqualStrings("the alert response could not be decoded", h.diag.message());
 }
 
 test "descriptor and list calls refuse what they will not send" {
