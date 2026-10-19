@@ -5,9 +5,9 @@ const std = @import("std");
 /// A location id as v1's `locations.list` answers them (`us-central1`),
 /// or `-`, which Cloud Run takes for "every region" on a services or
 /// revisions list (measured 2026-10-19, though the issue expected a
-/// refusal): lowercase letters, digits and `-`, one path segment.
+/// refusal). Lowercase letters, digits and `-`, one path segment, which
+/// `-` alone already is.
 pub fn isLocation(id: []const u8) bool {
-    if (std.mem.eql(u8, id, "-")) return true;
     if (id.len == 0 or id.len > 64) return false;
     for (id) |c| switch (c) {
         'a'...'z', '0'...'9', '-' => {},

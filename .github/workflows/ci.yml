@@ -542,7 +542,10 @@ jobs:
         # starts the same way: its one decoder property took about
         # 0.01 ms a run on the Mac (2M in 10 s of fuzzing), so 10M,
         # minutes even at several times the Mac, to be priced by its
-        # first nights as its corpus grows. The nightlies of 10-16
+        # first nights as its corpus grows. run (0.48.0) the same: its
+        # five decoders in one property took about 0.04 ms a run on the
+        # Mac (2M in 85 s of fuzzing; its corpus bodies are bigger), so
+        # 6M, to be priced by its first nights. The nightlies of 10-16
         # to 10-19 (runs 38871479649, 39014731663, 39109651208 and
         # 39225264813) price three jobs over the aim. fake-pubsub,
         # dropped to 800K on 10-18, took 108 minutes at that count on its
@@ -584,6 +587,7 @@ jobs:
           - { job: kms, module: kms, filter: fuzz, iterations: 2M }
           - { job: slow-kms, module: kms, filter: slow property, iterations: 300K }
           - { job: scheduler, module: scheduler, filter: fuzz, iterations: 10M }
+          - { job: run, module: run, filter: fuzz, iterations: 6M }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     # actions: read finds and downloads the corpus an earlier run kept.
