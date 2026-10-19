@@ -1759,6 +1759,50 @@ test "a write, held by the in-memory Cloud Monitoring" {
 }
 // end snippet
 
+// snippet: mon-google
+test "Pub/Sub's own counts, put in the in-memory Cloud Monitoring and read back" {
+    var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_331_195 * std.time.ns_per_s };
+    var fake: monitoring.testing.FakeMonitoring = .init(std.testing.allocator, clock.io(), .{ .project_id = "my-project" });
+    defer fake.deinit();
+
+    // No program can write Google's own metrics, so the test puts them in:
+    // a minute a point, as Pub/Sub reports them.
+    const t = std.Io.Clock.real.now(clock.io()).nanoseconds;
+    const minute: i96 = 60 * std.time.ns_per_s;
+    const points = [_]monitoring.testing.FakeMonitoring.Point{
+        .{ .start = .{ .nanoseconds = t - 2 * minute }, .end = .{ .nanoseconds = t - minute }, .value = .{ .int64 = 60 } },
+        .{ .start = .{ .nanoseconds = t - minute }, .end = .{ .nanoseconds = t }, .value = .{ .int64 = 90 } },
+    };
+    try fake.put(.{
+        .metric_type = "pubsub.googleapis.com/subscription/sent_message_count",
+        .metric_labels = &.{.{ .key = "delivery_type", .value = "pull" }},
+        .resource_type = "pubsub_subscription",
+        .resource_labels = &.{.{ .key = "subscription_id", .value = "orders" }},
+        .kind = .delta,
+        .value_type = .int64,
+        .points = &points,
+    });
+
+    var token: monitoring.StaticToken = .{ .token = "none" };
+    var client = try monitoring.Client.init(std.testing.allocator, clock.io(), .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    // Messages sent a second, minute by minute, newest first.
+    var page = try client.metric("pubsub.googleapis.com/subscription/sent_message_count").read(.{
+        .start = .{ .nanoseconds = t - 2 * minute },
+        .end = .{ .nanoseconds = t },
+        .filter = .{ .resource_labels = &.{.{ .key = "subscription_id", .value = "orders" }} },
+        .aggregation = .{ .alignment_period_s = 60, .aligner = .rate, .reducer = .sum },
+    });
+    defer page.deinit();
+    try std.testing.expectEqual(1.5, page.value.series[0].points[0].value.?.double);
+    try std.testing.expectEqual(1.0, page.value.series[0].points[1].value.?.double);
+}
+// end snippet
+
 test "the Monitoring guides' code, against the in-memory Cloud Monitoring" {
     const gpa = std.testing.allocator;
     var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_331_195 * std.time.ns_per_s };

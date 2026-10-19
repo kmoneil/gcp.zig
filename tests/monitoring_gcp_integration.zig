@@ -13,10 +13,18 @@
 //! are far inside the free million a month. The last test runs the same
 //! script against production and against `FakeMonitoring`, and holds the
 //! fake to what production did.
+//!
+//! One more test reads Pub/Sub's own metrics, and takes about ten minutes,
+//! so it runs only with MONITORING_TEST_PUBSUB=1 as well. It makes a topic
+//! and two subscriptions named `zigps-mon-<run>`, sends traffic for four
+//! minutes, waits until Monitoring shows it, and deletes them as it ends.
+//! It puts production's raw points into `FakeMonitoring` and holds every
+//! aligned answer of the fake to production's (issue #239).
 
 const std = @import("std");
 const core = @import("core");
 const monitoring = @import("monitoring");
+const pubsub = @import("pubsub");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
@@ -485,26 +493,8 @@ fn outcome(a: Allocator, client: *monitoring.Client, prefix: []const u8, base: i
                 pages += 1;
                 var on_page: usize = 0;
                 for (page.value.series) |s| {
-                    var line: std.Io.Writer.Allocating = .init(a);
-                    try line.writer.print("{t} {t} {{", .{ s.kind, s.value_type });
-                    try writeLabels(a, &line.writer, s.metric_labels, false);
-                    try line.writer.writeAll("} {");
-                    try writeLabels(a, &line.writer, s.resource_labels, true);
-                    try line.writer.writeAll("}");
-                    for (s.points) |p| {
-                        on_page += 1;
-                        const end_ms = @divFloor(p.end.nanoseconds - base, std.time.ns_per_ms);
-                        try line.writer.print(" {d}", .{end_ms});
-                        if (p.start) |st| if (st.nanoseconds != p.end.nanoseconds) try line.writer.print("@{d}", .{@divFloor(st.nanoseconds - base, std.time.ns_per_ms)});
-                        try line.writer.writeByte('=');
-                        if (p.value) |v| switch (v) {
-                            .int64 => |n| try line.writer.print("{d}", .{n}),
-                            .double => |d| try line.writer.print("{d}", .{d}),
-                            .bool => |b| try line.writer.print("{}", .{b}),
-                            else => try line.writer.writeAll("?"),
-                        } else try line.writer.writeAll("null");
-                    }
-                    try lines.append(a, line.written());
+                    on_page += s.points.len;
+                    try lines.append(a, try seriesLine(a, base, s));
                 }
                 if (r.page_size != 0) try out.writer.print("[{d}]", .{on_page});
                 token = if (page.value.next_page_token) |t| try a.dupe(u8, t) else null;
@@ -516,6 +506,31 @@ fn outcome(a: Allocator, client: *monitoring.Client, prefix: []const u8, base: i
             return out.written();
         },
     }
+}
+
+/// A series as one line: kind, value type, labels, and each point's end,
+/// its start where it differs, and its value, times in milliseconds from
+/// `base`, so production's and the fake's compare as text.
+fn seriesLine(a: Allocator, base: i96, s: monitoring.Series) ![]const u8 {
+    var line: std.Io.Writer.Allocating = .init(a);
+    try line.writer.print("{t} {t} {{", .{ s.kind, s.value_type });
+    try writeLabels(a, &line.writer, s.metric_labels, false);
+    try line.writer.writeAll("} {");
+    try writeLabels(a, &line.writer, s.resource_labels, true);
+    try line.writer.writeAll("}");
+    for (s.points) |p| {
+        const end_ms = @divFloor(p.end.nanoseconds - base, std.time.ns_per_ms);
+        try line.writer.print(" {d}", .{end_ms});
+        if (p.start) |st| if (st.nanoseconds != p.end.nanoseconds) try line.writer.print("@{d}", .{@divFloor(st.nanoseconds - base, std.time.ns_per_ms)});
+        try line.writer.writeByte('=');
+        if (p.value) |v| switch (v) {
+            .int64 => |n| try line.writer.print("{d}", .{n}),
+            .double => |d| try line.writer.print("{d}", .{d}),
+            .bool => |b| try line.writer.print("{}", .{b}),
+            else => try line.writer.writeAll("?"),
+        } else try line.writer.writeAll("null");
+    }
+    return line.written();
 }
 
 fn isServerError(text: []const u8) bool {
@@ -599,6 +614,301 @@ test "monitoring: the fake against production, every outcome of one script compa
             differences += 1;
             std.debug.print("{d}: {t}\n  production: {s}\n  fake:       {s}\n", .{ i, op, production, in_memory });
         }
+    }
+    try testing.expectEqual(0, differences);
+}
+
+// Pub/Sub's own metrics (issue #239).
+
+const pubsub_prefix = "pubsub.googleapis.com/";
+
+/// The nine metrics `FakeMonitoring` holds, after `pubsub_prefix`.
+const pubsub_metrics = [_][]const u8{
+    "subscription/num_undelivered_messages",
+    "subscription/oldest_unacked_message_age",
+    "subscription/sent_message_count",
+    "subscription/ack_message_count",
+    "subscription/expired_ack_deadlines_count",
+    "subscription/dead_letter_message_count",
+    "subscription/push_request_count",
+    "topic/send_message_operation_count",
+    "topic/byte_cost",
+};
+
+/// One read of the Pub/Sub test, made of production and of the fake.
+const PubsubRead = struct {
+    label: []const u8,
+    /// After `pubsub_prefix`.
+    metric: []const u8,
+    start: ?std.Io.Timestamp,
+    end: std.Io.Timestamp,
+    filter: monitoring.Filter,
+    aggregation: ?monitoring.Aggregation = null,
+};
+
+/// A read's outcome as text: its error, or its unit and its series, sorted.
+fn pubsubOutcome(a: Allocator, client: *monitoring.Client, diag: *monitoring.Diagnostics, base: i96, r: PubsubRead) ![]const u8 {
+    var page = client.metric(try a.print("{s}{s}", .{ pubsub_prefix, r.metric })).read(.{
+        .start = r.start,
+        .end = r.end,
+        .filter = r.filter,
+        .aggregation = r.aggregation,
+    }) catch |err| return a.print("{t}: {s}", .{ err, diag.message() });
+    defer page.deinit();
+    const lines = try a.alloc([]const u8, page.value.series.len);
+    for (page.value.series, lines) |s, *l| l.* = try seriesLine(a, base, s);
+    std.mem.sort([]const u8, lines, {}, lessThan);
+    var out: std.Io.Writer.Allocating = .init(a);
+    try out.writer.print("unit {s}, {d} series", .{ page.value.unit, lines.len });
+    for (lines) |l| try out.writer.print(" | {s}", .{l});
+    if (page.value.next_page_token != null) try out.writer.writeAll(" | more pages");
+    return out.written();
+}
+
+/// Pulls what a subscription has and acknowledges every `every`-th
+/// message, so the rest expire and come again.
+fn pullAndAck(ps: *pubsub.Client, id: []const u8, every: usize) !void {
+    var pulled = try ps.subscription(id).pull(.{ .max_messages = 100, .return_immediately = true });
+    defer pulled.deinit();
+    var ids: std.ArrayList([]const u8) = .empty;
+    defer ids.deinit(testing.allocator);
+    for (pulled.value.messages, 0..) |m, i| if (i % every == 0) try ids.append(testing.allocator, m.ack_id);
+    try ps.subscription(id).ack(ids.items);
+}
+
+/// Prints the outcome when production and the fake agree, both when not,
+/// and counts the second.
+fn agree(differences: *usize, label: []const u8, production: []const u8, in_memory: []const u8) void {
+    if (std.mem.eql(u8, production, in_memory)) {
+        fact("{s}: {s}", .{ label, production });
+    } else {
+        differences.* += 1;
+        std.debug.print("{s}\n  production: {s}\n  fake:       {s}\n", .{ label, production, in_memory });
+    }
+}
+
+fn floorMinute(ns: i96) i96 {
+    return @divFloor(ns, std.time.ns_per_min) * std.time.ns_per_min;
+}
+
+test "monitoring: Pub/Sub's own metrics, and the fake given production's points answers as production did" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    if (f.env.get("MONITORING_TEST_PUBSUB") == null) return error.SkipZigTest;
+    const a = f.arena.allocator();
+    var ps_diag: pubsub.Diagnostics = .{};
+    var ps = try pubsub.Client.init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = f.token.provider(), .diagnostics = &ps_diag });
+    defer ps.deinit();
+
+    // A topic and two subscriptions, made for the run: -a acknowledges
+    // everything, -b every other message and keeps a backlog at the end.
+    const topic_id = try a.print("zigps-mon-{s}", .{f.run});
+    const subs = [_][]const u8{ try a.print("{s}-a", .{topic_id}), try a.print("{s}-b", .{topic_id}) };
+    const topic = ps.topic(topic_id);
+    var made = try topic.create(.{});
+    made.deinit();
+    defer topic.delete() catch |err| fact("deleting {s} failed: {t}", .{ topic_id, err });
+    for (subs) |id| {
+        var sub = try ps.subscription(id).create(.{ .topic_id = topic_id, .ack_deadline_seconds = 10 });
+        sub.deinit();
+    }
+    defer for (subs) |id| ps.subscription(id).delete() catch |err| fact("deleting {s} failed: {t}", .{ id, err });
+    const created = nowMs();
+    fact("made {s} and its two subscriptions", .{topic_id});
+
+    var messages: [10]pubsub.Message = @splat(.{ .data = "zigps" });
+    for (0..8) |round| {
+        const t0 = nowMs();
+        var sent = try topic.publish(messages[0 .. 2 + round], .{});
+        sent.deinit();
+        try pullAndAck(&ps, subs[0], 1);
+        try pullAndAck(&ps, subs[1], 2);
+        const spent = nowMs() - t0;
+        if (spent < 30 * std.time.ns_per_s) try testing.io.sleep(.fromNanoseconds(30 * std.time.ns_per_s - spent), .awake);
+    }
+    var tail = try topic.publish(messages[0..5], .{});
+    tail.deinit();
+    const traffic_end = nowMs();
+    fact("traffic sent", .{});
+
+    // Production showed a minute's counts about 130 s after it ended, and a
+    // new subscription's first backlog point about 400 s after it was made.
+    const window_start: std.Io.Timestamp = .{ .nanoseconds = floorMinute(created) - 2 * std.time.ns_per_min };
+    const prefix_match = [_]monitoring.Match{.{ .key = "subscription_id", .op = .starts_with, .value = try a.print("{s}-", .{topic_id}) }};
+    const by_subs: monitoring.Filter = .{ .resource_labels = &prefix_match };
+    const by_topic: monitoring.Filter = .{ .resource_labels = &.{.{ .key = "topic_id", .value = topic_id }} };
+    var waited: usize = 0;
+    while (true) : (waited += 1) {
+        if (waited == 32) return error.TestPointsNeverReadable;
+        try testing.io.sleep(.fromSeconds(30), .awake);
+        const now: std.Io.Timestamp = .{ .nanoseconds = nowMs() };
+        var sent = try f.client.metric(pubsub_prefix ++ "subscription/sent_message_count").read(.{ .start = window_start, .end = now, .filter = by_subs });
+        defer sent.deinit();
+        var backlog = try f.client.metric(pubsub_prefix ++ "subscription/num_undelivered_messages").read(.{ .start = window_start, .end = now, .filter = by_subs });
+        defer backlog.deinit();
+        var latest: i96 = 0;
+        for (sent.value.series) |s| for (s.points) |p| {
+            latest = @max(latest, p.end.nanoseconds);
+        };
+        if (latest >= floorMinute(traffic_end) and backlog.value.series.len > 0 and now.nanoseconds - created > 7 * std.time.ns_per_min) break;
+    }
+    fact("points readable {d} s after the subscriptions were made", .{@divFloor(nowMs() - created, std.time.ns_per_s)});
+
+    // Production's raw points, put into the fake.
+    const end: std.Io.Timestamp = .{ .nanoseconds = floorMinute(nowMs()) };
+    const mid: std.Io.Timestamp = .{ .nanoseconds = end.nanoseconds - 30 * std.time.ns_per_s };
+    var fake: monitoring.testing.FakeMonitoring = .init(testing.allocator, testing.io, .{ .project_id = f.project });
+    defer fake.deinit();
+    var fake_diag: monitoring.Diagnostics = .{};
+    var fake_client = try monitoring.Client.init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = f.token.provider(), .transport = fake.transport(), .diagnostics = &fake_diag });
+    defer fake_client.deinit();
+    var put_series: usize = 0;
+    for (pubsub_metrics) |m| {
+        var raw = try f.client.metric(try a.print("{s}{s}", .{ pubsub_prefix, m })).read(.{ .start = window_start, .end = end, .filter = if (std.mem.startsWith(u8, m, "topic/")) by_topic else by_subs });
+        defer raw.deinit();
+        try testing.expectEqual(null, raw.value.next_page_token);
+        for (raw.value.series) |s| {
+            const pts = try a.alloc(monitoring.testing.FakeMonitoring.Point, s.points.len);
+            // Newest first in a read; oldest first in a put.
+            for (s.points, 0..) |p, i| pts[pts.len - 1 - i] = .{ .start = if (s.kind == .gauge) null else p.start, .end = p.end, .value = p.value.? };
+            try fake.put(.{ .metric_type = s.metric_type, .metric_labels = s.metric_labels, .resource_type = s.resource_type, .resource_labels = s.resource_labels, .kind = s.kind, .value_type = s.value_type, .points = pts });
+            put_series += 1;
+        }
+    }
+    fact("{d} series put into the fake", .{put_series});
+
+    // The reads a console makes, and the edges of their periods.
+    const by_type: []const []const u8 = &.{"metric.labels.delivery_type"};
+    const by_sub: []const []const u8 = &.{"resource.labels.subscription_id"};
+    var reads: std.ArrayList(PubsubRead) = .empty;
+    for (pubsub_metrics) |m| {
+        const topic_metric = std.mem.startsWith(u8, m, "topic/");
+        try reads.append(a, .{ .label = try a.print("raw {s}", .{m}), .metric = m, .start = window_start, .end = end, .filter = if (topic_metric) by_topic else by_subs });
+        const counted = !std.mem.endsWith(u8, m, "messages") and !std.mem.endsWith(u8, m, "age");
+        const aggregations: []const monitoring.Aggregation = if (counted) &.{
+            .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum },
+            .{ .alignment_period_s = 60, .aligner = .rate, .reducer = .sum },
+        } else &.{
+            .{ .alignment_period_s = 60, .aligner = .max },
+            .{ .alignment_period_s = 60, .aligner = .max, .reducer = .sum },
+            .{ .alignment_period_s = 120, .aligner = .mean, .reducer = .max, .group_by = by_sub },
+        };
+        for (aggregations, 0..) |agg, i| try reads.append(a, .{ .label = try a.print("{s} #{d}", .{ m, i }), .metric = m, .start = window_start, .end = end, .filter = if (topic_metric) by_topic else by_subs, .aggregation = agg });
+    }
+    const sent_metric = "subscription/sent_message_count";
+    for ([_]struct { []const u8, std.Io.Timestamp, monitoring.Aggregation }{
+        .{ "delta 60", end, .{ .alignment_period_s = 60, .aligner = .delta } },
+        .{ "delta 60 mid", mid, .{ .alignment_period_s = 60, .aligner = .delta } },
+        .{ "delta 60 sum mid", mid, .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum } },
+        .{ "delta 60 sum by delivery type", end, .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum, .group_by = by_type } },
+        .{ "delta 60 sum by subscription", end, .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum, .group_by = by_sub } },
+        .{ "delta 60 max", end, .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .max } },
+        .{ "delta 60 mean", end, .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .mean } },
+        .{ "delta 60 count", end, .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .count } },
+        .{ "delta 120", end, .{ .alignment_period_s = 120, .aligner = .delta } },
+        .{ "delta 300", end, .{ .alignment_period_s = 300, .aligner = .delta } },
+        .{ "delta 90", end, .{ .alignment_period_s = 90, .aligner = .delta } },
+        .{ "delta 30", end, .{ .alignment_period_s = 30, .aligner = .delta } },
+        .{ "rate 60", end, .{ .alignment_period_s = 60, .aligner = .rate } },
+        .{ "rate 60 mid", mid, .{ .alignment_period_s = 60, .aligner = .rate } },
+        .{ "rate 60 sum by delivery type", end, .{ .alignment_period_s = 60, .aligner = .rate, .reducer = .sum, .group_by = by_type } },
+        .{ "rate 120", end, .{ .alignment_period_s = 120, .aligner = .rate } },
+        .{ "rate 30", end, .{ .alignment_period_s = 30, .aligner = .rate } },
+    }) |c| try reads.append(a, .{ .label = c[0], .metric = sent_metric, .start = window_start, .end = c[1], .filter = by_subs, .aggregation = c[2] });
+    try reads.append(a, .{ .label = "raw sent mid", .metric = sent_metric, .start = window_start, .end = mid, .filter = by_subs });
+    try reads.append(a, .{ .label = "delta 60 sum instant", .metric = sent_metric, .start = null, .end = end, .filter = by_subs, .aggregation = .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum } });
+    try reads.append(a, .{ .label = "push by response class", .metric = "subscription/push_request_count", .start = window_start, .end = end, .filter = by_subs, .aggregation = .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum, .group_by = &.{"metric.labels.response_class"} } });
+    try reads.append(a, .{ .label = "publishes by response code", .metric = "topic/send_message_operation_count", .start = window_start, .end = end, .filter = by_topic, .aggregation = .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum, .group_by = &.{"metric.labels.response_code"} } });
+    // Around one point of -a's sent count: which reads hold it.
+    {
+        const only_a: monitoring.Filter = .{ .resource_labels = &.{.{ .key = "subscription_id", .value = subs[0] }} };
+        var raw = try f.client.metric(pubsub_prefix ++ sent_metric).read(.{ .start = window_start, .end = end, .filter = only_a });
+        defer raw.deinit();
+        if (raw.value.series.len > 0 and raw.value.series[0].points.len >= 3) {
+            const p = raw.value.series[0].points[1];
+            const pe = p.end.nanoseconds;
+            const point_start = p.start.?.nanoseconds;
+            const s = std.time.ns_per_s;
+            for ([_]struct { []const u8, ?i96, i96, ?monitoring.Aggregation }{
+                .{ "edge: start at the point's end", pe, end.nanoseconds, null },
+                .{ "edge: start inside the point", pe - 30 * s, end.nanoseconds, null },
+                .{ "edge: start at the point's start", point_start, end.nanoseconds, null },
+                .{ "edge: end inside the point", window_start.nanoseconds, pe - s, null },
+                .{ "edge: end at the point's end", window_start.nanoseconds, pe, null },
+                .{ "edge: instant at the point's end", null, pe, null },
+                .{ "edge: instant inside the point", null, pe - 30 * s, null },
+                .{ "edge: delta 60 ending at the point's end", window_start.nanoseconds, pe, .{ .alignment_period_s = 60, .aligner = .delta } },
+                .{ "edge: delta 60 ending inside the point", window_start.nanoseconds, pe - 30 * s, .{ .alignment_period_s = 60, .aligner = .delta } },
+                .{ "edge: delta 60 ending 1 s after it", window_start.nanoseconds, pe + s, .{ .alignment_period_s = 60, .aligner = .delta } },
+                .{ "edge: rate 60 ending inside the point", window_start.nanoseconds, pe - 30 * s, .{ .alignment_period_s = 60, .aligner = .rate } },
+            }) |c| try reads.append(a, .{ .label = c[0], .metric = sent_metric, .start = if (c[1]) |t| .{ .nanoseconds = t } else null, .end = .{ .nanoseconds = c[2] }, .filter = only_a, .aggregation = c[3] });
+        } else fact("-a's sent count has fewer than 3 points: no edge reads", .{});
+    }
+    // Filters production refused, or did not.
+    for ([_]struct { []const u8, []const u8, monitoring.Filter }{
+        .{ "filter: a subscription metric on topic_id", sent_metric, .{ .resource_labels = &.{.{ .key = "topic_id", .value = "x" }} } },
+        .{ "filter: a subscription metric on zone", sent_metric, .{ .resource_labels = &.{.{ .key = "zone", .value = "x" }} } },
+        .{ "filter: a topic metric on subscription_id", "topic/send_message_operation_count", .{ .resource_labels = &.{.{ .key = "subscription_id", .value = "x" }} } },
+        .{ "filter: a metric label the metric lacks", sent_metric, .{ .metric_labels = &.{.{ .key = "nope", .value = "x" }} } },
+        .{ "filter: another resource type", sent_metric, .{ .resource_type = "pubsub_topic" } },
+        .{ "filter: a backlog with a metric label", "subscription/num_undelivered_messages", .{ .metric_labels = &.{.{ .key = "delivery_type", .value = "pull" }} } },
+    }) |c| try reads.append(a, .{ .label = c[0], .metric = c[1], .start = window_start, .end = end, .filter = c[2] });
+
+    var differences: usize = 0;
+    for (reads.items) |r| {
+        const in_memory = try pubsubOutcome(a, &fake_client, &fake_diag, window_start.nanoseconds, r);
+        const production = try pubsubOutcome(a, &f.client, &f.diag, window_start.nanoseconds, r);
+        agree(&differences, r.label, production, in_memory);
+    }
+
+    // A user metric filtered on a label only Pub/Sub's resources have.
+    {
+        const g = try f.name("g");
+        for ([_]*monitoring.Client{ &f.client, &fake_client }) |client| {
+            var d = try client.metric(g).create(.{ .kind = .gauge, .value_type = .int64 });
+            d.deinit();
+        }
+        var info = try f.awaitDescriptor(g);
+        info.deinit();
+        var lines: [2][]const u8 = undefined;
+        for ([_]*monitoring.Client{ &f.client, &fake_client }, [_]*monitoring.Diagnostics{ &f.diag, &fake_diag }, &lines) |client, diag, *line| {
+            if (client.metric(g).read(.{ .end = end, .filter = .{ .resource_labels = &.{.{ .key = "subscription_id", .value = "x" }} } })) |page| {
+                var owned = page;
+                defer owned.deinit();
+                line.* = try a.print("{d} series", .{owned.value.series.len});
+            } else |err| line.* = try a.print("{t}: {s}", .{ err, diag.message() });
+        }
+        agree(&differences, "filter: a user metric on subscription_id", lines[0], lines[1]);
+    }
+
+    // Descriptors and resource types, as production gives them.
+    for (pubsub_metrics) |m| {
+        const t = try a.print("{s}{s}", .{ pubsub_prefix, m });
+        var lines: [2][]const u8 = undefined;
+        for ([_]*monitoring.Client{ &f.client, &fake_client }, &lines) |client, *line| {
+            var info = try client.metric(t).get();
+            defer info.deinit();
+            var out: std.Io.Writer.Allocating = .init(a);
+            try out.writer.print("{t} {t} unit {s}, \"{s}\", labels", .{ info.value.kind, info.value.value_type, info.value.unit, info.value.display_name });
+            for (info.value.labels) |l| try out.writer.print(" {s}", .{l.key});
+            try out.writer.writeAll(", on");
+            for (info.value.resource_types) |rt| try out.writer.print(" {s}", .{rt});
+            line.* = out.written();
+        }
+        agree(&differences, m, lines[0], lines[1]);
+    }
+    for ([_][]const u8{ "pubsub_subscription", "pubsub_topic" }) |rt| {
+        var lines: [2][]const u8 = undefined;
+        for ([_]*monitoring.Client{ &f.client, &fake_client }, &lines) |client, *line| {
+            var info = try client.resourceType(rt);
+            defer info.deinit();
+            var out: std.Io.Writer.Allocating = .init(a);
+            try out.writer.print("\"{s}\", labels", .{info.value.display_name});
+            for (info.value.labels) |l| try out.writer.print(" {s}", .{l.key});
+            line.* = out.written();
+        }
+        agree(&differences, rt, lines[0], lines[1]);
     }
     try testing.expectEqual(0, differences);
 }
