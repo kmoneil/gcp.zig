@@ -27,6 +27,18 @@
 //! `pubsub_subscription`, whose descriptor it makes all the same, under
 //! the run's prefix.
 //!
+//! An alerts test (MONITORING_TEST_ALERTS=1, ten to thirty minutes: a real
+//! incident opens in about four and closes in about two) makes a
+//! `zigps-alerts-<run>` metric and a threshold alert policy on it with no
+//! notification channels, writes points over the threshold until the
+//! alert opens, seeds `FakeMonitoring.putAlert` with every alert
+//! production lists, and holds the fake's answer to production's for each
+//! read: gets, the filters milestone 0 measured, both orders, paging, the
+//! 404 and the refusals (issue #246). Then it deletes the policy, waits
+//! for production to close the alert, reseeds and compares again. It
+//! sweeps `zigps-` alert policies of earlier runs first; the alert itself
+//! cannot be deleted and ages out on Google's side.
+//!
 //! A quota test (MONITORING_TEST_QUOTA=1, about seven minutes) does the
 //! same for Cloud's quota metrics (issue #247): it sends Pub/Sub topic
 //! lists to consume rate quota, waits until Monitoring shows their
@@ -710,6 +722,266 @@ fn agree(differences: *usize, label: []const u8, production: []const u8, in_memo
 
 fn floorMinute(ns: i96) i96 {
     return @divFloor(ns, std.time.ns_per_min) * std.time.ns_per_min;
+}
+
+// Alerts (issue #246).
+
+/// One raw call beside the client, for what it deliberately has no verb
+/// for: the alert policy the test fires and deletes.
+fn rawMonitoring(f: *Fixture, arena: Allocator, method: core.transport.Method, path: []const u8, body: ?[]const u8) !core.transport.Response {
+    const url = try std.fmt.allocPrint(arena, "{s}{s}", .{ f.client.base_url, path });
+    return f.client.transport.send(.{ .method = method, .url = url, .bearer = f.token.token, .body = body, .timeout_ms = 30_000 }, arena);
+}
+
+/// Deletes the `zigps-` alert policies earlier runs may have left.
+fn sweepAlertPolicies(f: *Fixture, arena: Allocator) !void {
+    const list_path = try std.fmt.allocPrint(arena, "/v3/projects/{s}/alertPolicies?pageSize=1000", .{f.project});
+    const res = try rawMonitoring(f, arena, .GET, list_path, null);
+    if (res.status != 200) {
+        fact("sweep: listing alert policies answered HTTP {d}", .{res.status});
+        return;
+    }
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, res.body, .{}) catch return;
+    if (parsed != .object) return;
+    const policies = parsed.object.get("alertPolicies") orelse return;
+    if (policies != .array) return;
+    for (policies.array.items) |p| {
+        if (p != .object) continue;
+        const name = p.object.get("name") orelse continue;
+        const display = p.object.get("displayName") orelse continue;
+        if (name != .string or display != .string) continue;
+        if (!std.mem.startsWith(u8, display.string, "zigps-")) continue;
+        const path = try std.fmt.allocPrint(arena, "/v3/{s}", .{name.string});
+        const deleted = try rawMonitoring(f, arena, .DELETE, path, null);
+        fact("sweep: deleted {s} ({s}): HTTP {d}", .{ display.string, name.string, deleted.status });
+    }
+}
+
+/// Every alert production lists, put into the fake as it holds them.
+fn seedFakeAlerts(fake: *monitoring.testing.FakeMonitoring, page: *const monitoring.AlertPage) !void {
+    for (page.alerts) |alert| {
+        _ = try fake.putAlert(.{
+            .id = alert.id,
+            .state = alert.state,
+            .open_time = alert.open_time,
+            .close_time = alert.close_time,
+            .policy = .{
+                .name = alert.policy.name,
+                .display_name = alert.policy.display_name,
+                .severity = alert.policy.severity,
+                .user_labels = alert.policy.user_labels,
+            },
+            .metric_type = alert.metric_type,
+            .metric_labels = alert.metric_labels,
+            .resource_type = alert.resource_type,
+            .resource_labels = alert.resource_labels,
+            .log_labels = alert.log_labels,
+        });
+    }
+}
+
+/// One read against `client`, formatted so production's answer and the
+/// fake's can be compared as text.
+const AlertOp = union(enum) {
+    get: []const u8,
+    list: monitoring.ListAlertsOptions,
+};
+
+fn alertOutcome(a: Allocator, client: *monitoring.Client, diag: *monitoring.Diagnostics, op: AlertOp) ![]const u8 {
+    var w: std.Io.Writer.Allocating = .init(a);
+    switch (op) {
+        .get => |id| {
+            var got = client.getAlert(id) catch |err| {
+                try w.writer.print("error.{t}: {s}", .{ err, diag.message() });
+                return w.written();
+            };
+            defer got.deinit();
+            try writeAlertLine(&w.writer, got.value);
+        },
+        .list => |options| {
+            var page = client.listAlerts(options) catch |err| {
+                try w.writer.print("error.{t}: {s}", .{ err, diag.message() });
+                return w.written();
+            };
+            defer page.deinit();
+            try w.writer.print("n={d} total={?d} next={}", .{ page.value.alerts.len, page.value.total_size, page.value.next_page_token != null });
+            for (page.value.alerts) |alert| {
+                try w.writer.writeAll(" | ");
+                try writeAlertLine(&w.writer, alert);
+            }
+        },
+    }
+    return w.written();
+}
+
+fn writeAlertLine(w: *std.Io.Writer, alert: monitoring.Alert) !void {
+    try w.print("{s} {t} open={d} close={?d} sev={t} policy=\"{s}\" metric={s} resource={s}", .{
+        alert.id,
+        alert.state,
+        @divFloor(alert.open_time.nanoseconds, std.time.ns_per_s),
+        if (alert.close_time) |t| @divFloor(t.nanoseconds, std.time.ns_per_s) else null,
+        alert.policy.severity,
+        alert.policy.display_name,
+        alert.metric_type,
+        alert.resource_type,
+    });
+}
+
+/// The reads both sides answer, run and compared one by one.
+fn compareAlertReads(f: *Fixture, a: Allocator, fake_client: *monitoring.Client, fake_diag: *monitoring.Diagnostics, our_display: []const u8, our_id: []const u8, differences: *usize, phase: []const u8) !void {
+    const ops = [_]struct { []const u8, AlertOp }{
+        .{ "get ours", .{ .get = our_id } },
+        .{ "get unknown", .{ .get = "1234567890" } },
+        .{ "list all", .{ .list = .{} } },
+        .{ "open only", .{ .list = .{ .open_only = true } } },
+        .{ "by severity", .{ .list = .{ .filter = "severity=\"WARNING\"" } } },
+        .{ "by display name", .{ .list = .{ .filter = try std.fmt.allocPrint(a, "policy.display_name=\"{s}\"", .{our_display}) } } },
+        .{ "state unquoted", .{ .list = .{ .filter = "state=OPEN" } } },
+        .{ "closed", .{ .list = .{ .filter = "state=\"CLOSED\"" } } },
+        .{ "order open_time", .{ .list = .{ .order_by = .open_time } } },
+        .{ "order close_time desc", .{ .list = .{ .order_by = .close_time_desc } } },
+        .{ "page of one", .{ .list = .{ .page_size = 1 } } },
+        .{ "unbalanced quote", .{ .list = .{ .filter = "\"unbalanced" } } },
+    };
+    for (ops) |op| {
+        const label = try std.fmt.allocPrint(a, "{s}: {s}", .{ phase, op[0] });
+        const in_production = try alertOutcome(a, &f.client, &f.diag, op[1]);
+        const in_memory = try alertOutcome(a, fake_client, fake_diag, op[1]);
+        agree(differences, label, in_production, in_memory);
+    }
+}
+
+test "monitoring: a real incident, and the fake seeded with production's alerts answers as production did" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    if (f.env.get("MONITORING_TEST_ALERTS") == null) return error.SkipZigTest;
+    const a = f.arena.allocator();
+    try sweepAlertPolicies(&f, a);
+
+    // The metric the policy watches, with a first point so the policy's
+    // create can see it (milestone 0: 404 until the metric is known).
+    const metric_type = try f.name("alert_level");
+    var made = try f.client.metric(metric_type).create(.{ .kind = .gauge, .value_type = .int64, .unit = "1" });
+    made.deinit();
+    var waited = try f.awaitDescriptor(metric_type);
+    waited.deinit();
+    const over: monitoring.TimeSeries = .{ .metric_type = metric_type, .resource = .global, .kind = .gauge, .end = .{ .nanoseconds = nowMs() }, .value = .{ .int64 = 42 } };
+    var first = try f.client.write(&.{over});
+    defer first.deinit();
+    try testing.expect(first.value.ok());
+
+    // The policy: WARNING, a user label, one threshold, no channels.
+    const display = try a.print("zigps-alerts-{s}", .{f.run});
+    const policy_body = try std.fmt.allocPrint(a,
+        \\{{"displayName":"{s}","severity":"WARNING","userLabels":{{"team":"zigps"}},"combiner":"OR","conditions":[{{"displayName":"{s} over 10","conditionThreshold":{{"filter":"metric.type=\"{s}\" AND resource.type=\"global\"","comparison":"COMPARISON_GT","thresholdValue":10,"duration":"0s","aggregations":[{{"alignmentPeriod":"60s","perSeriesAligner":"ALIGN_MAX"}}]}}}}]}}
+    , .{ display, display, metric_type });
+    const policies_path = try std.fmt.allocPrint(a, "/v3/projects/{s}/alertPolicies", .{f.project});
+    const policy_made_at = nowMs();
+    var policy_name: []const u8 = "";
+    for (0..24) |_| {
+        const res = try rawMonitoring(&f, a, .POST, policies_path, policy_body);
+        if (res.status == 200) {
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, res.body, .{});
+            policy_name = try a.dupe(u8, parsed.object.get("name").?.string);
+            break;
+        }
+        if (res.status != 404) {
+            std.debug.print("alertPolicies.create: HTTP {d} {s}\n", .{ res.status, res.body });
+            return error.PolicyCreateFailed;
+        }
+        try testing.io.sleep(.fromMilliseconds(30_000), .awake);
+    }
+    if (policy_name.len == 0) return error.PolicyNeverCreatable;
+    fact("policy {s} created {d} s after the descriptor", .{ policy_name, @divFloor(nowMs() - policy_made_at, std.time.ns_per_s) });
+    var policy_deleted = false;
+    defer if (!policy_deleted) {
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        if (std.fmt.allocPrint(scratch.allocator(), "/v3/{s}", .{policy_name})) |path| {
+            _ = rawMonitoring(&f, scratch.allocator(), .DELETE, path, null) catch {};
+        } else |_| {}
+    };
+
+    // Fire it: a point over the threshold every 30 s until the alert
+    // opens (the probe's opened 245 s after the first write).
+    const fired_at = nowMs();
+    const our_filter = try std.fmt.allocPrint(a, "policy.display_name=\"{s}\"", .{display});
+    var our_id: []const u8 = "";
+    for (0..50) |_| {
+        var again = try f.client.write(&.{.{ .metric_type = metric_type, .resource = .global, .kind = .gauge, .end = .{ .nanoseconds = nowMs() }, .value = .{ .int64 = 42 } }});
+        again.deinit();
+        var page = try f.client.listAlerts(.{ .filter = our_filter });
+        defer page.deinit();
+        if (page.value.alerts.len > 0) {
+            try testing.expectEqual(monitoring.AlertState.open, page.value.alerts[0].state);
+            try testing.expectEqual(null, page.value.alerts[0].close_time);
+            our_id = try a.dupe(u8, page.value.alerts[0].id);
+            break;
+        }
+        try testing.io.sleep(.fromMilliseconds(30_000), .awake);
+    }
+    if (our_id.len == 0) return error.AlertNeverOpened;
+    fact("alert {s} open {d} s after the first write", .{ our_id, @divFloor(nowMs() - fired_at, std.time.ns_per_s) });
+
+    // The fake, seeded with every alert production lists, answers every
+    // read as production does.
+    var differences: usize = 0;
+    {
+        var fake: monitoring.testing.FakeMonitoring = .init(testing.allocator, testing.io, .{ .project_id = f.project });
+        defer fake.deinit();
+        var fake_diag: monitoring.Diagnostics = .{};
+        var fake_token: core.StaticToken = .{ .token = "t" };
+        var fake_client = try monitoring.Client.init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = fake_token.provider(), .transport = fake.transport(), .diagnostics = &fake_diag });
+        defer fake_client.deinit();
+        var all = try f.client.listAlerts(.{ .page_size = 1000 });
+        defer all.deinit();
+        try seedFakeAlerts(&fake, &all.value);
+        fact("open phase: {d} alerts seeded", .{all.value.alerts.len});
+        try compareAlertReads(&f, a, &fake_client, &fake_diag, display, our_id, &differences, "open");
+
+        // Production-only facts the fake answers 501 for: the bare word
+        // and the structured filter language's parse tree in its 400.
+        try testing.expectError(error.InvalidArgument, f.client.listAlerts(.{ .filter = display }));
+        try testing.expect(std.mem.indexOf(u8, f.diag.message(), "Restriction must have a left-hand side") != null);
+    }
+
+    // Deleting the policy closes the alert (the probe measured 91 s).
+    const delete_path = try std.fmt.allocPrint(a, "/v3/{s}", .{policy_name});
+    const deleted = try rawMonitoring(&f, a, .DELETE, delete_path, null);
+    try testing.expectEqual(200, deleted.status);
+    policy_deleted = true;
+    const deleted_at = nowMs();
+    var closed = false;
+    for (0..40) |_| {
+        var got = try f.client.getAlert(our_id);
+        defer got.deinit();
+        if (got.value.state == .closed) {
+            try testing.expect(got.value.close_time != null);
+            try testing.expect(got.value.metric_type.len > 0);
+            closed = true;
+            break;
+        }
+        try testing.io.sleep(.fromMilliseconds(30_000), .awake);
+    }
+    if (!closed) return error.AlertNeverClosed;
+    fact("alert closed {d} s after the policy's delete", .{@divFloor(nowMs() - deleted_at, std.time.ns_per_s)});
+
+    // Seed afresh and compare the same reads over the closed state.
+    {
+        var fake: monitoring.testing.FakeMonitoring = .init(testing.allocator, testing.io, .{ .project_id = f.project });
+        defer fake.deinit();
+        var fake_diag: monitoring.Diagnostics = .{};
+        var fake_token: core.StaticToken = .{ .token = "t" };
+        var fake_client = try monitoring.Client.init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = fake_token.provider(), .transport = fake.transport(), .diagnostics = &fake_diag });
+        defer fake_client.deinit();
+        var all = try f.client.listAlerts(.{ .page_size = 1000 });
+        defer all.deinit();
+        try seedFakeAlerts(&fake, &all.value);
+        fact("closed phase: {d} alerts seeded", .{all.value.alerts.len});
+        try compareAlertReads(&f, a, &fake_client, &fake_diag, display, our_id, &differences, "closed");
+    }
+    try testing.expectEqual(0, differences);
 }
 
 test "monitoring: Pub/Sub's own metrics, and the fake given production's points answers as production did" {

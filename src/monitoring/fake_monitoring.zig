@@ -96,6 +96,9 @@ pub const FakeMonitoring = struct {
     /// Whether Google's own descriptors are in `descriptors`: they go in
     /// at the first call, since `init` cannot fail.
     google_loaded: bool = false,
+    /// By id, in the order put in (issue #246).
+    alerts: std.StringArrayHashMapUnmanaged(*FakeAlert) = .empty,
+    alert_counter: u64 = 0,
 
     const Fault = struct { n: usize = 0, status: u16 = 0, delay: ?core.retry_after.Asked = null };
     const refuse = 0;
@@ -151,6 +154,21 @@ pub const FakeMonitoring = struct {
         points: std.ArrayList(Point) = .empty,
     };
 
+    /// An alert as the fake keeps one: what production answered for a
+    /// policy's violation, measured 2026-10-19 (issue #246).
+    const FakeAlert = struct {
+        id: []const u8,
+        state: types.AlertState,
+        open_time: std.Io.Timestamp,
+        close_time: ?std.Io.Timestamp,
+        policy: types.PolicySnapshot,
+        metric_type: []const u8,
+        metric_labels: []const types.Label,
+        resource_type: []const u8,
+        resource_labels: []const types.Label,
+        log_labels: []const types.Label,
+    };
+
     pub fn init(gpa: Allocator, io: std.Io, options: Options) FakeMonitoring {
         return .{ .gpa = gpa, .io = io, .options = options, .store = .init(gpa) };
     }
@@ -158,6 +176,7 @@ pub const FakeMonitoring = struct {
     pub fn deinit(f: *FakeMonitoring) void {
         f.descriptors.deinit(f.gpa);
         f.series.deinit(f.gpa);
+        f.alerts.deinit(f.gpa);
         f.store.deinit();
         f.* = undefined;
     }
@@ -336,6 +355,99 @@ pub const FakeMonitoring = struct {
         try s.points.appendSlice(st, pts);
     }
 
+    /// An alert a test puts in, as `putAlert` takes one.
+    pub const PutAlert = struct {
+        /// System-assigned when null, as production assigns ids (and no
+        /// number when it does: production assigned `0.oe0ehmpm95z2`).
+        id: ?[]const u8 = null,
+        state: types.AlertState = .open,
+        open_time: std.Io.Timestamp,
+        close_time: ?std.Io.Timestamp = null,
+        /// The policy snapshot the alert carries.
+        policy: types.PolicySnapshot = .{},
+        /// The metric and resource preserved from the condition that
+        /// fired, as production kept them even after the close.
+        metric_type: []const u8 = "",
+        metric_labels: []const types.Label = &.{},
+        resource_type: []const u8 = "",
+        resource_labels: []const types.Label = &.{},
+        /// The labels a log-based alert extracted.
+        log_labels: []const types.Label = &.{},
+    };
+
+    /// Puts an alert in, as a policy's violation appears in production: a
+    /// test's lever, since no program can make one through the API. The
+    /// id, given or assigned, is returned, owned by the fake; times are
+    /// kept to the microsecond, as production keeps them.
+    ///
+    /// `error.InvalidEntry`, with nothing kept, for: a state other than
+    /// open or closed; an open alert with a close time, or a closed one
+    /// without; a close before the open; a severity of `.unknown`; an id
+    /// taken, empty, past 256 bytes, or with a character outside visible
+    /// ASCII, or `/`; a label key twice in one list.
+    pub fn putAlert(f: *FakeMonitoring, alert: PutAlert) PutError![]const u8 {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        switch (alert.state) {
+            .open, .closed => {},
+            else => return error.InvalidEntry,
+        }
+        if ((alert.state == .open) != (alert.close_time == null)) return error.InvalidEntry;
+        if (alert.close_time) |c| if (c.nanoseconds < alert.open_time.nanoseconds) return error.InvalidEntry;
+        if (alert.policy.severity == .unknown) return error.InvalidEntry;
+        if (alert.id) |id| if (!validate.isAlertId(id) or f.alerts.contains(id)) return error.InvalidEntry;
+        inline for (.{ alert.metric_labels, alert.resource_labels, alert.log_labels, alert.policy.user_labels }) |labels| {
+            for (labels, 0..) |l, i| {
+                for (labels[0..i]) |m| if (std.mem.eql(u8, l.key, m.key)) return error.InvalidEntry;
+            }
+        }
+        const s = f.store.allocator();
+        const id = if (alert.id) |given| try s.dupe(u8, given) else try std.fmt.allocPrint(s, "0.fake{d}", .{f.alert_counter});
+        f.alert_counter += 1;
+        const a = try s.create(FakeAlert);
+        a.* = .{
+            .id = id,
+            .state = alert.state,
+            .open_time = .{ .nanoseconds = truncated(alert.open_time.nanoseconds) },
+            .close_time = if (alert.close_time) |c| .{ .nanoseconds = truncated(c.nanoseconds) } else null,
+            .policy = .{
+                .name = try s.dupe(u8, alert.policy.name),
+                .display_name = try s.dupe(u8, alert.policy.display_name),
+                .severity = alert.policy.severity,
+                .user_labels = try dupeLabels(s, alert.policy.user_labels),
+            },
+            .metric_type = try s.dupe(u8, alert.metric_type),
+            .metric_labels = try dupeLabels(s, alert.metric_labels),
+            .resource_type = try s.dupe(u8, alert.resource_type),
+            .resource_labels = try dupeLabels(s, alert.resource_labels),
+            .log_labels = try dupeLabels(s, alert.log_labels),
+        };
+        try f.alerts.put(f.gpa, a.id, a);
+        return a.id;
+    }
+
+    /// Closes an open alert, as production closes one when its policy's
+    /// condition clears or the policy is deleted: measured, the alert
+    /// kept its metric and resource and stayed listable, its closeTime
+    /// set. `error.InvalidEntry` for an id nobody has, an alert already
+    /// closed, or a close before the open.
+    pub fn closeAlert(f: *FakeMonitoring, id: []const u8, close_time: std.Io.Timestamp) PutError!void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        const a = f.alerts.get(id) orelse return error.InvalidEntry;
+        if (a.state != .open) return error.InvalidEntry;
+        if (close_time.nanoseconds < a.open_time.nanoseconds) return error.InvalidEntry;
+        a.state = .closed;
+        a.close_time = .{ .nanoseconds = truncated(close_time.nanoseconds) };
+    }
+
+    /// Alerts held, whatever their state.
+    pub fn alertCount(f: *FakeMonitoring) usize {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        return f.alerts.count();
+    }
+
     /// Whether `put` takes `s`: each rule its doc comment lists.
     fn puttable(f: *FakeMonitoring, a: Allocator, s: PutSeries) Allocator.Error!bool {
         if (validate.metricTypeProblem(s.metric_type) != null) return false;
@@ -478,7 +590,242 @@ pub const FakeMonitoring = struct {
                     else => notModelled(arena, "this method on timeSeries"),
                 };
             },
+            .alerts => {
+                if (req.method != .GET) return notModelled(arena, "this method on alerts");
+                if (target.rest.len == 0) return f.listAlertsRoute(arena, params);
+                const id = try decoded(arena, target.rest);
+                const a = f.alerts.get(id) orelse return fail(arena, 404, "NOT_FOUND", "Requested entity was not found.");
+                var out: std.Io.Writer.Allocating = .init(arena);
+                var jw: Stringify = .{ .writer = &out.writer };
+                f.writeAlert(&jw, a) catch return error.OutOfMemory;
+                return .{ .status = 200, .body = out.written() };
+            },
         }
+    }
+
+    // Alerts, served as production answered them (issue #246).
+
+    /// The one filter shape production was measured on: `lhs="value"` or
+    /// `lhs=value`, lhs state, severity or policy.display_name.
+    const AlertMatch = union(enum) {
+        /// Production's 400 "Invalid filter syntax".
+        bad_syntax,
+        match: struct {
+            field: enum { state, severity, display_name },
+            value: []const u8,
+        },
+    };
+
+    fn parseAlertFilter(filter: []const u8) ?AlertMatch {
+        // An unclosed quote was production's 400 "Invalid filter syntax".
+        if (std.mem.count(u8, filter, "\"") % 2 == 1) return .bad_syntax;
+        const eq = std.mem.indexOfScalar(u8, filter, '=') orelse return null;
+        const lhs = std.mem.trim(u8, filter[0..eq], " ");
+        var rhs = std.mem.trim(u8, filter[eq + 1 ..], " ");
+        if (std.mem.startsWith(u8, rhs, "\"")) {
+            if (rhs.len < 2 or rhs[rhs.len - 1] != '"') return .bad_syntax;
+            rhs = rhs[1 .. rhs.len - 1];
+            if (std.mem.indexOfAny(u8, rhs, "\"\\") != null) return null;
+        } else if (rhs.len == 0 or std.mem.indexOfAny(u8, rhs, "\"\\ ") != null) return null;
+        if (std.mem.eql(u8, lhs, "state")) {
+            if (types.AlertState.fromWire(rhs) == .unknown) return null;
+            return .{ .match = .{ .field = .state, .value = rhs } };
+        }
+        if (std.mem.eql(u8, lhs, "severity")) {
+            if (types.Severity.fromWire(rhs) == .unknown) return null;
+            return .{ .match = .{ .field = .severity, .value = rhs } };
+        }
+        if (std.mem.eql(u8, lhs, "policy.display_name")) {
+            return .{ .match = .{ .field = .display_name, .value = rhs } };
+        }
+        return null;
+    }
+
+    fn alertMatches(a: *const FakeAlert, m: @FieldType(AlertMatch, "match")) bool {
+        return switch (m.field) {
+            .state => a.state == types.AlertState.fromWire(m.value),
+            .severity => a.policy.severity == types.Severity.fromWire(m.value),
+            .display_name => std.mem.eql(u8, a.policy.display_name, m.value),
+        };
+    }
+
+    const AlertOrderKey = struct { close_time: bool, desc: bool };
+
+    /// `orderBy`: a comma-separated list of open_time and close_time,
+    /// each with an optional desc, as the discovery document says and
+    /// production took; "" is production's default, open_time desc. Any
+    /// other field was production's bare 400.
+    fn parseAlertOrder(arena: Allocator, text: []const u8) Allocator.Error!?[]const AlertOrderKey {
+        var keys: std.ArrayList(AlertOrderKey) = .empty;
+        if (std.mem.trim(u8, text, " ").len == 0) {
+            try keys.append(arena, .{ .close_time = false, .desc = true });
+            return keys.items;
+        }
+        var it = std.mem.splitScalar(u8, text, ',');
+        while (it.next()) |entry| {
+            var words = std.mem.tokenizeScalar(u8, entry, ' ');
+            const field = words.next() orelse return null;
+            var key: AlertOrderKey = undefined;
+            if (std.mem.eql(u8, field, "open_time")) {
+                key = .{ .close_time = false, .desc = false };
+            } else if (std.mem.eql(u8, field, "close_time")) {
+                key = .{ .close_time = true, .desc = false };
+            } else return null;
+            if (words.next()) |word| {
+                if (!std.mem.eql(u8, word, "desc")) return null;
+                key.desc = true;
+            }
+            if (words.next() != null) return null;
+            try keys.append(arena, key);
+        }
+        return keys.items;
+    }
+
+    /// An open alert's close time sorts as if it were still to come:
+    /// after every closed one's.
+    fn alertSortsBefore(keys: []const AlertOrderKey, a: *const FakeAlert, b: *const FakeAlert) bool {
+        for (keys) |key| {
+            const av: i96 = if (key.close_time) (if (a.close_time) |t| t.nanoseconds else std.math.maxInt(i96)) else a.open_time.nanoseconds;
+            const bv: i96 = if (key.close_time) (if (b.close_time) |t| t.nanoseconds else std.math.maxInt(i96)) else b.open_time.nanoseconds;
+            if (av == bv) continue;
+            return if (key.desc) av > bv else av < bv;
+        }
+        return false;
+    }
+
+    fn listAlertsRoute(f: *FakeMonitoring, arena: Allocator, params: []const Param) Allocator.Error!Reply {
+        var matched: std.ArrayList(*FakeAlert) = .empty;
+        if (paramOf(params, "filter")) |filter| {
+            switch (parseAlertFilter(filter) orelse return notModelled(arena, "a filter production was not asked about")) {
+                .bad_syntax => return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Field filter had an invalid value of \"{s}\": Invalid filter syntax.", .{filter})),
+                .match => |m| for (f.alerts.values()) |a| {
+                    if (alertMatches(a, m)) try matched.append(arena, a);
+                },
+            }
+        } else try matched.appendSlice(arena, f.alerts.values());
+        const keys = try parseAlertOrder(arena, paramOf(params, "orderBy") orelse "") orelse
+            return fail(arena, 400, "INVALID_ARGUMENT", "Request contains an invalid argument.");
+        std.sort.insertion(*FakeAlert, matched.items, keys, struct {
+            fn lessThan(k: []const AlertOrderKey, a: *FakeAlert, b: *FakeAlert) bool {
+                return alertSortsBefore(k, a, b);
+            }
+        }.lessThan);
+        const window = alertsPageOf(params, matched.items.len) orelse return pageTokenRefusal(arena);
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        f.writeAlertsPage(&jw, matched.items[window.from..window.to], window.next, matched.items.len) catch return error.OutOfMemory;
+        return .{ .status = 200, .body = out.written() };
+    }
+
+    /// At most 50 alerts unset, and 1,000 however many are asked: the
+    /// document's words; the coercion is not observable with few alerts.
+    fn alertsPageOf(params: []const Param, total: usize) ?Window {
+        var size: usize = 50;
+        if (paramOf(params, "pageSize")) |text| {
+            const n = std.fmt.parseInt(usize, text, 10) catch return null;
+            if (n != 0) size = @min(n, 1000);
+        }
+        var from: usize = 0;
+        if (paramOf(params, "pageToken")) |t| {
+            if (!std.mem.startsWith(u8, t, "p")) return null;
+            from = std.fmt.parseInt(usize, t[1..], 10) catch return null;
+            if (from > total) return null;
+        }
+        const to = @min(total, from + size);
+        return .{ .from = from, .to = to, .next = if (to < total) to else null };
+    }
+
+    /// A page as production answered one: `{}` with nothing matched, the
+    /// alerts and `totalSize` otherwise.
+    fn writeAlertsPage(f: *const FakeMonitoring, jw: *Stringify, items: []const *FakeAlert, next: ?usize, total: usize) Stringify.Error!void {
+        try jw.beginObject();
+        if (items.len > 0) {
+            try jw.objectField("alerts");
+            try jw.beginArray();
+            for (items) |a| try f.writeAlert(jw, a);
+            try jw.endArray();
+        }
+        if (next) |n| {
+            try jw.objectField("nextPageToken");
+            try jw.print("\"p{d}\"", .{n});
+        }
+        if (total > 0) {
+            try jw.objectField("totalSize");
+            try jw.write(total);
+        }
+        try jw.endObject();
+    }
+
+    /// Production's field order: name, state, openTime, closeTime, then
+    /// resource before metric, then policy; what an alert does not have
+    /// is left out, as the open alert's closeTime was.
+    fn writeAlert(f: *const FakeMonitoring, jw: *Stringify, a: *const FakeAlert) Stringify.Error!void {
+        var buf: [core.timestamp.max_len]u8 = undefined;
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.print("\"projects/{s}/alerts/{s}\"", .{ f.options.project_id, a.id });
+        try jw.objectField("state");
+        try jw.write(if (a.state == .open) "OPEN" else "CLOSED");
+        try jw.objectField("openTime");
+        try jw.write(core.timestamp.format(&buf, a.open_time));
+        if (a.close_time) |t| {
+            try jw.objectField("closeTime");
+            try jw.write(core.timestamp.format(&buf, t));
+        }
+        if (a.resource_type.len > 0) {
+            try jw.objectField("resource");
+            try jw.beginObject();
+            try jw.objectField("type");
+            try jw.write(a.resource_type);
+            if (a.resource_labels.len > 0) {
+                try jw.objectField("labels");
+                try writeLabelObject(jw, a.resource_labels);
+            }
+            try jw.endObject();
+        }
+        if (a.metric_type.len > 0) {
+            try jw.objectField("metric");
+            try jw.beginObject();
+            try jw.objectField("type");
+            try jw.write(a.metric_type);
+            if (a.metric_labels.len > 0) {
+                try jw.objectField("labels");
+                try writeLabelObject(jw, a.metric_labels);
+            }
+            try jw.endObject();
+        }
+        try jw.objectField("policy");
+        try jw.beginObject();
+        if (a.policy.name.len > 0) {
+            try jw.objectField("name");
+            try jw.write(a.policy.name);
+        }
+        if (a.policy.display_name.len > 0) {
+            try jw.objectField("displayName");
+            try jw.write(a.policy.display_name);
+        }
+        if (a.policy.severity != .unspecified) {
+            try jw.objectField("severity");
+            try jw.write(switch (a.policy.severity) {
+                .critical => "CRITICAL",
+                .@"error" => "ERROR",
+                .warning => "WARNING",
+                else => unreachable,
+            });
+        }
+        if (a.policy.user_labels.len > 0) {
+            try jw.objectField("userLabels");
+            try writeLabelObject(jw, a.policy.user_labels);
+        }
+        try jw.endObject();
+        if (a.log_labels.len > 0) {
+            try jw.objectField("log");
+            try jw.beginObject();
+            try jw.objectField("extractedLabels");
+            try writeLabelObject(jw, a.log_labels);
+            try jw.endObject();
+        }
+        try jw.endObject();
     }
 
     // Descriptors.
@@ -1710,7 +2057,7 @@ fn fakeDouble(jw: *Stringify, d: f64) Stringify.Error!void {
 
 const Route = struct {
     project: []const u8,
-    collection: enum { metric_descriptors, resource_descriptors, time_series },
+    collection: enum { metric_descriptors, resource_descriptors, time_series, alerts },
     /// After the collection and its `/`, as sent; "" for the collection.
     rest: []const u8,
 };
@@ -1733,6 +2080,7 @@ fn parseRoute(path: []const u8) ?Route {
         .{ "metricDescriptors", .metric_descriptors },
         .{ "monitoredResourceDescriptors", .resource_descriptors },
         .{ "timeSeries", .time_series },
+        .{ "alerts", .alerts },
     };
     for (names) |n| {
         if (std.mem.eql(u8, tail, n[0])) return .{ .project = project, .collection = n[1], .rest = "" };
@@ -4497,4 +4845,211 @@ test "fuzz DELTA reads: each aligner a DELTA metric takes agrees with the points
         "\x01\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x08",
         "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
     } });
+}
+
+// Alerts, put in by a test (issue #246).
+
+const codec = @import("codec.zig");
+
+test "alerts: the probe's alert put in, got and listed as production answered" {
+    var b: Bench = undefined;
+    try b.init(.{ .project_id = "extractctl" });
+    defer b.deinit();
+    const opened = try core.timestamp.parse("2026-10-19T17:14:00Z");
+    const id = try b.fake.putAlert(.{
+        .id = "0.oe0ehmpm95z2",
+        .open_time = opened,
+        .policy = .{
+            .name = "projects/extractctl/alertPolicies/9108504683352368943",
+            .display_name = "zigps-alerts-0ea66e",
+            .severity = .warning,
+            .user_labels = &.{.{ .key = "team", .value = "zigps" }},
+        },
+        .metric_type = "custom.googleapis.com/zigps-alerts-0ea66e/level",
+        .resource_type = "global",
+        .resource_labels = &.{.{ .key = "project_id", .value = "extractctl" }},
+    });
+    try testing.expectEqualStrings("0.oe0ehmpm95z2", id);
+    try testing.expectEqual(1, b.fake.alertCount());
+
+    // Got by id: what production.alert_open decodes to, field by field.
+    var got = try b.client.getAlert(id);
+    defer got.deinit();
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const production_alert = try codec.decodeAlert(out.allocator(), scratch.allocator(), production.alert_open);
+    try testing.expectEqualStrings(production_alert.name, got.value.name);
+    try testing.expectEqual(production_alert.state, got.value.state);
+    try testing.expectEqual(production_alert.open_time.nanoseconds, got.value.open_time.nanoseconds);
+    try testing.expectEqual(null, got.value.close_time);
+    try testing.expectEqualStrings(production_alert.policy.name, got.value.policy.name);
+    try testing.expectEqual(production_alert.policy.severity, got.value.policy.severity);
+    try testing.expectEqualStrings(production_alert.policy.userLabel("team").?, got.value.policy.userLabel("team").?);
+    try testing.expectEqualStrings(production_alert.metric_type, got.value.metric_type);
+    try testing.expectEqualStrings(production_alert.resource_type, got.value.resource_type);
+    try testing.expectEqualStrings(production_alert.resourceLabel("project_id").?, got.value.resourceLabel("project_id").?);
+
+    // Listed: totalSize with a match, the filters production took, and
+    // production's words for one it refused.
+    var open = try b.client.listAlerts(.{ .open_only = true });
+    defer open.deinit();
+    try testing.expectEqual(1, open.value.alerts.len);
+    try testing.expectEqual(1, open.value.total_size.?);
+    var by_severity = try b.client.listAlerts(.{ .filter = "severity=\"WARNING\"" });
+    defer by_severity.deinit();
+    try testing.expectEqual(1, by_severity.value.alerts.len);
+    var by_name = try b.client.listAlerts(.{ .filter = "policy.display_name=\"zigps-alerts-0ea66e\"" });
+    defer by_name.deinit();
+    try testing.expectEqual(1, by_name.value.alerts.len);
+    var bare_state = try b.client.listAlerts(.{ .filter = "state=OPEN" });
+    defer bare_state.deinit();
+    try testing.expectEqual(1, bare_state.value.alerts.len);
+    var other_name = try b.client.listAlerts(.{ .filter = "policy.display_name=\"nobody\"" });
+    defer other_name.deinit();
+    try testing.expectEqual(0, other_name.value.alerts.len);
+    try testing.expectEqual(null, other_name.value.total_size);
+    try testing.expectError(error.InvalidArgument, b.client.listAlerts(.{ .filter = "\"unbalanced" }));
+    try testing.expectEqualStrings("Field filter had an invalid value of \"\"unbalanced\": Invalid filter syntax.", b.diag.message());
+    try testing.expectError(error.Unimplemented, b.client.listAlerts(.{ .filter = "zigps-alerts-0ea66e" }));
+    try testing.expectError(error.Unimplemented, b.client.listAlerts(.{ .filter = "state=\"BOGUS\"" }));
+    try testing.expectError(error.InvalidArgument, b.client.listAlerts(.{ .order_by = .open_time, .filter = "severity=WARNING", .page_token = "x" }));
+
+    // An id nobody has, in production's words.
+    try testing.expectError(error.NotFound, b.client.getAlert("1234567890"));
+    try testing.expectEqualStrings("Requested entity was not found.", b.diag.message());
+
+    // Closed, as production closed it: closeTime set, metric and
+    // resource kept, still listable, no longer open.
+    try b.fake.closeAlert(id, try core.timestamp.parse("2026-10-19T17:15:47Z"));
+    var closed = try b.client.getAlert(id);
+    defer closed.deinit();
+    const production_closed = try codec.decodeAlert(out.allocator(), scratch.allocator(), production.alert_closed);
+    try testing.expectEqual(production_closed.state, closed.value.state);
+    try testing.expectEqual(production_closed.close_time.?.nanoseconds, closed.value.close_time.?.nanoseconds);
+    try testing.expectEqualStrings(production_closed.metric_type, closed.value.metric_type);
+    try testing.expectEqualStrings(production_closed.resource_type, closed.value.resource_type);
+    var open_after = try b.client.listAlerts(.{ .open_only = true });
+    defer open_after.deinit();
+    try testing.expectEqual(0, open_after.value.alerts.len);
+    var all_after = try b.client.listAlerts(.{});
+    defer all_after.deinit();
+    try testing.expectEqual(1, all_after.value.alerts.len);
+}
+
+test "alerts: ordered and paged as the document says, log labels carried" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    // Three alerts: opened at 10, 20 and 30 minutes; the first two
+    // closed, the oldest last.
+    const first = try b.fake.putAlert(.{ .open_time = b.at(10 * 60_000), .state = .closed, .close_time = b.at(50 * 60_000), .policy = .{ .display_name = "a" } });
+    _ = try b.fake.putAlert(.{ .open_time = b.at(20 * 60_000), .state = .closed, .close_time = b.at(40 * 60_000), .policy = .{ .display_name = "b" } });
+    const newest = try b.fake.putAlert(.{ .open_time = b.at(30 * 60_000), .policy = .{ .display_name = "c" }, .log_labels = &.{.{ .key = "path", .value = "/checkout" }} });
+    try testing.expect(!std.mem.eql(u8, first, newest));
+
+    // Unset: open_time desc, production's default.
+    var page = try b.client.listAlerts(.{});
+    defer page.deinit();
+    try testing.expectEqual(3, page.value.alerts.len);
+    try testing.expectEqualStrings("c", page.value.alerts[0].policy.display_name);
+    try testing.expectEqualStrings("a", page.value.alerts[2].policy.display_name);
+    try testing.expectEqualStrings("/checkout", page.value.alerts[0].log_labels[0].value);
+
+    // Ascending, and the two-field order the document gives as its
+    // example; an open alert's close sorts as still to come.
+    var asc = try b.client.listAlerts(.{ .order_by = .open_time });
+    defer asc.deinit();
+    try testing.expectEqualStrings("a", asc.value.alerts[0].policy.display_name);
+    // None carries a severity, so a severity filter excludes them all.
+    var none_warn = try b.client.listAlerts(.{ .filter = "severity=\"WARNING\"" });
+    defer none_warn.deinit();
+    try testing.expectEqual(0, none_warn.value.alerts.len);
+    var by_close = try b.client.listAlerts(.{ .filter = "state=\"CLOSED\"", .order_by = .close_time_desc });
+    defer by_close.deinit();
+    try testing.expectEqual(2, by_close.value.alerts.len);
+    try testing.expectEqualStrings("a", by_close.value.alerts[0].policy.display_name);
+    var close_asc = try b.client.listAlerts(.{ .order_by = .close_time });
+    defer close_asc.deinit();
+    try testing.expectEqualStrings("b", close_asc.value.alerts[0].policy.display_name);
+    try testing.expectEqualStrings("c", close_asc.value.alerts[2].policy.display_name);
+
+    // Pages of one, totalSize on each, as production sent it with every
+    // non-empty answer, oldest first through the walk.
+    var token_buf: [32]u8 = undefined;
+    var token: ?[]const u8 = null;
+    var walked: usize = 0;
+    const order = [_][]const u8{ "a", "b", "c" };
+    while (walked < 4) {
+        var one = try b.client.listAlerts(.{ .page_size = 1, .page_token = token, .order_by = .open_time });
+        defer one.deinit();
+        try testing.expectEqual(1, one.value.alerts.len);
+        try testing.expectEqual(3, one.value.total_size.?);
+        try testing.expectEqualStrings(order[walked], one.value.alerts[0].policy.display_name);
+        walked += 1;
+        const next = one.value.next_page_token orelse break;
+        token = try std.fmt.bufPrint(&token_buf, "{s}", .{next});
+    }
+    try testing.expectEqual(3, walked);
+}
+
+test "alerts: what putAlert and closeAlert refuse, nothing kept" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    const base: FakeMonitoring.PutAlert = .{ .open_time = b.at(0) };
+
+    var bad = base;
+    bad.state = .unspecified;
+    try testing.expectError(error.InvalidEntry, b.fake.putAlert(bad));
+    bad = base;
+    bad.close_time = b.at(1);
+    try testing.expectError(error.InvalidEntry, b.fake.putAlert(bad));
+    bad = base;
+    bad.state = .closed;
+    try testing.expectError(error.InvalidEntry, b.fake.putAlert(bad));
+    bad = base;
+    bad.state = .closed;
+    bad.close_time = b.at(-1);
+    try testing.expectError(error.InvalidEntry, b.fake.putAlert(bad));
+    bad = base;
+    bad.policy = .{ .severity = .unknown };
+    try testing.expectError(error.InvalidEntry, b.fake.putAlert(bad));
+    bad = base;
+    bad.id = "a/b";
+    try testing.expectError(error.InvalidEntry, b.fake.putAlert(bad));
+    bad = base;
+    bad.metric_labels = &.{ .{ .key = "k", .value = "1" }, .{ .key = "k", .value = "2" } };
+    try testing.expectError(error.InvalidEntry, b.fake.putAlert(bad));
+    try testing.expectEqual(0, b.fake.alertCount());
+
+    const id = try b.fake.putAlert(base);
+    bad = base;
+    bad.id = id;
+    try testing.expectError(error.InvalidEntry, b.fake.putAlert(bad));
+    try testing.expectError(error.InvalidEntry, b.fake.closeAlert("nobody", b.at(1)));
+    try testing.expectError(error.InvalidEntry, b.fake.closeAlert(id, b.at(-1)));
+    try b.fake.closeAlert(id, b.at(1));
+    try testing.expectError(error.InvalidEntry, b.fake.closeAlert(id, b.at(2)));
+    try testing.expectEqual(1, b.fake.alertCount());
+}
+
+test "alerts: what the fake does not model answers 501, and writes stay refused" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A method production has no route for.
+    const posted = try b.raw(a, .POST, "alerts", "{}");
+    try testing.expectEqual(501, posted.status);
+    // orderBy on a field production does not sort by was its bare 400.
+    const ordered = try b.raw(a, .GET, "alerts?orderBy=severity", null);
+    try testing.expectEqual(400, ordered.status);
+    try testing.expect(std.mem.indexOf(u8, ordered.body, "Request contains an invalid argument.") != null);
+    // A filter form milestone 0 did not measure.
+    try testing.expectError(error.Unimplemented, b.client.listAlerts(.{ .filter = "metric.type=\"custom.googleapis.com/x\"" }));
+    try testing.expectError(error.Unimplemented, b.client.listAlerts(.{ .filter = "state = OPEN AND severity = WARNING" }));
 }

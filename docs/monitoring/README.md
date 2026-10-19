@@ -62,6 +62,7 @@ subscriber's counts into metrics through a `Recorder`.
 | --- | --- |
 | [Writing](writing.md) | A write and its result, the rules production holds each series to, resources, descriptors, retries, limits |
 | [Reading](reading.md) | Filters, aligning and reducing, paging, incomplete answers, cost |
+| [Alerts](alerts.md) | The incidents open in the project, read only: their policy snapshots, the filter production really parses, what a real incident showed |
 | [The Recorder](recorder.md) | Counters, gauges, histograms and observers written every interval, stopping, descriptors, stats |
 | [Testing](testing.md) | An in-memory Cloud Monitoring for your own tests, held to production's answers (experimental) |
 
@@ -74,6 +75,7 @@ subscriber's counts into metrics through a `Recorder`.
 | `Client.metric(type).read(options)` | One page of the metric's series, filtered, aligned and reduced |
 | `Client.listMetrics(options)` | The project's descriptors, or those under a prefix |
 | `Client.resourceType(name)`, `Client.listResourceTypes(options)` | The monitored resource types and their labels |
+| `Client.listAlerts(options)`, `Client.getAlert(id)` | The alerting incidents open (or lately closed) in the project, read only |
 | `Recorder` | Counters, gauges, histograms and observers, written every interval |
 
 ## Who is writing

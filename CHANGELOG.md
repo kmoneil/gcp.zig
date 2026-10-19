@@ -14,7 +14,35 @@ including the ones that did not change.
   whose tokens are the same whatever is asked (#252). A program that
   gives each client its narrowest scope calls `find` once, and again per
   scope set only when it answers true.
-- core, error_reporting, firestore, kms, logging, monitoring, pubsub,
+- monitoring: alerts, read only (#246), the incidents a console's health
+  view draws. `Client.listAlerts`: the structured filter production
+  parses, despite its documentation's "match on any fields" wording
+  (`state="OPEN"`, `severity="WARNING"` and `policy.display_name="x"`
+  matched; a bare word was 400 "Restriction must have a left-hand side
+  and a right-hand side"); an `open_only` convenience sends
+  `state="OPEN"`; `order_by` names the two fields production sorts by
+  (`orderBy=severity` was a 400), newest-opened first unset; pages carry
+  production's `totalSize` on every non-empty answer, and an answer with
+  no matches is `{}`. `Client.getAlert` by id or this project's full
+  name; ids are system-assigned and no numbers (production assigned
+  `0.oe0ehmpm95z2`). An `Alert` carries its policy's snapshot (display
+  name, severity, user labels), the metric and resource preserved from
+  the condition that fired, kept even after the close, the metadata's
+  user labels, its system labels as the JSON they came as, and a
+  log-based alert's extracted labels; `close_time` is null while it is
+  open, as production leaves the field out. Enum values this library
+  does not know decode to `.unknown`. `FakeMonitoring.putAlert` puts
+  alerts in, as policies open them in production (no program can make
+  one through the API), and `closeAlert` closes one, as production
+  closed an alert 91 s after its policy's delete. Measured in production
+  on 2026-10-19 with a real incident, which a gated suite repeats,
+  seeding the fake with production's alerts and holding it to every
+  read's answer, open and closed: a policy on a metric just created is
+  404 for up to 10 minutes (1 s once a point was written); the alert
+  opened 245 s after the first write over the threshold.
+  `examples/monitoring_alerts.zig --fake` draws the widget offline; the
+  guide is docs/monitoring/alerts.md.
+- core, error_reporting, firestore, kms, logging, pubsub,
   resource_manager, secret_manager and storage: unchanged.
 
 ## 0.45.0 (2026-10-19)
