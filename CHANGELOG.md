@@ -109,8 +109,13 @@ including the ones that did not change.
   production's 403, and a program's metric written to `consumer_quota`
   is refused in the summary, its descriptor made. Their descriptors name
   `producer_quota` too, which the fake does not hold: a put or a filter
-  naming it is a 501. Their text is the metrics list's of 2026-10-19,
-  not yet measured against production.
+  naming it is a 501. Their text is production's, measured with a replay
+  on 2026-10-19.
+- monitoring: an aligned read's period that reaches back before the
+  read's start now holds the series' earlier points, as production holds
+  them, found by the quota replay: the fake aligned only the points
+  inside the read before, so a day-aligned read of a daily sample lost
+  the period straddling the read's start.
 - auth, error_reporting, firestore, logging, pubsub and resource_manager:
   unchanged.
 

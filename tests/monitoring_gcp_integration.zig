@@ -30,10 +30,12 @@
 //! A quota test (MONITORING_TEST_QUOTA=1, about seven minutes) does the
 //! same for Cloud's quota metrics (issue #247): it sends Pub/Sub topic
 //! lists to consume rate quota, waits until Monitoring shows their
-//! minute, puts the project's own quota series for two services over 26
-//! hours into the fake, and holds the fake to production's answers,
-//! refusals, descriptors and the `consumer_quota` resource type. It
-//! creates and deletes nothing but the run's own user descriptor.
+//! minute, puts the project's own quota series for two services over 50
+//! hours into the fake (the 26 the reads compare and the day before, for
+//! the aligned periods that reach back), and holds the fake to
+//! production's answers, refusals, descriptors and the `consumer_quota`
+//! resource type. It creates and deletes nothing but the run's own user
+//! descriptor.
 
 const std = @import("std");
 const core = @import("core");
@@ -525,7 +527,9 @@ fn outcome(a: Allocator, client: *monitoring.Client, prefix: []const u8, base: i
 
 /// A series as one line: kind, value type, labels, and each point's end,
 /// its start where it differs, and its value, times in milliseconds from
-/// `base`, so production's and the fake's compare as text.
+/// `base`, so production's and the fake's compare as text. A double
+/// prints 12 significant digits: a reduced sum's last bits depend on the
+/// order it ran in, which production does not promise.
 fn seriesLine(a: Allocator, base: i96, s: monitoring.Series) ![]const u8 {
     var line: std.Io.Writer.Allocating = .init(a);
     try line.writer.print("{t} {t} {{", .{ s.kind, s.value_type });
@@ -540,7 +544,7 @@ fn seriesLine(a: Allocator, base: i96, s: monitoring.Series) ![]const u8 {
         try line.writer.writeByte('=');
         if (p.value) |v| switch (v) {
             .int64 => |n| try line.writer.print("{d}", .{n}),
-            .double => |d| try line.writer.print("{d}", .{d}),
+            .double => |d| try line.writer.print("{e:.11}", .{d}),
             .bool => |b| try line.writer.print("{}", .{b}),
             else => try line.writer.writeAll("?"),
         } else try line.writer.writeAll("null");
@@ -1002,6 +1006,13 @@ test "monitoring: Pub/Sub's own metrics, and the fake given production's points 
     try testing.expectEqual(0, differences);
 }
 
+/// The tail of a write summary's message, from after the series it names:
+/// the labels before it print in an order production varies call to call.
+fn reasonOf(message: []const u8) []const u8 {
+    const cut = std.mem.lastIndexOf(u8, message, "): ") orelse return message;
+    return message[cut + 3 ..];
+}
+
 const quota_prefix = "serviceruntime.googleapis.com/quota/";
 
 /// The four quota metrics `FakeMonitoring` holds, after `quota_prefix`.
@@ -1051,12 +1062,15 @@ test "monitoring: Cloud's quota metrics, and the fake given production's points 
     }
     fact("rate points readable {d} s after the calls", .{@divFloor(nowMs() - called, std.time.ns_per_s)});
 
-    // Production's raw points over 26 hours, put into the fake. The limit
-    // is sampled daily and usage repeats at least daily, so the window
-    // holds each series the project has; it ends five minutes back, past
-    // the calls above.
+    // Production's raw points, put into the fake: the 26 hours the reads
+    // below compare, and the 24 before them, so a period reaching back
+    // past the compare window's start holds the same points in both. The
+    // limit is sampled daily and usage repeats at least daily, so the
+    // window holds each series the project has; it ends five minutes
+    // back, past the calls above.
     const end: std.Io.Timestamp = .{ .nanoseconds = floorMinute(nowMs()) - 5 * std.time.ns_per_min };
     const window_start: std.Io.Timestamp = .{ .nanoseconds = end.nanoseconds - 26 * std.time.ns_per_hour };
+    const put_start: std.Io.Timestamp = .{ .nanoseconds = window_start.nanoseconds - 24 * std.time.ns_per_hour };
     var fake: monitoring.testing.FakeMonitoring = .init(testing.allocator, testing.io, .{ .project_id = f.project });
     defer fake.deinit();
     var fake_diag: monitoring.Diagnostics = .{};
@@ -1066,7 +1080,7 @@ test "monitoring: Cloud's quota metrics, and the fake given production's points 
     var put_series: usize = 0;
     var put_points: usize = 0;
     for (quota_metrics) |m| for (services) |svc| {
-        var raw = try f.client.metric(try a.print("{s}{s}", .{ quota_prefix, m })).read(.{ .start = window_start, .end = end, .filter = .{ .resource_labels = &.{.{ .key = "service", .value = svc }} } });
+        var raw = try f.client.metric(try a.print("{s}{s}", .{ quota_prefix, m })).read(.{ .start = put_start, .end = end, .filter = .{ .resource_labels = &.{.{ .key = "service", .value = svc }} } });
         defer raw.deinit();
         try testing.expectEqual(null, raw.value.next_page_token);
         for (raw.value.series) |s| {
@@ -1124,6 +1138,9 @@ test "monitoring: Cloud's quota metrics, and the fake given production's points 
             try reads.append(a, .{ .label = "usage by quota_metric", .metric = "allocation/usage", .prefix = quota_prefix, .start = window_start, .end = end, .filter = .{ .metric_labels = labels } });
         } else fact("no limit series for pubsub: no quota_metric reads", .{});
     }
+    // An instant aligned read: one period, ending at the end and reaching
+    // back a day.
+    try reads.append(a, .{ .label = "limit max instant", .metric = "limit", .prefix = quota_prefix, .start = null, .end = end, .filter = by_pubsub, .aggregation = .{ .alignment_period_s = 86400, .aligner = .max } });
     // Filters production refused, or did not.
     for ([_]struct { []const u8, []const u8, monitoring.Filter }{
         .{ "filter: a quota metric on subscription_id", "allocation/usage", .{ .resource_labels = &.{.{ .key = "subscription_id", .value = "x" }} } },
@@ -1170,7 +1187,9 @@ test "monitoring: Cloud's quota metrics, and the fake given production's points 
             if (client.write(&.{.{ .metric_type = on_quota, .resource = quota_resource, .kind = .gauge, .end = now, .value = .{ .int64 = 1 } }})) |r| {
                 var owned = r;
                 defer owned.deinit();
-                try out.writer.print(" | a user metric: {d} written, {s}", .{ owned.value.written, owned.value.message });
+                // From the reason on: the summary names the resource's
+                // labels in an order production varies call to call.
+                try out.writer.print(" | a user metric: {d} written, {s}", .{ owned.value.written, reasonOf(owned.value.message) });
             } else |err| try out.writer.print(" | a user metric: {t}: {s}", .{ err, diag.message() });
             if (client.metric(google_type).create(.{ .kind = .gauge, .value_type = .int64 })) |d| {
                 var owned = d;

@@ -38,7 +38,9 @@
 //!   (403, as is a create of one).
 //! - Times kept to the microsecond, as production keeps them.
 //! - Reads: its own reading of the filter the client writes, (start, end],
-//!   a resource type or label the metric cannot be on refused; the gauge
+//!   a resource type or label the metric cannot be on refused; an aligned
+//!   period may reach back before the read's start and holds the points
+//!   there, as production held a day-sampled limit's (issue #247); the gauge
 //!   aligners, and on DELTA metrics ALIGN_DELTA and ALIGN_SUM (a period's
 //!   total over the period), ALIGN_RATE (a second) and min, max, mean and
 //!   count, the aligners production refused on each kind refused in its
@@ -46,11 +48,11 @@
 //!   the unit as production gave it, `1` for a count and a second for a
 //!   rate.
 //! - Google's own metrics: the nine of Pub/Sub's a console reads (issue
-//!   #239), their descriptors as production gave them, and the four quota
-//!   metrics under `serviceruntime.googleapis.com/quota/` a console reads
-//!   for quota warnings (issue #247), their descriptors the metrics
-//!   list's of 2026-10-19, all there from the start, on the resource
-//!   types `pubsub_subscription`, `pubsub_topic` and `consumer_quota`.
+//!   #239) and the four quota metrics under
+//!   `serviceruntime.googleapis.com/quota/` a console reads for quota
+//!   warnings (issue #247), their descriptors as production gave them,
+//!   there from the start, on the resource types `pubsub_subscription`,
+//!   `pubsub_topic` and `consumer_quota`.
 //!   No program writes or creates one, as production answered; `put` puts
 //!   their points in, as it does any series a program could not write.
 //! - Faults a test asks for, and a write served and then answered with an
@@ -60,8 +62,8 @@
 //! US Pacific; a descriptor just made reads back at once, where production
 //! answered 404 for about 2 s, once for more than 15 s; its resource
 //! types are the seven `Resource` names, Pub/Sub's two and
-//! `consumer_quota`, only generic_task's and Pub/Sub's text production's
-//! and consumer_quota's the resource list's; nothing put in
+//! `consumer_quota`, only generic_task's, Pub/Sub's and consumer_quota's
+//! text production's; nothing put in
 //! arrives late, where production showed a minute's counts about 130 s
 //! after it. Not modelled, each
 //! answered 501 with the reason: another project, a cumulative start
@@ -994,7 +996,12 @@ pub const FakeMonitoring = struct {
             else => return notModelled(arena, "aligning a cumulative metric"),
         };
 
-        // The series the filter selects, with their points in the interval.
+        // The series the filter selects. A raw read keeps the points in
+        // (start, end]; an aligned read keeps them all, since a period
+        // may reach back before the read's start, and keeps the series
+        // whose periods hold anything (production aligned a day-sampled
+        // limit's point from before the read into the period straddling
+        // its start, issue #247).
         var raw: std.ArrayList(OutSeries) = .empty;
         for (f.series.values()) |s| {
             if (!std.mem.eql(u8, s.metric_type, metric_type)) continue;
@@ -1005,7 +1012,7 @@ pub const FakeMonitoring = struct {
                 i -= 1;
                 const p = s.points.items[i];
                 const in = if (start == end) p.end.nanoseconds == end else p.end.nanoseconds > start and p.end.nanoseconds <= end;
-                if (in) try pts.append(arena, .{ .start = if (s.kind == .gauge) p.end else p.start, .end = p.end, .value = p.value });
+                if (in or aligner != .none) try pts.append(arena, .{ .start = if (s.kind == .gauge) p.end else p.start, .end = p.end, .value = p.value });
             }
             if (pts.items.len == 0) continue;
             try raw.append(arena, .{
@@ -1021,7 +1028,14 @@ pub const FakeMonitoring = struct {
 
         var out = raw.items;
         if (aligner != .none) {
-            for (out) |*s| s.* = try alignSeries(arena, s.*, aligner, start, end, period_ns);
+            var kept: usize = 0;
+            for (raw.items) |s| {
+                const aligned = try alignSeries(arena, s, aligner, start, end, period_ns);
+                if (aligned.points.len == 0) continue;
+                out[kept] = aligned;
+                kept += 1;
+            }
+            out = out[0..kept];
             if (reducer != .none) out = try f.reduce(arena, out, reducer, paramsOf(arena, params, "aggregation.groupByFields") catch return error.OutOfMemory);
         }
         // The unit production gave: `1` for a count, the metric's a second
@@ -1399,9 +1413,10 @@ fn reducerOf(name: []const u8) ?types.Reducer {
 }
 
 /// A series' points, one per period: periods end at the read's end and
-/// every `period_ns` before it, each holding the points that end in (its
-/// end minus the period, its end]; a period with none has no point.
-/// Newest first.
+/// every `period_ns` before it, down to the first ending after the read's
+/// start, each holding the points that end in (its end minus the period,
+/// its end], wherever they lie; a period with none has no point. Newest
+/// first.
 fn alignSeries(arena: Allocator, s: FakeMonitoring.OutSeries, aligner: types.Aligner, start: i96, end: i96, period_ns: i96) Allocator.Error!FakeMonitoring.OutSeries {
     // ALIGN_DELTA's points span their period, and so do ALIGN_SUM's on a
     // DELTA metric; the others' are at the period's end.
@@ -1419,8 +1434,7 @@ fn alignSeries(arena: Allocator, s: FakeMonitoring.OutSeries, aligner: types.Ali
     var out = s;
     out.points = pts.items;
     out.kind = if (spans) .delta else .gauge;
-    // Every series read has a point in (start, end], so in a period.
-    out.value_type = pts.items[0].value.valueType();
+    if (pts.items.len > 0) out.value_type = pts.items[0].value.valueType();
     return out;
 }
 
@@ -1827,10 +1841,10 @@ const CatalogType = struct {
 
 const project_label = .{ "project_id", "The identifier of the GCP project associated with this resource, such as \"my-project\"." };
 
-/// generic_task's and Pub/Sub's text is production's, measured 2026-10-18
-/// and 2026-10-19, and consumer_quota's is the resource list's, read
-/// 2026-10-19 (issue #247); the others' labels are the ones `Resource`
-/// names, with no descriptions.
+/// generic_task's, Pub/Sub's and consumer_quota's text is production's,
+/// measured 2026-10-18 and 2026-10-19 (consumer_quota by issue #247's
+/// replay); the others' labels are the ones `Resource` names, with no
+/// descriptions.
 const catalog = [_]CatalogType{
     .{
         .type = "consumer_quota",
@@ -1838,8 +1852,8 @@ const catalog = [_]CatalogType{
         .description = "Quota used by consumers.",
         .labels = &.{
             project_label,
-            .{ "service", "The name of the used service, such as 'cloudsql.googleapis.com'." },
-            .{ "location", "The location where the quota are consumed. It is a region for regional quota, or a zone for zonal quota, or 'global' otherwise." },
+            .{ "service", "The name of the used service, such as \"cloudsql.googleapis.com\"." },
+            .{ "location", "The location where the quota are consumed. It is a region for regional quota, or a zone for zonal quota, or \"global\" otherwise." },
         },
         .location_labels = &.{"location"},
         .writable = false,
@@ -1926,11 +1940,11 @@ const response_code = .{ "response_code", "Operation response code string, deriv
 const quota_metric_label = .{ "quota_metric", "The name of quota metric or quota group." };
 const limit_name_label = .{ "limit_name", "The quota limit name, such as \"Requests per day\" or \"In-use IP addresses\"." };
 
-/// Pub/Sub's metrics a console reads, as production described them on
-/// 2026-10-19 (issue #239), and the four quota metrics a console reads
-/// for quota warnings, as the metrics list described them on 2026-10-19
-/// (issue #247): usage and limits on `consumer_quota`, the producer side
-/// named in their descriptors but not held.
+/// Pub/Sub's metrics a console reads, and the four quota metrics a
+/// console reads for quota warnings, as production described them on
+/// 2026-10-19 (issues #239 and #247): usage and limits on
+/// `consumer_quota`, the producer side named in their descriptors but
+/// not held.
 const google_metrics = [_]GoogleMetric{
     .{
         .type = "pubsub.googleapis.com/subscription/num_undelivered_messages",
@@ -4016,7 +4030,7 @@ test "the quota descriptors and consumer_quota: read and listed, never created, 
     try testing.expectEqualStrings("Quota used by consumers.", rt.value.description);
     try testing.expectEqual(3, rt.value.labels.len);
     try testing.expectEqualStrings("service", rt.value.labels[1].key);
-    try testing.expectEqualStrings("The location where the quota are consumed. It is a region for regional quota, or a zone for zonal quota, or 'global' otherwise.", rt.value.labels[2].description);
+    try testing.expectEqualStrings("The location where the quota are consumed. It is a region for regional quota, or a zone for zonal quota, or \"global\" otherwise.", rt.value.labels[2].description);
 
     // Filters: a resource label the type lacks is 400, a metric label the
     // metric lacks 404, another resource type 400; its own selects, and
@@ -4389,7 +4403,8 @@ fn deltaReadProperty(_: void, input: []const u8) !void {
     const m = client.metric(sent_type);
 
     // The model: each period's total and how many series have a point in
-    // it, newest first, for the points in (start, end].
+    // it, newest first. A period holds the points that end in it, before
+    // the read's start too.
     const Period = struct { end_s: i64, total: i64, series: usize, points: usize, max: i64 };
     var periods: std.ArrayList(Period) = .empty;
     var total: i64 = 0;
@@ -4399,7 +4414,6 @@ fn deltaReadProperty(_: void, input: []const u8) !void {
         var seen: [delta_series.len]bool = @splat(false);
         var any = false;
         for (model.items) |dp| {
-            if (dp.end_s <= start_s or dp.end_s > end_s) continue;
             if (dp.end_s <= window_end - period or dp.end_s > window_end) continue;
             any = true;
             p.total += dp.value;
