@@ -635,7 +635,11 @@ pub const Alert = struct {
     }
 };
 
-/// How a list of alerts orders its pages.
+/// How a list of alerts orders its pages. The direction always goes on
+/// the wire: production sorts a bare field name descending, despite its
+/// documentation's "the default sort direction is ascending", and takes
+/// an `asc` keyword the documentation does not mention (measured
+/// 2026-10-19).
 pub const AlertOrder = enum {
     open_time,
     open_time_desc,
@@ -644,9 +648,9 @@ pub const AlertOrder = enum {
 
     pub fn wire(o: AlertOrder) []const u8 {
         return switch (o) {
-            .open_time => "open_time",
+            .open_time => "open_time asc",
             .open_time_desc => "open_time desc",
-            .close_time => "close_time",
+            .close_time => "close_time asc",
             .close_time_desc => "close_time desc",
         };
     }
@@ -691,7 +695,8 @@ test "Alert: states, severities and orders on the wire, and the label helpers" {
     try testing.expectEqual(Severity.warning, Severity.fromWire("WARNING"));
     try testing.expectEqual(Severity.unspecified, Severity.fromWire("SEVERITY_UNSPECIFIED"));
     try testing.expectEqual(Severity.unknown, Severity.fromWire("FATAL"));
-    try testing.expectEqualStrings("open_time", AlertOrder.open_time.wire());
+    try testing.expectEqualStrings("open_time asc", AlertOrder.open_time.wire());
+    try testing.expectEqualStrings("close_time asc", AlertOrder.close_time.wire());
     try testing.expectEqualStrings("close_time desc", AlertOrder.close_time_desc.wire());
     const alert: Alert = .{
         .name = "projects/p/alerts/9",

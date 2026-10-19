@@ -618,9 +618,9 @@ test "golden: alerts listed with every option, and one got by id or by name" {
         .{ .respond = .{ .body = "{\"name\":\"projects/my-project/alerts/0.oe0ehmpm95z2\",\"state\":\"OPEN\",\"openTime\":\"2026-10-19T14:02:11.311Z\"}" } },
     }, .{});
     defer h.deinit();
-    var page = try h.client.listAlerts(.{ .filter = "state=\"OPEN\"", .order_by = .close_time_desc, .page_size = 2, .page_token = "t" });
+    var page = try h.client.listAlerts(.{ .filter = "state=\"OPEN\"", .order_by = .open_time, .page_size = 2, .page_token = "t" });
     defer page.deinit();
-    try h.expectRequest(0, .GET, "https://monitoring.googleapis.com/v3/projects/my-project/alerts?filter=state%3D%22OPEN%22&orderBy=close_time%20desc&pageSize=2&pageToken=t", null);
+    try h.expectRequest(0, .GET, "https://monitoring.googleapis.com/v3/projects/my-project/alerts?filter=state%3D%22OPEN%22&orderBy=open_time%20asc&pageSize=2&pageToken=t", null);
     try testing.expectEqual(1, page.value.alerts.len);
     try testing.expectEqualStrings("0.oe0ehmpm95z2", page.value.alerts[0].id);
     try testing.expectEqual(types.AlertState.open, page.value.alerts[0].state);
