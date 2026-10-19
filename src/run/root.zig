@@ -49,6 +49,18 @@ pub const limits = @import("validate.zig");
 /// another way, or to fake the server in your own tests.
 pub const transport = core.transport;
 
+/// What a test of code that reads services and revisions can stand on,
+/// with no network. **Experimental**, as the module is.
+pub const testing = struct {
+    /// Cloud Run in memory, behind `Client.Options.transport`: locations,
+    /// services and revisions a test puts in, read back as production
+    /// answered when measured, refusals in its words. It says so where it
+    /// does not model something.
+    pub const FakeRun = @import("fake_run.zig").FakeRun;
+    /// An `Io` whose clock a test moves.
+    pub const FakeClock = core.testing.FakeClock;
+};
+
 const core = @import("core");
 
 test {
@@ -58,6 +70,7 @@ test {
     _ = @import("Client.zig");
     _ = @import("codec.zig");
     _ = @import("errors.zig");
+    _ = @import("fake_run.zig");
     _ = @import("logging.zig");
     _ = @import("names.zig");
     _ = @import("rpc.zig");

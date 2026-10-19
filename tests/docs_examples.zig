@@ -2236,3 +2236,46 @@ test "the failing jobs, as a health view draws them" {
     try std.testing.expectEqual(14, job.last_attempt.?.code);
 }
 // end snippet
+
+const run = @import("run");
+
+// snippet: run-fake
+test "the recent revisions, as a health view draws them" {
+    var fake: run.testing.FakeRun = .init(std.testing.allocator, std.testing.io, .{ .project_id = "my-project" });
+    defer fake.deinit();
+    try fake.putLocation("us-central1");
+    _ = try fake.putService(.{
+        .location = "us-central1",
+        .id = "checkout",
+        .latest_ready_revision = "checkout-00007-abc",
+        .latest_created_revision = "checkout-00008-def",
+        .terminal_condition = .{ .type = "Ready", .state = .failed, .reason = "REVISION_FAILED", .message = "Image 'gcr.io/shop/checkout:v8' not found." },
+    });
+    // The deploy that broke, standing in for whoever deployed it.
+    _ = try fake.putRevision(.{
+        .location = "us-central1",
+        .service = "checkout",
+        .id = "checkout-00008-def",
+        .create_time = .{ .nanoseconds = 1_792_436_660 * std.time.ns_per_s },
+        .containers = &.{.{ .image = "gcr.io/shop/checkout:v8" }},
+        .conditions = &.{.{ .type = "Ready", .state = .failed, .message = "Image 'gcr.io/shop/checkout:v8' not found." }},
+    });
+
+    var token: run.StaticToken = .{ .token = "none" };
+    var client = try run.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    // The widget's read: every service's revisions in the region.
+    var revisions = try client.listRevisions("us-central1", "-", .{});
+    defer revisions.deinit();
+    try std.testing.expectEqual(1, revisions.value.revisions.len);
+    const broken = revisions.value.revisions[0];
+    try std.testing.expect(!broken.ready());
+    try std.testing.expect(std.mem.indexOf(u8, broken.readyCondition().?.message, "not found") != null);
+    // The deploy marker for the trend chart.
+    try std.testing.expect(broken.create_time != null);
+}
+// end snippet
