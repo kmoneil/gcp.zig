@@ -4,6 +4,19 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.46.0 (unreleased)
+
+- auth: `Credentials.bindsScopes` says whether a token from the found
+  credentials is minted for the scopes asked, so a second scope set needs
+  a second `Credentials`: true for a service account key, workload
+  identity federation and impersonation, which fix their scopes on the
+  first `getToken`; false for a person's login and the metadata server,
+  whose tokens are the same whatever is asked (#252). A program that
+  gives each client its narrowest scope calls `find` once, and again per
+  scope set only when it answers true.
+- core, error_reporting, firestore, kms, logging, monitoring, pubsub,
+  resource_manager, secret_manager and storage: unchanged.
+
 ## 0.45.0 (2026-10-19)
 
 - kms: new module, **experimental**: Cloud KMS's v1 API. Key rings,

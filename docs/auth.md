@@ -129,6 +129,11 @@ A `ServiceAccount` signs a short-lived JWT with the key file's RSA key
 before anything is sent) and trades it at the token endpoint. Its tokens
 are minted for particular scopes, so the first `getToken` fixes them;
 use a second provider for a second scope set.
+`creds.bindsScopes()` says whether what `findDefault` found does this
+(impersonation and federation do too; a person's login and the metadata
+server hand out the same token whatever is asked), so a program that
+gives each client its narrowest scope calls `find` once, and again per
+scope set only when it answers true.
 
 ## Workload identity federation
 

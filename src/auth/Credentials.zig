@@ -148,6 +148,21 @@ pub fn provider(self: Credentials) TokenProvider {
     return self.held.provider();
 }
 
+/// Whether a token from these credentials is minted for the scopes asked,
+/// so a second scope set needs a second `Credentials`: a service account
+/// key, workload identity federation and a login or file that impersonates
+/// a service account fix their scopes on the first `getToken` and refuse a
+/// different set after. A person's own login and the metadata server hand
+/// out the same token whatever is asked, so one of them serves every scope
+/// set. A program that gives each client its narrowest scope calls `find`
+/// once, and again per scope set only when this answers true.
+pub fn bindsScopes(self: Credentials) bool {
+    return switch (self.held.impl) {
+        .service_account, .external_account, .impersonated => true,
+        .user, .metadata => false,
+    };
+}
+
 /// A signer for these credentials, as a signed URL needs, or null when
 /// they cannot sign as a service account. A key file signs on this
 /// machine; a login that impersonates an account signs as it through IAM,
@@ -677,6 +692,81 @@ test "Credentials.signer: a key file signs here, impersonation and the metadata 
     const metadata_signer = metadata.signer().?;
     try testing.expectEqualStrings("worker@my-project.iam.gserviceaccount.com", try metadata_signer.email(testing.io, a));
     try testing.expectEqual(43_200, metadata_signer.lifetimeS());
+}
+
+test "Credentials.bindsScopes: a key, federation and impersonation mint per scope set; a login and the metadata server do not" {
+    var config: TmpConfig = undefined;
+    try config.init();
+    defer config.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pubsub_scope: []const []const u8 = &.{"https://www.googleapis.com/auth/pubsub"};
+    const read_scope: []const []const u8 = &.{"https://www.googleapis.com/auth/cloud-platform.read-only"};
+
+    // A key file's tokens follow the scopes asked: the first getToken
+    // fixes them, and a second scope set is refused, which is what true
+    // tells a caller to plan for.
+    var sa_fake: test_util.FakeTransport = .init(testing.allocator, &.{user_token});
+    defer sa_fake.deinit();
+    var sa_buf: [160]u8 = undefined;
+    const sa_path = try config.write(&sa_buf, "sa.json", try serviceAccountJson(a));
+    var key = try find(testing.allocator, testing.io, .{ .credentials_path = sa_path }, .{ .transport = sa_fake.transport() });
+    defer key.deinit();
+    try testing.expect(key.bindsScopes());
+    try testing.expectEqualStrings("ya29.from-file", try key.provider().getToken(testing.io, a, pubsub_scope));
+    try testing.expectEqual(error.TokenUnavailable, key.provider().getToken(testing.io, a, read_scope));
+    try testing.expectEqual(1, sa_fake.requests.items.len);
+
+    // So do a federation file's and an impersonating file's, known
+    // without a request.
+    var none: test_util.FakeTransport = .init(testing.allocator, &.{});
+    defer none.deinit();
+    var subject_buf: [160]u8 = undefined;
+    _ = try config.write(&subject_buf, "subject", "external-subject-token");
+    var external_buf: [160]u8 = undefined;
+    const external_path = try config.write(&external_buf, "external.json", try a.print(
+        \\{{"type": "external_account",
+        \\ "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/x",
+        \\ "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+        \\ "token_url": "https://sts.googleapis.com/v1/token",
+        \\ "credential_source": {{"file": "{s}/subject"}}}}
+    , .{config.dir}));
+    var external = try find(testing.allocator, testing.io, .{ .credentials_path = external_path }, .{ .transport = none.transport() });
+    defer external.deinit();
+    try testing.expect(external.bindsScopes());
+    var impersonated_buf: [160]u8 = undefined;
+    const impersonated_path = try config.write(&impersonated_buf, "impersonated.json",
+        \\{"type": "impersonated_service_account",
+        \\ "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:generateAccessToken",
+        \\ "source_credentials": {"type": "authorized_user", "client_id": "c", "client_secret": "SECRET", "refresh_token": "SECRET-refresh"}}
+    );
+    var impersonated = try find(testing.allocator, testing.io, .{ .credentials_path = impersonated_path }, .{ .transport = none.transport() });
+    defer impersonated.deinit();
+    try testing.expect(impersonated.bindsScopes());
+    try testing.expectEqual(0, none.requests.items.len);
+
+    // A person's login hands out the same token whatever is asked: two
+    // scope sets, one fetch, one token.
+    var user_fake: test_util.FakeTransport = .init(testing.allocator, &.{user_token});
+    defer user_fake.deinit();
+    var user_buf: [160]u8 = undefined;
+    const user_path = try config.write(&user_buf, "user.json", gcloud_json);
+    var user = try find(testing.allocator, testing.io, .{ .credentials_path = user_path }, .{ .transport = user_fake.transport() });
+    defer user.deinit();
+    try testing.expect(!user.bindsScopes());
+    const first = try user.provider().getToken(testing.io, a, pubsub_scope);
+    const second = try user.provider().getToken(testing.io, a, read_scope);
+    try testing.expectEqualStrings("ya29.from-file", first);
+    try testing.expectEqualStrings(first, second);
+    try testing.expectEqual(1, user_fake.requests.items.len);
+
+    // The metadata server too.
+    var metadata_fake: test_util.FakeTransport = .init(testing.allocator, &.{metadata_listing});
+    defer metadata_fake.deinit();
+    var metadata = try find(testing.allocator, testing.io, .{ .gcloud_config_dir = config.dir }, .{ .transport = metadata_fake.transport() });
+    defer metadata.deinit();
+    try testing.expect(!metadata.bindsScopes());
 }
 
 test "Credentials.account: each kind of credentials names its account as it can" {
