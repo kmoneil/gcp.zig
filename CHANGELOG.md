@@ -4,6 +4,35 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.48.0 (unreleased)
+
+- run: new module, **experimental**: the read side of Cloud Run's v2
+  API, for a health view's "recent revisions" widget and a trend
+  chart's deploy markers (#244). `Client.listLocations` (v1's list on
+  the same host, since v2 has none; 43 locations when measured),
+  `Client.listServices` per location or with `-` for every region at
+  once (production answers it, though its documentation says otherwise,
+  with `unreachable_regions` for the regions it could not ask),
+  `Client.getService` and `getServiceNamed`, `Client.listRevisions` per
+  service or with `services/-` across a region, `Client.getRevision`
+  and `getRevisionNamed`. A `Service` carries its uri and urls, latest
+  ready and created revision ids, traffic and traffic statuses, its
+  conditions and terminal condition, times, generations and
+  `reconciling`; a `Revision` its create time (the deploy marker),
+  generation, containers with images pinned to digests as production
+  answers them, conditions and the console's log link. `Service.ready`
+  and `Revision.ready` answer the health view's question;
+  `Revision.readyCondition` carries the reason and message (production
+  wrote "Image '<image>' not found." with reason `REVISION_FAILED` for
+  a bad deploy, while `latestReadyRevision` stayed on the old
+  revision). Revisions of a service nobody has are an empty page, not a
+  404, as production answered. The OAuth scope is `run.readonly`, the
+  narrowest every read takes. Writes (deploys, traffic, deletes, IAM)
+  are out on purpose.
+- auth, core, error_reporting, firestore, kms, logging, monitoring,
+  pubsub, resource_manager, scheduler, secret_manager and storage:
+  unchanged.
+
 ## 0.47.0 (2026-10-19)
 
 - scheduler: new module, **experimental**: the read side of Cloud

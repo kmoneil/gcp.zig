@@ -350,6 +350,19 @@ test "decodeRevision and the pages: production's bodies" {
     try testing.expectEqual(null, empty.next_page_token);
     const empty_revisions = try decodeRevisionPage(a, s, "{}");
     try testing.expectEqual(0, empty_revisions.revisions.len);
+    // proto3 JSON may send the default explicitly: "" is still the end.
+    const explicit = try decodeRevisionPage(a, s, "{\"revisions\":[],\"nextPageToken\":\"\"}");
+    try testing.expectEqual(null, explicit.next_page_token);
+
+    // A tagged traffic status carries the tag's own uri.
+    const tagged = try decodeServicePage(a, s,
+        \\{"services":[{"name":"projects/p/locations/l/services/s","trafficStatuses":[{"type":"TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION","revision":"s-00001-ab","percent":50,"tag":"blue","uri":"https://blue---s.run.app"}]}]}
+    );
+    const status = tagged.services[0].traffic_statuses[0];
+    try testing.expectEqual(types.TrafficType.revision, status.type);
+    try testing.expectEqual(50, status.percent);
+    try testing.expectEqualStrings("blue", status.tag);
+    try testing.expectEqualStrings("https://blue---s.run.app", status.uri);
 }
 
 test "lenient where it can be, InvalidResponse where it cannot" {
