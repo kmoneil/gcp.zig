@@ -114,6 +114,13 @@ Google, not only what Google documents, and where the emulators differ.
 | [Keys](kms/keys.md) | Key rings, keys and versions; states, rotation, destroying and deleting; what is billed; IAM |
 | [Testing](kms/testing.md) | An in-memory Cloud KMS for your own tests, held to production's answers (experimental) |
 
+## ⏰ Scheduler
+
+| Guide | What's in it |
+| --- | --- |
+| [Overview](scheduler/README.md) | The jobs a project schedules, read only: states, targets, last attempts, `Job.failing`, and what production showed when measured (experimental) |
+| [Testing](scheduler/testing.md) | An in-memory Cloud Scheduler for your own tests, held to production's answers (experimental) |
+
 ## 🛠️ Working on zig-gcp
 
 | Guide | What's in it |
