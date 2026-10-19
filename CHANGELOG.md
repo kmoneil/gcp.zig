@@ -21,7 +21,11 @@ including the ones that did not change.
   matched; a bare word was 400 "Restriction must have a left-hand side
   and a right-hand side"); an `open_only` convenience sends
   `state="OPEN"`; `order_by` names the two fields production sorts by
-  (`orderBy=severity` was a 400), newest-opened first unset; pages carry
+  (`orderBy=severity` was a 400), newest-opened first unset; the client
+  always sends the direction, since production sorts a bare field
+  descending, not its documentation's ascending, and takes an `asc`
+  keyword the documentation does not mention; an open alert's null close
+  time sorts before every closed one's; pages carry
   production's `totalSize` on every non-empty answer, and an answer with
   no matches is `{}`. `Client.getAlert` by id or this project's full
   name; ids are system-assigned and no numbers (production assigned

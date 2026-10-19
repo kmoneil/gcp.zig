@@ -45,8 +45,14 @@ side and a right-hand side". `open_only = true` sends `state="OPEN"`
 for you, and is refused beside a `filter` of your own.
 
 `order_by` names the two fields production sorts by (`orderBy=severity`
-was a 400); unset, production answers newest-opened first. A page holds
-at most 50 alerts unless `page_size` asks for more, up to 1,000.
+was a 400); unset, production answers newest-opened first. Production's
+direction words differ from its documentation too: a bare field name
+sorts descending, not the documented ascending, and an `asc` keyword
+the documentation does not mention chooses ascending, so this client
+always sends the direction (`open_time asc`, `close_time desc`, and so
+on). An open alert's null `close_time` sorts before every closed one's.
+A page holds at most 50 alerts unless `page_size` asks for more, up to
+1,000.
 
 ## What production showed
 

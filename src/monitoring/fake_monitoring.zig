@@ -651,10 +651,11 @@ pub const FakeMonitoring = struct {
 
     const AlertOrderKey = struct { close_time: bool, desc: bool };
 
-    /// `orderBy`: a comma-separated list of open_time and close_time,
-    /// each with an optional desc, as the discovery document says and
-    /// production took; "" is production's default, open_time desc. Any
-    /// other field was production's bare 400.
+    /// `orderBy`: a comma-separated list of open_time and close_time;
+    /// a bare field sorts descending, as production sorts one, despite
+    /// its documentation's "ascending", and `asc` and `desc` choose
+    /// (measured 2026-10-19); "" is production's default, open_time
+    /// descending. Any other field or word was production's bare 400.
     fn parseAlertOrder(arena: Allocator, text: []const u8) Allocator.Error!?[]const AlertOrderKey {
         var keys: std.ArrayList(AlertOrderKey) = .empty;
         if (std.mem.trim(u8, text, " ").len == 0) {
@@ -667,13 +668,14 @@ pub const FakeMonitoring = struct {
             const field = words.next() orelse return null;
             var key: AlertOrderKey = undefined;
             if (std.mem.eql(u8, field, "open_time")) {
-                key = .{ .close_time = false, .desc = false };
+                key = .{ .close_time = false, .desc = true };
             } else if (std.mem.eql(u8, field, "close_time")) {
-                key = .{ .close_time = true, .desc = false };
+                key = .{ .close_time = true, .desc = true };
             } else return null;
             if (words.next()) |word| {
-                if (!std.mem.eql(u8, word, "desc")) return null;
-                key.desc = true;
+                if (std.mem.eql(u8, word, "asc")) {
+                    key.desc = false;
+                } else if (!std.mem.eql(u8, word, "desc")) return null;
             }
             if (words.next() != null) return null;
             try keys.append(arena, key);
@@ -681,12 +683,13 @@ pub const FakeMonitoring = struct {
         return keys.items;
     }
 
-    /// An open alert's close time sorts as if it were still to come:
-    /// after every closed one's.
+    /// An open alert's close time sorts as the proto's zero, before every
+    /// closed one's: production's close_time desc answered the open alert
+    /// last when measured.
     fn alertSortsBefore(keys: []const AlertOrderKey, a: *const FakeAlert, b: *const FakeAlert) bool {
         for (keys) |key| {
-            const av: i96 = if (key.close_time) (if (a.close_time) |t| t.nanoseconds else std.math.maxInt(i96)) else a.open_time.nanoseconds;
-            const bv: i96 = if (key.close_time) (if (b.close_time) |t| t.nanoseconds else std.math.maxInt(i96)) else b.open_time.nanoseconds;
+            const av: i96 = if (key.close_time) (if (a.close_time) |t| t.nanoseconds else 0) else a.open_time.nanoseconds;
+            const bv: i96 = if (key.close_time) (if (b.close_time) |t| t.nanoseconds else 0) else b.open_time.nanoseconds;
             if (av == bv) continue;
             return if (key.desc) av > bv else av < bv;
         }
@@ -4970,10 +4973,13 @@ test "alerts: ordered and paged as the document says, log labels carried" {
     defer by_close.deinit();
     try testing.expectEqual(2, by_close.value.alerts.len);
     try testing.expectEqualStrings("a", by_close.value.alerts[0].policy.display_name);
+    // Ascending by close: the open alert's null close sorts as zero,
+    // before every closed one's, as production's desc put it last.
     var close_asc = try b.client.listAlerts(.{ .order_by = .close_time });
     defer close_asc.deinit();
-    try testing.expectEqualStrings("b", close_asc.value.alerts[0].policy.display_name);
-    try testing.expectEqualStrings("c", close_asc.value.alerts[2].policy.display_name);
+    try testing.expectEqualStrings("c", close_asc.value.alerts[0].policy.display_name);
+    try testing.expectEqualStrings("b", close_asc.value.alerts[1].policy.display_name);
+    try testing.expectEqualStrings("a", close_asc.value.alerts[2].policy.display_name);
 
     // Pages of one, totalSize on each, as production sent it with every
     // non-empty answer, oldest first through the walk.
@@ -5049,6 +5055,12 @@ test "alerts: what the fake does not model answers 501, and writes stay refused"
     const ordered = try b.raw(a, .GET, "alerts?orderBy=severity", null);
     try testing.expectEqual(400, ordered.status);
     try testing.expect(std.mem.indexOf(u8, ordered.body, "Request contains an invalid argument.") != null);
+    // A bare field sorts descending, as production sorts one.
+    _ = try b.fake.putAlert(.{ .open_time = b.at(0), .policy = .{ .display_name = "older" } });
+    _ = try b.fake.putAlert(.{ .open_time = b.at(60_000), .policy = .{ .display_name = "newer" } });
+    const bare = try b.raw(a, .GET, "alerts?orderBy=open_time", null);
+    try testing.expectEqual(200, bare.status);
+    try testing.expect(std.mem.indexOf(u8, bare.body, "newer").? < std.mem.indexOf(u8, bare.body, "older").?);
     // A filter form milestone 0 did not measure.
     try testing.expectError(error.Unimplemented, b.client.listAlerts(.{ .filter = "metric.type=\"custom.googleapis.com/x\"" }));
     try testing.expectError(error.Unimplemented, b.client.listAlerts(.{ .filter = "state = OPEN AND severity = WARNING" }));
