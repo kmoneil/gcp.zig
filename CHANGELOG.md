@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.46.0 (unreleased)
+## 0.46.0 (2026-10-19)
 
 - auth: `Credentials.bindsScopes` says whether a token from the found
   credentials is minted for the scopes asked, so a second scope set needs
