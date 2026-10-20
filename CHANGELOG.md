@@ -4,6 +4,32 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.50.0 (unreleased)
+
+- dataflow: new module, **experimental**: the read side of Dataflow's
+  v1b3 API, for a health view's pipelines widget. `Client.aggregatedJobs`
+  reads every region's jobs in one call, each job carrying the
+  `location` a get needs, with `failed_locations` naming any region
+  that did not answer (without it a partial page looks complete);
+  `Client.listJobs` reads one region, the only list that filters by
+  `name` (production accepts and ignores the parameter on the
+  aggregated list); `Client.getJob` and `getJobView` read one job
+  (`.description` adds labels and the pipeline description, `.all` the
+  steps, and production answers a job that failed provisioning with a
+  400 FAILED_PRECONDITION carrying the job's own error text). The
+  `view` parameter is deprecated on the lists, which always answer
+  summaries, so the client never sends it there. `JobState` has the
+  five terminal states the API labels so (`Job.terminal`,
+  `Job.failing`); RESOURCE_CLEANING_UP follows a success but is not
+  one. The OAuth scope is `cloud-platform`: v1b3 has no read-only
+  scope, so what a token may read is IAM's to decide. Measured against
+  a real Word_Count template run: PENDING at launch, RUNNING at 30 s,
+  DONE at 244 s; a made-up region answers us-central1's jobs rather
+  than a refusal.
+- auth, core, error_reporting, firestore, kms, logging, monitoring,
+  pubsub, resource_manager, run, scheduler, secret_manager and
+  storage: unchanged.
+
 ## 0.49.0 (2026-10-20)
 
 - storage: now **beta**, as `pubsub`, `firestore` and `core` are. No

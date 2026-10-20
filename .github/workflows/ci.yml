@@ -559,6 +559,10 @@ jobs:
         # 55K, about 87 minutes at 10-19's price. The first night with
         # kms ran both its jobs well under (kms 2M in 8 minutes,
         # slow-kms 300K in 58) and both stay, to be priced by more nights.
+        # dataflow (0.50.0) starts at estimates from a local run: its two
+        # decoders in one property took about 0.02 ms a run on the Mac
+        # (2M in 40 s of fuzzing), so 8M, between scheduler's and run's,
+        # to be priced by its first nights as its corpus grows.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 630K }
           - { job: auth, module: auth, filter: fuzz, iterations: 850K }
@@ -588,6 +592,7 @@ jobs:
           - { job: slow-kms, module: kms, filter: slow property, iterations: 300K }
           - { job: scheduler, module: scheduler, filter: fuzz, iterations: 10M }
           - { job: run, module: run, filter: fuzz, iterations: 6M }
+          - { job: dataflow, module: dataflow, filter: fuzz, iterations: 8M }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     # actions: read finds and downloads the corpus an earlier run kept.
