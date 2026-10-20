@@ -1,7 +1,8 @@
 //! Answers production gave on 2026-10-19, measured in milestone 0 of the
-//! Scheduler spec (`_tmp/scheduler-m0/`), for tests: the probes' own
-//! `zigps-` jobs and refusals, verbatim but for a final line break. Test
-//! code only.
+//! Scheduler spec (`_tmp/scheduler-m0/`), and on 2026-10-20 in milestone 0
+//! of the writes spec (`_tmp/scheduler-writes-m0/`), for tests: the
+//! probes' own `zigps-` jobs and refusals, verbatim but for a final line
+//! break. Test code only.
 
 /// A job just created with an HTTP target: born with status code -1 and
 /// no lastAttemptTime, the server's own User-Agent header and retry and
@@ -209,6 +210,234 @@ pub const page_size_501 =
     \\  "code": 400,
     \\  "message": "ListJobsRequest.pageSize must be less than or equal to 500.",
     \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// The answer to `:run` on a job never attempted: the job as it stood,
+/// status code -1, no lastAttemptTime. HTTP 200.
+pub const job_run_answer_status = 200;
+pub const job_run_answer =
+    \\{
+    \\ "name": "projects/extractctl/locations/us-central1/jobs/zigps-e03a4d-ok",
+    \\ "description": "zig-gcp scheduler writes probe, deleted by the probe",
+    \\ "httpTarget": {
+    \\  "uri": "https://www.gstatic.com/generate_204",
+    \\  "httpMethod": "GET",
+    \\  "headers": {
+    \\   "User-Agent": "Google-Cloud-Scheduler"
+    \\  }
+    \\ },
+    \\ "userUpdateTime": "2026-10-20T17:06:43.737881Z",
+    \\ "state": "ENABLED",
+    \\ "status": {
+    \\  "code": -1
+    \\ },
+    \\ "scheduleTime": "2027-01-01T00:00:00Z",
+    \\ "retryConfig": {
+    \\  "maxRetryDuration": "0s",
+    \\  "minBackoffDuration": "5s",
+    \\  "maxBackoffDuration": "3600s",
+    \\  "maxDoublings": 5
+    \\ },
+    \\ "schedule": "0 0 1 1 *",
+    \\ "timeZone": "UTC",
+    \\ "attemptDeadline": "180s"
+    \\}
+;
+
+/// A job whose last attempt succeeded (an HTTP GET answered 204): status
+/// is an empty object, code 0 by omission; the next run gained seconds of
+/// jitter. HTTP 200.
+pub const job_succeeded_status = 200;
+pub const job_succeeded =
+    \\{
+    \\ "name": "projects/extractctl/locations/us-central1/jobs/zigps-e03a4d-ok",
+    \\ "description": "zig-gcp scheduler writes probe, deleted by the probe",
+    \\ "httpTarget": {
+    \\  "uri": "https://www.gstatic.com/generate_204",
+    \\  "httpMethod": "GET",
+    \\  "headers": {
+    \\   "User-Agent": "Google-Cloud-Scheduler"
+    \\  }
+    \\ },
+    \\ "userUpdateTime": "2026-10-20T17:06:43.737881Z",
+    \\ "state": "ENABLED",
+    \\ "status": {},
+    \\ "scheduleTime": "2027-01-01T00:00:02.394322Z",
+    \\ "lastAttemptTime": "2026-10-20T17:06:51.850413Z",
+    \\ "retryConfig": {
+    \\  "maxRetryDuration": "0s",
+    \\  "minBackoffDuration": "5s",
+    \\  "maxBackoffDuration": "3600s",
+    \\  "maxDoublings": 5
+    \\ },
+    \\ "schedule": "0 0 1 1 *",
+    \\ "timeZone": "UTC",
+    \\ "attemptDeadline": "180s"
+    \\}
+;
+
+/// The answer to `:pause` with nothing in flight: PAUSED, the last attempt
+/// and the next run gone, userUpdateTime the pause's. HTTP 200.
+pub const job_pause_answer_status = 200;
+pub const job_pause_answer =
+    \\{
+    \\ "name": "projects/extractctl/locations/us-central1/jobs/zigps-394d25-nf2",
+    \\ "description": "zig-gcp scheduler writes probe, deleted by the probe",
+    \\ "httpTarget": {
+    \\  "uri": "https://www.google.com/zigps-394d25-nothing",
+    \\  "httpMethod": "GET",
+    \\  "headers": {
+    \\   "User-Agent": "Google-Cloud-Scheduler"
+    \\  }
+    \\ },
+    \\ "userUpdateTime": "2026-10-20T17:12:44.388152Z",
+    \\ "state": "PAUSED",
+    \\ "status": {
+    \\  "code": -1
+    \\ },
+    \\ "retryConfig": {
+    \\  "maxRetryDuration": "0s",
+    \\  "minBackoffDuration": "5s",
+    \\  "maxBackoffDuration": "3600s",
+    \\  "maxDoublings": 5
+    \\ },
+    \\ "schedule": "0 0 1 1 *",
+    \\ "timeZone": "UTC",
+    \\ "attemptDeadline": "180s"
+    \\}
+;
+
+/// The answer to `:resume` on that paused job: ENABLED, the next run back
+/// at the cron tick, the attempt still cleared, userUpdateTime the
+/// resume's. HTTP 200.
+pub const job_resume_answer_status = 200;
+pub const job_resume_answer =
+    \\{
+    \\ "name": "projects/extractctl/locations/us-central1/jobs/zigps-394d25-nf2",
+    \\ "description": "zig-gcp scheduler writes probe, deleted by the probe",
+    \\ "httpTarget": {
+    \\  "uri": "https://www.google.com/zigps-394d25-nothing",
+    \\  "httpMethod": "GET",
+    \\  "headers": {
+    \\   "User-Agent": "Google-Cloud-Scheduler"
+    \\  }
+    \\ },
+    \\ "userUpdateTime": "2026-10-20T17:12:55.812309Z",
+    \\ "state": "ENABLED",
+    \\ "status": {
+    \\  "code": -1
+    \\ },
+    \\ "scheduleTime": "2027-01-01T00:00:00Z",
+    \\ "retryConfig": {
+    \\  "maxRetryDuration": "0s",
+    \\  "minBackoffDuration": "5s",
+    \\  "maxBackoffDuration": "3600s",
+    \\  "maxDoublings": 5
+    \\ },
+    \\ "schedule": "0 0 1 1 *",
+    \\ "timeZone": "UTC",
+    \\ "attemptDeadline": "180s"
+    \\}
+;
+
+/// A job paused between a run's request and its dispatch: the attempt
+/// started on the paused job, so lastAttemptTime and a scheduleTime of
+/// that moment show, but its result never did (status code -1). HTTP 200.
+pub const job_paused_mid_run_status = 200;
+pub const job_paused_mid_run =
+    \\{
+    \\ "name": "projects/extractctl/locations/us-central1/jobs/zigps-e03a4d-nf",
+    \\ "description": "zig-gcp scheduler writes probe, deleted by the probe",
+    \\ "httpTarget": {
+    \\  "uri": "https://www.google.com/zigps-e03a4d-nothing",
+    \\  "httpMethod": "GET",
+    \\  "headers": {
+    \\   "User-Agent": "Google-Cloud-Scheduler"
+    \\  }
+    \\ },
+    \\ "userUpdateTime": "2026-10-20T17:10:23.597831Z",
+    \\ "state": "PAUSED",
+    \\ "status": {
+    \\  "code": -1
+    \\ },
+    \\ "scheduleTime": "2026-10-20T17:10:24.031279Z",
+    \\ "lastAttemptTime": "2026-10-20T17:10:24.031280Z",
+    \\ "retryConfig": {
+    \\  "maxRetryDuration": "0s",
+    \\  "minBackoffDuration": "5s",
+    \\  "maxBackoffDuration": "3600s",
+    \\  "maxDoublings": 5
+    \\ },
+    \\ "schedule": "0 0 1 1 *",
+    \\ "timeZone": "UTC",
+    \\ "attemptDeadline": "180s"
+    \\}
+;
+
+/// The answer to `:resume` on that job: status turned to an empty object,
+/// which reads as a successful attempt though none was recorded. HTTP 200.
+pub const job_resumed_mid_run_status = 200;
+pub const job_resumed_mid_run =
+    \\{
+    \\ "name": "projects/extractctl/locations/us-central1/jobs/zigps-e03a4d-nf",
+    \\ "description": "zig-gcp scheduler writes probe, deleted by the probe",
+    \\ "httpTarget": {
+    \\  "uri": "https://www.google.com/zigps-e03a4d-nothing",
+    \\  "httpMethod": "GET",
+    \\  "headers": {
+    \\   "User-Agent": "Google-Cloud-Scheduler"
+    \\  }
+    \\ },
+    \\ "userUpdateTime": "2026-10-20T17:10:55.614845Z",
+    \\ "state": "ENABLED",
+    \\ "status": {},
+    \\ "scheduleTime": "2027-01-01T00:00:00Z",
+    \\ "lastAttemptTime": "2026-10-20T17:10:24.031280Z",
+    \\ "retryConfig": {
+    \\  "maxRetryDuration": "0s",
+    \\  "minBackoffDuration": "5s",
+    \\  "maxBackoffDuration": "3600s",
+    \\  "maxDoublings": 5
+    \\ },
+    \\ "schedule": "0 0 1 1 *",
+    \\ "timeZone": "UTC",
+    \\ "attemptDeadline": "180s"
+    \\}
+;
+
+/// `:run` on a paused job. HTTP 400.
+pub const run_paused_status = 400;
+pub const run_paused =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "spanner.RunInTransaction: generic::failed_precondition: Job.state must be ENABLED for RunJob.",
+    \\  "status": "FAILED_PRECONDITION"
+    \\ }
+    \\}
+;
+
+/// Any call with a token minted for another scope (pubsub alone). HTTP 403.
+pub const narrow_scope_status = 403;
+pub const narrow_scope =
+    \\{
+    \\ "error": {
+    \\  "code": 403,
+    \\  "message": "Request had insufficient authentication scopes.",
+    \\  "status": "PERMISSION_DENIED",
+    \\  "details": [
+    \\   {
+    \\    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+    \\    "reason": "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+    \\    "domain": "googleapis.com",
+    \\    "metadata": {
+    \\     "method": "google.cloud.scheduler.v1.CloudScheduler.RunJob",
+    \\     "service": "cloudscheduler.googleapis.com"
+    \\    }
+    \\   }
+    \\  ]
     \\ }
     \\}
 ;

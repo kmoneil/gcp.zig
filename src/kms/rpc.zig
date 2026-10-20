@@ -149,17 +149,9 @@ pub fn createOnce(client: *Client, response: *std.heap.ArenaAllocator, create: C
 }
 
 /// Whether a failed attempt may be tried again when a repeat would make
-/// something new: only a failure raised before the request left, a
-/// refused connection or a name lookup that failed. A TLS failure or an
-/// unreachable network can also come after the request went, on a
-/// connection already open.
-pub fn unsentOnly(err: anyerror, http_status: u16) bool {
-    _ = http_status;
-    return switch (err) {
-        error.ConnectionRefused, error.NameServerFailure => true,
-        else => false,
-    };
-}
+/// something new: core's rule, only a failure raised before the request
+/// left.
+pub const unsentOnly = core.rpc.unsentOnly;
 
 /// How long to wait before attempt `attempt + 1`, under the client's
 /// policy and the delay the last refusal asked for; null when the policy

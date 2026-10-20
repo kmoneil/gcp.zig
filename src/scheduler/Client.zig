@@ -1,6 +1,8 @@
-//! A Cloud Scheduler client, read only: the locations a project's jobs
-//! live under, the jobs with their schedules, targets and last attempts.
-//! Nothing here creates, changes, runs or deletes a job.
+//! A Cloud Scheduler client: the locations a project's jobs live under,
+//! the jobs with their schedules, targets and last attempts, and three
+//! writes a console confirms: run a job now, pause it, resume it. Each
+//! write has a twin that builds its exact request without sending it.
+//! Nothing here creates, updates or deletes a job.
 //!
 //! Every call blocks the calling task until it completes, using the
 //! `std.Io` and allocator passed to `init`. A client must not be used from
@@ -20,6 +22,7 @@ const types = @import("types.zig");
 const validate = @import("validate.zig");
 const Diagnostics = core.Diagnostics;
 const Error = errors.Error;
+const PreparedRequest = core.PreparedRequest;
 const HttpTransport = core.transport.HttpTransport;
 const RetryPolicy = core.RetryPolicy;
 const TokenProvider = core.TokenProvider;
@@ -59,8 +62,9 @@ pub const Options = struct {
     /// Sends the credentials' quota project as `x-goog-user-project`, as
     /// every module does.
     send_quota_project: bool = true,
-    /// Every call here is a GET: 5xx, 429 and dropped connections are
-    /// retried.
+    /// The reads, a pause and a resume are retried on 5xx, 429 and
+    /// dropped connections; a run is resent only when it never left (see
+    /// `runJob`).
     retry: RetryPolicy = .{},
     /// How long one request may take before it is `error.TimedOut`, which
     /// is retried. 0 removes the limit.
@@ -225,6 +229,120 @@ pub fn getJobNamed(self: *Client, name: []const u8) Error!types.Owned(types.Job)
 }
 
 fn getJobChecked(self: *Client, location: []const u8, id: []const u8) Error!types.Owned(types.Job) {
+    try self.checkJob(location, id);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    return self.jobCall(a, .{ .method = .GET, .path = try names.job(a, self.project, location, id) });
+}
+
+/// Dispatches the job now, even if it is already running (production's
+/// words), and answers the job as it stood: the run's attempt shows in
+/// `last_attempt` and `last_attempt_time` seconds later, when Scheduler
+/// has dispatched it (the guide's "What a run comes to" has the measured
+/// times). A paused job keeps its state.
+///
+/// Every run that lands dispatches the job once more, so a run that may
+/// have reached the server is never sent again: only a refused connection
+/// or a failed name lookup is retried. Any other failure is returned, and
+/// whether the job ran is for a read of the job, or the target's own
+/// logs, to say. Google's own clients retry a run not at all.
+pub fn runJob(self: *Client, location: []const u8, id: []const u8) Error!types.Owned(types.Job) {
+    rpc.begin(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var call = try self.actionCall(a, .run, location, id);
+    call.retryable = core.rpc.unsentOnly;
+    return self.jobCall(a, call);
+}
+
+/// Stops the job's schedule until `resumeJob`. Production also takes away
+/// its next run (`schedule_time`) and its last attempt, which a list or a
+/// get then answers as never attempted. Pausing a paused job changes
+/// nothing and is no refusal (measured, though Google's reference says a
+/// job must be enabled), so a pause is retried as the reads are.
+///
+/// A run sent just before a pause can still start after it: the paused
+/// job then shows that attempt's `last_attempt_time` and a
+/// `schedule_time` of the same moment, with no result.
+pub fn pauseJob(self: *Client, location: []const u8, id: []const u8) Error!types.Owned(types.Job) {
+    return self.stateCall(.pause, location, id);
+}
+
+/// Re-enables a paused job: its schedule runs again, and its next run
+/// comes back at the next cron tick. The attempt a pause cleared stays
+/// cleared. Resuming an enabled job changes nothing and is no refusal
+/// (measured), so a resume is retried as the reads are.
+///
+/// One case reads wrong: a job paused while a run was starting (see
+/// `pauseJob`) answers an empty status after the resume, which decodes
+/// as a successful attempt though no result was recorded.
+pub fn resumeJob(self: *Client, location: []const u8, id: []const u8) Error!types.Owned(types.Job) {
+    return self.stateCall(.@"resume", location, id);
+}
+
+/// The request `runJob` sends for the same arguments, built without
+/// sending it, after the same checks with the same errors: to show before
+/// the call, or to record after it. Credentials and other headers are not
+/// part of it.
+pub fn runJobRequest(self: *Client, location: []const u8, id: []const u8) Error!types.Owned(PreparedRequest) {
+    return self.prepare(.run, location, id);
+}
+
+/// The request `pauseJob` sends, as `runJobRequest` says. A pause whose
+/// answer is lost is followed by a read of the job, which this does not
+/// show: it is the request a user confirms.
+pub fn pauseJobRequest(self: *Client, location: []const u8, id: []const u8) Error!types.Owned(PreparedRequest) {
+    return self.prepare(.pause, location, id);
+}
+
+/// The request `resumeJob` sends, as `pauseJobRequest` says.
+pub fn resumeJobRequest(self: *Client, location: []const u8, id: []const u8) Error!types.Owned(PreparedRequest) {
+    return self.prepare(.@"resume", location, id);
+}
+
+/// The three writes, each named as its path names it (`:run`).
+const Action = enum { run, pause, @"resume" };
+
+fn prepare(self: *Client, action: Action, location: []const u8, id: []const u8) Error!types.Owned(PreparedRequest) {
+    rpc.begin(self);
+    var result: types.Owned(PreparedRequest) = try .init(self.gpa);
+    errdefer result.deinit();
+    const a = result.arena.allocator();
+    result.value = try .fromCall(a, self.base_url, try self.actionCall(a, action, location, id));
+    return result;
+}
+
+/// The call `action` sends, after the checks every job call makes. Its
+/// body is `{}`: the request messages have no fields.
+fn actionCall(self: *Client, arena: Allocator, action: Action, location: []const u8, id: []const u8) Error!rpc.Call {
+    try self.checkJob(location, id);
+    const path = try std.mem.concat(arena, u8, &.{ try names.job(arena, self.project, location, id), ":", @tagName(action) });
+    return .{ .method = .POST, .path = path, .body = "{}" };
+}
+
+/// Sends a pause or a resume. Either one landing twice answers the job as
+/// the first left it, so both are retried as the reads are.
+fn stateCall(self: *Client, action: Action, location: []const u8, id: []const u8) Error!types.Owned(types.Job) {
+    rpc.begin(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    return self.jobCall(a, try self.actionCall(a, action, location, id));
+}
+
+/// Sends `call` and decodes the job it answers.
+fn jobCall(self: *Client, scratch: Allocator, call: rpc.Call) Error!types.Owned(types.Job) {
+    var result: types.Owned(types.Job) = try .init(self.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(self, result.arena, call);
+    result.value = codec.decodeJob(result.arena.allocator(), scratch, body) catch |err|
+        return rpc.decodeFailed(self, err, "job");
+    return result;
+}
+
+fn checkJob(self: *Client, location: []const u8, id: []const u8) Error!void {
     if (!validate.isLocation(location)) {
         if (self.diagnostics) |d| d.print("invalid location: expected a region id such as us-central1", .{});
         return error.InvalidName;
@@ -233,16 +351,6 @@ fn getJobChecked(self: *Client, location: []const u8, id: []const u8) Error!type
         if (self.diagnostics) |d| d.print("invalid job id: visible ASCII without /, at most 500", .{});
         return error.InvalidName;
     }
-    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
-    defer scratch.deinit();
-    const a = scratch.allocator();
-    const path = try names.job(a, self.project, location, id);
-    var result: types.Owned(types.Job) = try .init(self.gpa);
-    errdefer result.deinit();
-    const body = try rpc.execute(self, result.arena, .{ .method = .GET, .path = path });
-    result.value = codec.decodeJob(result.arena.allocator(), a, body) catch |err|
-        return rpc.decodeFailed(self, err, "job");
-    return result;
 }
 
 fn checkToken(self: *Client, token: ?[]const u8) Error!void {
@@ -348,6 +456,187 @@ test "the server's refusals arrive as errors, production's words kept" {
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "not a valid location") != null);
 }
 
+const job_url = "https://cloudscheduler.googleapis.com/v1/projects/my-project/locations/us-central1/jobs/zigps-399f5c-http";
+
+const unavailable: FakeTransport.Reply = .{ .respond = .{
+    .status = 503,
+    .body = "{\"error\":{\"code\":503,\"message\":\"The service is currently unavailable.\",\"status\":\"UNAVAILABLE\"}}",
+} };
+const FakeTransport = test_util.FakeTransport;
+const ran: FakeTransport.Reply = .{ .respond = .{ .body = production.job_run_answer } };
+const paused: FakeTransport.Reply = .{ .respond = .{ .body = production.job_pause_answer } };
+const enabled: FakeTransport.Reply = .{ .respond = .{ .body = production.job_resume_answer } };
+
+test "golden: run, pause and resume POST {} to the job's verb and answer the job" {
+    var h: Harness = undefined;
+    try h.init(&.{ ran, paused, enabled });
+    defer h.deinit();
+    var r = try h.client.runJob("us-central1", "zigps-399f5c-http");
+    defer r.deinit();
+    try h.expectWrite(0, job_url ++ ":run");
+    try testing.expectEqual(.enabled, r.value.state);
+    try testing.expectEqual(null, r.value.last_attempt);
+    var p = try h.client.pauseJob("us-central1", "zigps-399f5c-http");
+    defer p.deinit();
+    try h.expectWrite(1, job_url ++ ":pause");
+    try testing.expectEqual(.paused, p.value.state);
+    try testing.expectEqual(null, p.value.schedule_time);
+    var e = try h.client.resumeJob("us-central1", "zigps-399f5c-http");
+    defer e.deinit();
+    try h.expectWrite(2, job_url ++ ":resume");
+    try testing.expectEqual(.enabled, e.value.state);
+    try h.expectRequestCount(3);
+    try testing.expectEqual(null, e.value.last_attempt);
+    try testing.expect(e.value.schedule_time != null);
+}
+
+test "each preview is byte for byte what its write sends, and sends nothing" {
+    const Write = *const fn (*Client, []const u8, []const u8) Error!types.Owned(types.Job);
+    const Preview = *const fn (*Client, []const u8, []const u8) Error!types.Owned(PreparedRequest);
+    const pairs = [_]struct { Write, Preview, FakeTransport.Reply }{
+        .{ runJob, runJobRequest, ran },
+        .{ pauseJob, pauseJobRequest, paused },
+        .{ resumeJob, resumeJobRequest, enabled },
+    };
+    // An id that needs percent-encoding.
+    for (pairs) |pair| {
+        var h: Harness = undefined;
+        try h.init(&.{pair[2]});
+        defer h.deinit();
+        var prepared = try pair[1](&h.client, "europe-west1", "report#1");
+        defer prepared.deinit();
+        try h.expectRequestCount(0);
+        var answered = try pair[0](&h.client, "europe-west1", "report#1");
+        defer answered.deinit();
+        const sent = try h.fake.request(0);
+        try testing.expectEqual(sent.method, prepared.value.method);
+        try testing.expectEqualStrings(sent.url, prepared.value.url);
+        try testing.expectEqualStrings(sent.body.?, prepared.value.body);
+        try testing.expect(std.mem.indexOf(u8, prepared.value.url, "/locations/europe-west1/jobs/report%231:") != null);
+    }
+}
+
+test "the writes and their previews refuse what they will not send, with the same words" {
+    var h: Harness = undefined;
+    try h.init(&.{});
+    defer h.deinit();
+    const c = &h.client;
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "US-central1", "j", "invalid location: expected a region id such as us-central1" },
+        .{ "", "j", "invalid location: expected a region id such as us-central1" },
+        .{ "us-central1", "a/b", "invalid job id: visible ASCII without /, at most 500" },
+        .{ "us-central1", "", "invalid job id: visible ASCII without /, at most 500" },
+    };
+    for (cases) |case| {
+        try testing.expectError(error.InvalidName, c.runJob(case[0], case[1]));
+        try testing.expectEqualStrings(case[2], h.diag.message());
+        try testing.expectError(error.InvalidName, c.runJobRequest(case[0], case[1]));
+        try testing.expectEqualStrings(case[2], h.diag.message());
+        try testing.expectError(error.InvalidName, c.pauseJob(case[0], case[1]));
+        try testing.expectError(error.InvalidName, c.pauseJobRequest(case[0], case[1]));
+        try testing.expectError(error.InvalidName, c.resumeJob(case[0], case[1]));
+        try testing.expectError(error.InvalidName, c.resumeJobRequest(case[0], case[1]));
+    }
+    try h.expectRequestCount(0);
+}
+
+test "run: never sent again once it may have left" {
+    const after_send = [_]FakeTransport.Reply{
+        .{ .fail = error.ConnectionResetByPeer },
+        .{ .fail = error.TimedOut },
+        .{ .fail = error.TlsFailure },
+        .{ .fail = error.NetworkUnreachable },
+        unavailable,
+        .{ .respond = .{ .status = 429, .body = "{\"error\":{\"code\":429,\"message\":\"Quota exceeded.\",\"status\":\"RESOURCE_EXHAUSTED\"}}" } },
+        .{ .respond = .{ .status = 500, .body = "{\"error\":{\"code\":500,\"message\":\"Internal error.\",\"status\":\"INTERNAL\"}}" } },
+    };
+    for (after_send) |reply| {
+        var h: Harness = undefined;
+        try h.init(&.{ reply, ran });
+        defer h.deinit();
+        if (h.client.runJob("us-central1", "zigps-399f5c-http")) |r| {
+            var job = r;
+            job.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+        try h.expectRequestCount(1);
+        try testing.expectEqual(0, h.clock.sleep_count);
+    }
+}
+
+test "run: resent after a refused connection or a failed lookup, which never left" {
+    var h: Harness = undefined;
+    try h.init(&.{ .{ .fail = error.ConnectionRefused }, .{ .fail = error.NameServerFailure }, ran });
+    defer h.deinit();
+    var r = try h.client.runJob("us-central1", "zigps-399f5c-http");
+    defer r.deinit();
+    try h.expectRequestCount(3);
+    for (0..3) |i| try h.expectWrite(i, job_url ++ ":run");
+}
+
+test "run: a paused job is refused, production's words kept" {
+    var h: Harness = undefined;
+    try h.init(&.{.{ .respond = .{ .status = production.run_paused_status, .body = production.run_paused } }});
+    defer h.deinit();
+    try testing.expectError(error.FailedPrecondition, h.client.runJob("us-central1", "zigps-399f5c-http"));
+    try testing.expectEqualStrings("spanner.RunInTransaction: generic::failed_precondition: Job.state must be ENABLED for RunJob.", h.diag.message());
+    try h.expectRequestCount(1);
+}
+
+test "pause and resume: retried as the reads are, a repeat answering the job" {
+    var h: Harness = undefined;
+    try h.init(&.{ .{ .fail = error.ConnectionResetByPeer }, unavailable, paused, .{ .fail = error.TimedOut }, enabled });
+    defer h.deinit();
+    var p = try h.client.pauseJob("us-central1", "zigps-399f5c-http");
+    defer p.deinit();
+    try testing.expectEqual(.paused, p.value.state);
+    for (0..3) |i| try h.expectWrite(i, job_url ++ ":pause");
+    var e = try h.client.resumeJob("us-central1", "zigps-399f5c-http");
+    defer e.deinit();
+    try testing.expectEqual(.enabled, e.value.state);
+    for (3..5) |i| try h.expectWrite(i, job_url ++ ":resume");
+    try h.expectRequestCount(5);
+    try testing.expectEqual(3, h.clock.sleep_count);
+    try testing.expectEqualStrings("", h.diag.message());
+}
+
+test "pause and resume: a refusal is returned as it came, not retried" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = production.job_unknown_status, .body = production.job_unknown } },
+        .{ .respond = .{ .status = production.narrow_scope_status, .body = production.narrow_scope } },
+        .{ .respond = .{ .status = production.location_unknown_status, .body = production.location_unknown } },
+    });
+    defer h.deinit();
+    try testing.expectError(error.NotFound, h.client.pauseJob("us-central1", "zigps-nobody"));
+    try testing.expectEqualStrings("Job not found.", h.diag.message());
+    try testing.expectError(error.PermissionDenied, h.client.resumeJob("us-central1", "zigps-399f5c-http"));
+    try testing.expectEqualStrings("Request had insufficient authentication scopes.", h.diag.message());
+    try testing.expectError(error.InvalidArgument, h.client.runJob("us-fake1", "zigps-399f5c-http"));
+    try h.expectRequestCount(3);
+}
+
+test "pause and resume: what production answers mid-run, decoded as it reads" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = production.job_paused_mid_run } },
+        .{ .respond = .{ .body = production.job_resumed_mid_run } },
+    });
+    defer h.deinit();
+    // Paused while a run was starting: the attempt's start, no result.
+    var p = try h.client.getJob("us-central1", "zigps-e03a4d-nf");
+    defer p.deinit();
+    try testing.expectEqual(.paused, p.value.state);
+    try testing.expectEqual(null, p.value.last_attempt);
+    try testing.expect(p.value.last_attempt_time != null);
+    try testing.expect(p.value.schedule_time != null);
+    // Resumed: an empty status, which reads as success.
+    var e = try h.client.resumeJob("us-central1", "zigps-e03a4d-nf");
+    defer e.deinit();
+    try testing.expectEqual(0, e.value.last_attempt.?.code);
+    try testing.expect(!e.value.failing());
+}
+
 test "init refuses what no call could use" {
     var tokens: test_util.FakeTokenProvider = .{};
     var clock: test_util.FakeClock = .{};
@@ -367,6 +656,9 @@ test "every allocation failure is OutOfMemory without leaks" {
                 .{ .respond = .{ .body = production.jobs_page } },
                 .{ .respond = .{ .body = production.job_failed_http } },
                 .{ .respond = .{ .body = production.job_failed_pubsub } },
+                .{ .respond = .{ .body = production.job_run_answer } },
+                .{ .respond = .{ .body = production.job_pause_answer } },
+                .{ .respond = .{ .body = production.job_resume_answer } },
             });
             defer fake.deinit();
             var tokens: test_util.FakeTokenProvider = .{};
@@ -381,6 +673,16 @@ test "every allocation failure is OutOfMemory without leaks" {
             got.deinit();
             var by_name = try client.getJobNamed("projects/my-project/locations/us-central1/jobs/zigps-399f5c-ps");
             by_name.deinit();
+            var r = try client.runJob("us-central1", "zigps-399f5c-http");
+            r.deinit();
+            var p = try client.pauseJob("us-central1", "zigps-399f5c-http");
+            p.deinit();
+            var e = try client.resumeJob("us-central1", "zigps-399f5c-http");
+            e.deinit();
+            for ([_]Action{ .run, .pause, .@"resume" }) |action| {
+                var prepared = try client.prepare(action, "us-central1", "zigps-399f5c-http");
+                prepared.deinit();
+            }
         }
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.calls, .{});

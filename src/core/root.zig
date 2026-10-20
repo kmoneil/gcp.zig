@@ -36,6 +36,10 @@ pub const Diagnostics = errors.Diagnostics;
 
 pub const Owned = @import("owned.zig").Owned;
 
+/// A request as a client would send it, built without sending it, for a
+/// caller that shows a write before making it. Service modules re-export it.
+pub const PreparedRequest = @import("PreparedRequest.zig");
+
 /// What an update does to a setting that can be taken away: `.keep`,
 /// `.set`, or `.clear`. Service modules re-export it.
 pub const Change = @import("change.zig").Change;
@@ -92,6 +96,7 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("CountingWriter.zig");
     _ = @import("JsonArraySplitter.zig");
+    _ = @import("PreparedRequest.zig");
     _ = @import("Signer.zig");
     _ = @import("StaticToken.zig");
     _ = @import("TokenProvider.zig");

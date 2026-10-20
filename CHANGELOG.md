@@ -4,6 +4,35 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.51.0 (unreleased)
+
+- scheduler: three writes a console confirms before sending, for issue
+  #273: `Client.runJob`, `pauseJob` and `resumeJob`, each answering the
+  job as it then stands, and each with a twin (`runJobRequest`,
+  `pauseJobRequest`, `resumeJobRequest`) that builds its exact request
+  without sending it, after the same checks with the same errors. The
+  writes are **experimental** on their own. A run is never sent twice
+  once it may have left, since every run that lands dispatches the job
+  again; a pause and a resume are retried as the reads are, production
+  answering a repeat with 200 and no change (measured, though Google's
+  reference says a repeat is refused). A run of a paused job is
+  `error.FailedPrecondition`. Measured on 2026-10-20 and written in
+  docs/scheduler/README.md: a run answers the job as it stood, its
+  attempt starts about 1.3 s later and shows in a read 3.4 to 14.9 s
+  after the run (6 s in the middle), a success reads `status: {}`, no
+  attempt carries a message, a pause clears the last attempt, and a
+  run sent just before a pause can start on the paused job with no
+  result, which a resume then answers as a success.
+- core: `core.PreparedRequest`, a request as a client would send it
+  (method, URL, body), built without sending it with
+  `PreparedRequest.fromCall` from the same `rpc.Call` the write sends;
+  scheduler re-exports it, and the write modules after it will too.
+  `core.rpc.unsentOnly`, the retry rule for a call a repeat would act on
+  again, moves here from kms.
+- kms: `rpc.unsentOnly` is core's now; no call changes.
+- auth, dataflow, error_reporting, firestore, logging, monitoring,
+  pubsub, resource_manager, run, secret_manager and storage: unchanged.
+
 ## 0.50.0 (2026-10-20)
 
 - dataflow: new module, **experimental**: the read side of Dataflow's

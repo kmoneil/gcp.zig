@@ -2237,6 +2237,30 @@ test "the failing jobs, as a health view draws them" {
 }
 // end snippet
 
+// snippet: sched-confirm
+test "the exact request a run would send, for the user to confirm" {
+    var fake: scheduler.testing.FakeScheduler = .init(std.testing.allocator, std.testing.io, .{ .project_id = "my-project" });
+    defer fake.deinit();
+    var token: scheduler.StaticToken = .{ .token = "none" };
+    var client = try scheduler.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    // Built, not sent: what the confirmation shows.
+    var request = try client.runJobRequest("us-central1", "nightly-export");
+    defer request.deinit();
+    try std.testing.expectEqual(.POST, request.value.method);
+    try std.testing.expectEqualStrings(
+        "https://cloudscheduler.googleapis.com/v1/projects/my-project/locations/us-central1/jobs/nightly-export:run",
+        request.value.url,
+    );
+    try std.testing.expectEqualStrings("{}", request.value.body);
+    try std.testing.expectEqual(0, fake.callCount());
+}
+// end snippet
+
 const run = @import("run");
 
 // snippet: run-fake

@@ -1,10 +1,13 @@
-//! Cloud Scheduler's v1 API, read only: the jobs a project schedules,
-//! with their state, target and last attempt, for a health view that
-//! shows the failing ones. Nothing here creates, changes, runs or
+//! Cloud Scheduler's v1 API: the jobs a project schedules, with their
+//! state, target and last attempt, for a health view that shows the
+//! failing ones; and three writes a console confirms before sending, run
+//! a job now, pause it and resume it, each with a twin that builds the
+//! exact request without sending it. Nothing here creates, updates or
 //! deletes a job.
 //!
 //! **Experimental**: new in 0.47.0, and free to change between minor
-//! versions until it has been used in anger.
+//! versions until it has been used in anger. The writes are new in
+//! 0.51.0.
 //!
 //! Jobs live under a location, so a reader lists `listLocations` once and
 //! `listJobs` per location. `Job.failing` answers the health view's
@@ -21,6 +24,9 @@ pub const auth_scope = @import("rpc.zig").scope;
 
 pub const RetryPolicy = core.RetryPolicy;
 pub const Diagnostics = core.Diagnostics;
+/// What `Client.runJobRequest` and its siblings answer: a write's method,
+/// URL and body, built without sending it.
+pub const PreparedRequest = core.PreparedRequest;
 pub const Error = @import("errors.zig").Error;
 pub const ApiError = core.ApiError;
 
