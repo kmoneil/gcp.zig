@@ -78,7 +78,7 @@ pub const Options = struct {
     /// passed in keeps its own limit.
     max_response_bytes: usize = core.transport.default_max_response_bytes,
     /// Printable ASCII.
-    user_agent: []const u8 = "zig-gcp-kms/0.49",
+    user_agent: []const u8 = "zig-gcp-kms/0.50",
     /// Filled with details of every failed call; cleared by each new call.
     diagnostics: ?*Diagnostics = null,
     /// Sends requests through this instead of `std.http.Client`. Useful for
