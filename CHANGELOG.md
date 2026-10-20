@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.51.0 (unreleased)
+## 0.51.0 (2026-10-20)
 
 - scheduler: three writes a console confirms before sending, for issue
   #273: `Client.runJob`, `pauseJob` and `resumeJob`, each answering the
