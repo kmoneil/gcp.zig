@@ -4,6 +4,27 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.49.0 (unreleased)
+
+- storage: now **beta**, as `pubsub`, `firestore` and `core` are. No
+  call changes. It earned the label on the rule firestore's promotion
+  set: its hardening sweep merged 2026-10-10, its production suites
+  run 2026-10-12 (transforms, import topics and tags, 51 checks), and
+  its four nightly fuzz jobs, `storage`, `slow-storage`,
+  `heavy-storage` and `fault-storage`, running 2026-10-10 to
+  2026-10-19 without a failure.
+- secret_manager: now **beta**, on the same rule. No call changes. Its
+  two nightly fuzz jobs, `secret_manager` and `heavy-secret_manager`,
+  ran the same nights without a failure (2026-10-19's resize of the
+  `secret_manager` job was for time, not failures).
+- auth: now **beta**, on the same rule. No call changes. Its two
+  nightly fuzz jobs, `auth` and `slow-auth`, ran 2026-10-10 to
+  2026-10-19 without a failure, and every module's production suite
+  exercises it; `Credentials.bindsScopes` (0.46.0) was additive and
+  tested.
+- core, error_reporting, firestore, kms, logging, monitoring, pubsub,
+  resource_manager, run and scheduler: unchanged.
+
 ## 0.48.0 (2026-10-19)
 
 - run: new module, **experimental**: the read side of Cloud Run's v2
