@@ -1,7 +1,9 @@
-//! Dataflow's v1b3 API, read only: the jobs a project runs, across every
-//! region in one call or one region at a time, with their states, for a
-//! health view's pipelines widget. Nothing here creates, updates,
-//! cancels or drains a job, and nothing launches a template.
+//! Dataflow's v1b3 API: the jobs a project runs, across every region in
+//! one call or one region at a time, with their states, for a health
+//! view's pipelines widget, and two writes a console confirms first:
+//! cancelling a job and draining a streaming one, each with the exact
+//! request it sends built beforehand. Nothing here creates or updates a
+//! job in any other way, and nothing launches a template.
 //!
 //! **Experimental**: new in 0.50.0, and free to change between minor
 //! versions until it has been used in anger.
@@ -11,9 +13,11 @@
 //! `failed_locations` naming any region that did not answer, without
 //! which a partial page looks complete. `Job.terminal` and
 //! `Job.failing` answer the widget's questions; `Client.listMessages`
-//! at `.@"error"` answers "why is it red". The OAuth scope is
-//! `cloud-platform`: v1b3 has no read-only scope, so what a token may
-//! read is IAM's to decide.
+//! at `.@"error"` answers "why is it red". `Client.cancelJob` and
+//! `Client.drainJob` stop a job, and `Job.cancellable` and
+//! `Job.drainable` say beforehand whether production takes either. The
+//! OAuth scope is `cloud-platform`: v1b3 has no read-only scope, so what
+//! a token may read or stop is IAM's to decide.
 
 pub const Client = @import("Client.zig");
 
@@ -24,6 +28,7 @@ pub const auth_scope = @import("rpc.zig").scope;
 
 pub const RetryPolicy = core.RetryPolicy;
 pub const Diagnostics = core.Diagnostics;
+pub const PreparedRequest = core.PreparedRequest;
 pub const Error = @import("errors.zig").Error;
 pub const ApiError = core.ApiError;
 

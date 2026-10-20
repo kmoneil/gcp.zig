@@ -4,6 +4,35 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.53.0 (unreleased)
+
+- dataflow: two writes a console confirms before sending, for issue
+  #274: `Client.cancelJob` (batch or streaming) and `drainJob`
+  (streaming), each a `PUT` of the job's requested state alone, and
+  each with a twin (`cancelJobRequest`, `drainJobRequest`) that builds
+  its exact request without sending it, after the same checks with the
+  same errors. Both return nothing: production answered every write it
+  took with one field, the job's type (which said batch of a streaming
+  job too), so the job is read to watch it stop. Both are retried as
+  the reads are, a repeat answering 200 and changing nothing (measured).
+  `Job.cancellable()` and `Job.drainable()` say whether production
+  takes either for the job as it stands. Measured on 2026-10-20 and
+  written in docs/dataflow/README.md: a pending job refuses a cancel
+  ("not yet ready for canceling") until it runs; an ended job refuses
+  both; a batch job refuses a drain in any state; a real region the job
+  is not in is a 404, but a made-up one reaches the job; a get shows
+  `.cancelling` or `.draining` at once, a list's summary never carries
+  `requested_state`; a cancelled Word_Count took 240 s to end, one
+  cancelled as it finished ended `.done`, a drained streaming job took
+  126 s, a cancel while draining wins, and a streaming job reads
+  `.running` before its worker is up. The writes take
+  `dataflow.jobs.cancel`, which Dataflow Viewer lacks. `requested_state`
+  is now documented as measured. `dataflow.PreparedRequest` is
+  exported.
+- auth, core, error_reporting, firestore, kms, logging, monitoring,
+  pubsub, resource_manager, run, scheduler, secret_manager and storage:
+  unchanged.
+
 ## 0.52.1 (2026-10-20)
 
 - kms: `kms.testing.FakeKms` answered a post-quantum version's public

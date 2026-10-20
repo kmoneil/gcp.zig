@@ -134,7 +134,7 @@ Google, not only what Google documents, and where the emulators differ.
 
 | Guide | What's in it |
 | --- | --- |
-| [Overview](dataflow/README.md) | The jobs a project runs, read only: every region in one call, states and terminal states, `Job.failing`, error messages, and what production showed when measured (experimental) |
+| [Overview](dataflow/README.md) | The jobs a project runs: every region in one call, states and terminal states, `Job.failing`, error messages, cancelling and draining with the request shown first, and what production showed when measured (experimental) |
 | [Testing](dataflow/testing.md) | An in-memory Dataflow for your own tests, held to production's answers (experimental) |
 
 ## 🛠️ Working on zig-gcp
