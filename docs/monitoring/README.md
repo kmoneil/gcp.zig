@@ -63,6 +63,7 @@ subscriber's counts into metrics through a `Recorder`.
 | [Writing](writing.md) | A write and its result, the rules production holds each series to, resources, descriptors, retries, limits |
 | [Reading](reading.md) | Filters, aligning and reducing, paging, incomplete answers, cost |
 | [Alerts](alerts.md) | The incidents open in the project, read only: their policy snapshots, the filter production really parses, what a real incident showed |
+| [Alert policies](policies.md) | The policies behind the incidents, every condition kind, and enabling or disabling one with its exact request first |
 | [The Recorder](recorder.md) | Counters, gauges, histograms and observers written every interval, stopping, descriptors, stats |
 | [Testing](testing.md) | An in-memory Cloud Monitoring for your own tests, held to production's answers (experimental) |
 
@@ -76,6 +77,7 @@ subscriber's counts into metrics through a `Recorder`.
 | `Client.listMetrics(options)` | The project's descriptors, or those under a prefix |
 | `Client.resourceType(name)`, `Client.listResourceTypes(options)` | The monitored resource types and their labels |
 | `Client.listAlerts(options)`, `Client.getAlert(id)` | The alerting incidents open (or lately closed) in the project, read only |
+| `Client.listAlertPolicies(options)`, `Client.getAlertPolicy(id)`, `Client.setAlertPolicyEnabled(id, enabled)` | The alert policies, and enabling or disabling one; `setAlertPolicyEnabledRequest` builds its exact request first |
 | `Recorder` | Counters, gauges, histograms and observers, written every interval |
 
 ## Who is writing

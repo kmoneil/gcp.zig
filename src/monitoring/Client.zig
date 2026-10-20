@@ -21,6 +21,7 @@ const types = @import("types.zig");
 const validate = @import("validate.zig");
 const Diagnostics = core.Diagnostics;
 const Error = errors.Error;
+const PreparedRequest = core.PreparedRequest;
 const HttpTransport = core.transport.HttpTransport;
 const RetryPolicy = core.RetryPolicy;
 const TokenProvider = core.TokenProvider;
@@ -352,6 +353,107 @@ pub fn getAlert(self: *Client, id_or_name: []const u8) Error!types.Owned(types.A
     return result;
 }
 
+/// One page of the project's alert policies (#275): when Cloud Monitoring
+/// opens alerts, and what it tells people when it does. Without
+/// `order_by`, production orders them by name.
+pub fn listAlertPolicies(self: *Client, options: types.ListAlertPoliciesOptions) Error!types.Owned(types.AlertPolicyPage) {
+    rpc.begin(self);
+    if (options.filter) |f| if (!validate.isAlertFilter(f)) {
+        if (self.diagnostics) |d| d.print("invalid filter: text without control characters, at most 4096 bytes", .{});
+        return error.InvalidFilter;
+    };
+    if (options.order_by) |o| if (!validate.isAlertFilter(o)) {
+        if (self.diagnostics) |d| d.print("invalid order_by: text without control characters, at most 4096 bytes", .{});
+        return error.InvalidOptions;
+    };
+    try self.checkToken(options.page_token);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var w: std.Io.Writer.Allocating = .init(a);
+    names.writeCollection(&w.writer, self.project, .alert_policies) catch return error.OutOfMemory;
+    var params: core.query.Params = .init(&w.writer);
+    params.addOptional("filter", options.filter) catch return error.OutOfMemory;
+    params.addOptional("orderBy", options.order_by) catch return error.OutOfMemory;
+    params.addNonZero("pageSize", options.page_size) catch return error.OutOfMemory;
+    params.addOptional("pageToken", options.page_token) catch return error.OutOfMemory;
+
+    var result: types.Owned(types.AlertPolicyPage) = try .init(self.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(self, result.arena, .{ .method = .GET, .path = w.written() });
+    result.value = codec.decodeAlertPolicyPage(result.arena.allocator(), a, body) catch |err|
+        return rpc.decodeFailed(self, err, "alert policy list");
+    return result;
+}
+
+/// One alert policy, by its id or its full `projects/P/alertPolicies/ID`
+/// name. Another project's name is refused before sending.
+pub fn getAlertPolicy(self: *Client, id_or_name: []const u8) Error!types.Owned(types.AlertPolicy) {
+    rpc.begin(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const path = try names.alertPolicy(a, self.project, try self.policyId(id_or_name));
+    return self.policyCall(a, .{ .method = .GET, .path = path });
+}
+
+/// Enables or disables an alert policy, and answers it as it then
+/// stands: a disabled policy opens no alerts. Sends `PATCH
+/// ...?updateMask=enabled` with the field set, and nothing else can go
+/// with it: a patch without a mask would replace the whole policy.
+/// Production answers a repeat with 200, moving the mutation record again
+/// (measured 2026-10-20), so a patch is retried as the reads are. A token
+/// for `monitoring.read` alone is refused; this takes `monitoring` or
+/// `cloud-platform`.
+pub fn setAlertPolicyEnabled(self: *Client, id_or_name: []const u8, enabled: bool) Error!types.Owned(types.AlertPolicy) {
+    rpc.begin(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    return self.policyCall(a, try self.enabledCall(a, id_or_name, enabled));
+}
+
+/// The request `setAlertPolicyEnabled` sends for the same arguments,
+/// built without sending it, after the same checks with the same errors:
+/// to show before the call, or to record after it. Credentials and other
+/// headers are not part of it.
+pub fn setAlertPolicyEnabledRequest(self: *Client, id_or_name: []const u8, enabled: bool) Error!types.Owned(PreparedRequest) {
+    rpc.begin(self);
+    var result: types.Owned(PreparedRequest) = try .init(self.gpa);
+    errdefer result.deinit();
+    const a = result.arena.allocator();
+    result.value = try .fromCall(a, self.base_url, try self.enabledCall(a, id_or_name, enabled));
+    return result;
+}
+
+fn enabledCall(self: *Client, arena: Allocator, id_or_name: []const u8, enabled: bool) Error!rpc.Call {
+    const id = try self.policyId(id_or_name);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    w.writer.writeAll(try names.alertPolicy(arena, self.project, id)) catch return error.OutOfMemory;
+    var params: core.query.Params = .init(&w.writer);
+    params.add("updateMask", "enabled") catch return error.OutOfMemory;
+    return .{ .method = .PATCH, .path = w.written(), .body = try codec.encodeEnabled(arena, enabled) };
+}
+
+fn policyId(self: *Client, id_or_name: []const u8) Error![]const u8 {
+    const id = names.alertPolicyId(id_or_name, self.project) orelse "";
+    if (!validate.isAlertId(id)) {
+        if (self.diagnostics) |d| d.print("invalid alert policy: expected its id, or projects/{s}/alertPolicies/<id>", .{self.project});
+        return error.InvalidName;
+    }
+    return id;
+}
+
+/// Sends `call` and decodes the policy it answers.
+fn policyCall(self: *Client, scratch: Allocator, call: rpc.Call) Error!types.Owned(types.AlertPolicy) {
+    var result: types.Owned(types.AlertPolicy) = try .init(self.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(self, result.arena, call);
+    result.value = codec.decodeAlertPolicy(result.arena.allocator(), scratch, body) catch |err|
+        return rpc.decodeFailed(self, err, "alert policy");
+    return result;
+}
+
 fn checkToken(self: *Client, token: ?[]const u8) Error!void {
     if (token) |t| if (!validate.isPageToken(t)) {
         if (self.diagnostics) |d| d.print("invalid page token: expected printable ASCII", .{});
@@ -645,6 +747,124 @@ test "golden: alerts listed with every option, and one got by id or by name" {
     try testing.expectEqualStrings("0.oe0ehmpm95z2", by_name.value.id);
 }
 
+const policy_url = "https://monitoring.googleapis.com/v3/projects/my-project/alertPolicies/9594883664150561401";
+
+test "golden: alert policies listed, got by id and by name, disabled and enabled" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = production.policy_page } },
+        .{ .respond = .{ .body = "{}" } },
+        .{ .respond = .{ .body = production.policy_threshold } },
+        .{ .respond = .{ .body = production.policy_threshold } },
+        .{ .respond = .{ .body = production.policy_disabled } },
+        .{ .respond = .{ .body = production.policy_threshold } },
+    }, .{});
+    defer h.deinit();
+    var page = try h.client.listAlertPolicies(.{ .filter = "enabled=false AND display_name=starts_with(\"zigps-\")", .order_by = "-display_name", .page_size = 1, .page_token = "t" });
+    defer page.deinit();
+    try h.expectRequest(0, .GET, "https://monitoring.googleapis.com/v3/projects/my-project/alertPolicies?filter=enabled%3Dfalse%20AND%20display_name%3Dstarts_with%28%22zigps-%22%29&orderBy=-display_name&pageSize=1&pageToken=t", null);
+    try testing.expectEqual(1, page.value.policies.len);
+    try testing.expectEqual(6, page.value.total_size.?);
+    var empty = try h.client.listAlertPolicies(.{});
+    defer empty.deinit();
+    try h.expectRequest(1, .GET, "https://monitoring.googleapis.com/v3/projects/my-project/alertPolicies", null);
+    try testing.expectEqual(0, empty.value.policies.len);
+    var got = try h.client.getAlertPolicy("9594883664150561401");
+    defer got.deinit();
+    try h.expectRequest(2, .GET, policy_url, null);
+    try testing.expectEqualStrings("zigps-d5b8f4-threshold", got.value.display_name);
+    var by_name = try h.client.getAlertPolicy("projects/my-project/alertPolicies/9594883664150561401");
+    by_name.deinit();
+    try h.expectRequest(3, .GET, policy_url, null);
+    var off = try h.client.setAlertPolicyEnabled("9594883664150561401", false);
+    defer off.deinit();
+    try h.expectRequest(4, .PATCH, policy_url ++ "?updateMask=enabled", "{\"enabled\":false}");
+    try testing.expect(!off.value.enabled);
+    try testing.expect(off.value.mutated.time.?.nanoseconds > off.value.created.time.?.nanoseconds);
+    var on = try h.client.setAlertPolicyEnabled("projects/my-project/alertPolicies/9594883664150561401", true);
+    defer on.deinit();
+    try h.expectRequest(5, .PATCH, policy_url ++ "?updateMask=enabled", "{\"enabled\":true}");
+    try testing.expect(on.value.enabled);
+}
+
+test "setAlertPolicyEnabledRequest: byte for byte what the patch sends, and sends nothing" {
+    for ([_]bool{ false, true }) |enabled| {
+        var h: Harness = undefined;
+        try h.init(&.{.{ .respond = .{ .body = production.policy_threshold } }}, .{});
+        defer h.deinit();
+        var prepared = try h.client.setAlertPolicyEnabledRequest("9594883664150561401", enabled);
+        defer prepared.deinit();
+        try h.expectRequestCount(0);
+        var answered = try h.client.setAlertPolicyEnabled("9594883664150561401", enabled);
+        answered.deinit();
+        const sent = try h.fake.request(0);
+        try testing.expectEqual(sent.method, prepared.value.method);
+        try testing.expectEqualStrings(sent.url, prepared.value.url);
+        try testing.expectEqualStrings(sent.body.?, prepared.value.body);
+    }
+}
+
+test "alert policy calls refuse what they will not send, the preview with the same words" {
+    var h: Harness = undefined;
+    try h.init(&.{}, .{});
+    defer h.deinit();
+    const c = &h.client;
+    try testing.expectError(error.InvalidFilter, c.listAlertPolicies(.{ .filter = "a\nb" }));
+    try testing.expectError(error.InvalidFilter, c.listAlertPolicies(.{ .filter = "" }));
+    try testing.expectError(error.InvalidOptions, c.listAlertPolicies(.{ .order_by = "a\tb" }));
+    try testing.expectEqualStrings("invalid order_by: text without control characters, at most 4096 bytes", h.diag.message());
+    try testing.expectError(error.InvalidName, c.listAlertPolicies(.{ .page_token = "a b" }));
+    for ([_][]const u8{ "", "a/b", "a b", "projects/other/alertPolicies/9", "projects/my-project/alerts/9" }) |bad| {
+        try testing.expectError(error.InvalidName, c.getAlertPolicy(bad));
+        try testing.expectError(error.InvalidName, c.setAlertPolicyEnabled(bad, false));
+        try testing.expectEqualStrings("invalid alert policy: expected its id, or projects/my-project/alertPolicies/<id>", h.diag.message());
+        try testing.expectError(error.InvalidName, c.setAlertPolicyEnabledRequest(bad, false));
+        try testing.expectEqualStrings("invalid alert policy: expected its id, or projects/my-project/alertPolicies/<id>", h.diag.message());
+    }
+    try h.expectRequestCount(0);
+}
+
+test "alert policy refusals arrive as errors in production's words" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = production.policy_unknown_status, .body = production.policy_unknown } },
+        .{ .respond = .{ .status = production.policy_patch_unknown_status, .body = production.policy_patch_unknown } },
+        .{ .respond = .{ .status = production.policy_filter_severity_status, .body = production.policy_filter_severity } },
+        .{ .respond = .{ .status = production.policy_order_desc_word_status, .body = production.policy_order_desc_word } },
+        .{ .respond = .{ .status = production.policy_patch_read_scope_status, .body = production.policy_patch_read_scope } },
+        .{ .respond = .{ .body = "{\"alertPolicies\":1}" } },
+    }, .{});
+    defer h.deinit();
+    const c = &h.client;
+    try testing.expectError(error.NotFound, c.getAlertPolicy("1234567890"));
+    try testing.expectEqualStrings("Failed to find alert policy 1234567890 in extractctl.", h.diag.message());
+    try testing.expectError(error.NotFound, c.setAlertPolicyEnabled("1234567890", false));
+    try testing.expectEqualStrings("Failed to find alert policy 1234567890 in 82150720798.", h.diag.message());
+    try testing.expectError(error.InvalidArgument, c.listAlertPolicies(.{ .filter = "severity=\"WARNING\"" }));
+    try testing.expect(std.mem.endsWith(u8, h.diag.message(), "No such field: severity."));
+    try testing.expectError(error.InvalidArgument, c.listAlertPolicies(.{ .order_by = "display_name desc" }));
+    try testing.expectError(error.PermissionDenied, c.setAlertPolicyEnabled("9", true));
+    try testing.expectEqualStrings("Request had insufficient authentication scopes.", h.diag.message());
+    try testing.expectError(error.InvalidResponse, c.listAlertPolicies(.{}));
+    try testing.expectEqualStrings("the alert policy list response could not be decoded", h.diag.message());
+    try h.expectRequestCount(6);
+}
+
+test "setAlertPolicyEnabled: retried as the reads are, since a repeat answers 200" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .fail = error.ConnectionResetByPeer },
+        .{ .respond = .{ .status = 503, .body = "{\"error\":{\"code\":503,\"message\":\"The service is currently unavailable.\",\"status\":\"UNAVAILABLE\"}}" } },
+        .{ .respond = .{ .body = production.policy_disabled } },
+    }, .{});
+    defer h.deinit();
+    var off = try h.client.setAlertPolicyEnabled("9594883664150561401", false);
+    defer off.deinit();
+    try testing.expect(!off.value.enabled);
+    try h.expectRequestCount(3);
+    for (0..3) |i| try h.expectRequest(i, .PATCH, policy_url ++ "?updateMask=enabled", "{\"enabled\":false}");
+}
+
 test "alert calls refuse what they will not send" {
     var h: Harness = undefined;
     try h.init(&.{}, .{});
@@ -741,6 +961,9 @@ test "every allocation failure is OutOfMemory without leaks" {
                 .{ .respond = .{ .body = "{\"metricDescriptors\":[{\"type\":\"a/b\",\"labels\":[{\"key\":\"k\"}],\"monitoredResourceTypes\":[\"global\"]}],\"nextPageToken\":\"t\"}" } },
                 .{ .respond = .{ .body = production.resource_generic_task } },
                 .{ .respond = .{ .body = "{\"resourceDescriptors\":[{\"type\":\"global\",\"labels\":[{\"key\":\"project_id\"}]}]}" } },
+                .{ .respond = .{ .body = production.policy_page } },
+                .{ .respond = .{ .body = production.policy_two } },
+                .{ .respond = .{ .body = production.policy_disabled } },
             });
             defer fake.deinit();
             var tokens: test_util.FakeTokenProvider = .{};
@@ -762,6 +985,14 @@ test "every allocation failure is OutOfMemory without leaks" {
             r.deinit();
             var rpage = try client.listResourceTypes(.{});
             rpage.deinit();
+            var policies = try client.listAlertPolicies(.{ .filter = "enabled=true", .order_by = "name", .page_size = 1 });
+            policies.deinit();
+            var policy = try client.getAlertPolicy("7136103533907925714");
+            policy.deinit();
+            var off = try client.setAlertPolicyEnabled("9594883664150561401", false);
+            off.deinit();
+            var prepared = try client.setAlertPolicyEnabledRequest("9594883664150561401", true);
+            prepared.deinit();
         }
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.calls, .{});

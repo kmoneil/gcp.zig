@@ -63,6 +63,16 @@ pub const Alert = @import("types.zig").Alert;
 pub const AlertOrder = @import("types.zig").AlertOrder;
 pub const ListAlertsOptions = @import("types.zig").ListAlertsOptions;
 pub const AlertPage = @import("types.zig").AlertPage;
+pub const ConditionKind = @import("types.zig").ConditionKind;
+pub const Comparison = @import("types.zig").Comparison;
+pub const Trigger = @import("types.zig").Trigger;
+pub const Condition = @import("types.zig").Condition;
+pub const Combiner = @import("types.zig").Combiner;
+pub const Documentation = @import("types.zig").Documentation;
+pub const MutationRecord = @import("types.zig").MutationRecord;
+pub const AlertPolicy = @import("types.zig").AlertPolicy;
+pub const ListAlertPoliciesOptions = @import("types.zig").ListAlertPoliciesOptions;
+pub const AlertPolicyPage = @import("types.zig").AlertPolicyPage;
 
 /// The fixed limits and naming rules the client checks before sending.
 pub const limits = @import("validate.zig");
@@ -86,6 +96,7 @@ pub const testing = struct {
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("Client.zig");
+    _ = @import("fake_policies.zig");
     _ = @import("Metric.zig");
     _ = @import("Recorder.zig");
     _ = @import("codec.zig");

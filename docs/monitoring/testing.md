@@ -256,6 +256,68 @@ test "the open incidents, as a console draws them" {
 }
 ```
 
+### Alert policies
+
+`putAlertPolicy` puts a policy in, standing in for the console or the
+Terraform that made it (issue #275): its conditions of any kind, its
+documentation, labels and channels, its creation record on the fake's
+clock and `Options.caller`. The fake answers lists, gets and
+`setAlertPolicyEnabled` as production answered on 2026-10-20: lists by
+name without an order, `totalSize` on every page and `{}` for none;
+the filter forms milestone 0 measured, with `AND`; `severity`, any
+other field and a bare word refused in production's words; `OR`,
+`NOT`, brackets and regular expressions a 501. A patch takes
+`updateMask=enabled` alone, an absent `enabled` read as true, the
+mutation record moved by every patch, a repeat included; a 404 names
+the project id on a get and `Options.project_number` on a patch.
+
+<!-- snippet: tests/docs_examples.zig#mon-policies -->
+```zig
+test "the policy behind an incident, disabled after a confirmation" {
+    var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_331_195 * std.time.ns_per_s };
+    var fake: monitoring.testing.FakeMonitoring = .init(std.testing.allocator, clock.io(), .{ .project_id = "my-project" });
+    defer fake.deinit();
+    // Policies are made in the console or by Terraform; the test puts one in.
+    const name = try fake.putAlertPolicy(.{
+        .display_name = "Pub/Sub backlog too deep",
+        .severity = .warning,
+        .conditions = &.{.{
+            .display_name = "backlog over 1000",
+            .kind = .threshold,
+            .filter = "metric.type=\"pubsub.googleapis.com/subscription/num_undelivered_messages\" AND resource.type=\"pubsub_subscription\"",
+            .comparison = .gt,
+            .threshold_value = 1000,
+            .duration_s = 300,
+        }},
+    });
+
+    var token: monitoring.StaticToken = .{ .token = "none" };
+    var client = try monitoring.Client.init(std.testing.allocator, clock.io(), .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    var policy = try client.getAlertPolicy(name);
+    defer policy.deinit();
+    try std.testing.expectEqual(monitoring.ConditionKind.threshold, policy.value.conditions[0].kind);
+    try std.testing.expectEqual(1000, policy.value.conditions[0].threshold_value.?);
+
+    // What the confirmation shows, then the write it names.
+    var request = try client.setAlertPolicyEnabledRequest(name, false);
+    defer request.deinit();
+    try std.testing.expectEqualStrings("{\"enabled\":false}", request.value.body);
+    try std.testing.expect(std.mem.endsWith(u8, request.value.url, "?updateMask=enabled"));
+    var disabled = try client.setAlertPolicyEnabled(name, false);
+    defer disabled.deinit();
+    try std.testing.expect(!disabled.value.enabled);
+
+    var off = try client.listAlertPolicies(.{ .filter = "enabled=false" });
+    defer off.deinit();
+    try std.testing.expectEqual(1, off.value.policies.len);
+}
+```
+
 ## What it models
 
 Each as production answered when measured, refusals in its words:
