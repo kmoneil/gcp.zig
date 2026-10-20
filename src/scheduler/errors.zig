@@ -3,8 +3,9 @@
 
 const core = @import("core");
 
-/// Every error a client call can return. The module reads only, so each
-/// call is a GET, retried as any idempotent call is.
+/// Every error a client call can return. The reads, a pause and a resume
+/// are retried as any idempotent call is; `Client.runJob` says what a run
+/// repeats. A run of a paused job is `error.FailedPrecondition`.
 pub const Error = core.rpc.Error || error{
     /// A location, job id, page token or full name this client will not
     /// put in a request: nothing is sent. Another project's full name is

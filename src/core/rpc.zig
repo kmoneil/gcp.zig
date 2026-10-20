@@ -546,6 +546,20 @@ fn retryableByDefault(err: anyerror, http_status: u16) bool {
     return isRetryable(err);
 }
 
+/// Whether a failed attempt may be tried again when a repeat would act
+/// again, as a create makes something new or a run dispatches a job once
+/// more: only a failure raised before the request left, a refused
+/// connection or a name lookup that failed. A TLS failure or an
+/// unreachable network can also come after the request went, on a
+/// connection already open. For `Call.retryable`.
+pub fn unsentOnly(err: anyerror, http_status: u16) bool {
+    _ = http_status;
+    return switch (err) {
+        error.ConnectionRefused, error.NameServerFailure => true,
+        else => false,
+    };
+}
+
 /// Randomness for a jittered backoff. Public so a module that retries a call
 /// of its own, as Secret Manager does after a checksum mismatch, waits the
 /// same way the loop does.
@@ -562,6 +576,7 @@ pub fn entropy(io: std.Io) u64 {
 const testing = std.testing;
 const test_util = @import("testing.zig");
 const FakeTransport = test_util.FakeTransport;
+const PreparedRequest = @import("PreparedRequest.zig");
 const Reply = FakeTransport.Reply;
 
 const TestEngine = Engine(.gcp_core_rpc_test);
@@ -613,6 +628,29 @@ const Harness = struct {
         return e.execute(&h.arena, .{ .method = .GET, .path = "/v1/things" });
     }
 };
+
+test "PreparedRequest.fromCall names what execute sends, byte for byte" {
+    var h: Harness = undefined;
+    h.init(&.{ok});
+    defer h.deinit();
+    const call: Call = .{ .method = .POST, .path = "/v1/things/1:run?x=%2F", .body = "{\"a\":\"\\u00e9\"}" };
+    const e = h.engine();
+    e.begin();
+    _ = try e.execute(&h.arena, call);
+    const prepared = try PreparedRequest.fromCall(h.arena.allocator(), e.base_url, call);
+    const sent = try h.fake.request(0);
+    try testing.expectEqual(sent.method, prepared.method);
+    try testing.expectEqualStrings(sent.url, prepared.url);
+    try testing.expectEqualStrings(sent.body.?, prepared.body);
+}
+
+test "unsentOnly: a refused connection and a failed lookup, nothing after a send" {
+    try testing.expect(unsentOnly(error.ConnectionRefused, 0));
+    try testing.expect(unsentOnly(error.NameServerFailure, 0));
+    for ([_]anyerror{ error.ConnectionResetByPeer, error.TimedOut, error.Unavailable, error.Internal, error.TlsFailure, error.NetworkUnreachable, error.ResourceExhausted }) |err| {
+        try testing.expect(!unsentOnly(err, 503));
+    }
+}
 
 test "a success returns the body and clears the diagnostics" {
     var h: Harness = undefined;

@@ -118,7 +118,7 @@ Google, not only what Google documents, and where the emulators differ.
 
 | Guide | What's in it |
 | --- | --- |
-| [Overview](scheduler/README.md) | The jobs a project schedules, read only: states, targets, last attempts, `Job.failing`, and what production showed when measured (experimental) |
+| [Overview](scheduler/README.md) | The jobs a project schedules: states, targets, last attempts, `Job.failing`; run now, pause and resume with the exact request first; what production showed when measured (experimental) |
 | [Testing](scheduler/testing.md) | An in-memory Cloud Scheduler for your own tests, held to production's answers (experimental) |
 
 ## 🏃 Run
