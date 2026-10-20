@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.52.1 (unreleased)
+## 0.52.1 (2026-10-20)
 
 - kms: `kms.testing.FakeKms` answered a post-quantum version's public
   key in the NIST_PQC format with a slice of a temporary array in a
