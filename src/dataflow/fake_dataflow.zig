@@ -1,16 +1,36 @@
-//! Dataflow in memory, for tests of code that reads jobs: behind
-//! `Client.Options.transport`, it answers the module's reads as
-//! production answered them when measured on 2026-10-20.
+//! Dataflow in memory, for tests of code that reads jobs and stops them:
+//! behind `Client.Options.transport`, it answers the module's reads, its
+//! cancel and its drain as production answered them when measured on
+//! 2026-10-20.
 //!
 //! - Locations, jobs, messages and autoscaling events are put in by the
-//!   test: the API here is read only, so `putLocation`, `putJob`,
+//!   test: nothing here launches a job, so `putLocation`, `putJob`,
 //!   `setJobState`, `putMessage` and `putAutoscalingEvent` stand in for
-//!   whoever launched the pipeline.
+//!   whoever launched the pipeline, and for the service moving it along.
+//! - A cancel taken makes a running or draining job `cancelling` with
+//!   `requestedState` CANCELLED at once; a drain taken makes a running
+//!   streaming job `draining` with DRAINED. Each adds production's line
+//!   to the job's story ("Cancel request is committed for workflow job:
+//!   <id>.", a repeat cancel another, a repeat drain none) and answers
+//!   production's one field, `{"type":"JOB_TYPE_BATCH"}`, whatever the
+//!   job. The end state is the test's to set with `setJobState`, as the
+//!   service would (production took 240 s to end a cancel, 126 s a
+//!   drain); a terminal state takes `requestedState` away.
+//! - The writes' refusals, in production's words minus its request ids:
+//!   a pending job's cancel ("not yet ready for canceling"), a batch
+//!   job's drain in any state, an ended job's cancel naming its end
+//!   state and its drain ("Job has terminated."), and a job nobody has
+//!   ("Could not cancel workflow; ..."). A location nobody put reaches
+//!   the default location's job, as a made-up region did in production.
+//!   A write production's answer to was not measured is 501, naming it:
+//!   a drain of a pending or cancelling streaming job, a cancel of an
+//!   updated job, and either on a job in a state a template launch
+//!   cannot reach (queued, pausing, paused, stopped, cleaning up).
 //! - The aggregated list serves every location's jobs; the per-location
 //!   list serves its own, and only it honors the `name` filter: the
 //!   aggregated list accepts and ignores one, as production does. Lists
-//!   answer summaries, without labels or stage states, which only a get
-//!   carries, as production answered them.
+//!   answer summaries, without labels, stage states or `requestedState`,
+//!   which only a get carries, as production answered them.
 //! - A location nobody put is served by the default location's backend
 //!   rather than refused: production answered a made-up region with
 //!   us-central1's jobs, on a get and on a list.
@@ -31,8 +51,8 @@
 //! - Faults a test asks for: refusals, dropped connections, and a lost
 //!   answer.
 //!
-//! Not modelled, answered 501 with the reason: writes of any kind
-//! (creating, updating, cancelling, draining, launching templates),
+//! Not modelled, answered 501 with the reason: every other write
+//! (creating, updating with a mask, pausing, launching templates),
 //! metrics, snapshots, the legacy no-location paths, and another
 //! project's paths.
 
@@ -256,12 +276,15 @@ pub const FakeDataflow = struct {
     }
 
     /// Moves a job along, as the service does: PENDING to RUNNING to
-    /// DONE, or a cancel showing in `requestedState` first.
+    /// DONE, or a cancel's CANCELLING on to CANCELLED. A terminal state
+    /// takes away `requestedState`, as production's ended jobs carried
+    /// none.
     pub fn setJobState(f: *FakeDataflow, id: []const u8, state: types.JobState, at: ?std.Io.Timestamp) PutError!void {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         const job = f.jobs.get(id) orelse return error.InvalidEntry;
         job.current_state = state;
+        if (state.terminal()) job.requested_state = .unspecified;
         if (at) |t| job.current_state_time = t;
     }
 
@@ -360,10 +383,14 @@ pub const FakeDataflow = struct {
 
     fn route(f: *FakeDataflow, req: tp.Request, arena: Allocator, route_text: []const u8, query: []const u8) Allocator.Error!Reply {
         if (req.bearer == null) return fail(arena, 401, "UNAUTHENTICATED", "Request is missing required authentication credential. Expected OAuth 2 access token, login cookie or other valid authentication credential. See https://developers.google.com/identity/sign-in/web/devconsole-project.");
-        if (req.method != .GET) return notModelled(arena, "anything but a read");
+        if (req.method != .GET and req.method != .PUT) return notModelled(arena, "anything but a read, a cancel or a drain");
         const target = parseRoute(route_text) orelse return notModelled(arena, "this path");
         if (!std.mem.eql(u8, target.project, f.options.project_id)) return notModelled(arena, "a project other than the fake's own");
         const params = try parseParams(arena, query) orelse return fail(arena, 400, "INVALID_ARGUMENT", "Invalid query string.");
+        if (req.method == .PUT) switch (target.kind) {
+            .job => |job| return f.stop(arena, job.location, job.id, params, req.body orelse ""),
+            else => return notModelled(arena, "a write other than a cancel or a drain"),
+        };
         switch (target.kind) {
             .aggregated => return f.listJobs(arena, null, params, true),
             .jobs => |location| return f.listJobs(arena, f.resolve(location), params, false),
@@ -384,6 +411,99 @@ pub const FakeDataflow = struct {
                 return f.listMessages(arena, held, params);
             },
         }
+    }
+
+    const Stop = enum { cancel, drain };
+
+    /// A cancel or a drain, as production answered them on 2026-10-20:
+    /// the refusals first, in the order production checks (the job, then
+    /// a drain's job type, then the state), then the change, a message
+    /// in the job's story, and production's one-field answer, which says
+    /// batch whatever the job is.
+    fn stop(f: *FakeDataflow, arena: Allocator, location: []const u8, id: []const u8, params: []const Param, body: []const u8) Allocator.Error!Reply {
+        if (params.len > 0) return notModelled(arena, "an update with an update mask or other parameters");
+        const which = stopOf(arena, body) orelse return notModelled(arena, "an update other than a requested state of cancelled or drained alone");
+        const held = f.find(f.resolve(location), id) orelse return fail(arena, 404, "NOT_FOUND", try arena.print("Could not cancel workflow; user does not have sufficient permissions on project: {s}, or the job does not exist in the project.", .{f.options.project_id}));
+        if (which == .drain and held.type != .streaming) {
+            return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Job {s} is not a streaming workflow. Only streaming workflows can be drained.", .{held.id}));
+        }
+        if (held.current_state.terminal()) return ended(arena, which, held);
+        switch (held.current_state) {
+            .running, .draining => {},
+            .pending => {
+                if (which == .drain) return unmeasured(arena, "a drain of a pending streaming job");
+                return fail(arena, 400, "FAILED_PRECONDITION", try arena.print("Workflow modification failed. Causes: Operation cancel not allowed for job {s}. Job is not yet ready for canceling. Please retry in a few minutes.", .{held.id}));
+            },
+            .cancelling => if (which == .drain) return unmeasured(arena, "a drain of a cancelling streaming job"),
+            else => return unmeasured(arena, "a write to a job in this state, which a template launch cannot put it in"),
+        }
+        const now = std.Io.Clock.real.now(f.io);
+        switch (which) {
+            // Taken while running or draining; a repeat while cancelling
+            // changes nothing but adds its line to the story, as
+            // production's did.
+            .cancel => {
+                if (held.current_state != .cancelling) {
+                    held.current_state = .cancelling;
+                    held.current_state_time = now;
+                }
+                held.requested_state = .cancelled;
+                try f.committed(held, "Cancel", now);
+            },
+            // A repeat while draining changes nothing and adds no line.
+            .drain => if (held.current_state == .running) {
+                held.current_state = .draining;
+                held.current_state_time = now;
+                held.requested_state = .drained;
+                try f.committed(held, "Drain", now);
+            },
+        }
+        return .{ .status = 200, .body = "{\"type\":\"JOB_TYPE_BATCH\"}" };
+    }
+
+    /// The write a body asks for, when it is a requested state of
+    /// cancelled or drained and nothing else.
+    fn stopOf(arena: Allocator, body: []const u8) ?Stop {
+        const value = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch return null;
+        if (value != .object or value.object.count() != 1) return null;
+        const state = value.object.get("requestedState") orelse return null;
+        if (state != .string) return null;
+        if (std.mem.eql(u8, state.string, "JOB_STATE_CANCELLED")) return .cancel;
+        if (std.mem.eql(u8, state.string, "JOB_STATE_DRAINED")) return .drain;
+        return null;
+    }
+
+    /// An ended job's refusal: a cancel names the state it ended in, a
+    /// drain only that it has ended.
+    fn ended(arena: Allocator, which: Stop, job: *const FakeJob) Allocator.Error!Reply {
+        if (which == .drain) {
+            return fail(arena, 400, "FAILED_PRECONDITION", try arena.print("Workflow modification failed. Causes: Cannot perform operation 'drain' on Job: {s}. Job has terminated.", .{job.id}));
+        }
+        const state: []const u8, const how: []const u8 = switch (job.current_state) {
+            .done => .{ "SUCCESS", "succeeded" },
+            .cancelled => .{ "CANCELLED", "cancelled" },
+            .drained => .{ "DRAINED", "was drained" },
+            .failed => if (job.provisioning_error != null) .{ "NOT_STARTED", "failed to start" } else .{ "FAILED", "failed" },
+            else => return unmeasured(arena, "a cancel of an updated job"),
+        };
+        return fail(arena, 400, "FAILED_PRECONDITION", try arena.print("Workflow modification failed. Causes: Cannot perform operation 'cancel' on Job: {s}. Job has terminated in state {s}: Workflow job: {s} {s}.", .{ job.id, state, job.id, how }));
+    }
+
+    /// The line production adds to a job's story when it takes a write,
+    /// at BASIC, its id the time in milliseconds as production's were.
+    fn committed(f: *FakeDataflow, job: *FakeJob, verb: []const u8, now: std.Io.Timestamp) Allocator.Error!void {
+        const s = f.store.allocator();
+        try job.messages.append(f.gpa, .{
+            .id = try std.fmt.allocPrint(s, "{d}", .{@divFloor(now.nanoseconds, std.time.ns_per_ms)}),
+            .time = now,
+            .text = try std.fmt.allocPrint(s, "{s} request is committed for workflow job: {s}.", .{ verb, job.id }),
+            .importance = .basic,
+        });
+    }
+
+    /// What production would answer cannot be said: no one measured it.
+    fn unmeasured(arena: Allocator, what: []const u8) Allocator.Error!Reply {
+        return fail(arena, 501, "UNIMPLEMENTED", try arena.print("fake: production's answer to {s} was not measured", .{what}));
     }
 
     /// A location nobody put is served by the default location, as
@@ -609,7 +729,8 @@ pub const FakeDataflow = struct {
         }
         try jw.objectField("projectId");
         try jw.write(f.options.project_id);
-        if (job.requested_state != .unspecified) {
+        // A get carries it; a list's summary never did (measured).
+        if (full and job.requested_state != .unspecified) {
             try jw.objectField("requestedState");
             try jw.write(stateWire(job.requested_state));
         }
@@ -1064,4 +1185,416 @@ test "faults on request: dropped, refused and lost answers" {
     var again = try b.client.getJob("us-central1", "j");
     again.deinit();
     try testing.expect(b.fake.callCount() >= 5);
+}
+
+const test_util = @import("test_util.zig");
+
+/// Production's words without the request ids it puts in parentheses
+/// before each cause, which the fake leaves out.
+fn withoutIds(arena: Allocator, text: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '(') if (std.mem.indexOfPos(u8, text, i, "): ")) |close| {
+            const inner = text[i + 1 .. close];
+            const hex = inner.len > 0 and for (inner) |c| {
+                if (!std.ascii.isHex(c)) break false;
+            } else true;
+            if (hex) {
+                i = close + 3;
+                continue;
+            }
+        };
+        try out.append(arena, text[i]);
+        i += 1;
+    }
+    return out.items;
+}
+
+fn errorMessage(arena: Allocator, body: []const u8) ![]const u8 {
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+    return value.object.get("error").?.object.get("message").?.string;
+}
+
+test "the writes' refusals are production's words, minus its request ids" {
+    const Case = struct {
+        name: []const u8,
+        job: FakeDataflow.PutJob,
+        drain: bool = false,
+        location: []const u8 = "us-central1",
+        want: anyerror,
+        production: []const u8,
+    };
+    const b1 = "2026-10-20_15_12_39-16726637407140010736";
+    const b2 = "2026-10-20_15_12_40-17194894741260815925";
+    const b3 = "2026-10-20_15_14_29-4138990520061636327";
+    const s1 = "2026-10-20_15_12_41-6567995927817659660";
+    const s3 = "2026-10-20_15_21_25-1828704797262605315";
+    const launch_failed = "2026-10-20_07_09_34-8524524531325271694";
+    const cases = [_]Case{
+        .{ .name = "pending", .job = .{ .location = "us-central1", .id = b3, .current_state = .pending }, .want = error.FailedPrecondition, .production = production.cancel_not_ready },
+        .{ .name = "made-up region", .job = .{ .location = "us-central1", .id = b1, .current_state = .pending }, .location = "us-fake1", .want = error.FailedPrecondition, .production = production.cancel_made_up_region },
+        .{ .name = "batch drain", .job = .{ .location = "us-central1", .id = b2, .current_state = .running }, .drain = true, .want = error.InvalidArgument, .production = production.drain_batch },
+        .{ .name = "done", .job = .{ .location = "us-central1", .id = b1, .current_state = .done }, .want = error.FailedPrecondition, .production = production.cancel_ended },
+        .{ .name = "cancelled", .job = .{ .location = "us-central1", .id = b3, .current_state = .cancelled }, .want = error.FailedPrecondition, .production = production.cancel_cancelled },
+        .{ .name = "failed", .job = .{ .location = "us-central1", .id = s1, .type = .streaming, .current_state = .failed }, .want = error.FailedPrecondition, .production = production.cancel_failed },
+        .{ .name = "failed to start", .job = .{ .location = "us-central1", .id = launch_failed, .current_state = .failed, .provisioning_error = "Workflow failed." }, .want = error.FailedPrecondition, .production = production.cancel_not_started },
+        .{ .name = "drained", .job = .{ .location = "us-central1", .id = s3, .type = .streaming, .current_state = .drained }, .want = error.FailedPrecondition, .production = production.cancel_drained },
+        .{ .name = "ended drain", .job = .{ .location = "us-central1", .id = s1, .type = .streaming, .current_state = .failed }, .drain = true, .want = error.FailedPrecondition, .production = production.drain_ended },
+        .{ .name = "nobody", .job = .{ .location = "us-central1", .id = "someone-else" }, .want = error.NotFound, .production = production.cancel_unknown },
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        var b: Bench = undefined;
+        try b.init(.{ .project_id = "extractctl" });
+        defer b.deinit();
+        try b.fake.putLocation("us-central1");
+        _ = try b.fake.putJob(case.job);
+        const id = if (case.want == error.NotFound) b1 else case.job.id;
+        const got = if (case.drain) b.client.drainJob(case.location, id) else b.client.cancelJob(case.location, id);
+        try testing.expectError(case.want, got);
+        try testing.expectEqualStrings(try withoutIds(a, try errorMessage(a, case.production)), b.diag.message());
+    }
+}
+
+test "a cancel, as production took one: cancelling at once, its line in the story, the end the test's" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    b.clock.now_ns = ts("2026-10-20T22:14:50.918Z").nanoseconds;
+    try b.fake.putLocation("us-central1");
+    const id = try b.fake.putJob(.{ .location = "us-central1", .id = "j", .current_state = .running });
+
+    try b.client.cancelJob("us-central1", id);
+    var got = try b.client.getJob("us-central1", id);
+    defer got.deinit();
+    try testing.expectEqual(types.JobState.cancelling, got.value.current_state);
+    try testing.expectEqual(types.JobState.cancelled, got.value.requested_state);
+    try testing.expectEqual(b.clock.now_ns, got.value.current_state_time.?.nanoseconds);
+    try testing.expect(!got.value.cancellable());
+
+    // The list's summary shows the state, never the request.
+    var listed = try b.client.aggregatedJobs(.{});
+    defer listed.deinit();
+    try testing.expectEqual(types.JobState.cancelling, listed.value.jobs[0].current_state);
+    try testing.expectEqual(types.JobState.unspecified, listed.value.jobs[0].requested_state);
+
+    // A repeat is taken, changes nothing, and adds its line.
+    b.clock.now_ns += std.time.ns_per_s;
+    try b.client.cancelJob("us-central1", id);
+    var story = try b.client.listMessages("us-central1", id, .{});
+    defer story.deinit();
+    try testing.expectEqual(2, story.value.messages.len);
+    try testing.expectEqualStrings("Cancel request is committed for workflow job: j.", story.value.messages[0].text);
+    try testing.expectEqualStrings("1792534490918", story.value.messages[0].id);
+    try testing.expectEqual(types.MessageImportance.basic, story.value.messages[0].importance);
+    var again = try b.client.getJob("us-central1", id);
+    defer again.deinit();
+    try testing.expectEqual(got.value.current_state_time.?.nanoseconds, again.value.current_state_time.?.nanoseconds);
+
+    // The service ends it; the request goes with the end.
+    try b.fake.setJobState(id, .cancelled, null);
+    var done = try b.client.getJob("us-central1", id);
+    defer done.deinit();
+    try testing.expectEqual(types.JobState.unspecified, done.value.requested_state);
+    try testing.expectError(error.FailedPrecondition, b.client.cancelJob("us-central1", id));
+    try testing.expectError(error.InvalidArgument, b.client.drainJob("us-central1", id));
+}
+
+test "a drain, as production took one: draining at once, a repeat adding nothing, a cancel winning" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    try b.fake.putLocation("us-central1");
+    const id = try b.fake.putJob(.{ .location = "us-central1", .id = "s", .type = .streaming, .current_state = .running });
+    var before = try b.client.getJob("us-central1", id);
+    defer before.deinit();
+    try testing.expect(before.value.drainable());
+
+    try b.client.drainJob("us-central1", id);
+    try b.client.drainJob("us-central1", id);
+    var got = try b.client.getJob("us-central1", id);
+    defer got.deinit();
+    try testing.expectEqual(types.JobState.draining, got.value.current_state);
+    try testing.expectEqual(types.JobState.drained, got.value.requested_state);
+    try testing.expect(!got.value.drainable());
+    try testing.expect(got.value.cancellable());
+    var story = try b.client.listMessages("us-central1", id, .{});
+    defer story.deinit();
+    try testing.expectEqual(1, story.value.messages.len);
+    try testing.expectEqualStrings("Drain request is committed for workflow job: s.", story.value.messages[0].text);
+
+    try b.client.cancelJob("us-central1", id);
+    var cancelled = try b.client.getJob("us-central1", id);
+    defer cancelled.deinit();
+    try testing.expectEqual(types.JobState.cancelling, cancelled.value.current_state);
+    try testing.expectEqual(types.JobState.cancelled, cancelled.value.requested_state);
+    try b.fake.setJobState(id, .cancelled, null);
+    try testing.expectError(error.FailedPrecondition, b.client.drainJob("us-central1", id));
+    try testing.expect(std.mem.endsWith(u8, b.diag.message(), "Job has terminated."));
+}
+
+test "writes production's answer to was not measured are 501, naming what" {
+    const Case = struct { job: FakeDataflow.PutJob, drain: bool };
+    const cases = [_]Case{
+        .{ .job = .{ .location = "us-central1", .id = "j", .type = .streaming, .current_state = .pending }, .drain = true },
+        .{ .job = .{ .location = "us-central1", .id = "j", .type = .streaming, .current_state = .cancelling }, .drain = true },
+        .{ .job = .{ .location = "us-central1", .id = "j", .current_state = .updated }, .drain = false },
+        .{ .job = .{ .location = "us-central1", .id = "j", .current_state = .queued }, .drain = false },
+        .{ .job = .{ .location = "us-central1", .id = "j", .type = .streaming, .current_state = .paused }, .drain = true },
+        .{ .job = .{ .location = "us-central1", .id = "j", .current_state = .stopped }, .drain = false },
+        .{ .job = .{ .location = "us-central1", .id = "j", .current_state = .resource_cleaning_up }, .drain = false },
+        .{ .job = .{ .location = "us-central1", .id = "j", .current_state = .pausing }, .drain = false },
+    };
+    for (cases) |case| {
+        var b: Bench = undefined;
+        try b.init(.{});
+        defer b.deinit();
+        try b.fake.putLocation("us-central1");
+        _ = try b.fake.putJob(case.job);
+        const got = if (case.drain) b.client.drainJob("us-central1", "j") else b.client.cancelJob("us-central1", "j");
+        try testing.expectError(error.Unimplemented, got);
+        try testing.expect(std.mem.startsWith(u8, b.diag.message(), "fake: production's answer to "));
+    }
+    // A batch job's drain is refused before any state is looked at, as
+    // production's was.
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    try b.fake.putLocation("us-central1");
+    _ = try b.fake.putJob(.{ .location = "us-central1", .id = "q", .current_state = .queued });
+    try testing.expectError(error.InvalidArgument, b.client.drainJob("us-central1", "q"));
+}
+
+test "the write route takes a requested state alone, on a job, nothing else" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    try b.fake.putLocation("us-central1");
+    try b.fake.putLocation("us-east1");
+    _ = try b.fake.putJob(.{ .location = "us-central1", .id = "j", .current_state = .running });
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const url = "https://host/v1b3/projects/my-project/locations/us-central1/jobs/j";
+    const Put = struct { url: []const u8, body: []const u8 };
+    for ([_]Put{
+        .{ .url = url ++ "?updateMask=labels", .body = "{\"requestedState\":\"JOB_STATE_CANCELLED\"}" },
+        .{ .url = url, .body = "{\"requestedState\":\"JOB_STATE_CANCELLED\",\"labels\":{\"force_cancel_job\":\"true\"}}" },
+        .{ .url = url, .body = "{\"requestedState\":\"JOB_STATE_PAUSING\"}" },
+        .{ .url = url, .body = "{\"requestedState\":7}" },
+        .{ .url = url, .body = "[]" },
+        .{ .url = url, .body = "" },
+        .{ .url = "https://host/v1b3/projects/my-project/locations/us-central1/jobs", .body = "{\"requestedState\":\"JOB_STATE_CANCELLED\"}" },
+    }) |put| {
+        const reply = try b.fake.serve(.{ .method = .PUT, .url = put.url, .bearer = "t", .body = put.body }, a);
+        try testing.expectEqual(501, reply.status);
+    }
+    var job = try b.client.getJob("us-central1", "j");
+    defer job.deinit();
+    try testing.expectEqual(types.JobState.running, job.value.current_state);
+
+    // A region put in that the job is not in is the 404; the answer to
+    // a taken write is production's one field.
+    try testing.expectError(error.NotFound, b.client.cancelJob("us-east1", "j"));
+    const taken = try b.fake.serve(.{ .method = .PUT, .url = url, .bearer = "t", .body = "{\"requestedState\":\"JOB_STATE_CANCELLED\"}" }, a);
+    try testing.expectEqual(200, taken.status);
+    try testing.expectEqualStrings("{\"type\":\"JOB_TYPE_BATCH\"}", taken.body);
+}
+
+test "faults on writes: a lost cancel's retry lands as a repeat, a dropped one as the first" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    try b.fake.putLocation("us-central1");
+    _ = try b.fake.putJob(.{ .location = "us-central1", .id = "lost", .current_state = .running });
+    _ = try b.fake.putJob(.{ .location = "us-central1", .id = "dropped", .type = .streaming, .current_state = .running });
+
+    b.fake.loseNext(1, 503);
+    try b.client.cancelJob("us-central1", "lost");
+    var story = try b.client.listMessages("us-central1", "lost", .{});
+    defer story.deinit();
+    try testing.expectEqual(2, story.value.messages.len);
+
+    b.fake.dropNext(1);
+    try b.client.drainJob("us-central1", "dropped");
+    var drained = try b.client.listMessages("us-central1", "dropped", .{});
+    defer drained.deinit();
+    try testing.expectEqual(1, drained.value.messages.len);
+
+    b.fake.refuseNext(1, 403);
+    try testing.expectError(error.PermissionDenied, b.client.cancelJob("us-central1", "dropped"));
+    var still = try b.client.getJob("us-central1", "dropped");
+    defer still.deinit();
+    try testing.expectEqual(types.JobState.draining, still.value.current_state);
+}
+
+/// What the property expects of one job, from what production took and
+/// refused on 2026-10-20.
+const StopModel = struct {
+    type: types.JobType,
+    current: types.JobState,
+    requested: types.JobState = .unspecified,
+    launch_failed: bool,
+    lines: usize = 0,
+
+    const Outcome = enum { taken, failed_precondition, invalid_argument, unimplemented };
+
+    fn cancel(m: *StopModel) Outcome {
+        if (m.current.terminal()) {
+            return if (m.current == .updated) .unimplemented else .failed_precondition;
+        }
+        switch (m.current) {
+            .pending => return .failed_precondition,
+            .running, .draining => {
+                m.current = .cancelling;
+                m.requested = .cancelled;
+                m.lines += 1;
+                return .taken;
+            },
+            .cancelling => {
+                m.requested = .cancelled;
+                m.lines += 1;
+                return .taken;
+            },
+            else => return .unimplemented,
+        }
+    }
+
+    fn drain(m: *StopModel) Outcome {
+        if (m.type != .streaming) return .invalid_argument;
+        if (m.current.terminal()) return .failed_precondition;
+        switch (m.current) {
+            .running => {
+                m.current = .draining;
+                m.requested = .drained;
+                m.lines += 1;
+                return .taken;
+            },
+            .draining => return .taken,
+            else => return .unimplemented,
+        }
+    }
+
+    fn set(m: *StopModel, state: types.JobState) void {
+        m.current = state;
+        if (state.terminal()) m.requested = .unspecified;
+    }
+};
+
+fn expectOutcome(want: StopModel.Outcome, got: anyerror!void) !void {
+    switch (want) {
+        .taken => try got,
+        .failed_precondition => try testing.expectError(error.FailedPrecondition, got),
+        .invalid_argument => try testing.expectError(error.InvalidArgument, got),
+        .unimplemented => try testing.expectError(error.Unimplemented, got),
+    }
+}
+
+const all_states = [_]types.JobState{ .stopped, .running, .done, .failed, .cancelled, .updated, .draining, .drained, .pending, .cancelling, .queued, .resource_cleaning_up, .pausing, .paused };
+
+fn stopsProperty(_: void, input: []const u8) !void {
+    const gpa = test_util.propertyAllocator();
+    var g: test_util.ByteGen = .init(input);
+    var clock: core.testing.FakeClock = .{};
+    var fake: FakeDataflow = .init(gpa, clock.io(), .{});
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "t" };
+    var diag: core.Diagnostics = .{};
+    var client = try Client.init(gpa, clock.io(), .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+        .diagnostics = &diag,
+        .retry = .{ .max_attempts = 2, .initial_backoff_ms = 1, .max_backoff_ms = 1 },
+    });
+    defer client.deinit();
+    try fake.putLocation("us-central1");
+
+    var m: StopModel = .{
+        .type = if (g.boolean()) .streaming else .batch,
+        .current = g.pick(types.JobState, &all_states),
+        .launch_failed = g.boolean(),
+    };
+    _ = try fake.putJob(.{
+        .location = "us-central1",
+        .id = "j",
+        .type = m.type,
+        .current_state = m.current,
+        .provisioning_error = if (m.launch_failed) "Workflow failed." else null,
+    });
+
+    const steps = g.intRange(usize, 0, 24);
+    for (0..steps) |_| {
+        switch (g.intRange(u8, 0, 6)) {
+            0 => try expectOutcome(m.cancel(), client.cancelJob(g.pick([]const u8, &.{ "us-central1", "us-fake1" }), "j")),
+            1 => try expectOutcome(m.drain(), client.drainJob("us-central1", "j")),
+            2 => {
+                const state = g.pick(types.JobState, &all_states);
+                m.set(state);
+                try fake.setJobState("j", state, null);
+            },
+            // A lost answer: the write lands, and the client's retry is
+            // judged against what the first left.
+            3 => {
+                fake.loseNext(1, 503);
+                if (g.boolean()) {
+                    _ = m.cancel();
+                    try expectOutcome(m.cancel(), client.cancelJob("us-central1", "j"));
+                } else {
+                    _ = m.drain();
+                    try expectOutcome(m.drain(), client.drainJob("us-central1", "j"));
+                }
+            },
+            4 => {
+                var listed = try client.aggregatedJobs(.{});
+                defer listed.deinit();
+                try testing.expectEqual(1, listed.value.jobs.len);
+                try testing.expectEqual(m.current, listed.value.jobs[0].current_state);
+                try testing.expectEqual(types.JobState.unspecified, listed.value.jobs[0].requested_state);
+            },
+            5 => {
+                var story = try client.listMessages("us-central1", "j", .{});
+                defer story.deinit();
+                try testing.expectEqual(m.lines, story.value.messages.len);
+            },
+            else => {},
+        }
+        var got = try client.getJob("us-central1", "j");
+        defer got.deinit();
+        try testing.expectEqual(m.current, got.value.current_state);
+        try testing.expectEqual(m.requested, got.value.requested_state);
+        // The helpers agree with what the fake then takes, where
+        // production was measured. In the states a template launch
+        // cannot reach, the fake answers 501 and `cancellable` follows
+        // the documentation, which lets any job not ended be cancelled.
+        const measured = switch (m.current) {
+            .queued, .stopped, .paused, .pausing, .resource_cleaning_up => false,
+            else => true,
+        };
+        var probe = m;
+        if (measured) {
+            try testing.expectEqual(probe.cancel() == .taken and m.current != .cancelling and m.requested != .cancelled, got.value.cancellable());
+        } else {
+            try testing.expectEqual(m.requested != .cancelled, got.value.cancellable());
+        }
+        probe = m;
+        const asked = m.requested == .drained or m.requested == .cancelled;
+        try testing.expectEqual(probe.drain() == .taken and m.current == .running and !asked, got.value.drainable());
+    }
+}
+
+test "slow property stops: any sequence of cancels, drains, lost answers and state changes moves the job as production did" {
+    try test_util.fuzzBytes({}, stopsProperty, .{
+        .corpus = &.{
+            // A running streaming job drained, cancelled while draining, ended.
+            "\x01\x02\x00\x06\x01\x00\x00\x02\x04\x05",
+            // A pending batch job: refused, then running, then cancelled twice.
+            "\x00\x09\x00\x05\x00\x00\x02\x02\x00\x00\x03\x01",
+            "",
+        },
+    });
 }
