@@ -1887,6 +1887,53 @@ test "the policy behind an incident, disabled after a confirmation" {
 }
 // end snippet
 
+// snippet: mon-snooze
+test "a snooze from the incidents widget: the alert closes, and it ends early" {
+    var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_522_800 * std.time.ns_per_s };
+    var fake: monitoring.testing.FakeMonitoring = .init(std.testing.allocator, clock.io(), .{ .project_id = "my-project" });
+    defer fake.deinit();
+    const policy = try fake.putAlertPolicy(.{ .display_name = "Pub/Sub backlog too deep", .severity = .warning });
+    const alert = try fake.putAlert(.{
+        .open_time = std.Io.Clock.real.now(clock.io()),
+        .policy = .{ .name = policy, .display_name = "Pub/Sub backlog too deep", .severity = .warning },
+    });
+
+    var token: monitoring.StaticToken = .{ .token = "none" };
+    var client = try monitoring.Client.init(std.testing.allocator, clock.io(), .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+
+    // An hour from now, confirmed first.
+    const now = std.Io.Clock.real.now(clock.io());
+    const spec: monitoring.NewSnooze = .{
+        .display_name = "deploy window",
+        .policies = &.{policy},
+        .start = now,
+        .end = .{ .nanoseconds = now.nanoseconds + std.time.ns_per_hour },
+    };
+    var request = try client.createSnoozeRequest(spec);
+    defer request.deinit();
+    try std.testing.expect(std.mem.endsWith(u8, request.value.url, "/snoozes"));
+    var snooze = try client.createSnooze(spec);
+    defer snooze.deinit();
+
+    // From its start, the policy's open alert is closed.
+    var closed = try client.getAlert(alert);
+    defer closed.deinit();
+    try std.testing.expectEqual(monitoring.AlertState.closed, closed.value.state);
+
+    // Ended early, ten minutes in: its end set to now.
+    clock.now_ns += 10 * std.time.ns_per_min;
+    const later = std.Io.Clock.real.now(clock.io());
+    var ended = try client.endSnooze(snooze.value, later);
+    defer ended.deinit();
+    try std.testing.expectEqual(monitoring.SnoozeState.ended, ended.value.stateAt(later));
+}
+// end snippet
+
 // snippet: mon-quota
 test "quota usage against its limit, put in the in-memory Cloud Monitoring" {
     var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_331_195 * std.time.ns_per_s };

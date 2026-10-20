@@ -1,7 +1,9 @@
 //! Answers production gave on 2026-10-18, measured in milestone 0 of the
 //! Monitoring spec (`_tmp/monitoring-m0/`), for tests: the probes' own
 //! `zigps-m0*` metrics and refusals, verbatim but for a final line break;
-//! and on 2026-10-19, for issue #239, at the end. Test code only.
+//! and on 2026-10-19, for issue #239, at the end; and on 2026-10-20, for
+//! issue #275, alert policies and snoozes (`_tmp/policies-m0/`). Test code
+//! only.
 
 /// A descriptor the probe made: GAUGE INT64, unit 1, one string label. HTTP 200.
 pub const descriptor_get_status = 200;
@@ -1809,6 +1811,347 @@ pub const policy_patch_read_scope =
     \\    }
     \\   }
     \\  ]
+    \\ }
+    \\}
+;
+
+/// The answer to a create: the times as sent, to the microsecond (the
+/// probe sent whole seconds here). HTTP 200.
+pub const snooze_created_status = 200;
+pub const snooze_created =
+    \\{
+    \\ "name": "projects/extractctl/snoozes/66323307854672813985269061791550861051",
+    \\ "criteria": {
+    \\  "policies": [
+    \\   "projects/extractctl/alertPolicies/1234567890"
+    \\  ]
+    \\ },
+    \\ "interval": {
+    \\  "startTime": "2026-10-20T18:58:49Z",
+    \\  "endTime": "2026-10-20T19:08:29Z"
+    \\ },
+    \\ "displayName": "zigps-98dd5a-active"
+    \\}
+;
+
+/// A create sent with microseconds, answered with them; later reads keep
+/// whole seconds. HTTP 200.
+pub const snooze_created_micros_status = 200;
+pub const snooze_created_micros =
+    \\{
+    \\ "name": "projects/extractctl/snoozes/141366793827031231927670956031820956967",
+    \\ "criteria": {
+    \\  "policies": [
+    \\   "projects/extractctl/alertPolicies/9594883664150561401"
+    \\  ]
+    \\ },
+    \\ "interval": {
+    \\  "startTime": "2026-10-20T18:56:34.868813Z",
+    \\  "endTime": "2026-10-20T18:58:34.868813Z"
+    \\ },
+    \\ "displayName": "zigps-d5b8f4-active"
+    \\}
+;
+
+/// That snooze read back: whole seconds. HTTP 200.
+pub const snooze_read_status = 200;
+pub const snooze_read =
+    \\{
+    \\ "name": "projects/extractctl/snoozes/141366793827031231927670956031820956967",
+    \\ "criteria": {
+    \\  "policies": [
+    \\   "projects/extractctl/alertPolicies/9594883664150561401"
+    \\  ]
+    \\ },
+    \\ "interval": {
+    \\  "startTime": "2026-10-20T18:56:34Z",
+    \\  "endTime": "2026-10-20T18:58:34Z"
+    \\ },
+    \\ "displayName": "zigps-d5b8f4-active"
+    \\}
+;
+
+/// Every snooze, newest start first, no token. HTTP 200.
+pub const snooze_page_status = 200;
+pub const snooze_page =
+    \\{
+    \\ "snoozes": [
+    \\  {
+    \\   "name": "projects/extractctl/snoozes/19761671275394382374556839010361943928",
+    \\   "criteria": {
+    \\    "policies": [
+    \\     "projects/extractctl/alertPolicies/9594883664150561401"
+    \\    ]
+    \\   },
+    \\   "interval": {
+    \\    "startTime": "2026-10-20T19:11:14Z",
+    \\    "endTime": "2026-10-20T19:12:44Z"
+    \\   },
+    \\   "displayName": "zigps-d5b8f4-odd"
+    \\  },
+    \\  {
+    \\   "name": "projects/extractctl/snoozes/242867838827108119907480401533518316931",
+    \\   "criteria": {
+    \\    "policies": [
+    \\     "projects/extractctl/alertPolicies/1234567890"
+    \\    ]
+    \\   },
+    \\   "interval": {
+    \\    "startTime": "2026-10-20T19:11:14Z",
+    \\    "endTime": "2026-10-20T19:12:14Z"
+    \\   },
+    \\   "displayName": "zigps-d5b8f4-nobody"
+    \\  },
+    \\  {
+    \\   "name": "projects/extractctl/snoozes/194576221680978247011253250776386421153",
+    \\   "criteria": {
+    \\    "policies": [
+    \\     "projects/extractctl/alertPolicies/9594883664150561401",
+    \\     "projects/extractctl/alertPolicies/4294582767119635845"
+    \\    ]
+    \\   },
+    \\   "interval": {
+    \\    "startTime": "2026-10-20T19:06:14Z",
+    \\    "endTime": "2026-10-20T19:07:14Z"
+    \\   },
+    \\   "displayName": "zigps-d5b8f4-upcoming"
+    \\  },
+    \\  {
+    \\   "name": "projects/extractctl/snoozes/141366793827031231927670956031820956967",
+    \\   "criteria": {
+    \\    "policies": [
+    \\     "projects/extractctl/alertPolicies/9594883664150561401"
+    \\    ]
+    \\   },
+    \\   "interval": {
+    \\    "startTime": "2026-10-20T18:56:34Z",
+    \\    "endTime": "2026-10-20T18:58:34Z"
+    \\   },
+    \\   "displayName": "zigps-d5b8f4-active"
+    \\  }
+    \\ ]
+    \\}
+;
+
+/// An active snooze, over a minute old, ended at now. HTTP 200.
+pub const snooze_ended_status = 200;
+pub const snooze_ended =
+    \\{
+    \\ "name": "projects/extractctl/snoozes/66323307854672813985269061791550861051",
+    \\ "criteria": {
+    \\  "policies": [
+    \\   "projects/extractctl/alertPolicies/1234567890"
+    \\  ]
+    \\ },
+    \\ "interval": {
+    \\  "startTime": "2026-10-20T18:58:49Z",
+    \\  "endTime": "2026-10-20T19:00:03Z"
+    \\ },
+    \\ "displayName": "zigps-98dd5a-active"
+    \\}
+;
+
+/// An active snooze under a minute old, cancelled: end equal to start.
+/// HTTP 200.
+pub const snooze_cancelled_active_status = 200;
+pub const snooze_cancelled_active =
+    \\{
+    \\ "name": "projects/extractctl/snoozes/103582372923997332788178603503246600980",
+    \\ "criteria": {
+    \\  "policies": [
+    \\   "projects/extractctl/alertPolicies/1234567890"
+    \\  ]
+    \\ },
+    \\ "interval": {
+    \\  "startTime": "2026-10-20T18:58:49Z",
+    \\  "endTime": "2026-10-20T18:58:49Z"
+    \\ },
+    \\ "displayName": "zigps-98dd5a-young"
+    \\}
+;
+
+/// An upcoming snooze cancelled: start and end both now. HTTP 200.
+pub const snooze_cancelled_upcoming_status = 200;
+pub const snooze_cancelled_upcoming =
+    \\{
+    \\ "name": "projects/extractctl/snoozes/242831289449413298544550108805664711645",
+    \\ "criteria": {
+    \\  "policies": [
+    \\   "projects/extractctl/alertPolicies/1234567890"
+    \\  ]
+    \\ },
+    \\ "interval": {
+    \\  "startTime": "2026-10-20T19:00:44Z",
+    \\  "endTime": "2026-10-20T19:00:44Z"
+    \\ },
+    \\ "displayName": "zigps-98dd5a-late"
+    \\}
+;
+
+/// A create starting two minutes ago. HTTP 400.
+pub const snooze_past_start_status = 400;
+pub const snooze_past_start =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "The Snooze cannot start in the past.",
+    \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// A create naming 17 policies. HTTP 400.
+pub const snooze_seventeen_status = 400;
+pub const snooze_seventeen =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "The criteria cannot have more than 16 policies that the Snooze applies to.",
+    \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// A create with a filter and two policies. HTTP 400.
+pub const snooze_filter_two_status = 400;
+pub const snooze_filter_two =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "The criteria must have exactly one policy given a non-empty filter.",
+    \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// A create without a display name. HTTP 400.
+pub const snooze_no_name_status = 400;
+pub const snooze_no_name =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "The Snooze must have a display name.",
+    \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// A create whose end comes before its start. HTTP 400.
+pub const snooze_backwards_status = 400;
+pub const snooze_backwards =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "The snooze duration must be >= 1m.",
+    \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// A get of a snooze nobody has. HTTP 404.
+pub const snooze_unknown_status = 404;
+pub const snooze_unknown =
+    \\{
+    \\ "error": {
+    \\  "code": 404,
+    \\  "message": "The snooze (with id 1234567890) was not found.",
+    \\  "status": "NOT_FOUND"
+    \\ }
+    \\}
+;
+
+/// A patch of a snooze nobody has. HTTP 404.
+pub const snooze_patch_unknown_status = 404;
+pub const snooze_patch_unknown =
+    \\{
+    \\ "error": {
+    \\  "code": 404,
+    \\  "message": "The snooze to update (with id 1234567890) was not found.",
+    \\  "status": "NOT_FOUND"
+    \\ }
+    \\}
+;
+
+/// An active snooze under a minute old, its end moved to now. HTTP 400.
+pub const snooze_too_short_status = 400;
+pub const snooze_too_short =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "The snooze duration must be >= 1m, unless the snooze is being canceled, in which case it should be of length 0.",
+    \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// An upcoming snooze, its end alone moved to its start. HTTP 400.
+pub const snooze_cancel_upcoming_end_only_status = 400;
+pub const snooze_cancel_upcoming_end_only =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "An upcoming snooze's start and end time must be set to the current time to cancel it.",
+    \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// Any change to an ended or cancelled snooze, a repeat included. HTTP 400.
+pub const snooze_already_ended_status = 400;
+pub const snooze_already_ended =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Cannot update a snooze that already ended, or that was canceled.",
+    \\  "status": "FAILED_PRECONDITION"
+    \\ }
+    \\}
+;
+
+/// A snooze filter with `>`. HTTP 400.
+pub const snooze_filter_greater_status = 400;
+pub const snooze_filter_greater =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Field filter had an invalid value of \"go/debugstr  \ncomparator: GREATER_THAN\nlhs {\n  member {\n    expressions {\n      value: \"interval\"\n    }\n    expressions {\n      value: \"end_time\"\n    }\n  }\n}\nrhs {\n  phrase {\n    values: \"2026-10-20T18\"\n    values: \":\"\n    values: \"56\"\n    values: \":\"\n    values: \"41.506362Z\"\n  }\n}\n\": Only equality, greater than or equals comparison and less than or equals comparison restrictions are supported.",
+    \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// A snooze filter with OR. HTTP 400.
+pub const snooze_filter_or_status = 400;
+pub const snooze_filter_or =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Field filter had an invalid value of \"go/debugproto   \ndisjunction {\n  expressions {\n    restriction {\n      comparator: GREATER_THAN_EQUALS\n      lhs {\n        member {\n          expressions {\n            value: \"interval\"\n          }\n          expressions {\n            value: \"start_time\"\n          }\n        }\n      }\n      rhs {\n        phrase {\n          values: \"2026-10-20T18\"\n          values: \":\"\n          values: \"58\"\n          values: \":\"\n          values: \"55Z\"\n        }\n      }\n    }\n  }\n  expressions {\n    restriction {\n      comparator: LESS_THAN_EQUALS\n      lhs {\n        member {\n          expressions {\n            value: \"interval\"\n          }\n          expressions {\n            value: \"end_time\"\n          }\n        }\n      }\n      rhs {\n        phrase {\n          values: \"2026-10-20T18\"\n          values: \":\"\n          values: \"58\"\n          values: \":\"\n          values: \"55Z\"\n        }\n      }\n    }\n  }\n}\n\": Only restrictions and conjunctions are supported.",
+    \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// A snooze filter with an unquoted time. HTTP 400.
+pub const snooze_filter_unquoted_status = 400;
+pub const snooze_filter_unquoted =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Field filter had an invalid value of \"interval.end_time >= 2026-10-20T18:58:55Z\": Invalid filter syntax.",
+    \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// A snooze filter on display_name. HTTP 400.
+pub const snooze_filter_display_name_status = 400;
+pub const snooze_filter_display_name =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Field filter had an invalid value of \"go/debugstr  \ncomparator: EQUALS\nlhs {\n  value: \"display_name\"\n}\nrhs {\n  phrase {\n    values: \"zigps-d5b8f4-active\"\n  }\n}\n\": Unrecognized filter property: display_name",
+    \\  "status": "INVALID_ARGUMENT"
     \\ }
     \\}
 ;

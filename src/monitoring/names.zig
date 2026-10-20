@@ -13,6 +13,7 @@ pub const Collection = enum {
     time_series,
     alerts,
     alert_policies,
+    snoozes,
 
     fn segment(c: Collection) []const u8 {
         return switch (c) {
@@ -21,6 +22,7 @@ pub const Collection = enum {
             .time_series => "timeSeries",
             .alerts => "alerts",
             .alert_policies => "alertPolicies",
+            .snoozes => "snoozes",
         };
     }
 };
@@ -75,6 +77,15 @@ pub fn alertPolicy(arena: Allocator, project: []const u8, id: []const u8) Alloca
     return w.written();
 }
 
+/// `/v3/projects/P/snoozes/<id>`.
+pub fn snooze(arena: Allocator, project: []const u8, id: []const u8) Allocator.Error![]const u8 {
+    var w: Writer.Allocating = .init(arena);
+    writeCollection(&w.writer, project, .snoozes) catch return error.OutOfMemory;
+    w.writer.writeByte('/') catch return error.OutOfMemory;
+    core.query.writeSegment(&w.writer, id) catch return error.OutOfMemory;
+    return w.written();
+}
+
 /// The id in `id_or_name`: the trailing segment when it is exactly
 /// `projects/<project>/alerts/<id>`, the input itself when it is no full
 /// name at all. Null for another project's name or a malformed one.
@@ -85,6 +96,11 @@ pub fn alertId(id_or_name: []const u8, project: []const u8) ?[]const u8 {
 /// `alertId` for `projects/<project>/alertPolicies/<id>`.
 pub fn alertPolicyId(id_or_name: []const u8, project: []const u8) ?[]const u8 {
     return idIn(id_or_name, project, .alert_policies);
+}
+
+/// `alertId` for `projects/<project>/snoozes/<id>`.
+pub fn snoozeId(id_or_name: []const u8, project: []const u8) ?[]const u8 {
+    return idIn(id_or_name, project, .snoozes);
 }
 
 fn idIn(id_or_name: []const u8, project: []const u8, c: Collection) ?[]const u8 {
@@ -121,6 +137,9 @@ test "alert policy paths and names" {
     try std.testing.expectEqual(null, alertPolicyId("projects/q/alertPolicies/95", "p"));
     try std.testing.expectEqual(null, alertPolicyId("projects/p/alerts/95", "p"));
     try std.testing.expectEqual(null, alertPolicyId("projects/p/alertPolicies/95/conditions/1", "p"));
+    try std.testing.expectEqualStrings("/v3/projects/p/snoozes/14", try snooze(arena.allocator(), "p", "14"));
+    try std.testing.expectEqualStrings("14", snoozeId("projects/p/snoozes/14", "p").?);
+    try std.testing.expectEqual(null, snoozeId("projects/p/alertPolicies/14", "p"));
 }
 
 const testing = std.testing;

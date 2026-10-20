@@ -14,6 +14,7 @@ const core = @import("core");
 
 const codec = @import("codec.zig");
 const errors = @import("errors.zig");
+const logging = @import("logging.zig");
 const Metric = @import("Metric.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
@@ -433,6 +434,240 @@ fn enabledCall(self: *Client, arena: Allocator, id_or_name: []const u8, enabled:
     var params: core.query.Params = .init(&w.writer);
     params.add("updateMask", "enabled") catch return error.OutOfMemory;
     return .{ .method = .PATCH, .path = w.written(), .body = try codec.encodeEnabled(arena, enabled) };
+}
+
+/// Makes a snooze (#275): from its start, the open alerts of the
+/// policies it names are closed and none open until its end (measured:
+/// the open alert closed within a second of the start). Snoozes cannot
+/// be deleted, and their policies and filter cannot change. Checked
+/// before sending as production checks one: a display name of 1 to 512
+/// characters, 1 to 16 policies (ids or this project's names; production
+/// does not check that they exist), a filter only with exactly one, an
+/// end at least a minute after the start; the start must not be in the
+/// past, which only the server can judge. Times go in whole seconds.
+///
+/// Every create that lands makes a snooze, and none can be deleted, so a
+/// create that may have reached the server is never sent again: only a
+/// refused connection or a failed name lookup is retried. Any other
+/// failure is returned; list the snoozes to see whether it landed.
+pub fn createSnooze(self: *Client, spec: types.NewSnooze) Error!types.Owned(types.Snooze) {
+    rpc.begin(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var call = try self.createSnoozeCall(a, spec);
+    call.retryable = core.rpc.unsentOnly;
+    return self.snoozeCall(a, call);
+}
+
+/// The request `createSnooze` sends for the same spec, built without
+/// sending it, after the same checks with the same errors.
+pub fn createSnoozeRequest(self: *Client, spec: types.NewSnooze) Error!types.Owned(PreparedRequest) {
+    rpc.begin(self);
+    var result: types.Owned(PreparedRequest) = try .init(self.gpa);
+    errdefer result.deinit();
+    const a = result.arena.allocator();
+    result.value = try .fromCall(a, self.base_url, try self.createSnoozeCall(a, spec));
+    return result;
+}
+
+/// One page of the project's snoozes, newest start first.
+pub fn listSnoozes(self: *Client, options: types.ListSnoozesOptions) Error!types.Owned(types.SnoozePage) {
+    rpc.begin(self);
+    if (options.filter) |f| if (!validate.isAlertFilter(f)) {
+        if (self.diagnostics) |d| d.print("invalid filter: text without control characters, at most 4096 bytes", .{});
+        return error.InvalidFilter;
+    };
+    if (options.active_at != null and options.filter != null) {
+        if (self.diagnostics) |d| d.print("active_at writes its own filter; give one or the other", .{});
+        return error.InvalidOptions;
+    }
+    try self.checkToken(options.page_token);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var w: std.Io.Writer.Allocating = .init(a);
+    names.writeCollection(&w.writer, self.project, .snoozes) catch return error.OutOfMemory;
+    var params: core.query.Params = .init(&w.writer);
+    var filter = options.filter;
+    if (options.active_at) |t| {
+        var buf: [core.timestamp.max_len]u8 = undefined;
+        const at = core.timestamp.format(&buf, codec.wholeSeconds(t));
+        filter = try std.fmt.allocPrint(a, "interval.start_time <= \"{s}\" AND interval.end_time >= \"{s}\"", .{ at, at });
+    }
+    params.addOptional("filter", filter) catch return error.OutOfMemory;
+    params.addNonZero("pageSize", options.page_size) catch return error.OutOfMemory;
+    params.addOptional("pageToken", options.page_token) catch return error.OutOfMemory;
+
+    var result: types.Owned(types.SnoozePage) = try .init(self.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(self, result.arena, .{ .method = .GET, .path = w.written() });
+    result.value = codec.decodeSnoozePage(result.arena.allocator(), a, body) catch |err|
+        return rpc.decodeFailed(self, err, "snooze list");
+    return result;
+}
+
+/// One snooze, by its id or its full `projects/P/snoozes/ID` name.
+pub fn getSnooze(self: *Client, id_or_name: []const u8) Error!types.Owned(types.Snooze) {
+    rpc.begin(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    return self.snoozeCall(a, .{ .method = .GET, .path = try names.snooze(a, self.project, try self.snoozeId(id_or_name)) });
+}
+
+/// Ends a snooze at `at` (now, for a console), and answers it as it then
+/// stands. Production takes a different patch for each state, so this
+/// takes the snooze as read and sends the one its state at `at` needs
+/// (measured 2026-10-20):
+///
+/// - active for a minute or more: its end set to `at`;
+/// - active for less: cancelled, its end set to its start, since
+///   production refuses a snooze shorter than a minute but of no length;
+/// - upcoming: cancelled, its start and end both set to `at`, the only
+///   cancel production takes for one.
+///
+/// A snooze already ended (or cancelled) at `at` is refused before
+/// sending: production refuses any change to one. `at` goes in whole
+/// seconds; give `endSnoozeRequest` the same snooze and `at` to show the
+/// same request.
+///
+/// A repeat after a patch that landed is refused ("Cannot update a
+/// snooze that already ended, or that was canceled."), so a failure
+/// after one that may have reached the server is followed by a read: a
+/// snooze that ended by `at` is the answer; otherwise the patch goes out
+/// again, up to the retry policy's attempts.
+pub fn endSnooze(self: *Client, snooze: types.Snooze, at: std.Io.Timestamp) Error!types.Owned(types.Snooze) {
+    rpc.begin(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var call = try self.endSnoozeCall(a, snooze, at);
+    call.retry = false;
+    const get_path = try names.snooze(a, self.project, try self.snoozeId(snooze.name));
+    const t = codec.wholeSeconds(at);
+    var attempt: u32 = 0;
+    var sent_before = false;
+    while (true) {
+        attempt += 1;
+        if (self.snoozeCall(a, call)) |ended| {
+            return ended;
+        } else |err| {
+            const refused_as_ended = sent_before and err == error.FailedPrecondition;
+            if (!core.isRetryable(err) and !refused_as_ended) return err;
+            if (!refused_as_ended) {
+                const delay_ms = self.retry.waitMs(attempt, core.rpc.entropy(self.io), self.server_delay_ms) orelse return err;
+                logging.warn("ending a snooze failed with {t}; reading it in {d} ms", .{ err, delay_ms });
+                try self.io.sleep(.fromMilliseconds(delay_ms), .awake);
+            }
+            sent_before = true;
+            var read = self.snoozeCall(a, .{ .method = .GET, .path = get_path }) catch |get_err| switch (get_err) {
+                error.OutOfMemory, error.Canceled => return get_err,
+                else => {
+                    if (self.diagnostics) |d| d.print("ending the snooze failed with {t}, and reading it to see whether it landed failed with {t}", .{ err, get_err });
+                    return err;
+                },
+            };
+            if (read.value.end.nanoseconds <= t.nanoseconds) {
+                if (self.diagnostics) |d| d.clear();
+                return read;
+            }
+            read.deinit();
+            if (refused_as_ended or attempt >= self.retry.max_attempts) return err;
+        }
+    }
+}
+
+/// The request `endSnooze` sends first for the same snooze and `at`,
+/// built without sending it, after the same checks with the same errors.
+pub fn endSnoozeRequest(self: *Client, snooze: types.Snooze, at: std.Io.Timestamp) Error!types.Owned(PreparedRequest) {
+    rpc.begin(self);
+    var result: types.Owned(PreparedRequest) = try .init(self.gpa);
+    errdefer result.deinit();
+    const a = result.arena.allocator();
+    result.value = try .fromCall(a, self.base_url, try self.endSnoozeCall(a, snooze, at));
+    return result;
+}
+
+fn createSnoozeCall(self: *Client, arena: Allocator, spec: types.NewSnooze) Error!rpc.Call {
+    const chars = std.unicode.utf8CountCodepoints(spec.display_name) catch 0;
+    if (spec.display_name.len == 0 or chars == 0 or chars > validate.max_snooze_name_chars) {
+        if (self.diagnostics) |d| d.print("invalid snooze: a display name of 1 to {d} characters, UTF-8", .{validate.max_snooze_name_chars});
+        return error.InvalidOptions;
+    }
+    if (spec.policies.len == 0 or spec.policies.len > validate.max_snooze_policies) {
+        if (self.diagnostics) |d| d.print("invalid snooze: 1 to {d} policies", .{validate.max_snooze_policies});
+        return error.InvalidOptions;
+    }
+    const policies = try arena.alloc([]const u8, spec.policies.len);
+    for (spec.policies, policies) |p, *full| {
+        full.* = try std.fmt.allocPrint(arena, "projects/{s}/alertPolicies/{s}", .{ self.project, try self.policyId(p) });
+    }
+    if (spec.filter) |f| {
+        if (!validate.isAlertFilter(f)) {
+            if (self.diagnostics) |d| d.print("invalid filter: text without control characters, at most 4096 bytes", .{});
+            return error.InvalidFilter;
+        }
+        if (spec.policies.len != 1) {
+            if (self.diagnostics) |d| d.print("invalid snooze: a filter goes with exactly one policy, as production requires", .{});
+            return error.InvalidOptions;
+        }
+    }
+    const start = codec.wholeSeconds(spec.start);
+    const end = codec.wholeSeconds(spec.end);
+    if (end.nanoseconds - start.nanoseconds < @as(i96, validate.min_snooze_seconds) * std.time.ns_per_s) {
+        if (self.diagnostics) |d| d.print("invalid snooze: its end at least {d} s after its start, as production requires", .{validate.min_snooze_seconds});
+        return error.InvalidOptions;
+    }
+    return .{
+        .method = .POST,
+        .path = try names.collection(arena, self.project, .snoozes),
+        .body = try codec.encodeSnooze(arena, spec.display_name, policies, spec.filter, start, end),
+    };
+}
+
+fn endSnoozeCall(self: *Client, arena: Allocator, snooze: types.Snooze, at: std.Io.Timestamp) Error!rpc.Call {
+    const id = try self.snoozeId(snooze.name);
+    const t = codec.wholeSeconds(at);
+    if (snooze.stateAt(t) == .ended) {
+        if (self.diagnostics) |d| d.print("the snooze has ended: production refuses any change to an ended or cancelled snooze", .{});
+        return error.InvalidOptions;
+    }
+    var mask: []const u8 = "interval.end_time";
+    var start: ?std.Io.Timestamp = null;
+    var end = t;
+    if (t.nanoseconds < snooze.start.nanoseconds) {
+        // Upcoming: production cancels one only with both times now.
+        mask = "interval.start_time,interval.end_time";
+        start = t;
+    } else if (t.nanoseconds - snooze.start.nanoseconds < @as(i96, validate.min_snooze_seconds) * std.time.ns_per_s) {
+        // Active for less than a minute: cancelled, of no length.
+        end = codec.wholeSeconds(snooze.start);
+    }
+    var w: std.Io.Writer.Allocating = .init(arena);
+    w.writer.writeAll(try names.snooze(arena, self.project, id)) catch return error.OutOfMemory;
+    var params: core.query.Params = .init(&w.writer);
+    params.add("updateMask", mask) catch return error.OutOfMemory;
+    return .{ .method = .PATCH, .path = w.written(), .body = try codec.encodeSnoozeInterval(arena, start, end) };
+}
+
+fn snoozeId(self: *Client, id_or_name: []const u8) Error![]const u8 {
+    const id = names.snoozeId(id_or_name, self.project) orelse "";
+    if (!validate.isAlertId(id)) {
+        if (self.diagnostics) |d| d.print("invalid snooze: expected its id, or projects/{s}/snoozes/<id>", .{self.project});
+        return error.InvalidName;
+    }
+    return id;
+}
+
+/// Sends `call` and decodes the snooze it answers.
+fn snoozeCall(self: *Client, scratch: Allocator, call: rpc.Call) Error!types.Owned(types.Snooze) {
+    var result: types.Owned(types.Snooze) = try .init(self.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(self, result.arena, call);
+    result.value = codec.decodeSnooze(result.arena.allocator(), scratch, body) catch |err|
+        return rpc.decodeFailed(self, err, "snooze");
+    return result;
 }
 
 fn policyId(self: *Client, id_or_name: []const u8) Error![]const u8 {
@@ -865,6 +1100,292 @@ test "setAlertPolicyEnabled: retried as the reads are, since a repeat answers 20
     for (0..3) |i| try h.expectRequest(i, .PATCH, policy_url ++ "?updateMask=enabled", "{\"enabled\":false}");
 }
 
+const snooze_base = "https://monitoring.googleapis.com/v3/projects/my-project/snoozes";
+
+fn stamp(text: []const u8) std.Io.Timestamp {
+    return core.timestamp.parse(text) catch unreachable;
+}
+
+/// The probe's active snooze, as this project's: started 18:58:49.
+const active_snooze: types.Snooze = .{
+    .name = "projects/my-project/snoozes/66323307854672813985269061791550861051",
+    .id = "66323307854672813985269061791550861051",
+    .display_name = "zigps-98dd5a-active",
+    .policies = &.{"projects/my-project/alertPolicies/1234567890"},
+    .start = .{ .nanoseconds = 1_792_522_729 * std.time.ns_per_s },
+    .end = .{ .nanoseconds = 1_792_523_309 * std.time.ns_per_s },
+};
+
+test "golden: a snooze made, listed active, got, and ended in each of production's three forms" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = production.snooze_created } },
+        .{ .respond = .{ .body = production.snooze_page } },
+        .{ .respond = .{ .body = production.snooze_read } },
+        .{ .respond = .{ .body = production.snooze_ended } },
+        .{ .respond = .{ .body = production.snooze_cancelled_active } },
+        .{ .respond = .{ .body = production.snooze_cancelled_upcoming } },
+    }, .{});
+    defer h.deinit();
+    const c = &h.client;
+    var made = try c.createSnooze(.{
+        .display_name = "deploy",
+        .policies = &.{ "1234567890", "projects/my-project/alertPolicies/42" },
+        .start = .{ .nanoseconds = stamp("2026-10-20T18:58:29Z").nanoseconds + 868_813_000 },
+        .end = stamp("2026-10-20T19:08:29Z"),
+    });
+    defer made.deinit();
+    try h.expectRequest(0, .POST, snooze_base, "{\"displayName\":\"deploy\",\"criteria\":{\"policies\":[\"projects/my-project/alertPolicies/1234567890\",\"projects/my-project/alertPolicies/42\"]},\"interval\":{\"startTime\":\"2026-10-20T18:58:29Z\",\"endTime\":\"2026-10-20T19:08:29Z\"}}");
+    try testing.expectEqualStrings("zigps-98dd5a-active", made.value.display_name);
+
+    var active = try c.listSnoozes(.{ .active_at = .{ .nanoseconds = stamp("2026-10-20T18:58:55Z").nanoseconds + 506_362_000 } });
+    defer active.deinit();
+    try h.expectRequest(1, .GET, snooze_base ++ "?filter=interval.start_time%20%3C%3D%20%222026-10-20T18%3A58%3A55Z%22%20AND%20interval.end_time%20%3E%3D%20%222026-10-20T18%3A58%3A55Z%22", null);
+    try testing.expectEqual(4, active.value.snoozes.len);
+
+    var got = try c.getSnooze("141366793827031231927670956031820956967");
+    got.deinit();
+    try h.expectRequest(2, .GET, snooze_base ++ "/141366793827031231927670956031820956967", null);
+
+    const url = snooze_base ++ "/66323307854672813985269061791550861051";
+    // Active for over a minute: its end, now.
+    var ended = try c.endSnooze(active_snooze, .{ .nanoseconds = stamp("2026-10-20T19:00:03Z").nanoseconds + 400_000_000 });
+    defer ended.deinit();
+    try h.expectRequest(3, .PATCH, url ++ "?updateMask=interval.end_time", "{\"interval\":{\"endTime\":\"2026-10-20T19:00:03Z\"}}");
+    try testing.expectEqual(stamp("2026-10-20T19:00:03Z").nanoseconds, ended.value.end.nanoseconds);
+    // Active for under a minute: cancelled, its end its start.
+    var young = try c.endSnooze(active_snooze, stamp("2026-10-20T18:58:58Z"));
+    young.deinit();
+    try h.expectRequest(4, .PATCH, url ++ "?updateMask=interval.end_time", "{\"interval\":{\"endTime\":\"2026-10-20T18:58:49Z\"}}");
+    // Upcoming: cancelled, both times now.
+    var upcoming = try c.endSnooze(active_snooze, stamp("2026-10-20T18:50:00Z"));
+    defer upcoming.deinit();
+    try h.expectRequest(5, .PATCH, url ++ "?updateMask=interval.start_time%2Cinterval.end_time", "{\"interval\":{\"startTime\":\"2026-10-20T18:50:00Z\",\"endTime\":\"2026-10-20T18:50:00Z\"}}");
+    try testing.expect(upcoming.value.cancelled());
+}
+
+test "snooze previews: byte for byte what the create and each end send, and nothing sent" {
+    const spec: types.NewSnooze = .{ .display_name = "deploy", .policies = &.{"1"}, .filter = "resource.labels.zone=\"a\"", .start = stamp("2026-10-20T19:00:00Z"), .end = stamp("2026-10-20T20:00:00Z") };
+    {
+        var h: Harness = undefined;
+        try h.init(&.{.{ .respond = .{ .body = production.snooze_created } }}, .{});
+        defer h.deinit();
+        var prepared = try h.client.createSnoozeRequest(spec);
+        defer prepared.deinit();
+        try h.expectRequestCount(0);
+        var made = try h.client.createSnooze(spec);
+        made.deinit();
+        const sent = try h.fake.request(0);
+        try testing.expectEqualStrings(sent.url, prepared.value.url);
+        try testing.expectEqualStrings(sent.body.?, prepared.value.body);
+        try testing.expectEqual(sent.method, prepared.value.method);
+    }
+    for ([_][]const u8{ "2026-10-20T19:00:03Z", "2026-10-20T18:58:58Z", "2026-10-20T18:50:00Z" }) |at| {
+        var h: Harness = undefined;
+        try h.init(&.{.{ .respond = .{ .body = production.snooze_ended } }}, .{});
+        defer h.deinit();
+        var prepared = try h.client.endSnoozeRequest(active_snooze, stamp(at));
+        defer prepared.deinit();
+        try h.expectRequestCount(0);
+        var ended = try h.client.endSnooze(active_snooze, stamp(at));
+        ended.deinit();
+        const sent = try h.fake.request(0);
+        try testing.expectEqualStrings(sent.url, prepared.value.url);
+        try testing.expectEqualStrings(sent.body.?, prepared.value.body);
+    }
+}
+
+test "snooze calls refuse what production would, before sending, the previews with the same words" {
+    var h: Harness = undefined;
+    try h.init(&.{}, .{});
+    defer h.deinit();
+    const c = &h.client;
+    const ok: types.NewSnooze = .{ .display_name = "d", .policies = &.{"1"}, .start = stamp("2026-10-20T19:00:00Z"), .end = stamp("2026-10-20T19:01:00Z") };
+    var long: [513]u8 = @splat('x');
+    var seventeen: [17][]const u8 = @splat("1");
+    const cases = [_]struct { types.NewSnooze, Error, []const u8 }{
+        .{ blk: {
+            var s = ok;
+            s.display_name = "";
+            break :blk s;
+        }, error.InvalidOptions, "invalid snooze: a display name of 1 to 512 characters, UTF-8" },
+        .{ blk: {
+            var s = ok;
+            s.display_name = &long;
+            break :blk s;
+        }, error.InvalidOptions, "invalid snooze: a display name of 1 to 512 characters, UTF-8" },
+        .{ blk: {
+            var s = ok;
+            s.display_name = "\xff";
+            break :blk s;
+        }, error.InvalidOptions, "invalid snooze: a display name of 1 to 512 characters, UTF-8" },
+        .{ blk: {
+            var s = ok;
+            s.policies = &.{};
+            break :blk s;
+        }, error.InvalidOptions, "invalid snooze: 1 to 16 policies" },
+        .{ blk: {
+            var s = ok;
+            s.policies = &seventeen;
+            break :blk s;
+        }, error.InvalidOptions, "invalid snooze: 1 to 16 policies" },
+        .{ blk: {
+            var s = ok;
+            s.policies = &.{"projects/other/alertPolicies/1"};
+            break :blk s;
+        }, error.InvalidName, "invalid alert policy: expected its id, or projects/my-project/alertPolicies/<id>" },
+        .{ blk: {
+            var s = ok;
+            s.policies = &.{ "1", "2" };
+            s.filter = "resource.labels.zone=\"a\"";
+            break :blk s;
+        }, error.InvalidOptions, "invalid snooze: a filter goes with exactly one policy, as production requires" },
+        .{ blk: {
+            var s = ok;
+            s.end = stamp("2026-10-20T19:00:59.9Z");
+            break :blk s;
+        }, error.InvalidOptions, "invalid snooze: its end at least 60 s after its start, as production requires" },
+    };
+    for (cases) |case| {
+        try testing.expectError(case[1], c.createSnooze(case[0]));
+        try testing.expectEqualStrings(case[2], h.diag.message());
+        try testing.expectError(case[1], c.createSnoozeRequest(case[0]));
+        try testing.expectEqualStrings(case[2], h.diag.message());
+    }
+    // Ended at `at`: nothing to send.
+    try testing.expectError(error.InvalidOptions, c.endSnooze(active_snooze, stamp("2026-10-20T19:08:29Z")));
+    try testing.expectEqualStrings("the snooze has ended: production refuses any change to an ended or cancelled snooze", h.diag.message());
+    var cancelled = active_snooze;
+    cancelled.end = cancelled.start;
+    try testing.expectError(error.InvalidOptions, c.endSnoozeRequest(cancelled, stamp("2026-10-20T18:00:00Z")));
+    var foreign = active_snooze;
+    foreign.name = "projects/other/snoozes/1";
+    try testing.expectError(error.InvalidName, c.endSnooze(foreign, stamp("2026-10-20T19:00:00Z")));
+    try testing.expectError(error.InvalidName, c.getSnooze("a/b"));
+    try testing.expectEqualStrings("invalid snooze: expected its id, or projects/my-project/snoozes/<id>", h.diag.message());
+    try testing.expectError(error.InvalidOptions, c.listSnoozes(.{ .active_at = stamp("2026-10-20T19:00:00Z"), .filter = "x" }));
+    try testing.expectError(error.InvalidFilter, c.listSnoozes(.{ .filter = "a\nb" }));
+    try testing.expectError(error.InvalidName, c.listSnoozes(.{ .page_token = "a b" }));
+    try h.expectRequestCount(0);
+}
+
+test "snooze refusals arrive as errors in production's words" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = production.snooze_past_start_status, .body = production.snooze_past_start } },
+        .{ .respond = .{ .status = production.snooze_unknown_status, .body = production.snooze_unknown } },
+        .{ .respond = .{ .status = production.snooze_patch_unknown_status, .body = production.snooze_patch_unknown } },
+        .{ .respond = .{ .status = production.snooze_too_short_status, .body = production.snooze_too_short } },
+        .{ .respond = .{ .status = production.snooze_already_ended_status, .body = production.snooze_already_ended } },
+        .{ .respond = .{ .status = production.snooze_filter_greater_status, .body = production.snooze_filter_greater } },
+    }, .{});
+    defer h.deinit();
+    const c = &h.client;
+    try testing.expectError(error.InvalidArgument, c.createSnooze(.{ .display_name = "d", .policies = &.{"1"}, .start = stamp("2026-10-20T18:00:00Z"), .end = stamp("2026-10-20T19:00:00Z") }));
+    try testing.expectEqualStrings("The Snooze cannot start in the past.", h.diag.message());
+    try testing.expectError(error.NotFound, c.getSnooze("1234567890"));
+    try testing.expectEqualStrings("The snooze (with id 1234567890) was not found.", h.diag.message());
+    try testing.expectError(error.NotFound, c.endSnooze(active_snooze, stamp("2026-10-20T19:00:03Z")));
+    try testing.expectEqualStrings("The snooze to update (with id 1234567890) was not found.", h.diag.message());
+    try testing.expectError(error.InvalidArgument, c.endSnooze(active_snooze, stamp("2026-10-20T19:00:03Z")));
+    try testing.expect(std.mem.startsWith(u8, h.diag.message(), "The snooze duration must be >= 1m"));
+    try testing.expectError(error.FailedPrecondition, c.endSnooze(active_snooze, stamp("2026-10-20T19:00:03Z")));
+    try testing.expectEqualStrings("Cannot update a snooze that already ended, or that was canceled.", h.diag.message());
+    try testing.expectError(error.InvalidArgument, c.listSnoozes(.{ .filter = "interval.end_time > \"2026-10-20T18:56:41Z\"" }));
+    try testing.expect(std.mem.endsWith(u8, h.diag.message(), "Only equality, greater than or equals comparison and less than or equals comparison restrictions are supported."));
+    try h.expectRequestCount(6);
+}
+
+test "createSnooze: never sent again once it may have left; resent when it never left" {
+    const spec: types.NewSnooze = .{ .display_name = "d", .policies = &.{"1"}, .start = stamp("2026-10-20T19:00:00Z"), .end = stamp("2026-10-20T19:01:00Z") };
+    for ([_]FakeTransport.Reply{
+        .{ .fail = error.ConnectionResetByPeer },
+        .{ .fail = error.TimedOut },
+        .{ .respond = .{ .status = 503, .body = "{\"error\":{\"code\":503,\"message\":\"x\",\"status\":\"UNAVAILABLE\"}}" } },
+        .{ .respond = .{ .status = 500, .body = "{\"error\":{\"code\":500,\"message\":\"x\",\"status\":\"INTERNAL\"}}" } },
+    }) |reply| {
+        var h: Harness = undefined;
+        try h.init(&.{ reply, .{ .respond = .{ .body = production.snooze_created } } }, .{});
+        defer h.deinit();
+        if (h.client.createSnooze(spec)) |made| {
+            var m = made;
+            m.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+        try h.expectRequestCount(1);
+    }
+    var h: Harness = undefined;
+    try h.init(&.{ .{ .fail = error.ConnectionRefused }, .{ .respond = .{ .body = production.snooze_created } } }, .{});
+    defer h.deinit();
+    var made = try h.client.createSnooze(spec);
+    made.deinit();
+    try h.expectRequestCount(2);
+}
+
+const FakeTransport = test_util.FakeTransport;
+const unavailable_reply: FakeTransport.Reply = .{ .respond = .{ .status = 503, .body = "{\"error\":{\"code\":503,\"message\":\"The service is currently unavailable.\",\"status\":\"UNAVAILABLE\"}}" } };
+const ended_reply: FakeTransport.Reply = .{ .respond = .{ .status = 400, .body = production.snooze_already_ended } };
+const still_active: FakeTransport.Reply = .{ .respond = .{ .body = production.snooze_created } };
+const ended_at_3: FakeTransport.Reply = .{ .respond = .{ .body = production.snooze_ended } };
+
+test "endSnooze: a lost answer is read back, an ended snooze the answer" {
+    var h: Harness = undefined;
+    try h.init(&.{ .{ .fail = error.ConnectionResetByPeer }, ended_at_3 }, .{});
+    defer h.deinit();
+    var ended = try h.client.endSnooze(active_snooze, stamp("2026-10-20T19:00:03Z"));
+    defer ended.deinit();
+    try testing.expectEqual(stamp("2026-10-20T19:00:03Z").nanoseconds, ended.value.end.nanoseconds);
+    try h.expectRequest(1, .GET, snooze_base ++ "/66323307854672813985269061791550861051", null);
+    try h.expectRequestCount(2);
+    try testing.expectEqualStrings("", h.diag.message());
+}
+
+test "endSnooze: read back still running, the patch again; a refused repeat read back ended" {
+    {
+        var h: Harness = undefined;
+        try h.init(&.{ unavailable_reply, still_active, ended_at_3 }, .{});
+        defer h.deinit();
+        var ended = try h.client.endSnooze(active_snooze, stamp("2026-10-20T19:00:03Z"));
+        ended.deinit();
+        try h.expectRequestCount(3);
+        try testing.expectEqual(.PATCH, (try h.fake.request(2)).method);
+    }
+    {
+        // The first lands late: read back running, the second refused as
+        // ended, read back ended.
+        var h: Harness = undefined;
+        try h.init(&.{ unavailable_reply, still_active, ended_reply, ended_at_3 }, .{});
+        defer h.deinit();
+        var ended = try h.client.endSnooze(active_snooze, stamp("2026-10-20T19:00:03Z"));
+        ended.deinit();
+        try h.expectRequestCount(4);
+        try testing.expectEqualStrings("", h.diag.message());
+    }
+    {
+        // Refused as ended, yet read back running: the refusal stands.
+        var h: Harness = undefined;
+        try h.init(&.{ unavailable_reply, still_active, ended_reply, still_active }, .{});
+        defer h.deinit();
+        try testing.expectError(error.FailedPrecondition, h.client.endSnooze(active_snooze, stamp("2026-10-20T19:00:03Z")));
+        try h.expectRequestCount(4);
+    }
+}
+
+test "endSnooze: a refusal on the first send as it came; a read that fails names both" {
+    {
+        var h: Harness = undefined;
+        try h.init(&.{ended_reply}, .{});
+        defer h.deinit();
+        try testing.expectError(error.FailedPrecondition, h.client.endSnooze(active_snooze, stamp("2026-10-20T19:00:03Z")));
+        try h.expectRequestCount(1);
+    }
+    var h: Harness = undefined;
+    try h.init(&.{ .{ .fail = error.ConnectionResetByPeer }, .{ .respond = .{ .status = 403, .body = "{\"error\":{\"code\":403,\"message\":\"Request had insufficient authentication scopes.\",\"status\":\"PERMISSION_DENIED\"}}" } } }, .{});
+    defer h.deinit();
+    try testing.expectError(error.ConnectionResetByPeer, h.client.endSnooze(active_snooze, stamp("2026-10-20T19:00:03Z")));
+    try testing.expectEqualStrings("ending the snooze failed with ConnectionResetByPeer, and reading it to see whether it landed failed with PermissionDenied", h.diag.message());
+}
+
 test "alert calls refuse what they will not send" {
     var h: Harness = undefined;
     try h.init(&.{}, .{});
@@ -964,6 +1485,10 @@ test "every allocation failure is OutOfMemory without leaks" {
                 .{ .respond = .{ .body = production.policy_page } },
                 .{ .respond = .{ .body = production.policy_two } },
                 .{ .respond = .{ .body = production.policy_disabled } },
+                .{ .respond = .{ .body = production.snooze_created } },
+                .{ .respond = .{ .body = production.snooze_page } },
+                .{ .respond = .{ .body = production.snooze_read } },
+                .{ .respond = .{ .body = production.snooze_ended } },
             });
             defer fake.deinit();
             var tokens: test_util.FakeTokenProvider = .{};
@@ -993,6 +1518,19 @@ test "every allocation failure is OutOfMemory without leaks" {
             off.deinit();
             var prepared = try client.setAlertPolicyEnabledRequest("9594883664150561401", true);
             prepared.deinit();
+            const spec: types.NewSnooze = .{ .display_name = "d", .policies = &.{ "1", "2" }, .start = stamp("2026-10-20T19:00:00Z"), .end = stamp("2026-10-20T19:01:00Z") };
+            var snoozed = try client.createSnooze(spec);
+            snoozed.deinit();
+            var made_request = try client.createSnoozeRequest(spec);
+            made_request.deinit();
+            var snoozes = try client.listSnoozes(.{ .active_at = stamp("2026-10-20T19:00:00Z") });
+            snoozes.deinit();
+            var one = try client.getSnooze("1");
+            one.deinit();
+            var ended = try client.endSnooze(active_snooze, stamp("2026-10-20T19:00:03Z"));
+            ended.deinit();
+            var end_request = try client.endSnoozeRequest(active_snooze, stamp("2026-10-20T18:50:00Z"));
+            end_request.deinit();
         }
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.calls, .{});

@@ -417,6 +417,26 @@ pub const FakeMonitoring = struct {
         return f.policy_store.count();
     }
 
+    /// Snoozes made, ended ones included: production deletes none.
+    pub fn snoozeCount(f: *FakeMonitoring) usize {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        return f.policy_store.snoozeCount();
+    }
+
+    /// Closes the open alerts every snooze begun by now held over, at its
+    /// start, as production closed one within a second of a snooze's
+    /// start. Called with the mutex held.
+    fn settleSnoozes(f: *FakeMonitoring) void {
+        const now = f.nowNs();
+        for (f.alerts.values()) |a| {
+            if (a.state != .open) continue;
+            const at = f.policy_store.closesAt(a.policy.name, a.resource_labels, a.open_time.nanoseconds, now) orelse continue;
+            a.state = .closed;
+            a.close_time = .{ .nanoseconds = at };
+        }
+    }
+
     pub fn putAlert(f: *FakeMonitoring, alert: PutAlert) PutError![]const u8 {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
@@ -427,6 +447,8 @@ pub const FakeMonitoring = struct {
         if ((alert.state == .open) != (alert.close_time == null)) return error.InvalidEntry;
         if (alert.close_time) |c| if (c.nanoseconds < alert.open_time.nanoseconds) return error.InvalidEntry;
         if (alert.policy.severity == .unknown) return error.InvalidEntry;
+        // Production opened none while a snooze held.
+        if (alert.state == .open and f.policy_store.holdsAt(alert.policy.name, alert.resource_labels, alert.open_time.nanoseconds)) return error.InvalidEntry;
         if (alert.id) |id| if (!validate.isAlertId(id) or f.alerts.contains(id)) return error.InvalidEntry;
         inline for (.{ alert.metric_labels, alert.resource_labels, alert.log_labels, alert.policy.user_labels }) |labels| {
             for (labels, 0..) |l, i| {
@@ -577,6 +599,7 @@ pub const FakeMonitoring = struct {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         f.calls += 1;
+        f.settleSnoozes();
         if (f.takeFault(drop) != null) return error.ConnectionResetByPeer;
         if (f.takeFault(refuse)) |fault| return asking(arena, try refusal(arena, fault.status), fault.delay);
         const lost = f.takeFault(lose);
@@ -623,6 +646,12 @@ pub const FakeMonitoring = struct {
                 };
             },
             .alert_policies => return f.policy_store.route(arena, .{
+                .project = f.options.project_id,
+                .project_number = f.options.project_number,
+                .caller = f.options.caller,
+                .now_ns = f.nowNs(),
+            }, req.method, target.rest, params, req.body),
+            .snoozes => return f.policy_store.snoozeRoute(f.gpa, f.store.allocator(), arena, .{
                 .project = f.options.project_id,
                 .project_number = f.options.project_number,
                 .caller = f.options.caller,
@@ -2098,7 +2127,7 @@ fn fakeDouble(jw: *Stringify, d: f64) Stringify.Error!void {
 
 const Route = struct {
     project: []const u8,
-    collection: enum { metric_descriptors, resource_descriptors, time_series, alerts, alert_policies },
+    collection: enum { metric_descriptors, resource_descriptors, time_series, alerts, alert_policies, snoozes },
     /// After the collection and its `/`, as sent; "" for the collection.
     rest: []const u8,
 };
@@ -2123,6 +2152,7 @@ fn parseRoute(path: []const u8) ?Route {
         .{ "timeSeries", .time_series },
         .{ "alerts", .alerts },
         .{ "alertPolicies", .alert_policies },
+        .{ "snoozes", .snoozes },
     };
     for (names) |n| {
         if (std.mem.eql(u8, tail, n[0])) return .{ .project = project, .collection = n[1], .rest = "" };

@@ -318,6 +318,72 @@ test "the policy behind an incident, disabled after a confirmation" {
 }
 ```
 
+### Snoozes
+
+Snoozes are made through the API, as production makes them (issue
+#275), and the fake answers as production did on 2026-10-20: a create
+checked in production's order and words (a start more than 15 s in
+the past, more than 16 policies, a filter without exactly one policy,
+no display name, under a minute), policies that need not exist, the
+answer carrying the times as sent and reads after keeping whole
+seconds; lists newest start first, filtered by `interval.start_time`
+and `interval.end_time` with `>=` and `<=`, the refusals' reasons
+production's; the three ways production ends one, and its refusal of
+any change to an ended snooze. An active snooze closes the open alerts
+of its policies at its start (and its filter's resource labels), on
+the fake's clock, whenever the fake is next asked, and `putAlert`
+refuses an open alert for a policy a snooze holds. Production wrote
+its own parse tree into its filter refusals; the fake writes the
+filter there, and the reason after it is production's.
+
+<!-- snippet: tests/docs_examples.zig#mon-snooze -->
+```zig
+test "a snooze from the incidents widget: the alert closes, and it ends early" {
+    var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_522_800 * std.time.ns_per_s };
+    var fake: monitoring.testing.FakeMonitoring = .init(std.testing.allocator, clock.io(), .{ .project_id = "my-project" });
+    defer fake.deinit();
+    const policy = try fake.putAlertPolicy(.{ .display_name = "Pub/Sub backlog too deep", .severity = .warning });
+    const alert = try fake.putAlert(.{
+        .open_time = std.Io.Clock.real.now(clock.io()),
+        .policy = .{ .name = policy, .display_name = "Pub/Sub backlog too deep", .severity = .warning },
+    });
+
+    var token: monitoring.StaticToken = .{ .token = "none" };
+    var client = try monitoring.Client.init(std.testing.allocator, clock.io(), .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+
+    // An hour from now, confirmed first.
+    const now = std.Io.Clock.real.now(clock.io());
+    const spec: monitoring.NewSnooze = .{
+        .display_name = "deploy window",
+        .policies = &.{policy},
+        .start = now,
+        .end = .{ .nanoseconds = now.nanoseconds + std.time.ns_per_hour },
+    };
+    var request = try client.createSnoozeRequest(spec);
+    defer request.deinit();
+    try std.testing.expect(std.mem.endsWith(u8, request.value.url, "/snoozes"));
+    var snooze = try client.createSnooze(spec);
+    defer snooze.deinit();
+
+    // From its start, the policy's open alert is closed.
+    var closed = try client.getAlert(alert);
+    defer closed.deinit();
+    try std.testing.expectEqual(monitoring.AlertState.closed, closed.value.state);
+
+    // Ended early, ten minutes in: its end set to now.
+    clock.now_ns += 10 * std.time.ns_per_min;
+    const later = std.Io.Clock.real.now(clock.io());
+    var ended = try client.endSnooze(snooze.value, later);
+    defer ended.deinit();
+    try std.testing.expectEqual(monitoring.SnoozeState.ended, ended.value.stateAt(later));
+}
+```
+
 ## What it models
 
 Each as production answered when measured, refusals in its words:

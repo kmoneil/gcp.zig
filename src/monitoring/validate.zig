@@ -27,6 +27,13 @@ pub const max_buckets = 200;
 /// The domain whose metrics are a program's own. Production refuses to
 /// create a DELTA or STRING metric under it.
 pub const custom_domain = "custom.googleapis.com/";
+/// Production refused a snooze of 17 policies.
+pub const max_snooze_policies = 16;
+/// The proto's limit on a snooze's display name, in characters.
+pub const max_snooze_name_chars = 512;
+/// Production refused a snooze shorter than a minute ("The snooze
+/// duration must be >= 1m."), but for a cancelled one, of no length.
+pub const min_snooze_seconds = 60;
 
 /// A project as the API names it: a project number, or a project id, which
 /// is 6 to 30 lowercase letters, digits and hyphens for a new project and
