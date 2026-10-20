@@ -1358,3 +1358,457 @@ pub const alerts_order_bogus =
     \\  }
     \\}
 ;
+
+/// A threshold policy on Pub/Sub's publish count, WARNING, with
+/// documentation, a label, ALIGN_RATE and a count trigger. HTTP 200.
+pub const policy_threshold_status = 200;
+pub const policy_threshold =
+    \\{
+    \\ "name": "projects/extractctl/alertPolicies/9594883664150561401",
+    \\ "displayName": "zigps-d5b8f4-threshold",
+    \\ "combiner": "OR",
+    \\ "creationRecord": {
+    \\  "mutateTime": "2026-10-20T18:55:53.325284581Z",
+    \\  "mutatedBy": "zig-gcp@extractctl.iam.gserviceaccount.com"
+    \\ },
+    \\ "mutationRecord": {
+    \\  "mutateTime": "2026-10-20T18:55:53.325284581Z",
+    \\  "mutatedBy": "zig-gcp@extractctl.iam.gserviceaccount.com"
+    \\ },
+    \\ "conditions": [
+    \\  {
+    \\   "conditionThreshold": {
+    \\    "filter": "metric.type=\"pubsub.googleapis.com/topic/send_message_operation_count\" AND resource.type=\"pubsub_topic\"",
+    \\    "comparison": "COMPARISON_GT",
+    \\    "thresholdValue": 1000,
+    \\    "duration": "60s",
+    \\    "trigger": {
+    \\     "count": 1
+    \\    },
+    \\    "aggregations": [
+    \\     {
+    \\      "alignmentPeriod": "60s",
+    \\      "perSeriesAligner": "ALIGN_RATE"
+    \\     }
+    \\    ]
+    \\   },
+    \\   "displayName": "rate over 1000",
+    \\   "name": "projects/extractctl/alertPolicies/9594883664150561401/conditions/9594883664150564016"
+    \\  }
+    \\ ],
+    \\ "documentation": {
+    \\  "content": "Publish rate over 1000/s.",
+    \\  "mimeType": "text/markdown",
+    \\  "subject": "zigps publish rate"
+    \\ },
+    \\ "userLabels": {
+    \\  "zigps": "probe"
+    \\ },
+    \\ "enabled": true,
+    \\ "severity": "WARNING"
+    \\}
+;
+
+/// An absence policy, disabled, ERROR, with a percent trigger. HTTP 200.
+pub const policy_absence_status = 200;
+pub const policy_absence =
+    \\{
+    \\ "name": "projects/extractctl/alertPolicies/5575262459168249474",
+    \\ "displayName": "zigps-d5b8f4-absence",
+    \\ "combiner": "OR",
+    \\ "creationRecord": {
+    \\  "mutateTime": "2026-10-20T18:55:54.785040626Z",
+    \\  "mutatedBy": "zig-gcp@extractctl.iam.gserviceaccount.com"
+    \\ },
+    \\ "mutationRecord": {
+    \\  "mutateTime": "2026-10-20T18:55:54.785040626Z",
+    \\  "mutatedBy": "zig-gcp@extractctl.iam.gserviceaccount.com"
+    \\ },
+    \\ "conditions": [
+    \\  {
+    \\   "conditionAbsent": {
+    \\    "filter": "metric.type=\"pubsub.googleapis.com/topic/send_message_operation_count\" AND resource.type=\"pubsub_topic\"",
+    \\    "duration": "300s",
+    \\    "trigger": {
+    \\     "percent": 50
+    \\    },
+    \\    "aggregations": [
+    \\     {
+    \\      "alignmentPeriod": "60s",
+    \\      "perSeriesAligner": "ALIGN_COUNT"
+    \\     }
+    \\    ]
+    \\   },
+    \\   "displayName": "no publishes",
+    \\   "name": "projects/extractctl/alertPolicies/5575262459168249474/conditions/5575262459168251595"
+    \\  }
+    \\ ],
+    \\ "userLabels": {
+    \\  "zigps": "probe"
+    \\ },
+    \\ "enabled": false,
+    \\ "severity": "ERROR"
+    \\}
+;
+
+/// A log-match policy, CRITICAL, with a label extractor and the alert
+/// strategy production requires of one. HTTP 200.
+pub const policy_log_status = 200;
+pub const policy_log =
+    \\{
+    \\ "name": "projects/extractctl/alertPolicies/3389115242718001746",
+    \\ "displayName": "zigps-d5b8f4-log",
+    \\ "combiner": "OR",
+    \\ "creationRecord": {
+    \\  "mutateTime": "2026-10-20T18:55:56.159593832Z",
+    \\  "mutatedBy": "zig-gcp@extractctl.iam.gserviceaccount.com"
+    \\ },
+    \\ "mutationRecord": {
+    \\  "mutateTime": "2026-10-20T18:55:56.159593832Z",
+    \\  "mutatedBy": "zig-gcp@extractctl.iam.gserviceaccount.com"
+    \\ },
+    \\ "conditions": [
+    \\  {
+    \\   "displayName": "probe log line",
+    \\   "name": "projects/extractctl/alertPolicies/3389115242718001746/conditions/3389115242717999981",
+    \\   "conditionMatchedLog": {
+    \\    "filter": "logName=\"projects/extractctl/logs/zigps-d5b8f4\" AND severity>=ERROR",
+    \\    "labelExtractors": {
+    \\     "k": "EXTRACT(jsonPayload.k)"
+    \\    }
+    \\   }
+    \\  }
+    \\ ],
+    \\ "userLabels": {
+    \\  "zigps": "probe"
+    \\ },
+    \\ "enabled": true,
+    \\ "alertStrategy": {
+    \\  "notificationRateLimit": {
+    \\   "period": "300s"
+    \\  },
+    \\  "autoClose": "1800s"
+    \\ },
+    \\ "severity": "CRITICAL"
+    \\}
+;
+
+/// An MQL policy with no severity: the field is absent. HTTP 200.
+pub const policy_mql_status = 200;
+pub const policy_mql =
+    \\{
+    \\ "name": "projects/extractctl/alertPolicies/4294582767119635845",
+    \\ "displayName": "zigps-d5b8f4-mql",
+    \\ "combiner": "OR",
+    \\ "creationRecord": {
+    \\  "mutateTime": "2026-10-20T18:55:57.262961882Z",
+    \\  "mutatedBy": "zig-gcp@extractctl.iam.gserviceaccount.com"
+    \\ },
+    \\ "mutationRecord": {
+    \\  "mutateTime": "2026-10-20T18:55:57.262961882Z",
+    \\  "mutatedBy": "zig-gcp@extractctl.iam.gserviceaccount.com"
+    \\ },
+    \\ "conditions": [
+    \\  {
+    \\   "displayName": "mql rate",
+    \\   "name": "projects/extractctl/alertPolicies/4294582767119635845/conditions/4294582767119635738",
+    \\   "conditionMonitoringQueryLanguage": {
+    \\    "query": "fetch pubsub_topic | metric 'pubsub.googleapis.com/topic/send_message_operation_count' | align rate(1m) | every 1m | condition val() > 1000 '1/s'",
+    \\    "duration": "60s",
+    \\    "trigger": {
+    \\     "count": 1
+    \\    }
+    \\   }
+    \\  }
+    \\ ],
+    \\ "userLabels": {
+    \\  "zigps": "probe"
+    \\ },
+    \\ "enabled": true
+    \\}
+;
+
+/// A PromQL policy with an evaluation interval and labels. HTTP 200.
+pub const policy_promql_status = 200;
+pub const policy_promql =
+    \\{
+    \\ "name": "projects/extractctl/alertPolicies/6864678670941340587",
+    \\ "displayName": "zigps-d5b8f4-promql",
+    \\ "combiner": "OR",
+    \\ "creationRecord": {
+    \\  "mutateTime": "2026-10-20T18:55:58.538873776Z",
+    \\  "mutatedBy": "zig-gcp@extractctl.iam.gserviceaccount.com"
+    \\ },
+    \\ "mutationRecord": {
+    \\  "mutateTime": "2026-10-20T18:55:58.538873776Z",
+    \\  "mutatedBy": "zig-gcp@extractctl.iam.gserviceaccount.com"
+    \\ },
+    \\ "conditions": [
+    \\  {
+    \\   "displayName": "promql rate",
+    \\   "name": "projects/extractctl/alertPolicies/6864678670941340587/conditions/6864678670941342846",
+    \\   "conditionPrometheusQueryLanguage": {
+    \\    "query": "rate(pubsub_googleapis_com:topic_send_message_operation_count[5m]) > 1000",
+    \\    "duration": "60s",
+    \\    "evaluationInterval": "30s",
+    \\    "labels": {
+    \\     "zigps": "probe"
+    \\    }
+    \\   }
+    \\  }
+    \\ ],
+    \\ "userLabels": {
+    \\  "zigps": "probe"
+    \\ },
+    \\ "enabled": true
+    \\}
+;
+
+/// Two threshold conditions combined with AND. HTTP 200.
+pub const policy_two_status = 200;
+pub const policy_two =
+    \\{
+    \\ "name": "projects/extractctl/alertPolicies/7136103533907925714",
+    \\ "displayName": "zigps-d5b8f4-two",
+    \\ "combiner": "AND",
+    \\ "creationRecord": {
+    \\  "mutateTime": "2026-10-20T18:55:59.726220947Z",
+    \\  "mutatedBy": "zig-gcp@extractctl.iam.gserviceaccount.com"
+    \\ },
+    \\ "mutationRecord": {
+    \\  "mutateTime": "2026-10-20T18:55:59.726220947Z",
+    \\  "mutatedBy": "zig-gcp@extractctl.iam.gserviceaccount.com"
+    \\ },
+    \\ "conditions": [
+    \\  {
+    \\   "conditionThreshold": {
+    \\    "filter": "metric.type=\"pubsub.googleapis.com/topic/send_message_operation_count\" AND resource.type=\"pubsub_topic\"",
+    \\    "comparison": "COMPARISON_GT",
+    \\    "thresholdValue": 1000,
+    \\    "duration": "0s",
+    \\    "aggregations": [
+    \\     {
+    \\      "alignmentPeriod": "60s",
+    \\      "perSeriesAligner": "ALIGN_RATE"
+    \\     }
+    \\    ]
+    \\   },
+    \\   "displayName": "rate over 1000",
+    \\   "name": "projects/extractctl/alertPolicies/7136103533907925714/conditions/7136103533907926391"
+    \\  },
+    \\  {
+    \\   "conditionThreshold": {
+    \\    "filter": "metric.type=\"pubsub.googleapis.com/topic/send_message_operation_count\" AND resource.type=\"pubsub_topic\"",
+    \\    "comparison": "COMPARISON_LT",
+    \\    "thresholdValue": 1,
+    \\    "duration": "0s",
+    \\    "aggregations": [
+    \\     {
+    \\      "alignmentPeriod": "60s",
+    \\      "perSeriesAligner": "ALIGN_RATE"
+    \\     }
+    \\    ]
+    \\   },
+    \\   "displayName": "rate under 1",
+    \\   "name": "projects/extractctl/alertPolicies/7136103533907925714/conditions/7136103533907923886"
+    \\  }
+    \\ ],
+    \\ "userLabels": {
+    \\  "zigps": "probe"
+    \\ },
+    \\ "enabled": true
+    \\}
+;
+
+/// One page of one policy: `totalSize` on every page, a token. HTTP 200.
+pub const policy_page_status = 200;
+pub const policy_page =
+    \\{
+    \\ "nextPageToken": "H4sIAAAAAAAAAAXBsQ2AQAwEwY6Q923O5y-IEBEg6mfmft7r-NgkYw1quQwlx870wLlqNY6gSz8lohzAMAAAAA==",
+    \\ "alertPolicies": [
+    \\  {
+    \\   "name": "projects/extractctl/alertPolicies/3389115242718001746",
+    \\   "displayName": "zigps-d5b8f4-log",
+    \\   "combiner": "OR",
+    \\   "creationRecord": {
+    \\    "mutateTime": "2026-10-20T18:55:56.159593832Z",
+    \\    "mutatedBy": "zig-gcp@extractctl.iam.gserviceaccount.com"
+    \\   },
+    \\   "mutationRecord": {
+    \\    "mutateTime": "2026-10-20T18:55:56.159593832Z",
+    \\    "mutatedBy": "zig-gcp@extractctl.iam.gserviceaccount.com"
+    \\   },
+    \\   "conditions": [
+    \\    {
+    \\     "displayName": "probe log line",
+    \\     "name": "projects/extractctl/alertPolicies/3389115242718001746/conditions/3389115242717999981",
+    \\     "conditionMatchedLog": {
+    \\      "filter": "logName=\"projects/extractctl/logs/zigps-d5b8f4\" AND severity>=ERROR",
+    \\      "labelExtractors": {
+    \\       "k": "EXTRACT(jsonPayload.k)"
+    \\      }
+    \\     }
+    \\    }
+    \\   ],
+    \\   "userLabels": {
+    \\    "zigps": "probe"
+    \\   },
+    \\   "enabled": true,
+    \\   "alertStrategy": {
+    \\    "notificationRateLimit": {
+    \\     "period": "300s"
+    \\    },
+    \\    "autoClose": "1800s"
+    \\   },
+    \\   "severity": "CRITICAL"
+    \\  }
+    \\ ],
+    \\ "totalSize": 6
+    \\}
+;
+
+/// The answer to `PATCH ...?updateMask=enabled` with `{"enabled":false}`:
+/// the whole policy, its mutation record moved. HTTP 200.
+pub const policy_disabled_status = 200;
+pub const policy_disabled =
+    \\{
+    \\ "name": "projects/extractctl/alertPolicies/9594883664150561401",
+    \\ "displayName": "zigps-d5b8f4-threshold",
+    \\ "combiner": "OR",
+    \\ "creationRecord": {
+    \\  "mutateTime": "2026-10-20T18:55:53.325284581Z",
+    \\  "mutatedBy": "zig-gcp@extractctl.iam.gserviceaccount.com"
+    \\ },
+    \\ "mutationRecord": {
+    \\  "mutateTime": "2026-10-20T18:56:08.456766336Z",
+    \\  "mutatedBy": "zig-gcp@extractctl.iam.gserviceaccount.com"
+    \\ },
+    \\ "conditions": [
+    \\  {
+    \\   "conditionThreshold": {
+    \\    "filter": "metric.type=\"pubsub.googleapis.com/topic/send_message_operation_count\" AND resource.type=\"pubsub_topic\"",
+    \\    "comparison": "COMPARISON_GT",
+    \\    "thresholdValue": 1000,
+    \\    "duration": "60s",
+    \\    "trigger": {
+    \\     "count": 1
+    \\    },
+    \\    "aggregations": [
+    \\     {
+    \\      "alignmentPeriod": "60s",
+    \\      "perSeriesAligner": "ALIGN_RATE"
+    \\     }
+    \\    ]
+    \\   },
+    \\   "displayName": "rate over 1000",
+    \\   "name": "projects/extractctl/alertPolicies/9594883664150561401/conditions/9594883664150564016"
+    \\  }
+    \\ ],
+    \\ "documentation": {
+    \\  "content": "Publish rate over 1000/s.",
+    \\  "mimeType": "text/markdown",
+    \\  "subject": "zigps publish rate"
+    \\ },
+    \\ "userLabels": {
+    \\  "zigps": "probe"
+    \\ },
+    \\ "enabled": false,
+    \\ "severity": "WARNING"
+    \\}
+;
+
+/// A get of a policy nobody has. HTTP 404.
+pub const policy_unknown_status = 404;
+pub const policy_unknown =
+    \\{
+    \\ "error": {
+    \\  "code": 404,
+    \\  "message": "Failed to find alert policy 1234567890 in extractctl.",
+    \\  "status": "NOT_FOUND"
+    \\ }
+    \\}
+;
+
+/// A patch of a policy nobody has: the project's number in the words.
+/// HTTP 404.
+pub const policy_patch_unknown_status = 404;
+pub const policy_patch_unknown =
+    \\{
+    \\ "error": {
+    \\  "code": 404,
+    \\  "message": "Failed to find alert policy 1234567890 in 82150720798.",
+    \\  "status": "NOT_FOUND"
+    \\ }
+    \\}
+;
+
+/// A filter on `severity`, which policies cannot be filtered by. HTTP 400.
+pub const policy_filter_severity_status = 400;
+pub const policy_filter_severity =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Invalid field \"filter\" [value ==\"severity=\"WARNING\"\"]; member reference \"severity\" is not valid; No such field: severity.",
+    \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// A filter of a bare word. HTTP 400.
+pub const policy_filter_bare_status = 400;
+pub const policy_filter_bare =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Invalid field \"filter\" [value ==\"zigps-d5b8f4\"]; member reference \"zigps-d5b8f4\" is not valid; No such field: zigps-d5b8f4.",
+    \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// A filter that does not parse. HTTP 400.
+pub const policy_filter_syntax_status = 400;
+pub const policy_filter_syntax =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Could not parse filter \"display_name=(\"; syntax error at line 1, token '<EOF>'",
+    \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// `orderBy` with a trailing `desc`. HTTP 400.
+pub const policy_order_desc_word_status = 400;
+pub const policy_order_desc_word =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Invalid field \"order_by\" [value == \"display_name desc\"; member reference \"display_name desc\" is invalid; No such field: display_name desc.",
+    \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// A patch with a token for `monitoring.read` alone. HTTP 403.
+pub const policy_patch_read_scope_status = 403;
+pub const policy_patch_read_scope =
+    \\{
+    \\ "error": {
+    \\  "code": 403,
+    \\  "message": "Request had insufficient authentication scopes.",
+    \\  "status": "PERMISSION_DENIED",
+    \\  "details": [
+    \\   {
+    \\    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+    \\    "reason": "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+    \\    "domain": "googleapis.com",
+    \\    "metadata": {
+    \\     "method": "google.monitoring.v3.AlertPolicyService.UpdateAlertPolicy",
+    \\     "service": "monitoring.googleapis.com"
+    \\    }
+    \\   }
+    \\  ]
+    \\ }
+    \\}
+;

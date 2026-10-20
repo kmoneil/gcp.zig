@@ -4,6 +4,26 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.52.0 (unreleased)
+
+- monitoring: alert policies, for issue #275: `Client.listAlertPolicies`
+  and `getAlertPolicy` read the policies behind the incidents, every
+  condition decoded by kind (threshold, absence, log match, MQL, PromQL,
+  SQL) with its raw JSON kept beside; `setAlertPolicyEnabled` enables or
+  disables one with `updateMask=enabled` always on the wire (a patch
+  without a mask would replace the whole policy), and
+  `setAlertPolicyEnabledRequest` builds that exact request without
+  sending it. The write is **experimental** on its own. Measured on
+  2026-10-20: `severity` is not a filter field, no order sorts by name,
+  a repeat patch is 200 and moves the mutation record, `monitoring.read`
+  reads and is refused the patch. `FakeMonitoring.putAlertPolicy` puts
+  policies in, read and patched as production answered, refusals in its
+  words (`Options.project_number` and `Options.caller` are new).
+  `Aligner.fromWire` and `Reducer.fromWire` are new.
+- auth, core, dataflow, error_reporting, firestore, kms, logging,
+  pubsub, resource_manager, run, scheduler, secret_manager and storage:
+  unchanged.
+
 ## 0.51.0 (2026-10-20)
 
 - scheduler: three writes a console confirms before sending, for issue

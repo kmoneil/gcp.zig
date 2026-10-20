@@ -304,6 +304,170 @@ pub fn decodeAlert(out: Allocator, scratch: Allocator, body: []const u8) DecodeE
     return alertOf(out, scratch, try parse(scratch, body));
 }
 
+/// One alert policy, as a get and a patch answer it.
+pub fn decodeAlertPolicy(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.AlertPolicy {
+    return policyOf(out, scratch, try parse(scratch, body));
+}
+
+/// A page of `alertPolicies.list`: `{}` is an empty last page.
+pub fn decodeAlertPolicyPage(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.AlertPolicyPage {
+    const obj = try object(try parse(scratch, body));
+    const list = try field(obj, "alertPolicies", .array);
+    const policies = try out.alloc(types.AlertPolicy, if (list) |l| l.items.len else 0);
+    if (list) |l| for (l.items, policies) |v, *p| {
+        p.* = try policyOf(out, scratch, v);
+    };
+    return .{
+        .policies = policies,
+        .next_page_token = try token(out, obj),
+        .total_size = try integer(i64, obj, "totalSize"),
+    };
+}
+
+/// The body of a patch with `updateMask=enabled`. The field always goes
+/// on the wire: production reads an absent `enabled` as true (measured).
+pub fn encodeEnabled(arena: Allocator, enabled: bool) Allocator.Error![]u8 {
+    return arena.dupe(u8, if (enabled) "{\"enabled\":true}" else "{\"enabled\":false}");
+}
+
+fn policyOf(out: Allocator, scratch: Allocator, v: Value) DecodeError!types.AlertPolicy {
+    const obj = try object(v);
+    const name = try string(out, obj, "name") orelse return error.InvalidResponse;
+    var p: types.AlertPolicy = .{
+        .name = name,
+        .id = if (std.mem.lastIndexOfScalar(u8, name, '/')) |i| name[i + 1 ..] else name,
+        .display_name = try string(out, obj, "displayName") orelse "",
+        // Production always sends it; absent, it reads as Google's write
+        // default.
+        .enabled = if (obj.get("enabled")) |e| switch (e) {
+            .bool => |b| b,
+            .null => true,
+            else => return error.InvalidResponse,
+        } else true,
+        .severity = if (try field(obj, "severity", .string)) |s| types.Severity.fromWire(s) else .unspecified,
+        .combiner = if (try field(obj, "combiner", .string)) |s| types.Combiner.fromWire(s) else .unspecified,
+        .user_labels = try labelMapNamed(out, obj, "userLabels"),
+        .created = try mutationOf(out, obj, "creationRecord"),
+        .mutated = try mutationOf(out, obj, "mutationRecord"),
+    };
+    if (try field(obj, "documentation", .object)) |d| p.documentation = .{
+        .content = try string(out, d, "content") orelse "",
+        .mime_type = try string(out, d, "mimeType") orelse "",
+        .subject = try string(out, d, "subject") orelse "",
+    };
+    if (try field(obj, "notificationChannels", .array)) |list| {
+        const channels = try out.alloc([]const u8, list.items.len);
+        for (list.items, channels) |c, *dst| dst.* = switch (c) {
+            .string => |s| try out.dupe(u8, s),
+            else => return error.InvalidResponse,
+        };
+        p.notification_channels = channels;
+    }
+    if (try field(obj, "conditions", .array)) |list| {
+        const conditions = try out.alloc(types.Condition, list.items.len);
+        for (list.items, conditions) |c, *dst| dst.* = try conditionOf(out, scratch, c);
+        p.conditions = conditions;
+    }
+    if (try field(obj, "validity", .object)) |val| {
+        const code = try integer(i64, val, "code") orelse 0;
+        const message = try string(out, val, "message") orelse "";
+        if (code != 0 or message.len > 0) p.invalid = .{ .code = code, .message = message };
+    }
+    return p;
+}
+
+fn mutationOf(out: Allocator, obj: std.json.ObjectMap, name: []const u8) DecodeError!types.MutationRecord {
+    const r = try field(obj, name, .object) orelse return .{};
+    return .{ .time = try time(r, "mutateTime"), .by = try string(out, r, "mutatedBy") orelse "" };
+}
+
+fn conditionOf(out: Allocator, scratch: Allocator, v: Value) DecodeError!types.Condition {
+    _ = scratch;
+    const obj = try object(v);
+    var c: types.Condition = .{
+        .name = try string(out, obj, "name") orelse "",
+        .display_name = try string(out, obj, "displayName") orelse "",
+        .raw = Stringify.valueAlloc(out, v, .{}) catch return error.OutOfMemory,
+    };
+    if (try field(obj, "conditionThreshold", .object)) |t| {
+        c.kind = .threshold;
+        c.filter = try string(out, t, "filter") orelse "";
+        c.comparison = if (try field(t, "comparison", .string)) |s| types.Comparison.fromWire(s) else .unspecified;
+        c.threshold_value = if (t.get("thresholdValue")) |x| (if (x == .null) null else try doubleOf(x)) else null;
+        c.duration_s = try durationOf(t, "duration");
+        c.aggregations = try aggregationsOf(out, t);
+        c.trigger = try triggerOf(t);
+    } else if (try field(obj, "conditionAbsent", .object)) |t| {
+        c.kind = .absence;
+        c.filter = try string(out, t, "filter") orelse "";
+        c.duration_s = try durationOf(t, "duration");
+        c.aggregations = try aggregationsOf(out, t);
+        c.trigger = try triggerOf(t);
+    } else if (try field(obj, "conditionMatchedLog", .object)) |t| {
+        c.kind = .log_match;
+        c.filter = try string(out, t, "filter") orelse "";
+    } else if (try field(obj, "conditionMonitoringQueryLanguage", .object)) |t| {
+        c.kind = .mql;
+        c.query = try string(out, t, "query") orelse "";
+        c.duration_s = try durationOf(t, "duration");
+        c.trigger = try triggerOf(t);
+    } else if (try field(obj, "conditionPrometheusQueryLanguage", .object)) |t| {
+        c.kind = .promql;
+        c.query = try string(out, t, "query") orelse "";
+        c.duration_s = try durationOf(t, "duration");
+    } else if (try field(obj, "conditionSql", .object)) |t| {
+        c.kind = .sql;
+        c.query = try string(out, t, "query") orelse "";
+    }
+    return c;
+}
+
+/// A proto3 duration such as "60s", in seconds.
+fn durationOf(obj: std.json.ObjectMap, name: []const u8) DecodeError!?f64 {
+    const text = try field(obj, name, .string) orelse return null;
+    const d = core.duration.parse(text) catch return error.InvalidResponse;
+    return @as(f64, @floatFromInt(d.nanoseconds)) / std.time.ns_per_s;
+}
+
+fn triggerOf(obj: std.json.ObjectMap) DecodeError!?types.Trigger {
+    const t = try field(obj, "trigger", .object) orelse return null;
+    return .{
+        .count = try integer(i64, t, "count"),
+        .percent = if (t.get("percent")) |x| (if (x == .null) null else try doubleOf(x)) else null,
+    };
+}
+
+/// A condition's aggregations; empty when one names an aligner or a
+/// reducer this library does not know, or a period that is not whole
+/// seconds, since `Condition.raw` keeps them as they came.
+fn aggregationsOf(out: Allocator, obj: std.json.ObjectMap) DecodeError![]const types.Aggregation {
+    const list = try field(obj, "aggregations", .array) orelse return &.{};
+    const aggs = try out.alloc(types.Aggregation, list.items.len);
+    for (list.items, aggs) |item, *a| {
+        const o = try object(item);
+        var period: u32 = 0;
+        if (try field(o, "alignmentPeriod", .string)) |text| {
+            const d = core.duration.parse(text) catch return error.InvalidResponse;
+            if (@rem(d.nanoseconds, std.time.ns_per_s) != 0) return &.{};
+            period = std.math.cast(u32, @divTrunc(d.nanoseconds, std.time.ns_per_s)) orelse return &.{};
+        }
+        a.* = .{
+            .alignment_period_s = period,
+            .aligner = if (try field(o, "perSeriesAligner", .string)) |s| types.Aligner.fromWire(s) orelse return &.{} else .none,
+            .reducer = if (try field(o, "crossSeriesReducer", .string)) |s| types.Reducer.fromWire(s) orelse return &.{} else .none,
+        };
+        if (try field(o, "groupByFields", .array)) |g| {
+            const fields = try out.alloc([]const u8, g.items.len);
+            for (g.items, fields) |x, *dst| dst.* = switch (x) {
+                .string => |s| try out.dupe(u8, s),
+                else => return error.InvalidResponse,
+            };
+            a.group_by = fields;
+        }
+    }
+    return aggs;
+}
+
 /// A page of `alerts.list`: `{}` is an empty last page.
 pub fn decodeAlertPage(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.AlertPage {
     const obj = try object(try parse(scratch, body));
@@ -877,7 +1041,7 @@ fn decodersProperty(_: void, input: []const u8) !void {
     if (decodeSummary(a, s, input)) |summary| {
         if (summary) |sum| try testing.expect(sum.written <= sum.total);
     } else |err| try testing.expectEqual(error.InvalidResponse, err);
-    inline for (.{ decodeMetricInfo, decodeMetricPage, decodeResourceType, decodeResourceTypePage, decodeSeriesPage, decodeAlert, decodeAlertPage }) |decode| {
+    inline for (.{ decodeMetricInfo, decodeMetricPage, decodeResourceType, decodeResourceTypePage, decodeSeriesPage, decodeAlert, decodeAlertPage, decodeAlertPolicy, decodeAlertPolicyPage }) |decode| {
         if (decode(a, s, input)) |_| {} else |err| try testing.expectEqual(error.InvalidResponse, err);
     }
 }
@@ -896,7 +1060,123 @@ test "fuzz decoders: any body decodes or is InvalidResponse, never a crash or a 
         "{\"alerts\":[{\"name\":\"projects/p/alerts/9\",\"state\":\"OPEN\",\"openTime\":\"2026-10-19T14:02:11.311Z\",\"policy\":{\"severity\":\"WARNING\",\"userLabels\":{\"team\":\"ingest\"}},\"metadata\":{\"systemLabels\":{\"spot\":false,\"groups\":[\"a\"]}}}],\"totalSize\":7}",
         "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.monitoring.v3.CreateTimeSeriesSummary\",\"totalPointCount\":\"x\"}]}}",
         "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.monitoring.v3.CreateTimeSeriesSummary\",\"totalPointCount\":\"3\",\"errors\":[{\"status\":{\"code\":9},\"pointCount\":3}]}]}}",
+        production.policy_threshold,
+        production.policy_page,
+        production.policy_two,
+        "{\"name\":\"projects/p/alertPolicies/1\",\"conditions\":[{\"conditionSql\":{\"query\":\"SELECT 1\"}},{\"conditionThreshold\":{\"thresholdValue\":\"NaN\",\"aggregations\":[{\"alignmentPeriod\":\"1.5s\",\"groupByFields\":[\"a\"]}]}}],\"validity\":{\"code\":3,\"message\":\"bad\"},\"notificationChannels\":[\"c\"]}",
     } });
+}
+
+test "alert policies: each condition kind production answered, decoded, the raw kept" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = out.allocator();
+    const s = scratch.allocator();
+
+    const threshold = try decodeAlertPolicy(a, s, production.policy_threshold);
+    try testing.expectEqualStrings("9594883664150561401", threshold.id);
+    try testing.expectEqualStrings("zigps-d5b8f4-threshold", threshold.display_name);
+    try testing.expect(threshold.enabled);
+    try testing.expectEqual(types.Severity.warning, threshold.severity);
+    try testing.expectEqual(types.Combiner.@"or", threshold.combiner);
+    try testing.expectEqualStrings("zigps publish rate", threshold.documentation.subject);
+    try testing.expectEqualStrings("text/markdown", threshold.documentation.mime_type);
+    try testing.expectEqualStrings("probe", threshold.userLabel("zigps").?);
+    try testing.expectEqualStrings("zig-gcp@extractctl.iam.gserviceaccount.com", threshold.created.by);
+    try testing.expect(threshold.created.time != null);
+    try testing.expectEqual(null, threshold.invalid);
+    const tc = threshold.conditions[0];
+    try testing.expectEqual(types.ConditionKind.threshold, tc.kind);
+    try testing.expectEqualStrings("rate over 1000", tc.display_name);
+    try testing.expect(std.mem.endsWith(u8, tc.name, "/conditions/9594883664150564016"));
+    try testing.expectEqual(types.Comparison.gt, tc.comparison);
+    try testing.expectEqual(1000, tc.threshold_value.?);
+    try testing.expectEqual(60, tc.duration_s.?);
+    try testing.expectEqual(1, tc.aggregations.len);
+    try testing.expectEqual(types.Aligner.rate, tc.aggregations[0].aligner);
+    try testing.expectEqual(60, tc.aggregations[0].alignment_period_s);
+    try testing.expectEqual(1, tc.trigger.?.count.?);
+    try testing.expect(std.mem.indexOf(u8, tc.raw, "\"conditionThreshold\"") != null);
+
+    const absence = try decodeAlertPolicy(a, s, production.policy_absence);
+    try testing.expect(!absence.enabled);
+    try testing.expectEqual(types.Severity.@"error", absence.severity);
+    try testing.expectEqual(types.ConditionKind.absence, absence.conditions[0].kind);
+    try testing.expectEqual(300, absence.conditions[0].duration_s.?);
+    try testing.expectEqual(50, absence.conditions[0].trigger.?.percent.?);
+    try testing.expectEqual(types.Aligner.count, absence.conditions[0].aggregations[0].aligner);
+
+    const log = try decodeAlertPolicy(a, s, production.policy_log);
+    try testing.expectEqual(types.ConditionKind.log_match, log.conditions[0].kind);
+    try testing.expect(std.mem.startsWith(u8, log.conditions[0].filter, "logName="));
+    try testing.expect(std.mem.indexOf(u8, log.conditions[0].raw, "labelExtractors") != null);
+
+    const mql = try decodeAlertPolicy(a, s, production.policy_mql);
+    try testing.expectEqual(types.Severity.unspecified, mql.severity);
+    try testing.expectEqual(types.ConditionKind.mql, mql.conditions[0].kind);
+    try testing.expect(std.mem.startsWith(u8, mql.conditions[0].query, "fetch pubsub_topic"));
+
+    const promql = try decodeAlertPolicy(a, s, production.policy_promql);
+    try testing.expectEqual(types.ConditionKind.promql, promql.conditions[0].kind);
+    try testing.expectEqual(60, promql.conditions[0].duration_s.?);
+    try testing.expect(std.mem.indexOf(u8, promql.conditions[0].raw, "evaluationInterval") != null);
+
+    const two = try decodeAlertPolicy(a, s, production.policy_two);
+    try testing.expectEqual(types.Combiner.@"and", two.combiner);
+    try testing.expectEqual(2, two.conditions.len);
+    try testing.expectEqual(types.Comparison.lt, two.conditions[1].comparison);
+
+    const page = try decodeAlertPolicyPage(a, s, production.policy_page);
+    try testing.expectEqual(1, page.policies.len);
+    try testing.expectEqual(6, page.total_size.?);
+    try testing.expect(page.next_page_token != null);
+    const empty = try decodeAlertPolicyPage(a, s, "{}");
+    try testing.expectEqual(0, empty.policies.len);
+    try testing.expectEqual(null, empty.next_page_token);
+}
+
+test "alert policies: SQL, an invalid policy, channels, and what decodes to unknown" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const p = try decodeAlertPolicy(out.allocator(), scratch.allocator(),
+        \\{"name":"projects/p/alertPolicies/7","combiner":"AND_WITH_MATCHING_RESOURCE","severity":"FATAL",
+        \\ "notificationChannels":["projects/p/notificationChannels/1","projects/p/notificationChannels/2"],
+        \\ "validity":{"code":3,"message":"The filter is invalid."},
+        \\ "conditions":[
+        \\  {"name":"c1","conditionSql":{"query":"SELECT 1","minutes":{"periodicity":5}}},
+        \\  {"name":"c2","conditionSomethingNew":{"x":1}},
+        \\  {"name":"c3","conditionThreshold":{"comparison":"COMPARISON_BETWEEN","aggregations":[{"alignmentPeriod":"60s","perSeriesAligner":"ALIGN_TOMORROW"}]}},
+        \\  {"name":"c4","conditionThreshold":{"aggregations":[{"alignmentPeriod":"60s","perSeriesAligner":"ALIGN_MEAN","crossSeriesReducer":"REDUCE_SUM","groupByFields":["resource.labels.zone"]}]}}
+        \\ ]}
+    );
+    try testing.expectEqual(types.Combiner.and_with_matching_resource, p.combiner);
+    try testing.expectEqual(types.Severity.unknown, p.severity);
+    try testing.expectEqual(2, p.notification_channels.len);
+    try testing.expectEqual(3, p.invalid.?.code);
+    try testing.expectEqualStrings("The filter is invalid.", p.invalid.?.message);
+    try testing.expectEqual(types.ConditionKind.sql, p.conditions[0].kind);
+    try testing.expectEqualStrings("SELECT 1", p.conditions[0].query);
+    try testing.expectEqual(types.ConditionKind.unknown, p.conditions[1].kind);
+    try testing.expect(std.mem.indexOf(u8, p.conditions[1].raw, "conditionSomethingNew") != null);
+    try testing.expectEqual(types.Comparison.unknown, p.conditions[2].comparison);
+    try testing.expectEqual(0, p.conditions[2].aggregations.len);
+    try testing.expectEqual(types.Reducer.sum, p.conditions[3].aggregations[0].reducer);
+    try testing.expectEqualStrings("resource.labels.zone", p.conditions[3].aggregations[0].group_by[0]);
+    try testing.expect(p.enabled);
+    try testing.expectError(error.InvalidResponse, decodeAlertPolicy(out.allocator(), scratch.allocator(), "{\"displayName\":\"no name\"}"));
+    try testing.expectError(error.InvalidResponse, decodeAlertPolicy(out.allocator(), scratch.allocator(), "{\"name\":\"n\",\"enabled\":\"yes\"}"));
+    try testing.expectError(error.InvalidResponse, decodeAlertPolicy(out.allocator(), scratch.allocator(), "{\"name\":\"n\",\"conditions\":[{\"conditionThreshold\":{\"duration\":\"soon\"}}]}"));
+}
+
+test "encodeEnabled: the field always on the wire" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("{\"enabled\":false}", try encodeEnabled(arena.allocator(), false));
+    try testing.expectEqualStrings("{\"enabled\":true}", try encodeEnabled(arena.allocator(), true));
 }
 
 test "decodeAlert: every field as the discovery document shapes them" {

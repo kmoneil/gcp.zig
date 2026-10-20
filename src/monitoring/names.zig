@@ -12,6 +12,7 @@ pub const Collection = enum {
     resource_descriptors,
     time_series,
     alerts,
+    alert_policies,
 
     fn segment(c: Collection) []const u8 {
         return switch (c) {
@@ -19,6 +20,7 @@ pub const Collection = enum {
             .resource_descriptors => "monitoredResourceDescriptors",
             .time_series => "timeSeries",
             .alerts => "alerts",
+            .alert_policies => "alertPolicies",
         };
     }
 };
@@ -64,15 +66,33 @@ pub fn alert(arena: Allocator, project: []const u8, id: []const u8) Allocator.Er
     return w.written();
 }
 
+/// `/v3/projects/P/alertPolicies/<id>`.
+pub fn alertPolicy(arena: Allocator, project: []const u8, id: []const u8) Allocator.Error![]const u8 {
+    var w: Writer.Allocating = .init(arena);
+    writeCollection(&w.writer, project, .alert_policies) catch return error.OutOfMemory;
+    w.writer.writeByte('/') catch return error.OutOfMemory;
+    core.query.writeSegment(&w.writer, id) catch return error.OutOfMemory;
+    return w.written();
+}
+
 /// The id in `id_or_name`: the trailing segment when it is exactly
 /// `projects/<project>/alerts/<id>`, the input itself when it is no full
 /// name at all. Null for another project's name or a malformed one.
 pub fn alertId(id_or_name: []const u8, project: []const u8) ?[]const u8 {
+    return idIn(id_or_name, project, .alerts);
+}
+
+/// `alertId` for `projects/<project>/alertPolicies/<id>`.
+pub fn alertPolicyId(id_or_name: []const u8, project: []const u8) ?[]const u8 {
+    return idIn(id_or_name, project, .alert_policies);
+}
+
+fn idIn(id_or_name: []const u8, project: []const u8, c: Collection) ?[]const u8 {
     if (!std.mem.startsWith(u8, id_or_name, "projects/")) return id_or_name;
     var parts = std.mem.splitScalar(u8, id_or_name, '/');
     _ = parts.next();
     const p = parts.next() orelse return null;
-    if (!std.mem.eql(u8, parts.next() orelse return null, "alerts")) return null;
+    if (!std.mem.eql(u8, parts.next() orelse return null, c.segment())) return null;
     const id = parts.next() orelse return null;
     if (parts.next() != null) return null;
     if (!std.mem.eql(u8, p, project) or id.len == 0) return null;
@@ -90,6 +110,17 @@ test "alert paths and names: a bare id, this project's full name, nobody else's"
     try std.testing.expectEqual(null, alertId("projects/p/alerts/9/x", "p"));
     try std.testing.expectEqual(null, alertId("projects/p/alertPolicies/9", "p"));
     try std.testing.expectEqual(null, alertId("projects/p", "p"));
+}
+
+test "alert policy paths and names" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings("/v3/projects/p/alertPolicies/95", try alertPolicy(arena.allocator(), "p", "95"));
+    try std.testing.expectEqualStrings("95", alertPolicyId("95", "p").?);
+    try std.testing.expectEqualStrings("95", alertPolicyId("projects/p/alertPolicies/95", "p").?);
+    try std.testing.expectEqual(null, alertPolicyId("projects/q/alertPolicies/95", "p"));
+    try std.testing.expectEqual(null, alertPolicyId("projects/p/alerts/95", "p"));
+    try std.testing.expectEqual(null, alertPolicyId("projects/p/alertPolicies/95/conditions/1", "p"));
 }
 
 const testing = std.testing;

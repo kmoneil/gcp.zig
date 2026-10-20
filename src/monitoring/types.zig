@@ -396,6 +396,13 @@ pub const Aligner = enum {
             inline else => |tag| "ALIGN_" ++ comptime upper(@tagName(tag)),
         };
     }
+
+    /// The aligner a wire name names, or null for one this library does
+    /// not know.
+    pub fn fromWire(name: []const u8) ?Aligner {
+        for (std.enums.values(Aligner)) |a| if (std.mem.eql(u8, name, a.wire())) return a;
+        return null;
+    }
 };
 
 /// How aligned series are combined into fewer, as `common.proto` names them.
@@ -420,6 +427,13 @@ pub const Reducer = enum {
         return switch (r) {
             inline else => |tag| "REDUCE_" ++ comptime upper(@tagName(tag)),
         };
+    }
+
+    /// The reducer a wire name names, or null for one this library does
+    /// not know.
+    pub fn fromWire(name: []const u8) ?Reducer {
+        for (std.enums.values(Reducer)) |r| if (std.mem.eql(u8, name, r.wire())) return r;
+        return null;
     }
 };
 
@@ -683,6 +697,178 @@ pub const AlertPage = struct {
     total_size: ?i64 = null,
 };
 
+/// What a condition tests, by the one kind field it carries.
+pub const ConditionKind = enum {
+    /// `conditionThreshold`: series compared against a value.
+    threshold,
+    /// `conditionAbsent`: series that stopped reporting.
+    absence,
+    /// `conditionMatchedLog`: a log entry that matched a filter.
+    log_match,
+    /// `conditionMonitoringQueryLanguage`.
+    mql,
+    /// `conditionPrometheusQueryLanguage`.
+    promql,
+    /// `conditionSql`: GoogleSQL over logs.
+    sql,
+    /// A kind this library does not know; `Condition.raw` has it.
+    unknown,
+};
+
+pub const Comparison = enum {
+    unspecified,
+    gt,
+    ge,
+    lt,
+    le,
+    eq,
+    ne,
+    unknown,
+
+    pub fn fromWire(name: []const u8) Comparison {
+        const map = std.StaticStringMap(Comparison).initComptime(.{
+            .{ "COMPARISON_UNSPECIFIED", .unspecified },
+            .{ "COMPARISON_GT", .gt },
+            .{ "COMPARISON_GE", .ge },
+            .{ "COMPARISON_LT", .lt },
+            .{ "COMPARISON_LE", .le },
+            .{ "COMPARISON_EQ", .eq },
+            .{ "COMPARISON_NE", .ne },
+        });
+        return map.get(name) orelse .unknown;
+    }
+};
+
+/// How many series must fail a condition's test for it to fire; Google
+/// treats none as a count of 1.
+pub const Trigger = struct {
+    count: ?i64 = null,
+    percent: ?f64 = null,
+};
+
+/// One test of an alert policy. The fields a console shows are decoded;
+/// `raw` holds the whole condition as production sent it, for the rest
+/// (denominators, forecasts, PromQL labels and rule names, SQL schedules
+/// and tests) and for kinds Google adds later.
+pub const Condition = struct {
+    /// `projects/P/alertPolicies/A/conditions/C`.
+    name: []const u8 = "",
+    display_name: []const u8 = "",
+    kind: ConditionKind = .unknown,
+    /// The metric filter (threshold, absence) or the log filter (log
+    /// match); empty for the query kinds.
+    filter: []const u8 = "",
+    /// The query (MQL, PromQL, SQL); empty for the filter kinds.
+    query: []const u8 = "",
+    /// Threshold conditions only.
+    comparison: Comparison = .unspecified,
+    threshold_value: ?f64 = null,
+    /// How long the test must hold before the condition fires, in
+    /// seconds; null when production sent none.
+    duration_s: ?f64 = null,
+    /// Threshold and absence conditions. Empty when the condition names an
+    /// aligner or reducer this library does not know: `raw` has it.
+    aggregations: []const Aggregation = &.{},
+    trigger: ?Trigger = null,
+    /// The condition object as production sent it, as JSON text.
+    raw: []const u8 = "",
+};
+
+/// How an alert policy combines its conditions.
+pub const Combiner = enum {
+    unspecified,
+    @"and",
+    @"or",
+    /// Every condition, on the same resource.
+    and_with_matching_resource,
+    unknown,
+
+    pub fn fromWire(name: []const u8) Combiner {
+        const map = std.StaticStringMap(Combiner).initComptime(.{
+            .{ "COMBINE_UNSPECIFIED", .unspecified },
+            .{ "AND", .@"and" },
+            .{ "OR", .@"or" },
+            .{ "AND_WITH_MATCHING_RESOURCE", .and_with_matching_resource },
+        });
+        return map.get(name) orelse .unknown;
+    }
+};
+
+/// What a policy's notifications and incidents carry.
+pub const Documentation = struct {
+    content: []const u8 = "",
+    /// `text/markdown` or `text/plain`.
+    mime_type: []const u8 = "",
+    /// The notification's subject line.
+    subject: []const u8 = "",
+};
+
+/// Who changed a policy, and when.
+pub const MutationRecord = struct {
+    time: ?std.Io.Timestamp = null,
+    /// An email, or a service account's.
+    by: []const u8 = "",
+};
+
+/// An alert policy: when Cloud Monitoring opens alerts, and what it tells
+/// people when it does.
+pub const AlertPolicy = struct {
+    /// `projects/P/alertPolicies/ID`, the id system-assigned.
+    name: []const u8,
+    /// The trailing segment of `name`.
+    id: []const u8,
+    display_name: []const u8 = "",
+    /// A disabled policy opens no alerts.
+    enabled: bool = true,
+    severity: Severity = .unspecified,
+    combiner: Combiner = .unspecified,
+    documentation: Documentation = .{},
+    user_labels: []const Label = &.{},
+    /// Full names, `projects/P/notificationChannels/ID`.
+    notification_channels: []const []const u8 = &.{},
+    conditions: []const Condition = &.{},
+    created: MutationRecord = .{},
+    /// The latest change. Production moves it on every patch, a disable
+    /// of a disabled policy included (measured 2026-10-20).
+    mutated: MutationRecord = .{},
+    /// Set only when production holds the policy invalid: it opens nothing
+    /// until fixed.
+    invalid: ?Invalid = null,
+
+    pub const Invalid = struct { code: i64, message: []const u8 };
+
+    /// The user label named `key`, or null.
+    pub fn userLabel(self: AlertPolicy, key: []const u8) ?[]const u8 {
+        for (self.user_labels) |l| if (std.mem.eql(u8, l.key, key)) return l.value;
+        return null;
+    }
+};
+
+pub const ListAlertPoliciesOptions = struct {
+    /// Sent as `filter`, as written, in the sorting-and-filtering
+    /// language over `name`, `display_name`, `documentation.content`,
+    /// `documentation.mime_type`, `user_labels`, `conditions.size`,
+    /// `combiner`, `enabled` and `notification_channels`; production
+    /// refuses any other field, `severity` included, and a bare word
+    /// (measured 2026-10-20). Null lists them all.
+    filter: ?[]const u8 = null,
+    /// Sent as `orderBy`, as written: field paths from the same list,
+    /// comma-separated, `-` before one for descending (production refuses
+    /// a trailing `desc`). Null: production orders by name.
+    order_by: ?[]const u8 = null,
+    /// 0 for the server's default, which answered every policy measured.
+    page_size: u32 = 0,
+    page_token: ?[]const u8 = null,
+};
+
+pub const AlertPolicyPage = struct {
+    policies: []const AlertPolicy,
+    /// Null on the last page.
+    next_page_token: ?[]const u8 = null,
+    /// The count of every match, which production sends on every page.
+    total_size: ?i64 = null,
+};
+
 const testing = std.testing;
 
 test "Alert: states, severities and orders on the wire, and the label helpers" {
@@ -712,6 +898,17 @@ test "Alert: states, severities and orders on the wire, and the label helpers" {
     try testing.expectEqual(null, alert.resourceLabel("k"));
     try testing.expectEqualStrings("ingest", alert.policy.userLabel("team").?);
     try testing.expectEqual(null, alert.policy.userLabel("x"));
+}
+
+test "Aligner, Reducer, Comparison and Combiner: wire names both ways, the unknown kept apart" {
+    for (std.enums.values(Aligner)) |a| try testing.expectEqual(a, Aligner.fromWire(a.wire()).?);
+    for (std.enums.values(Reducer)) |r| try testing.expectEqual(r, Reducer.fromWire(r.wire()).?);
+    try testing.expectEqual(null, Aligner.fromWire("ALIGN_SOMETHING_NEW"));
+    try testing.expectEqual(null, Reducer.fromWire("max"));
+    try testing.expectEqual(Comparison.gt, Comparison.fromWire("COMPARISON_GT"));
+    try testing.expectEqual(Comparison.unknown, Comparison.fromWire("COMPARISON_BETWEEN"));
+    try testing.expectEqual(Combiner.and_with_matching_resource, Combiner.fromWire("AND_WITH_MATCHING_RESOURCE"));
+    try testing.expectEqual(Combiner.unknown, Combiner.fromWire("XOR"));
 }
 
 test "Aligner and Reducer: the proto's names" {

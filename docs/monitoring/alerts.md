@@ -6,8 +6,9 @@ An alert is the violation of an alert policy: Cloud Monitoring opens one
 when a policy's condition fires and closes it when the condition clears
 or the policy is deleted. The API reads them only; nothing here (or
 anywhere in `monitoring.googleapis.com`) can make, change or close one.
-Alert policies themselves, notification channels and the rest of the
-configuration plane are not in this module.
+The policies themselves are read, and enabled or disabled, through
+[Alert policies](policies.md); notification channels and the rest of
+the configuration plane are not in this module.
 
 ```zig
 var page = try client.listAlerts(.{ .open_only = true });

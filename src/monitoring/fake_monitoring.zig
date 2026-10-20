@@ -80,6 +80,7 @@ const core = @import("core");
 const tp = core.transport;
 const types = @import("types.zig");
 const validate = @import("validate.zig");
+const fake_policies = @import("fake_policies.zig");
 
 pub const FakeMonitoring = struct {
     gpa: Allocator,
@@ -98,6 +99,8 @@ pub const FakeMonitoring = struct {
     google_loaded: bool = false,
     /// By id, in the order put in (issue #246).
     alerts: std.StringArrayHashMapUnmanaged(*FakeAlert) = .empty,
+    /// Alert policies (issue #275), in `fake_policies.zig`.
+    policy_store: fake_policies.Store = .{},
     alert_counter: u64 = 0,
 
     const Fault = struct { n: usize = 0, status: u16 = 0, delay: ?core.retry_after.Asked = null };
@@ -116,7 +119,16 @@ pub const FakeMonitoring = struct {
     pub const Options = struct {
         /// The project it answers for, by id.
         project_id: []const u8 = "my-project",
+        /// The same project by number, which production names in some
+        /// refusals: a patch of an alert policy nobody has.
+        project_number: []const u8 = "123456789012",
+        /// Who production says made a change, in a policy's mutation
+        /// record: the caller's email.
+        caller: []const u8 = "fake-caller@my-project.iam.gserviceaccount.com",
     };
+
+    pub const PutAlertPolicy = fake_policies.PutAlertPolicy;
+    pub const PutCondition = fake_policies.PutCondition;
 
     pub const Reply = struct { status: u16, headers: []const tp.Header = &.{}, body: []const u8 };
 
@@ -177,6 +189,7 @@ pub const FakeMonitoring = struct {
         f.descriptors.deinit(f.gpa);
         f.series.deinit(f.gpa);
         f.alerts.deinit(f.gpa);
+        f.policy_store.deinit(f.gpa);
         f.store.deinit();
         f.* = undefined;
     }
@@ -385,6 +398,25 @@ pub const FakeMonitoring = struct {
     /// without; a close before the open; a severity of `.unknown`; an id
     /// taken, empty, past 256 bytes, or with a character outside visible
     /// ASCII, or `/`; a label key twice in one list.
+    /// An alert policy, standing in for whoever made it (issue #275): read
+    /// back by list and get, enabled and disabled through the API. Returns
+    /// its full name, owned by the fake. `error.InvalidEntry`, with
+    /// nothing kept, for an id taken or not one production could hold, a
+    /// severity or combiner of `.unknown`, a condition of `.unknown` kind,
+    /// or one without the filter or query its kind needs.
+    pub fn putAlertPolicy(f: *FakeMonitoring, policy: PutAlertPolicy) PutError![]const u8 {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        return f.policy_store.put(f.gpa, f.store.allocator(), f.options.project_id, f.options.caller, f.nowNs(), policy);
+    }
+
+    /// Alert policies held.
+    pub fn alertPolicyCount(f: *FakeMonitoring) usize {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        return f.policy_store.count();
+    }
+
     pub fn putAlert(f: *FakeMonitoring, alert: PutAlert) PutError![]const u8 {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
@@ -590,6 +622,12 @@ pub const FakeMonitoring = struct {
                     else => notModelled(arena, "this method on timeSeries"),
                 };
             },
+            .alert_policies => return f.policy_store.route(arena, .{
+                .project = f.options.project_id,
+                .project_number = f.options.project_number,
+                .caller = f.options.caller,
+                .now_ns = f.nowNs(),
+            }, req.method, target.rest, params, req.body),
             .alerts => {
                 if (req.method != .GET) return notModelled(arena, "this method on alerts");
                 if (target.rest.len == 0) return f.listAlertsRoute(arena, params);
@@ -2060,7 +2098,7 @@ fn fakeDouble(jw: *Stringify, d: f64) Stringify.Error!void {
 
 const Route = struct {
     project: []const u8,
-    collection: enum { metric_descriptors, resource_descriptors, time_series, alerts },
+    collection: enum { metric_descriptors, resource_descriptors, time_series, alerts, alert_policies },
     /// After the collection and its `/`, as sent; "" for the collection.
     rest: []const u8,
 };
@@ -2084,6 +2122,7 @@ fn parseRoute(path: []const u8) ?Route {
         .{ "monitoredResourceDescriptors", .resource_descriptors },
         .{ "timeSeries", .time_series },
         .{ "alerts", .alerts },
+        .{ "alertPolicies", .alert_policies },
     };
     for (names) |n| {
         if (std.mem.eql(u8, tail, n[0])) return .{ .project = project, .collection = n[1], .rest = "" };
@@ -2099,7 +2138,7 @@ fn decoded(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
     return std.Uri.percentDecodeInPlace(copy);
 }
 
-const Param = struct { name: []const u8, value: []const u8 };
+pub const Param = struct { name: []const u8, value: []const u8 };
 
 fn parseParams(arena: Allocator, query: []const u8) Allocator.Error!?[]const Param {
     var list: std.ArrayList(Param) = .empty;
@@ -3402,7 +3441,8 @@ test "what the fake does not answer: no credentials, another project, other path
         .{ .PATCH, "metricDescriptors/custom.googleapis.com/x" },
         .{ .POST, "monitoredResourceDescriptors" },
         .{ .POST, "timeSeries/x" },
-        .{ .GET, "alertPolicies" },
+        .{ .POST, "alertPolicies" },
+        .{ .GET, "notificationChannels" },
     }) |c| try testing.expectEqual(501, (try b.raw(a, c[0], c[1], "{}")).status);
     try testing.expectEqual(400, (try b.raw(a, .GET, "metricDescriptors?pageSize", null)).status);
     try testing.expectEqual(501, (try b.raw(a, .GET, "metricDescriptors?filter=metric.type%3D%22x%22", null)).status);
