@@ -49,7 +49,7 @@ Against production, pass a `.token_provider` as well:
 | [Schemas](schemas.md) | Avro and Protocol Buffer schemas and their revisions; a topic that takes only what fits; asking before publishing; what a subscriber reads off a message |
 | [Message transforms](transforms.md) | JavaScript functions Pub/Sub runs on a topic's or a subscription's messages: rewriting, dropping and refusing; changing the list; why the emulator cannot test one |
 | [Import topics](import-topics.md) | A topic that fills itself from a bucket, Kinesis, Event Hubs, MSK or Confluent Cloud; the source's state; changing and stopping |
-| [Testing](testing.md) | `pubsub.testing.FakePubSub`, Pub/Sub in memory for your own tests: production's answers, a clock the test moves, faults on request; what it models and what it does not (experimental) |
+| [Testing](testing.md) | `pubsub.testing.FakePubSub`, Pub/Sub in memory for your own tests: production's answers, a clock the test moves, faults on request; what it models and what it does not |
 
 **On this page:** [Handles and calls](#handles-and-calls) ·
 [Pulling](#pulling) · [Retries](#retries) · [Limits](#limits) ·

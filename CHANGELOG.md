@@ -22,7 +22,12 @@ including the ones that did not change.
   2026-10-19 without a failure, and every module's production suite
   exercises it; `Credentials.bindsScopes` (0.46.0) was additive and
   tested.
-- core, error_reporting, firestore, kms, logging, monitoring, pubsub,
+- pubsub: `pubsub.testing.FakePubSub` drops its **experimental**
+  marker: beta, as the module is. No call changes. It earned it on the
+  same rule: the production replay of 2026-10-13 (24 of 24 scripts
+  agree), and its nightly fuzz job, `fake-pubsub`, running from its
+  first nightly, 2026-10-13, to 2026-10-20 without a failure.
+- core, error_reporting, firestore, kms, logging, monitoring,
   resource_manager, run and scheduler: unchanged.
 
 ## 0.48.0 (2026-10-19)
