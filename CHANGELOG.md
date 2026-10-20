@@ -36,7 +36,16 @@ including the ones that did not change.
   API in production's words, closes the alerts they hold over, and
   refuses an open `putAlert` for a snoozed policy. A slow property
   holds the fake's snoozes and alerts to a model in the
-  `slow-monitoring` nightly job.
+  `slow-monitoring` nightly job. Production's snooze lists lag behind a
+  create (one showed 91 s after it, where a get showed it at once):
+  keep a create's answer rather than re-list. A gated suite
+  (`MONITORING_TEST_POLICIES=1`, about three minutes) reads, disables
+  and enables real `zigps-` policies, makes, lists and ends snoozes in
+  each of production's forms, holds every preview byte for byte to what
+  was sent, and replays every step on a fake seeded from production.
+  `examples/monitoring_policies.zig` draws the policy view and, with
+  `--disable` or `--snooze`, shows a write's request, sending it with
+  `--yes`.
 - auth, core, dataflow, error_reporting, firestore, kms, logging,
   pubsub, resource_manager, run, scheduler, secret_manager and storage:
   unchanged.

@@ -48,6 +48,20 @@
 //! production's answers, refusals, descriptors and the `consumer_quota`
 //! resource type. It creates and deletes nothing but the run's own user
 //! descriptor.
+//!
+//! A policies test (MONITORING_TEST_POLICIES=1, about two minutes; issue
+//! #275) makes a threshold and an MQL policy named `zigps-pol-<run>-`
+//! raw, reads them through the client, disables and enables one, and
+//! makes, lists and ends snoozes in each of production's three forms (a
+//! cancel under a minute, an upcoming one cancelled, one ended after a
+//! minute), with its refusals. Each write's preview is held byte for byte
+//! to what was sent, and every step is replayed on a fake seeded from
+//! production and compared. Production's snooze lists lag behind a
+//! create (measured: up to 91 s), so the active-list comparison polls
+//! until production's reads as the fake's, three minutes at most. It
+//! deletes its policies; its snoozes cannot be deleted and stay, ended or
+//! cancelled, in the project's history. Its first run agreed on every
+//! step but that list, which then read so 79 s after polling began.
 
 const std = @import("std");
 const core = @import("core");
@@ -1506,5 +1520,311 @@ test "monitoring: Cloud's quota metrics, and the fake given production's points 
         }
         agree(&differences, "consumer_quota", lines[0], lines[1]);
     }
+    try testing.expectEqual(0, differences);
+}
+
+// Alert policies and snoozes (issue #275).
+
+/// A transport that keeps the last request it passed on, to hold a
+/// preview to what was sent.
+const Recorder = struct {
+    inner: core.transport.Transport,
+    arena: std.heap.ArenaAllocator,
+    method: core.transport.Method = .GET,
+    url: []const u8 = "",
+    body: []const u8 = "",
+
+    fn transport(r: *Recorder) core.transport.Transport {
+        return .{ .ptr = r, .vtable = &.{ .send = send } };
+    }
+
+    fn send(ptr: *anyopaque, req: core.transport.Request, arena: Allocator) core.transport.Error!core.transport.Response {
+        const r: *Recorder = @ptrCast(@alignCast(ptr));
+        r.method = req.method;
+        r.url = r.arena.allocator().dupe(u8, req.url) catch return error.OutOfMemory;
+        r.body = r.arena.allocator().dupe(u8, req.body orelse "") catch return error.OutOfMemory;
+        return r.inner.send(req, arena);
+    }
+
+    fn expectSent(r: *const Recorder, prepared: core.PreparedRequest) !void {
+        try testing.expectEqual(prepared.method, r.method);
+        try testing.expectEqualStrings(prepared.url, r.url);
+        try testing.expectEqualStrings(prepared.body, r.body);
+    }
+};
+
+/// The reason after production's parse tree in a snooze refusal, or the
+/// whole message when it has none.
+fn tailOf(message: []const u8) []const u8 {
+    const cut = std.mem.lastIndexOf(u8, message, "\": ") orelse return message;
+    return message[cut + 3 ..];
+}
+
+/// The message in a refusal's raw body.
+fn bodyMessage(a: Allocator, body: []const u8) []const u8 {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch return body;
+    if (v != .object) return body;
+    const e = v.object.get("error") orelse return body;
+    if (e != .object) return body;
+    const m = e.object.get("message") orelse return body;
+    return if (m == .string) m.string else body;
+}
+
+fn policyLine(a: Allocator, p: monitoring.AlertPolicy) ![]const u8 {
+    var w: std.Io.Writer.Allocating = .init(a);
+    try w.writer.print("{s} enabled={} severity={t} combiner={t} subject=\"{s}\" by={s} label={?s} conditions=", .{ p.display_name, p.enabled, p.severity, p.combiner, p.documentation.subject, p.mutated.by, p.userLabel("zigps") });
+    for (p.conditions) |c| {
+        try w.writer.print("[{t} \"{s}\" filter={d}B query={d}B {t} {?d} {?d}s aggs={d} trigger={?d}]", .{ c.kind, c.display_name, c.filter.len, c.query.len, c.comparison, c.threshold_value, c.duration_s, c.aggregations.len, if (c.trigger) |t| t.count else null });
+    }
+    return w.written();
+}
+
+fn policyOutcome(a: Allocator, page: anytype, err_diag: ?[]const u8) ![]const u8 {
+    if (err_diag) |text| return text;
+    var w: std.Io.Writer.Allocating = .init(a);
+    try w.writer.print("n={d} total={?d} next={}", .{ page.policies.len, page.total_size, page.next_page_token != null });
+    for (page.policies) |p| try w.writer.print(" | {s}", .{try policyLine(a, p)});
+    return w.written();
+}
+
+fn listPoliciesOutcome(a: Allocator, client: *monitoring.Client, diag: *monitoring.Diagnostics, options: monitoring.ListAlertPoliciesOptions) ![]const u8 {
+    var page = client.listAlertPolicies(options) catch |err| return a.print("error.{t}: {s}", .{ err, diag.message() });
+    defer page.deinit();
+    return policyOutcome(a, page.value, null);
+}
+
+fn snoozeLine(a: Allocator, s: monitoring.Snooze, now: std.Io.Timestamp) ![]const u8 {
+    return a.print("{s} {t} cancelled={} policies={d} filter=\"{s}\" start={d} end={d}", .{ s.display_name, s.stateAt(now), s.cancelled(), s.policies.len, s.filter, s.start.nanoseconds, s.end.nanoseconds });
+}
+
+/// A snooze write's answer, or its refusal, as text.
+fn snoozeOutcome(a: Allocator, result: anytype, diag: *monitoring.Diagnostics, now: std.Io.Timestamp) ![]const u8 {
+    var answer = result catch |err| return a.print("error.{t}: {s}", .{ err, tailOf(diag.message()) });
+    defer answer.deinit();
+    return snoozeLine(a, answer.value, now);
+}
+
+test "monitoring: alert policies and snoozes, and the fake seeded with production's answers as production did" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    if (f.env.get("MONITORING_TEST_POLICIES") == null) return error.SkipZigTest;
+    const a = f.arena.allocator();
+    try sweepAlertPolicies(&f, a);
+
+    // Two policies, made raw: the client changes nothing but `enabled`.
+    const display = try a.print("zigps-pol-{s}", .{f.run});
+    const topic = "metric.type=\\\"pubsub.googleapis.com/topic/send_message_operation_count\\\" AND resource.type=\\\"pubsub_topic\\\"";
+    var made: std.ArrayList([]const u8) = .empty;
+    defer {
+        var cleanup: std.heap.ArenaAllocator = .init(testing.allocator);
+        for (made.items) |name| {
+            const res = rawMonitoring(&f, cleanup.allocator(), .DELETE, cleanup.allocator().print("/v3/{s}", .{name}) catch "", null) catch null;
+            fact("cleanup {s}: HTTP {d}", .{ name, if (res) |r| r.status else 0 });
+        }
+        cleanup.deinit();
+    }
+    for ([_][]const u8{
+        try a.print("{{\"displayName\":\"{s}-threshold\",\"severity\":\"WARNING\",\"combiner\":\"OR\",\"userLabels\":{{\"zigps\":\"suite\"}},\"documentation\":{{\"content\":\"Publish rate over 1000/s.\",\"mimeType\":\"text/markdown\",\"subject\":\"zigps publish rate\"}},\"conditions\":[{{\"displayName\":\"rate over 1000\",\"conditionThreshold\":{{\"filter\":\"{s}\",\"comparison\":\"COMPARISON_GT\",\"thresholdValue\":1000,\"duration\":\"60s\",\"aggregations\":[{{\"alignmentPeriod\":\"60s\",\"perSeriesAligner\":\"ALIGN_RATE\"}}],\"trigger\":{{\"count\":1}}}}}}]}}", .{ display, topic }),
+        try a.print("{{\"displayName\":\"{s}-mql\",\"combiner\":\"OR\",\"userLabels\":{{\"zigps\":\"suite\"}},\"conditions\":[{{\"displayName\":\"mql rate\",\"conditionMonitoringQueryLanguage\":{{\"query\":\"fetch pubsub_topic | metric 'pubsub.googleapis.com/topic/send_message_operation_count' | align rate(1m) | every 1m | condition val() > 1000 '1/s'\",\"duration\":\"60s\",\"trigger\":{{\"count\":1}}}}}}]}}", .{display}),
+    }) |body| {
+        const res = try rawMonitoring(&f, a, .POST, try a.print("/v3/projects/{s}/alertPolicies", .{f.project}), body);
+        try testing.expectEqual(200, res.status);
+        const v = try std.json.parseFromSliceLeaky(std.json.Value, a, res.body, .{});
+        try made.append(a, try a.dupe(u8, v.object.get("name").?.string));
+    }
+    const threshold_id = made.items[0][std.mem.lastIndexOfScalar(u8, made.items[0], '/').? + 1 ..];
+    fact("made {s} and {s}", .{ made.items[0], made.items[1] });
+
+    // The project's number and the caller, from production's own answers,
+    // for the fake's 404 words and mutation records.
+    const number = blk: {
+        _ = f.client.setAlertPolicyEnabled("1", true) catch {};
+        const msg = f.diag.message();
+        const in = std.mem.lastIndexOf(u8, msg, " in ") orelse break :blk "0";
+        break :blk try a.dupe(u8, std.mem.trimEnd(u8, msg[in + 4 ..], "."));
+    };
+    var first = try f.client.getAlertPolicy(threshold_id);
+    const caller = try a.dupe(u8, first.value.created.by);
+    first.deinit();
+    fact("project number {s}, caller {s}", .{ number, caller });
+
+    // The fake, seeded with production's two policies.
+    var fake: monitoring.testing.FakeMonitoring = .init(testing.allocator, testing.io, .{ .project_id = f.project, .project_number = number, .caller = caller });
+    defer fake.deinit();
+    var fake_diag: monitoring.Diagnostics = .{};
+    var fake_token: core.StaticToken = .{ .token = "t" };
+    var fake_client = try monitoring.Client.init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = fake_token.provider(), .transport = fake.transport(), .diagnostics = &fake_diag });
+    defer fake_client.deinit();
+    {
+        var page = try f.client.listAlertPolicies(.{ .filter = try a.print("display_name=starts_with(\"{s}\")", .{display}) });
+        defer page.deinit();
+        try testing.expectEqual(2, page.value.policies.len);
+        for (page.value.policies) |p| {
+            const conditions = try a.alloc(monitoring.testing.FakeMonitoring.PutCondition, p.conditions.len);
+            for (p.conditions, conditions) |c, *o| o.* = .{ .display_name = c.display_name, .kind = c.kind, .filter = c.filter, .query = c.query, .comparison = c.comparison, .threshold_value = c.threshold_value, .duration_s = c.duration_s, .aggregations = c.aggregations, .trigger = c.trigger };
+            _ = try fake.putAlertPolicy(.{ .id = p.id, .display_name = p.display_name, .enabled = p.enabled, .severity = p.severity, .combiner = p.combiner, .documentation = p.documentation, .user_labels = p.user_labels, .notification_channels = p.notification_channels, .conditions = conditions, .created = p.created.time, .created_by = p.created.by });
+        }
+    }
+
+    var differences: usize = 0;
+    const prefix_filter = try a.print("display_name=starts_with(\"{s}\")", .{display});
+    for ([_]struct { []const u8, monitoring.ListAlertPoliciesOptions }{
+        .{ "list ours", .{ .filter = prefix_filter } },
+        .{ "list ours by display name, descending", .{ .filter = prefix_filter, .order_by = "-display_name" } },
+        .{ "list a page of one", .{ .filter = prefix_filter, .page_size = 1 } },
+        .{ "list ours with two conditions", .{ .filter = try a.print("{s} AND conditions.size>1", .{prefix_filter}) } },
+        .{ "a filter on severity", .{ .filter = "severity=\"WARNING\"" } },
+        .{ "a bare word", .{ .filter = display } },
+        .{ "a filter that does not parse", .{ .filter = "display_name=(" } },
+        .{ "an order production refuses", .{ .filter = prefix_filter, .order_by = "display_name desc" } },
+    }) |case| {
+        agree(&differences, case[0], try listPoliciesOutcome(a, &f.client, &f.diag, case[1]), try listPoliciesOutcome(a, &fake_client, &fake_diag, case[1]));
+    }
+
+    // Disable, a repeat, enable: through clients whose sends are kept.
+    var recorder: Recorder = .{ .inner = f.client.transport, .arena = .init(testing.allocator) };
+    defer recorder.arena.deinit();
+    var wdiag: monitoring.Diagnostics = .{};
+    var wc = try monitoring.Client.init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = f.token.provider(), .diagnostics = &wdiag, .transport = recorder.transport(), .user_agent = "zig-gcp-monitoring-gcp-integration/0.1" });
+    defer wc.deinit();
+    var previews: usize = 0;
+    for ([_]struct { []const u8, []const u8, bool }{
+        .{ "disable", threshold_id, false },
+        .{ "disable again", threshold_id, false },
+        .{ "enable", threshold_id, true },
+        .{ "disable a policy nobody has", "1234567890", false },
+    }) |step| {
+        var prepared = try wc.setAlertPolicyEnabledRequest(step[1], step[2]);
+        defer prepared.deinit();
+        var p_answer = wc.setAlertPolicyEnabled(step[1], step[2]);
+        try recorder.expectSent(prepared.value);
+        previews += 1;
+        const in_production = if (p_answer) |*p| blk: {
+            defer p.deinit();
+            break :blk try policyLine(a, p.value);
+        } else |err| try a.print("error.{t}: {s}", .{ err, wdiag.message() });
+        var f_answer = fake_client.setAlertPolicyEnabled(step[1], step[2]);
+        const in_memory = if (f_answer) |*p| blk: {
+            defer p.deinit();
+            break :blk try policyLine(a, p.value);
+        } else |err| try a.print("error.{t}: {s}", .{ err, fake_diag.message() });
+        agree(&differences, step[0], in_production, in_memory);
+    }
+    agree(&differences, "list ours after", try listPoliciesOutcome(a, &f.client, &f.diag, .{ .filter = prefix_filter }), try listPoliciesOutcome(a, &fake_client, &fake_diag, .{ .filter = prefix_filter }));
+
+    // Snoozes. Each side gets the same specs and the same `at`, so their
+    // times agree to the second.
+    const policy_name = made.items[0];
+    var snoozes: std.ArrayList(monitoring.Snooze) = .empty;
+    var fake_snoozes: std.ArrayList(monitoring.Snooze) = .empty;
+    const Made = struct {
+        fn snooze(al: Allocator, list: *std.ArrayList(monitoring.Snooze), result: anytype) !void {
+            var s = try result;
+            defer s.deinit();
+            var copy = s.value;
+            copy.name = try al.dupe(u8, s.value.name);
+            copy.id = try al.dupe(u8, s.value.id);
+            copy.display_name = try al.dupe(u8, s.value.display_name);
+            copy.policies = &.{};
+            try list.append(al, copy);
+        }
+    };
+    const now0 = std.Io.Clock.real.now(testing.io);
+    const specs = [_]monitoring.NewSnooze{
+        .{ .display_name = try a.print("{s}-young", .{display}), .policies = &.{policy_name}, .start = now0, .end = .{ .nanoseconds = now0.nanoseconds + 5 * std.time.ns_per_min } },
+        .{ .display_name = try a.print("{s}-upcoming", .{display}), .policies = &.{ policy_name, made.items[1] }, .start = .{ .nanoseconds = now0.nanoseconds + 10 * std.time.ns_per_min }, .end = .{ .nanoseconds = now0.nanoseconds + 11 * std.time.ns_per_min } },
+        .{ .display_name = try a.print("{s}-long", .{display}), .policies = &.{policy_name}, .start = now0, .end = .{ .nanoseconds = now0.nanoseconds + 10 * std.time.ns_per_min } },
+    };
+    defer {
+        // Whatever is still running, ended: nothing is left holding.
+        const t = std.Io.Clock.real.now(testing.io);
+        for (snoozes.items) |s| {
+            if (s.stateAt(t) == .ended) continue;
+            if (f.client.getSnooze(s.id)) |read| {
+                var r = read;
+                defer r.deinit();
+                if (r.value.stateAt(t) != .ended) {
+                    var e = f.client.endSnooze(r.value, t) catch continue;
+                    e.deinit();
+                }
+            } else |_| {}
+        }
+    }
+    for (specs) |spec| {
+        var prepared = try wc.createSnoozeRequest(spec);
+        defer prepared.deinit();
+        try Made.snooze(a, &snoozes, wc.createSnooze(spec));
+        try recorder.expectSent(prepared.value);
+        previews += 1;
+        try Made.snooze(a, &fake_snoozes, fake_client.createSnooze(spec));
+        const t = std.Io.Clock.real.now(testing.io);
+        agree(&differences, try a.print("made {s}", .{spec.display_name}), try snoozeLine(a, snoozes.getLast(), t), try snoozeLine(a, fake_snoozes.getLast(), t));
+    }
+    // Ending: the young one (under a minute old, so cancelled) and the
+    // upcoming one (cancelled), at once; the long one later.
+    const End = struct {
+        fn step(fx: *Fixture, al: Allocator, w: *monitoring.Client, wd: *monitoring.Diagnostics, rec: *Recorder, fk: *monitoring.testing.FakeMonitoring, fc: *monitoring.Client, fd: *monitoring.Diagnostics, prod: monitoring.Snooze, mem: monitoring.Snooze, label: []const u8, differences_out: *usize) !void {
+            const t = std.Io.Clock.real.now(testing.io);
+            var prepared = try w.endSnoozeRequest(prod, t);
+            defer prepared.deinit();
+            const in_production = try snoozeOutcome(al, w.endSnooze(prod, t), wd, t);
+            try rec.expectSent(prepared.value);
+            const in_memory = try snoozeOutcome(al, fc.endSnooze(mem, t), fd, t);
+            agree(differences_out, label, in_production, in_memory);
+            // The same patch again: production refuses any change to it now.
+            const again_path = prepared.value.url[fx.client.base_url.len..];
+            const p_again = try rawMonitoring(fx, al, .PATCH, again_path, prepared.value.body);
+            const fake_again = try fk.serve(.{ .method = .PATCH, .url = try al.print("https://monitoring.googleapis.com/v3/projects/{s}/snoozes/{s}{s}", .{ fx.project, mem.id, again_path[std.mem.indexOfScalar(u8, again_path, '?').?..] }), .bearer = "t", .body = prepared.value.body }, al);
+            agree(differences_out, try al.print("{s}, sent again", .{label}), try al.print("{d} {s}", .{ p_again.status, tailOf(bodyMessage(al, p_again.body)) }), try al.print("{d} {s}", .{ fake_again.status, tailOf(bodyMessage(al, fake_again.body)) }));
+        }
+    };
+    try End.step(&f, a, &wc, &wdiag, &recorder, &fake, &fake_client, &fake_diag, snoozes.items[0], fake_snoozes.items[0], "cancel the young one", &differences);
+    try End.step(&f, a, &wc, &wdiag, &recorder, &fake, &fake_client, &fake_diag, snoozes.items[1], fake_snoozes.items[1], "cancel the upcoming one", &differences);
+    previews += 2;
+
+    // The snoozes holding now: the long one alone. Production's lists
+    // showed a new snooze anywhere from at once to 91 s after its create
+    // (measured 2026-10-20), where a get showed it at once; so poll until
+    // production's list reads as the fake's, three minutes at most.
+    {
+        const polled_from = std.Io.Clock.real.now(testing.io);
+        var in_production: []const u8 = "";
+        var in_memory: []const u8 = "";
+        for (0..60) |_| {
+            const t = std.Io.Clock.real.now(testing.io);
+            var p_page = try f.client.listSnoozes(.{ .active_at = t });
+            defer p_page.deinit();
+            var f_page = try fake_client.listSnoozes(.{ .active_at = t });
+            defer f_page.deinit();
+            var pw: std.Io.Writer.Allocating = .init(a);
+            var fw: std.Io.Writer.Allocating = .init(a);
+            for (p_page.value.snoozes) |s| if (std.mem.startsWith(u8, s.display_name, display)) try pw.writer.print("{s} | ", .{try snoozeLine(a, s, t)});
+            for (f_page.value.snoozes) |s| try fw.writer.print("{s} | ", .{try snoozeLine(a, s, t)});
+            in_production = pw.written();
+            in_memory = fw.written();
+            // Both sides had the same requests, so their times agree.
+            if (std.mem.eql(u8, in_production, in_memory)) break;
+            try testing.io.sleep(.fromMilliseconds(3_000), .awake);
+        }
+        agree(&differences, "the snoozes holding now", in_production, in_memory);
+        fact("production's list read so {d} s after polling began", .{@divFloor(std.Io.Clock.real.now(testing.io).nanoseconds - polled_from.nanoseconds, std.time.ns_per_s)});
+    }
+
+    // The long one, once it has run a minute: its end at now.
+    while (std.Io.Clock.real.now(testing.io).nanoseconds < now0.nanoseconds + 65 * std.time.ns_per_s) try testing.io.sleep(.fromMilliseconds(1_000), .awake);
+    try End.step(&f, a, &wc, &wdiag, &recorder, &fake, &fake_client, &fake_diag, snoozes.items[2], fake_snoozes.items[2], "end the long one after a minute", &differences);
+    previews += 1;
+
+    // Refusals: a start in the past, and a snooze nobody has.
+    {
+        const t = std.Io.Clock.real.now(testing.io);
+        const past: monitoring.NewSnooze = .{ .display_name = try a.print("{s}-past", .{display}), .policies = &.{policy_name}, .start = .{ .nanoseconds = t.nanoseconds - 2 * std.time.ns_per_min }, .end = .{ .nanoseconds = t.nanoseconds + 2 * std.time.ns_per_min } };
+        agree(&differences, "a snooze starting two minutes ago", try snoozeOutcome(a, f.client.createSnooze(past), &f.diag, t), try snoozeOutcome(a, fake_client.createSnooze(past), &fake_diag, t));
+        agree(&differences, "a snooze nobody has", try snoozeOutcome(a, f.client.getSnooze("1234567890"), &f.diag, t), try snoozeOutcome(a, fake_client.getSnooze("1234567890"), &fake_diag, t));
+        agree(&differences, "a snooze filter with >", try a.print("{t}", .{if (f.client.listSnoozes(.{ .filter = "interval.end_time > \"2026-10-20T18:00:00Z\"" })) |_| error.Unexpected else |err| err}), try a.print("{t}", .{if (fake_client.listSnoozes(.{ .filter = "interval.end_time > \"2026-10-20T18:00:00Z\"" })) |_| error.Unexpected else |err| err}));
+        agree(&differences, "its reason", tailOf(f.diag.message()), tailOf(fake_diag.message()));
+    }
+    fact("{d} previews held byte for byte to what was sent", .{previews});
     try testing.expectEqual(0, differences);
 }

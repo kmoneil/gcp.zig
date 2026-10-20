@@ -334,7 +334,9 @@ of its policies at its start (and its filter's resource labels), on
 the fake's clock, whenever the fake is next asked, and `putAlert`
 refuses an open alert for a policy a snooze holds. Production wrote
 its own parse tree into its filter refusals; the fake writes the
-filter there, and the reason after it is production's.
+filter there, and the reason after it is production's. Where it
+differs: the fake lists a new snooze at once, where production's lists
+showed one anywhere from at once to 91 s after its create.
 
 <!-- snippet: tests/docs_examples.zig#mon-snooze -->
 ```zig

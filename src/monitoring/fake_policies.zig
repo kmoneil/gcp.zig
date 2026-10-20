@@ -52,6 +52,9 @@
 //! - An active snooze closes the open alerts of its policies at its start
 //!   (production's closed within a second, its close time the next
 //!   second) and keeps `putAlert` from opening one for them.
+//! - Where it differs: a new snooze lists at once, where production's
+//!   lists showed one anywhere from at once to 91 s after its create (a
+//!   get, at once, as here).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
