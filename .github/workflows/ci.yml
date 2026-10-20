@@ -563,6 +563,12 @@ jobs:
         # decoders in one property took about 0.02 ms a run on the Mac
         # (2M in 40 s of fuzzing), so 8M, between scheduler's and run's,
         # to be priced by its first nights as its corpus grows.
+        # slow-scheduler (0.51.0) holds FakeScheduler's runs, pauses and
+        # resumes to a model, the client against the fake for up to 40
+        # steps a run: about 0.23 ms a run on the Mac (200K in 47 s), so
+        # 4M, about an hour at four times the Mac, to be priced by its
+        # first nights. Its seven clean nights are the writes' own
+        # week toward dropping their experimental marker.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 630K }
           - { job: auth, module: auth, filter: fuzz, iterations: 850K }
@@ -591,6 +597,7 @@ jobs:
           - { job: kms, module: kms, filter: fuzz, iterations: 2M }
           - { job: slow-kms, module: kms, filter: slow property, iterations: 300K }
           - { job: scheduler, module: scheduler, filter: fuzz, iterations: 10M }
+          - { job: slow-scheduler, module: scheduler, filter: slow property, iterations: 4M }
           - { job: run, module: run, filter: fuzz, iterations: 6M }
           - { job: dataflow, module: dataflow, filter: fuzz, iterations: 8M }
     runs-on: ubuntu-latest
