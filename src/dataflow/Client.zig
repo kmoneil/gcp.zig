@@ -1,6 +1,7 @@
-//! A Dataflow client, read only: the jobs a project runs, across every
-//! region or one at a time, with their states. Nothing here creates,
-//! updates, cancels or drains a job.
+//! A Dataflow client: the jobs a project runs, across every region or one
+//! at a time, with their states, and two writes, `cancelJob` and
+//! `drainJob`, each with a preview of the exact request it sends. Nothing
+//! here creates or launches a job, or changes one in any other way.
 //!
 //! Every call blocks the calling task until it completes, using the
 //! `std.Io` and allocator passed to `init`. A client must not be used from
@@ -21,6 +22,7 @@ const validate = @import("validate.zig");
 const Diagnostics = core.Diagnostics;
 const Error = errors.Error;
 const HttpTransport = core.transport.HttpTransport;
+const PreparedRequest = core.PreparedRequest;
 const RetryPolicy = core.RetryPolicy;
 const TokenProvider = core.TokenProvider;
 const Transport = core.transport.Transport;
@@ -59,8 +61,9 @@ pub const Options = struct {
     /// Sends the credentials' quota project as `x-goog-user-project`, as
     /// every module does.
     send_quota_project: bool = true,
-    /// Every call here is a GET: 5xx, 429 and dropped connections are
-    /// retried.
+    /// Every call here is safe to repeat, the two writes included (a
+    /// repeat cancel or drain answered 200 and changed nothing, measured):
+    /// 5xx, 429 and dropped connections are retried.
     retry: RetryPolicy = .{},
     /// How long one request may take before it is `error.TimedOut`, which
     /// is retried. 0 removes the limit.
@@ -226,11 +229,7 @@ pub fn getJobView(self: *Client, location: []const u8, id: []const u8, view: typ
 }
 
 fn getChecked(self: *Client, location: []const u8, id: []const u8, view: ?types.JobView) Error!types.Owned(types.Job) {
-    try self.checkLocation(location);
-    if (!validate.isJobId(id)) {
-        if (self.diagnostics) |d| d.print("invalid job id: visible ASCII without /, at most 1024", .{});
-        return error.InvalidName;
-    }
+    try self.checkJob(location, id);
     var scratch: std.heap.ArenaAllocator = .init(self.gpa);
     defer scratch.deinit();
     const a = scratch.allocator();
@@ -253,11 +252,7 @@ fn getChecked(self: *Client, location: []const u8, id: []const u8, view: ?types.
 /// the filter.
 pub fn listMessages(self: *Client, location: []const u8, id: []const u8, options: types.ListMessagesOptions) Error!types.Owned(types.MessagePage) {
     rpc.begin(self);
-    try self.checkLocation(location);
-    if (!validate.isJobId(id)) {
-        if (self.diagnostics) |d| d.print("invalid job id: visible ASCII without /, at most 1024", .{});
-        return error.InvalidName;
-    }
+    try self.checkJob(location, id);
     try self.checkToken(options.page_token);
     var scratch: std.heap.ArenaAllocator = .init(self.gpa);
     defer scratch.deinit();
@@ -281,9 +276,103 @@ pub fn listMessages(self: *Client, location: []const u8, id: []const u8, options
     return result;
 }
 
+/// Asks the service to cancel the job, batch or streaming: its workers
+/// stop without finishing what is in flight. Production answers nothing
+/// but the job's type, so read the job to watch it stop: a get right
+/// after shows `current_state` `.cancelling` and `requested_state`
+/// `.cancelled`, then `.cancelled` (measured; the guide has the times).
+///
+/// A job still `.pending` is refused, `error.FailedPrecondition`, "Job is
+/// not yet ready for canceling. Please retry in a few minutes.": it is
+/// taken once the job runs. A job that has ended is refused too. Takes
+/// `dataflow.jobs.cancel`, which Dataflow Developer holds and Dataflow
+/// Viewer does not.
+pub fn cancelJob(self: *Client, location: []const u8, id: []const u8) Error!void {
+    return self.stop(.cancel, location, id);
+}
+
+/// Asks a streaming job to drain: it stops pulling from its sources,
+/// finishes what is in flight, and ends `.drained`. As with `cancelJob`,
+/// production answers nothing but the job's type; read the job to watch
+/// it. A batch job is refused, `error.InvalidArgument`, "Only streaming
+/// workflows can be drained.". Takes `dataflow.jobs.cancel` too: the API
+/// has no drain permission.
+pub fn drainJob(self: *Client, location: []const u8, id: []const u8) Error!void {
+    return self.stop(.drain, location, id);
+}
+
+/// The request `cancelJob` sends for the same arguments, built without
+/// sending it, after the same checks with the same errors: to show before
+/// the call, or to record after it. Credentials and other headers are not
+/// part of it.
+pub fn cancelJobRequest(self: *Client, location: []const u8, id: []const u8) Error!types.Owned(PreparedRequest) {
+    return self.prepare(.cancel, location, id);
+}
+
+/// The request `drainJob` sends, as `cancelJobRequest` says.
+pub fn drainJobRequest(self: *Client, location: []const u8, id: []const u8) Error!types.Owned(PreparedRequest) {
+    return self.prepare(.drain, location, id);
+}
+
+/// The two writes: one method, `UpdateJob`, a PUT of the job's requested
+/// state alone.
+const Stop = enum {
+    cancel,
+    drain,
+
+    /// What gcloud sends too. With no update mask the server considers
+    /// the requested state alone; a drain asks for the end state.
+    fn body(self: Stop) []const u8 {
+        return switch (self) {
+            .cancel => "{\"requestedState\":\"JOB_STATE_CANCELLED\"}",
+            .drain => "{\"requestedState\":\"JOB_STATE_DRAINED\"}",
+        };
+    }
+};
+
+fn prepare(self: *Client, which: Stop, location: []const u8, id: []const u8) Error!types.Owned(PreparedRequest) {
+    rpc.begin(self);
+    var result: types.Owned(PreparedRequest) = try .init(self.gpa);
+    errdefer result.deinit();
+    const a = result.arena.allocator();
+    result.value = try .fromCall(a, self.base_url, try self.stopCall(a, which, location, id));
+    return result;
+}
+
+/// The call `which` sends, after the checks every job call makes.
+fn stopCall(self: *Client, arena: Allocator, which: Stop, location: []const u8, id: []const u8) Error!rpc.Call {
+    try self.checkJob(location, id);
+    return .{ .method = .PUT, .path = try names.job(arena, self.project, location, id), .body = which.body() };
+}
+
+/// Sends a cancel or a drain. Either one landing twice changes nothing
+/// (a repeat while cancelling answered 200, measured), so both are
+/// retried as the reads are.
+fn stop(self: *Client, which: Stop, location: []const u8, id: []const u8) Error!void {
+    rpc.begin(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const call = try self.stopCall(a, which, location, id);
+    // Apart from the call's own memory: a retry resets it.
+    var response: std.heap.ArenaAllocator = .init(self.gpa);
+    defer response.deinit();
+    const body = try rpc.execute(self, &response, call);
+    codec.checkStopAnswer(a, body) catch |err|
+        return rpc.decodeFailed(self, err, @tagName(which));
+}
+
 fn checkLocation(self: *Client, location: []const u8) Error!void {
     if (!validate.isLocation(location)) {
         if (self.diagnostics) |d| d.print("invalid location: expected a region id such as us-central1", .{});
+        return error.InvalidName;
+    }
+}
+
+fn checkJob(self: *Client, location: []const u8, id: []const u8) Error!void {
+    try self.checkLocation(location);
+    if (!validate.isJobId(id)) {
+        if (self.diagnostics) |d| d.print("invalid job id: visible ASCII without /, at most 1024", .{});
         return error.InvalidName;
     }
 }
@@ -423,6 +512,173 @@ test "the server's refusals arrive as errors, production's words kept" {
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "service agent") != null);
 }
 
+const job_url = "https://dataflow.googleapis.com/v1b3/projects/my-project/locations/us-central1/jobs/2026-10-20_07_11_01-16829577348630633066";
+const cancel_body = "{\"requestedState\":\"JOB_STATE_CANCELLED\"}";
+const drain_body = "{\"requestedState\":\"JOB_STATE_DRAINED\"}";
+const cancelled_reply: test_util.FakeTransport.Reply = .{ .respond = .{ .body = production.cancel_taken } };
+const drained_reply: test_util.FakeTransport.Reply = .{ .respond = .{ .body = production.drain_taken } };
+
+test "golden: cancel and drain PUT the requested state alone" {
+    var h: Harness = undefined;
+    try h.init(&.{ cancelled_reply, drained_reply });
+    defer h.deinit();
+    try h.client.cancelJob("us-central1", "2026-10-20_07_11_01-16829577348630633066");
+    try h.expectWrite(0, job_url, cancel_body);
+    try h.client.drainJob("us-central1", "2026-10-20_07_11_01-16829577348630633066");
+    try h.expectWrite(1, job_url, drain_body);
+    try h.expectRequestCount(2);
+    try testing.expectEqualStrings("", h.diag.message());
+}
+
+test "each preview is byte for byte what its write sends, and sends nothing" {
+    const Write = *const fn (*Client, []const u8, []const u8) Error!void;
+    const Preview = *const fn (*Client, []const u8, []const u8) Error!types.Owned(PreparedRequest);
+    const pairs = [_]struct { Write, Preview, test_util.FakeTransport.Reply }{
+        .{ cancelJob, cancelJobRequest, cancelled_reply },
+        .{ drainJob, drainJobRequest, drained_reply },
+    };
+    // An id that needs percent-encoding.
+    for (pairs) |pair| {
+        var h: Harness = undefined;
+        try h.init(&.{pair[2]});
+        defer h.deinit();
+        var prepared = try pair[1](&h.client, "europe-west1", "job#1");
+        defer prepared.deinit();
+        try h.expectRequestCount(0);
+        try pair[0](&h.client, "europe-west1", "job#1");
+        const sent = try h.fake.request(0);
+        try testing.expectEqual(sent.method, prepared.value.method);
+        try testing.expectEqualStrings(sent.url, prepared.value.url);
+        try testing.expectEqualStrings(sent.body.?, prepared.value.body);
+        try testing.expect(std.mem.endsWith(u8, prepared.value.url, "/locations/europe-west1/jobs/job%231"));
+    }
+}
+
+test "the writes and their previews refuse what they will not send, with the same words" {
+    var h: Harness = undefined;
+    try h.init(&.{});
+    defer h.deinit();
+    const c = &h.client;
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "US-central1", "j", "invalid location: expected a region id such as us-central1" },
+        .{ "", "j", "invalid location: expected a region id such as us-central1" },
+        .{ "us-central1", "a/b", "invalid job id: visible ASCII without /, at most 1024" },
+        .{ "us-central1", "", "invalid job id: visible ASCII without /, at most 1024" },
+    };
+    for (cases) |case| {
+        try testing.expectError(error.InvalidName, c.cancelJob(case[0], case[1]));
+        try testing.expectEqualStrings(case[2], h.diag.message());
+        try testing.expectError(error.InvalidName, c.cancelJobRequest(case[0], case[1]));
+        try testing.expectEqualStrings(case[2], h.diag.message());
+        try testing.expectError(error.InvalidName, c.drainJob(case[0], case[1]));
+        try testing.expectEqualStrings(case[2], h.diag.message());
+        try testing.expectError(error.InvalidName, c.drainJobRequest(case[0], case[1]));
+        try testing.expectEqualStrings(case[2], h.diag.message());
+    }
+    try h.expectRequestCount(0);
+}
+
+test "a cancel's and a drain's refusals arrive as errors, production's words kept, sent once" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = production.cancel_not_ready_status, .body = production.cancel_not_ready } },
+        .{ .respond = .{ .status = production.drain_batch_status, .body = production.drain_batch } },
+        .{ .respond = .{ .status = production.cancel_ended_status, .body = production.cancel_ended } },
+        .{ .respond = .{ .status = production.cancel_unknown_status, .body = production.cancel_unknown } },
+    });
+    defer h.deinit();
+    const id = "2026-10-20_15_14_29-4138990520061636327";
+    try testing.expectError(error.FailedPrecondition, h.client.cancelJob("us-central1", id));
+    try testing.expect(std.mem.endsWith(u8, h.diag.message(), "Job is not yet ready for canceling. Please retry in a few minutes."));
+    try testing.expectError(error.InvalidArgument, h.client.drainJob("us-central1", id));
+    try testing.expect(std.mem.endsWith(u8, h.diag.message(), "Only streaming workflows can be drained."));
+    try testing.expectError(error.FailedPrecondition, h.client.cancelJob("us-central1", id));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "Job has terminated in state SUCCESS") != null);
+    try testing.expectError(error.NotFound, h.client.cancelJob("us-east1", id));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "or the job does not exist in the project.") != null);
+    try h.expectRequestCount(4);
+    try testing.expectEqual(0, h.clock.sleep_count);
+}
+
+test "each write and each preview starts with Diagnostics clear" {
+    const refused: test_util.FakeTransport.Reply = .{ .respond = .{ .status = production.cancel_ended_status, .body = production.cancel_ended } };
+    var h: Harness = undefined;
+    try h.init(&.{ refused, refused, cancelled_reply, refused, drained_reply });
+    defer h.deinit();
+    const id = "2026-10-20_15_12_39-16726637407140010736";
+    try testing.expectError(error.FailedPrecondition, h.client.cancelJob("us-central1", id));
+    var cancel = try h.client.cancelJobRequest("us-central1", id);
+    cancel.deinit();
+    try testing.expectEqualStrings("", h.diag.message());
+    try testing.expectError(error.FailedPrecondition, h.client.cancelJob("us-central1", id));
+    var drain = try h.client.drainJobRequest("us-central1", id);
+    drain.deinit();
+    try testing.expectEqualStrings("", h.diag.message());
+    try h.client.cancelJob("us-central1", id);
+    try testing.expectEqualStrings("", h.diag.message());
+    try testing.expectError(error.FailedPrecondition, h.client.drainJob("us-central1", id));
+    try h.client.drainJob("us-central1", id);
+    try testing.expectEqualStrings("", h.diag.message());
+}
+
+test "a write that fails before sending does not keep the last call's words" {
+    const refused: test_util.FakeTransport.Reply = .{ .respond = .{ .status = production.cancel_ended_status, .body = production.cancel_ended } };
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{});
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{ refused, refused });
+    defer fake.deinit();
+    var tokens: test_util.FakeTokenProvider = .{};
+    var clock: test_util.FakeClock = .{};
+    var diag: core.Diagnostics = .{};
+    var client = try Client.init(failing.allocator(), clock.io(), .{
+        .project_id = "my-project",
+        .token_provider = tokens.provider(),
+        .transport = fake.transport(),
+        .diagnostics = &diag,
+    });
+    defer client.deinit();
+    const Write = *const fn (*Client, []const u8, []const u8) Error!void;
+    for ([_]Write{ cancelJob, drainJob }) |write| {
+        failing.fail_index = std.math.maxInt(usize);
+        try testing.expectError(error.FailedPrecondition, write(&client, "us-central1", "j"));
+        try testing.expect(diag.message().len > 0);
+        failing.fail_index = failing.alloc_index;
+        try testing.expectError(error.OutOfMemory, write(&client, "us-central1", "j"));
+        try testing.expectEqualStrings("", diag.message());
+    }
+}
+
+test "cancel and drain: retried as the reads are, a repeat answering as the first" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .fail = error.ConnectionResetByPeer },
+        .{ .respond = .{ .status = 503, .body = "{\"error\":{\"code\":503,\"message\":\"The service is currently unavailable.\",\"status\":\"UNAVAILABLE\"}}" } },
+        cancelled_reply,
+        .{ .fail = error.TimedOut },
+        drained_reply,
+    });
+    defer h.deinit();
+    try h.client.cancelJob("us-central1", "2026-10-20_07_11_01-16829577348630633066");
+    for (0..3) |i| try h.expectWrite(i, job_url, cancel_body);
+    try h.client.drainJob("us-central1", "2026-10-20_07_11_01-16829577348630633066");
+    for (3..5) |i| try h.expectWrite(i, job_url, drain_body);
+    try h.expectRequestCount(5);
+    try testing.expectEqual(3, h.clock.sleep_count);
+    try testing.expectEqualStrings("", h.diag.message());
+}
+
+test "a stop answered with something other than an object is InvalidResponse" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "[]" } },
+        .{ .respond = .{ .body = "<html>ok</html>" } },
+    });
+    defer h.deinit();
+    try testing.expectError(error.InvalidResponse, h.client.cancelJob("us-central1", "j"));
+    try testing.expectEqualStrings("the cancel response could not be decoded", h.diag.message());
+    try testing.expectError(error.InvalidResponse, h.client.drainJob("us-central1", "j"));
+    try testing.expectEqualStrings("the drain response could not be decoded", h.diag.message());
+}
+
 test "init refuses what no call could use" {
     var tokens: test_util.FakeTokenProvider = .{};
     var clock: test_util.FakeClock = .{};
@@ -443,6 +699,8 @@ test "every allocation failure is OutOfMemory without leaks" {
                 .{ .respond = .{ .body = production.job_done } },
                 .{ .respond = .{ .body = production.job_failed } },
                 .{ .respond = .{ .body = production.messages_error_failed } },
+                .{ .respond = .{ .body = production.cancel_taken } },
+                .{ .respond = .{ .body = production.drain_taken } },
             });
             defer fake.deinit();
             var tokens: test_util.FakeTokenProvider = .{};
@@ -459,6 +717,10 @@ test "every allocation failure is OutOfMemory without leaks" {
             failed.deinit();
             var story = try client.listMessages("us-central1", "2026-10-20_07_09_34-8524524531325271694", .{ .minimum_importance = .@"error" });
             story.deinit();
+            try client.cancelJob("us-central1", "2026-10-20_07_09_34-8524524531325271694");
+            try client.drainJob("us-central1", "2026-10-20_07_09_34-8524524531325271694");
+            var preview = try client.drainJobRequest("us-central1", "2026-10-20_07_09_34-8524524531325271694");
+            preview.deinit();
         }
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.calls, .{});

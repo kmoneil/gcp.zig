@@ -1,7 +1,8 @@
 //! Runs one API call: core's request engine builds the URL, attaches
 //! credentials and the quota project, sends through the client's
 //! transport, maps failures to errors and keeps `Diagnostics` and the log
-//! current. Every call here is a GET, safe to repeat.
+//! current. The reads are GETs, safe to repeat; the writes say in
+//! `Client` what each may repeat.
 
 const std = @import("std");
 const core = @import("core");
@@ -12,9 +13,9 @@ const Error = errors.Error;
 
 /// The OAuth scope the client asks its token provider for. v1b3 has no
 /// read-only scope anywhere (its only other scope is `compute`, no
-/// narrower); what a token may read is IAM's to decide, through
+/// narrower); what a token may read or stop is IAM's to decide, through
 /// `dataflow.jobs.list`, `dataflow.jobs.get` and
-/// `dataflow.messages.list`.
+/// `dataflow.messages.list`, and `dataflow.jobs.cancel` for both writes.
 pub const scope = "https://www.googleapis.com/auth/cloud-platform";
 
 /// The shared engine, logging under this module's scope.

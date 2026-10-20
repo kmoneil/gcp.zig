@@ -62,6 +62,15 @@ pub const Harness = struct {
         try std.testing.expectEqual(null, r.body);
     }
 
+    /// Asserts the request at `index` is a write: PUT to `url` with
+    /// `body`, the requested state alone.
+    pub fn expectWrite(h: *const Harness, index: usize, url: []const u8, body: []const u8) !void {
+        const r = try h.fake.request(index);
+        try std.testing.expectEqual(.PUT, r.method);
+        try std.testing.expectEqualStrings(url, r.url);
+        try std.testing.expectEqualStrings(body, r.body.?);
+    }
+
     pub fn expectRequestCount(h: *const Harness, count: usize) !void {
         try std.testing.expectEqual(count, h.fake.requests.items.len);
     }

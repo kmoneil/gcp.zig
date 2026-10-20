@@ -82,6 +82,15 @@ pub fn decodeMessagePage(out: Allocator, scratch: Allocator, body: []const u8) D
     };
 }
 
+/// Checks a cancel's or a drain's answer, which carries nothing to keep:
+/// production answered `{"type":"JOB_TYPE_BATCH"}` alone, the job's type
+/// and no id or state (measured 2026-10-20). Anything but an object is
+/// `error.InvalidResponse`, so a 200 from something that is not the API
+/// is not taken for a stop.
+pub fn checkStopAnswer(scratch: Allocator, body: []const u8) DecodeError!void {
+    _ = try object(try parse(scratch, body));
+}
+
 fn jobOf(out: Allocator, v: Value) DecodeError!types.Job {
     const obj = try object(v);
     const id = try string(out, obj, "id") orelse return error.InvalidResponse;

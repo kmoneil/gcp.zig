@@ -112,8 +112,11 @@ pub const Job = struct {
     type: JobType = .unspecified,
     current_state: JobState = .unspecified,
     current_state_time: ?std.Io.Timestamp = null,
-    /// Informational on a read: a pending cancel or drain shows here
-    /// before `current_state` catches up.
+    /// What a cancel or a drain asked for, while it is under way: a get
+    /// right after one carries `.cancelled` or `.drained` here, with
+    /// `current_state` already `.cancelling` or `.draining`. A list's
+    /// summary never carries it, and it is gone once the job has ended
+    /// (measured 2026-10-20).
     requested_state: JobState = .unspecified,
     create_time: ?std.Io.Timestamp = null,
     /// Equals `create_time` except FlexRS delayed starts.
@@ -129,6 +132,26 @@ pub const Job = struct {
     /// The widget's red: the one terminal state that is trouble.
     pub fn failing(self: Job) bool {
         return self.current_state == .failed;
+    }
+
+    /// Whether production takes a cancel of the job as it stands: one
+    /// that has not ended, is not already being cancelled, and is past
+    /// `.pending` (production refuses a pending job as "not yet ready for
+    /// canceling", measured, and takes it once it runs). For a console's
+    /// button; `Client.cancelJob` does not ask it, and leaves the
+    /// refusing to the server.
+    pub fn cancellable(self: Job) bool {
+        if (self.current_state.terminal()) return false;
+        if (self.current_state == .pending or self.current_state == .cancelling) return false;
+        return self.requested_state != .cancelled;
+    }
+
+    /// Whether production takes a drain: a streaming job that is running
+    /// and has not been asked to stop already. Reads only what a list's
+    /// summary carries, as `cancellable` does.
+    pub fn drainable(self: Job) bool {
+        if (self.type != .streaming or self.current_state != .running) return false;
+        return self.requested_state != .drained and self.requested_state != .cancelled;
     }
 
     /// A label's value, or null when the job does not carry the key.
@@ -331,6 +354,24 @@ test "Job.terminal, failing and label answer the widget's questions" {
     try testing.expectEqualStrings("JOB_VIEW_SUMMARY", JobView.summary.toWire());
     try testing.expectEqualStrings("JOB_VIEW_ALL", JobView.all.toWire());
     try testing.expectEqualStrings("JOB_VIEW_DESCRIPTION", JobView.description.toWire());
+}
+
+test "Job.cancellable and drainable over every type, state and request" {
+    const all_states = std.enums.values(JobState);
+    const all_types = std.enums.values(JobType);
+    for (all_types) |job_type| for (all_states) |current| for (all_states) |requested| {
+        const job: Job = .{ .id = "j", .type = job_type, .current_state = current, .requested_state = requested };
+        const stopping = requested == .cancelled or requested == .drained;
+        try testing.expectEqual(!current.terminal() and current != .pending and current != .cancelling and requested != .cancelled, job.cancellable());
+        try testing.expectEqual(job_type == .streaming and current == .running and !stopping, job.drainable());
+    };
+    // The cases a console's buttons meet.
+    try testing.expect((Job{ .id = "j", .type = .batch, .current_state = .running }).cancellable());
+    try testing.expect(!(Job{ .id = "j", .type = .batch, .current_state = .pending }).cancellable());
+    try testing.expect(!(Job{ .id = "j", .type = .batch, .current_state = .running }).drainable());
+    try testing.expect((Job{ .id = "j", .type = .streaming, .current_state = .running }).drainable());
+    try testing.expect((Job{ .id = "j", .type = .streaming, .current_state = .draining, .requested_state = .drained }).cancellable());
+    try testing.expect(!(Job{ .id = "j", .type = .streaming, .current_state = .done }).cancellable());
 }
 
 test "message importances wire both ways and order as a minimum filter" {

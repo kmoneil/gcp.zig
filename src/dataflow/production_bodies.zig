@@ -1,5 +1,6 @@
 //! Answers production gave on 2026-10-20, measured in milestone 0 of the
-//! Dataflow spec (`_tmp/dataflow-m0/`), for tests: the probe's own
+//! Dataflow spec (`_tmp/dataflow-m0/`) and of the writes spec, cancel and
+//! drain (`_tmp/dataflow-writes-m0/`), for tests: the probes' own
 //! `zigps-` Word_Count jobs and refusals, reserialized with sorted keys
 //! (the probe saved parsed bodies). Test code only.
 
@@ -730,5 +731,139 @@ pub const messages_error_done =
     \\   "workerPool": "Regular"
     \\  }
     \\ ]
+    \\}
+;
+
+/// A cancel taken by a running Word_Count job, and its repeat while cancelling: the job's type alone, no id or state. HTTP 200.
+pub const cancel_taken =
+    \\{
+    \\ "type": "JOB_TYPE_BATCH"
+    \\}
+;
+
+/// A drain taken by a running Pub/Sub-to-Pub/Sub streaming job, and its repeat while draining: one field, which says JOB_TYPE_BATCH of the streaming job, so the answer carries nothing. HTTP 200.
+pub const drain_taken =
+    \\{
+    \\ "type": "JOB_TYPE_BATCH"
+    \\}
+;
+
+/// A cancel of a job still PENDING, 0.4 to 17.5 s after its launch: 400 FAILED_PRECONDITION; taken at 20.9 s, once it ran.
+pub const cancel_not_ready_status = 400;
+pub const cancel_not_ready =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "(87cd38ee6aa5ad75): Workflow modification failed. Causes: (891fdc8387302e9c): Operation cancel not allowed for job 2026-10-20_15_14_29-4138990520061636327. Job is not yet ready for canceling. Please retry in a few minutes.",
+    \\  "status": "FAILED_PRECONDITION"
+    \\ }
+    \\}
+;
+
+/// A drain of a running batch job: 400 INVALID_ARGUMENT, before any check of its state (an ended or cancelling batch job answers the same).
+pub const drain_batch_status = 400;
+pub const drain_batch =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "(f689798c2adad10c): Job 2026-10-20_15_12_40-17194894741260815925 is not a streaming workflow. Only streaming workflows can be drained.",
+    \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// A cancel of a batch job that has ended DONE: 400 FAILED_PRECONDITION naming the state it ended in.
+pub const cancel_ended_status = 400;
+pub const cancel_ended =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "(19f81b97a8fbcd51): Workflow modification failed. Causes: (897135efbf4d3a23): Cannot perform operation 'cancel' on Job: 2026-10-20_15_12_39-16726637407140010736. Job has terminated in state SUCCESS: Workflow job: 2026-10-20_15_12_39-16726637407140010736 succeeded.",
+    \\  "status": "FAILED_PRECONDITION"
+    \\ }
+    \\}
+;
+
+/// A cancel of a job nobody has: 404 in a sentence that says cancel, for a drain too, and for a real region the job is not in.
+pub const cancel_unknown_status = 404;
+pub const cancel_unknown =
+    \\{
+    \\ "error": {
+    \\  "code": 404,
+    \\  "message": "(18461e55926cc416): Could not cancel workflow; user does not have sufficient permissions on project: extractctl, or the job does not exist in the project.",
+    \\  "status": "NOT_FOUND"
+    \\ }
+    \\}
+;
+
+/// A cancel of a batch job that has ended CANCELLED: 400 FAILED_PRECONDITION naming the state.
+pub const cancel_cancelled_status = 400;
+pub const cancel_cancelled =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "(58b258f1ac4ecd4): Workflow modification failed. Causes: (642b8d656b0be058): Cannot perform operation 'cancel' on Job: 2026-10-20_15_14_29-4138990520061636327. Job has terminated in state CANCELLED: Workflow job: 2026-10-20_15_14_29-4138990520061636327 cancelled.",
+    \\  "status": "FAILED_PRECONDITION"
+    \\ }
+    \\}
+;
+
+/// A cancel of a streaming job that ended FAILED (its one worker never started, a zone out of resources): 400 FAILED_PRECONDITION naming the state.
+pub const cancel_failed_status = 400;
+pub const cancel_failed =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "(5c4f5c0e8305c936): Workflow modification failed. Causes: (c7fc581a343ccf1c): Cannot perform operation 'cancel' on Job: 2026-10-20_15_12_41-6567995927817659660. Job has terminated in state FAILED: Workflow job: 2026-10-20_15_12_41-6567995927817659660 failed.",
+    \\  "status": "FAILED_PRECONDITION"
+    \\ }
+    \\}
+;
+
+/// A cancel of the job that failed its launch (the read spec's, FAILED with the service agent's provisioning error): its state named NOT_STARTED.
+pub const cancel_not_started_status = 400;
+pub const cancel_not_started =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "(3bdea72ad4fa527): Workflow modification failed. Causes: (a487fc6f4309d9b): Cannot perform operation 'cancel' on Job: 2026-10-20_07_09_34-8524524531325271694. Job has terminated in state NOT_STARTED: Workflow job: 2026-10-20_07_09_34-8524524531325271694 failed to start.",
+    \\  "status": "FAILED_PRECONDITION"
+    \\ }
+    \\}
+;
+
+/// A drain of a streaming job that has ended: 400 FAILED_PRECONDITION, "Job has terminated." and no state named.
+pub const drain_ended_status = 400;
+pub const drain_ended =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "(aa00684133f7ce3b): Workflow modification failed. Causes: (7491567bbed4c09a): Cannot perform operation 'drain' on Job: 2026-10-20_15_12_41-6567995927817659660. Job has terminated.",
+    \\  "status": "FAILED_PRECONDITION"
+    \\ }
+    \\}
+;
+
+/// A cancel through a made-up region (us-fake1) of a PENDING us-central1 job: answered by the job's own backend, the job named, so a made-up region reaches the job (a real region it is not in, us-east1, is the 404 of cancel_unknown).
+pub const cancel_made_up_region_status = 400;
+pub const cancel_made_up_region =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "(e2641736f91bff2e): Workflow modification failed. Causes: (39d4f0b0a2fa3dda): Operation cancel not allowed for job 2026-10-20_15_12_39-16726637407140010736. Job is not yet ready for canceling. Please retry in a few minutes.",
+    \\  "status": "FAILED_PRECONDITION"
+    \\ }
+    \\}
+;
+
+/// A cancel of a streaming job that has ended DRAINED (126 s after its drain): 400 FAILED_PRECONDITION naming the state.
+pub const cancel_drained_status = 400;
+pub const cancel_drained =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "(332829a012d8ae21): Workflow modification failed. Causes: (18b98733be202381): Cannot perform operation 'cancel' on Job: 2026-10-20_15_21_25-1828704797262605315. Job has terminated in state DRAINED: Workflow job: 2026-10-20_15_21_25-1828704797262605315 was drained.",
+    \\  "status": "FAILED_PRECONDITION"
+    \\ }
     \\}
 ;

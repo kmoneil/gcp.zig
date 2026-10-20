@@ -2479,3 +2479,28 @@ test "the pipelines widget, a failed job called out with its error" {
     try std.testing.expect(std.mem.indexOf(u8, story.value.messages[0].text, "service agent") != null);
 }
 // end snippet
+
+// snippet: dataflow-confirm
+test "the exact request a cancel would send, for the user to confirm" {
+    var fake: dataflow.testing.FakeDataflow = .init(std.testing.allocator, std.testing.io, .{ .project_id = "my-project" });
+    defer fake.deinit();
+    var token: dataflow.StaticToken = .{ .token = "none" };
+    var client = try dataflow.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    // Built, not sent: what the confirmation shows, the job's own
+    // location taken from the list that found it.
+    var request = try client.cancelJobRequest("us-central1", "2026-10-20_07_11_01-16829577348630633066");
+    defer request.deinit();
+    try std.testing.expectEqual(.PUT, request.value.method);
+    try std.testing.expectEqualStrings(
+        "https://dataflow.googleapis.com/v1b3/projects/my-project/locations/us-central1/jobs/2026-10-20_07_11_01-16829577348630633066",
+        request.value.url,
+    );
+    try std.testing.expectEqualStrings("{\"requestedState\":\"JOB_STATE_CANCELLED\"}", request.value.body);
+    try std.testing.expectEqual(0, fake.callCount());
+}
+// end snippet
