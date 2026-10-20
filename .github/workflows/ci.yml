@@ -589,6 +589,13 @@ jobs:
         # 4M, about an hour at four times the Mac, to be priced by its
         # first nights. Its seven clean nights are the writes' own
         # week toward dropping their experimental marker.
+        # slow-dataflow (0.53.0) holds FakeDataflow's cancels and drains
+        # to a model of what production took and refused, the client
+        # against the fake for up to 24 steps a run: about 0.24 ms a run
+        # on the Mac (200K in 50 s), too slow to share dataflow's 8M, so
+        # its own job at 4M, about an hour at four times the Mac, to be
+        # priced by its first nights. Its seven clean nights are the
+        # writes' own week, as slow-scheduler's are.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 630K }
           - { job: auth, module: auth, filter: fuzz, iterations: 850K }
@@ -620,6 +627,7 @@ jobs:
           - { job: slow-scheduler, module: scheduler, filter: slow property, iterations: 4M }
           - { job: run, module: run, filter: fuzz, iterations: 6M }
           - { job: dataflow, module: dataflow, filter: fuzz, iterations: 8M }
+          - { job: slow-dataflow, module: dataflow, filter: slow property, iterations: 4M }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     # actions: read finds and downloads the corpus an earlier run kept.

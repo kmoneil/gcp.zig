@@ -28,7 +28,23 @@ including the ones that did not change.
   `.running` before its worker is up. The writes take
   `dataflow.jobs.cancel`, which Dataflow Viewer lacks. `requested_state`
   is now documented as measured. `dataflow.PreparedRequest` is
-  exported.
+  exported. `dataflow.testing.FakeDataflow` takes both writes as
+  measured: the job `cancelling` or `draining` at once with its
+  requested state, production's line added to its story ("Cancel
+  request is committed for workflow job: <id>."), production's
+  one-field answer, every refusal above in production's words, and
+  501 naming what was not measured (a drain of a pending or cancelling
+  streaming job, a cancel of an updated job, either write in a state a
+  template launch cannot reach). `setJobState` to a terminal state now
+  takes `requested_state` away, and a list's summary no longer carries
+  it, as production's did not. A slow property holds the fake's
+  writes to a model in a new nightly job, `slow-dataflow` (4M). A
+  gated suite (`DATAFLOW_WRITES_TEST=1`, about 3 cents and ten minutes)
+  cancels a real batch job and drains a real streaming one through the
+  client, holds every preview byte for byte to what was sent, and
+  replays every write on a fake kept in step with production.
+  `examples/dataflow_stop.zig` shows a write's request, sends it with
+  `--yes`, and reads the job until it has ended.
 - auth, core, error_reporting, firestore, kms, logging, monitoring,
   pubsub, resource_manager, run, scheduler, secret_manager and storage:
   unchanged.

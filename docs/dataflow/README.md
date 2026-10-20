@@ -217,5 +217,8 @@ Viewer does not**, so a console signed in as a viewer can read a job it
 cannot stop.
 
 In tests, `dataflow.testing.FakeDataflow` holds locations, jobs and
-messages a test puts in: [Testing](testing.md). `examples/dataflow_jobs.zig
---fake` draws the pipelines widget offline.
+messages a test puts in, and takes cancels and drains as production
+did: [Testing](testing.md). `examples/dataflow_jobs.zig --fake` draws
+the pipelines widget offline, and `examples/dataflow_stop.zig --fake`
+says whether the job takes the write, shows its request, sends it with
+`--yes`, and reads the job until it has ended.

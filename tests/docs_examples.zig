@@ -2504,3 +2504,43 @@ test "the exact request a cancel would send, for the user to confirm" {
     try std.testing.expectEqual(0, fake.callCount());
 }
 // end snippet
+
+// snippet: dataflow-stop-fake
+test "a confirmed drain, and the reads that watch the job end" {
+    var fake: dataflow.testing.FakeDataflow = .init(std.testing.allocator, std.testing.io, .{ .project_id = "my-project" });
+    defer fake.deinit();
+    try fake.putLocation("us-central1");
+    const id = try fake.putJob(.{
+        .location = "us-central1",
+        .id = "2026-10-20_15_21_25-1828704797262605315",
+        .name = "orders-stream",
+        .type = .streaming,
+        .current_state = .running,
+    });
+    var token: dataflow.StaticToken = .{ .token = "none" };
+    var client = try dataflow.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+
+    // The button: a running streaming job takes a drain.
+    var before = try client.getJob("us-central1", id);
+    defer before.deinit();
+    try std.testing.expect(before.value.drainable());
+    // The write answers nothing; a read shows it under way at once.
+    try client.drainJob("us-central1", id);
+    var during = try client.getJob("us-central1", id);
+    defer during.deinit();
+    try std.testing.expectEqual(.draining, during.value.current_state);
+    try std.testing.expectEqual(.drained, during.value.requested_state);
+    // The service ends it, which a test stands in for.
+    try fake.setJobState(id, .drained, null);
+    var after = try client.getJob("us-central1", id);
+    defer after.deinit();
+    try std.testing.expect(after.value.terminal());
+    // An ended job refuses both, in production's words.
+    try std.testing.expectError(error.FailedPrecondition, client.cancelJob("us-central1", id));
+}
+// end snippet
