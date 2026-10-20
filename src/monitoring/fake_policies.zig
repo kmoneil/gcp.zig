@@ -1,8 +1,9 @@
-//! FakeMonitoring's alert policies (issue #275): the ones a test puts in,
-//! listed, got and enabled or disabled as production answered on
+//! FakeMonitoring's alert policies and snoozes (issue #275): policies a
+//! test puts in, listed, got and enabled or disabled, and snoozes made,
+//! listed, got and ended through the API, as production answered on
 //! 2026-10-20 (milestone 0 of the policies spec, `_tmp/policies-m0/`).
-//! `FakeMonitoring` holds the `Store` and routes `alertPolicies` here,
-//! under its mutex.
+//! `FakeMonitoring` holds the `Store` and routes `alertPolicies` and
+//! `snoozes` here, under its mutex.
 //!
 //! - Lists order by name without `orderBy`, carry `totalSize` on every
 //!   page with policies, and answer `{}` when none match.
@@ -26,6 +27,31 @@
 //!   mask answer 501.
 //! - A policy nobody has is production's 404: its get names the project
 //!   id, its patch the project number (`Options.project_number`).
+//!
+//! Snoozes:
+//!
+//! - A create is checked in production's order and words: a start more
+//!   than 15 s in the past, more than 16 policies, a filter without
+//!   exactly one policy, no display name, under a minute long. Policies
+//!   need not exist, as production did not check. The answer carries
+//!   the times as sent; reads after keep whole seconds. None can be
+//!   deleted. A filter is resource labels joined by AND; another form,
+//!   and a snooze of no policies, answer 501.
+//! - Lists order by start, newest first, a later-made one first on a
+//!   tie. Filters take `interval.start_time` and `interval.end_time`
+//!   with `>=` and `<=`, joined by AND; `>`, `<`, `=`, `OR`, another
+//!   field and an unquoted time are refused with production's reasons.
+//!   Production wrote its own parse tree into those messages where this
+//!   writes the filter: the reason after the last `": ` is production's.
+//! - Ending: an active snooze's end moved at least a minute after its
+//!   start, or to its start (cancelled); an upcoming one cancelled with
+//!   both times now (15 s of skew); anything shorter, and any change to
+//!   an ended or cancelled snooze, refused in production's words. A
+//!   display name can be changed while a snooze is not ended. Moving an
+//!   active snooze's start answers 501.
+//! - An active snooze closes the open alerts of its policies at its start
+//!   (production's closed within a second, its close time the next
+//!   second) and keeps `putAlert` from opening one for them.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -91,19 +117,86 @@ const Policy = struct {
     const Stored = struct { name: []const u8, c: PutCondition };
 };
 
-/// What FakeMonitoring holds for alert policies.
+const Snooze = struct {
+    name: []const u8,
+    id: []const u8,
+    display_name: []const u8,
+    policies: []const []const u8,
+    filter: []const u8,
+    /// The filter's resource labels.
+    labels: []const types.Label,
+    start_ns: i96,
+    end_ns: i96,
+    /// Its place in the order made, for ties in a list.
+    made: u64,
+    /// Cancelled before its start: it never held.
+    never_held: bool = false,
+
+    fn names(z: *const Snooze, policy: []const u8, resource_labels: []const types.Label) bool {
+        for (z.policies) |p| {
+            if (std.mem.eql(u8, p, policy)) return labelsMeet(z.labels, resource_labels);
+        }
+        return false;
+    }
+
+    fn ended(z: *const Snooze, now_ns: i96) bool {
+        return z.start_ns == z.end_ns or z.end_ns <= now_ns;
+    }
+
+    /// Whether it held at `t`: from its start until its end, and at its
+    /// start alone for one cancelled once running.
+    fn heldAt(z: *const Snooze, t: i96) bool {
+        if (z.never_held or t < z.start_ns) return false;
+        return t < @max(z.end_ns, z.start_ns + 1);
+    }
+};
+
+/// What FakeMonitoring holds for alert policies and snoozes.
 pub const Store = struct {
     /// By id, in the order put in.
     policies: std.StringArrayHashMapUnmanaged(*Policy) = .empty,
     next_id: u64 = 0,
+    /// By id, in the order made.
+    snoozes: std.StringArrayHashMapUnmanaged(*Snooze) = .empty,
+    next_snooze: u64 = 0,
 
     pub fn deinit(s: *Store, gpa: Allocator) void {
         s.policies.deinit(gpa);
+        s.snoozes.deinit(gpa);
         s.* = undefined;
     }
 
     pub fn count(s: *const Store) usize {
         return s.policies.count();
+    }
+
+    pub fn snoozeCount(s: *const Store) usize {
+        return s.snoozes.count();
+    }
+
+    /// Whether a snooze naming `policy`, whose filter (if any) the
+    /// resource labels meet, holds at `t`.
+    pub fn holdsAt(s: *const Store, policy: []const u8, resource_labels: []const types.Label, t: i96) bool {
+        for (s.snoozes.values()) |z| {
+            if (z.heldAt(t) and z.names(policy, resource_labels)) return true;
+        }
+        return false;
+    }
+
+    /// When an alert of `policy` opened at `open_ns` is closed by the
+    /// snoozes begun by `now_ns`: at the start of the first whose window
+    /// it was open in, or when it opened if that came later; null when
+    /// none has closed it. Production closed one within a second of a
+    /// snooze's start, so this holds whenever the fake is asked.
+    pub fn closesAt(s: *const Store, policy: []const u8, resource_labels: []const types.Label, open_ns: i96, now_ns: i96) ?i96 {
+        var first: ?i96 = null;
+        for (s.snoozes.values()) |z| {
+            if (z.never_held or z.start_ns > now_ns or !z.names(policy, resource_labels)) continue;
+            if (open_ns >= @max(z.end_ns, z.start_ns + 1)) continue;
+            const at = @max(z.start_ns, open_ns);
+            if (first == null or at < first.?) first = at;
+        }
+        return first;
     }
 
     /// Puts a policy in and returns its full name, kept in `keep`.
@@ -166,6 +259,184 @@ pub const Store = struct {
         };
         try s.policies.put(gpa, held.id, held);
         return held.name;
+    }
+
+    /// `rest` is what follows `snoozes` and its `/` ("" for the
+    /// collection).
+    pub fn snoozeRoute(s: *Store, gpa: Allocator, keep: Allocator, arena: Allocator, ctx: Context, method: Method, rest: []const u8, params: []const Param, body: ?[]const u8) Allocator.Error!Reply {
+        if (rest.len == 0) return switch (method) {
+            .POST => s.createSnooze(gpa, keep, arena, ctx, body orelse ""),
+            .GET => s.listSnoozes(arena, params),
+            else => notModelled(arena, "this method on snoozes"),
+        };
+        const id = try decoded(arena, rest);
+        if (std.mem.indexOfScalar(u8, id, '/') != null) return notModelled(arena, "this path under a snooze");
+        switch (method) {
+            .GET => {
+                const z = s.snoozes.get(id) orelse return fail(arena, 404, "NOT_FOUND", try arena.print("The snooze (with id {s}) was not found.", .{id}));
+                return renderSnooze(arena, z, null);
+            },
+            .PATCH => return s.patchSnooze(keep, arena, ctx, id, params, body orelse ""),
+            .DELETE => return notModelled(arena, "deleting a snooze, which production has no method for"),
+            else => return notModelled(arena, "this method on a snooze"),
+        }
+    }
+
+    fn createSnooze(s: *Store, gpa: Allocator, keep: Allocator, arena: Allocator, ctx: Context, body: []const u8) Allocator.Error!Reply {
+        const v = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch
+            return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        const obj = switch (v) {
+            .object => |o| o,
+            else => return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received."),
+        };
+        const display_name = stringIn(obj, "displayName") orelse "";
+        var policies: []const []const u8 = &.{};
+        var filter: []const u8 = "";
+        if (objectIn(obj, "criteria")) |c| {
+            filter = stringIn(c, "filter") orelse "";
+            if (c.get("policies")) |given| switch (given) {
+                .array => |items| {
+                    const out = try arena.alloc([]const u8, items.items.len);
+                    for (items.items, out) |p, *o| o.* = switch (p) {
+                        .string => |text| text,
+                        else => return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received."),
+                    };
+                    policies = out;
+                },
+                else => return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received."),
+            };
+        }
+        const interval = objectIn(obj, "interval") orelse return notModelled(arena, "a snooze without an interval");
+        const start = timeIn(interval, "startTime") orelse return notModelled(arena, "a snooze without a start time");
+        const end = timeIn(interval, "endTime") orelse return notModelled(arena, "a snooze without an end time");
+        // Production's checks, in the order the fake asks them.
+        if (start.nanoseconds < ctx.now_ns - skew_ns) return fail(arena, 400, "INVALID_ARGUMENT", "The Snooze cannot start in the past.");
+        if (policies.len > validate.max_snooze_policies) return fail(arena, 400, "INVALID_ARGUMENT", "The criteria cannot have more than 16 policies that the Snooze applies to.");
+        if (filter.len > 0 and policies.len != 1) return fail(arena, 400, "INVALID_ARGUMENT", "The criteria must have exactly one policy given a non-empty filter.");
+        if (display_name.len == 0) return fail(arena, 400, "INVALID_ARGUMENT", "The Snooze must have a display name.");
+        const start_s = wholeSecondsNs(start.nanoseconds);
+        const end_s = wholeSecondsNs(end.nanoseconds);
+        if (end_s - start_s < min_snooze_ns) return fail(arena, 400, "INVALID_ARGUMENT", "The snooze duration must be >= 1m.");
+        if (policies.len == 0) return notModelled(arena, "a snooze of no policies");
+        const labels = labelsOfFilter(arena, filter) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.NotModelled => return notModelled(arena, "a snooze filter other than resource labels joined by AND"),
+        };
+
+        s.next_snooze += 1;
+        const id = try std.fmt.allocPrint(keep, "{d}", .{@as(u128, 100_000_000_000_000_000_000_000_000_000_000_000) + s.next_snooze});
+        const held = try keep.create(Snooze);
+        const kept_policies = try keep.alloc([]const u8, policies.len);
+        for (policies, kept_policies) |p, *o| o.* = try keep.dupe(u8, p);
+        held.* = .{
+            .name = try std.fmt.allocPrint(keep, "projects/{s}/snoozes/{s}", .{ ctx.project, id }),
+            .id = id,
+            .display_name = try keep.dupe(u8, display_name),
+            .policies = kept_policies,
+            .filter = try keep.dupe(u8, filter),
+            .labels = try dupeLabels(keep, labels),
+            .start_ns = start_s,
+            .end_ns = end_s,
+            .made = s.next_snooze,
+        };
+        try s.snoozes.put(gpa, held.id, held);
+        // The answer carries the times as sent, as production's did.
+        return renderSnooze(arena, held, .{ start.nanoseconds, end.nanoseconds });
+    }
+
+    fn listSnoozes(s: *Store, arena: Allocator, params: []const Param) Allocator.Error!Reply {
+        var bounds: []const Bound = &.{};
+        if (paramOf(params, "filter")) |text| switch (try parseSnoozeFilter(arena, text)) {
+            .ok => |b| bounds = b,
+            .reply => |r| return r,
+        };
+        var matched: std.ArrayList(*Snooze) = .empty;
+        for (s.snoozes.values()) |z| {
+            if (meetsBounds(z, bounds)) try matched.append(arena, z);
+        }
+        std.mem.sort(*Snooze, matched.items, {}, struct {
+            fn before(_: void, a: *Snooze, b: *Snooze) bool {
+                if (a.start_ns != b.start_ns) return a.start_ns > b.start_ns;
+                return a.made > b.made;
+            }
+        }.before);
+        const window = pageOf(params, matched.items.len) orelse return fail(arena, 400, "INVALID_ARGUMENT", "Invalid page token or page size.");
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        write: {
+            jw.beginObject() catch break :write;
+            if (window.to > window.from) {
+                jw.objectField("snoozes") catch break :write;
+                jw.beginArray() catch break :write;
+                for (matched.items[window.from..window.to]) |z| writeSnooze(&jw, z, null) catch break :write;
+                jw.endArray() catch break :write;
+            }
+            if (window.next) |n| {
+                jw.objectField("nextPageToken") catch break :write;
+                jw.print("\"p{d}\"", .{n}) catch break :write;
+            }
+            jw.endObject() catch break :write;
+            return .{ .status = 200, .body = out.written() };
+        }
+        return error.OutOfMemory;
+    }
+
+    fn patchSnooze(s: *Store, keep: Allocator, arena: Allocator, ctx: Context, id: []const u8, params: []const Param, body: []const u8) Allocator.Error!Reply {
+        const z = s.snoozes.get(id) orelse return fail(arena, 404, "NOT_FOUND", try arena.print("The snooze to update (with id {s}) was not found.", .{id}));
+        if (z.ended(ctx.now_ns)) return fail(arena, 400, "FAILED_PRECONDITION", "Cannot update a snooze that already ended, or that was canceled.");
+        const mask = paramOf(params, "updateMask") orelse return notModelled(arena, "a snooze patch without updateMask");
+        var set_name = false;
+        var set_start = false;
+        var set_end = false;
+        var fields = std.mem.splitScalar(u8, mask, ',');
+        while (fields.next()) |raw| {
+            const f = std.mem.trim(u8, raw, " ");
+            if (std.mem.eql(u8, f, "display_name")) {
+                set_name = true;
+            } else if (std.mem.eql(u8, f, "interval.start_time")) {
+                set_start = true;
+            } else if (std.mem.eql(u8, f, "interval.end_time")) {
+                set_end = true;
+            } else return notModelled(arena, "a snooze patch of a field other than display_name and the interval's times");
+        }
+        const v = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch
+            return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        const obj = switch (v) {
+            .object => |o| o,
+            else => return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received."),
+        };
+        var start = z.start_ns;
+        var end = z.end_ns;
+        if (set_start or set_end) {
+            const interval = objectIn(obj, "interval") orelse return notModelled(arena, "an interval patch without an interval");
+            if (set_start) start = wholeSecondsNs((timeIn(interval, "startTime") orelse return notModelled(arena, "a start patch without a start")).nanoseconds);
+            if (set_end) end = wholeSecondsNs((timeIn(interval, "endTime") orelse return notModelled(arena, "an end patch without an end")).nanoseconds);
+        }
+        const upcoming = ctx.now_ns < z.start_ns;
+        if (set_start or set_end) {
+            if (upcoming) {
+                if (end == start) {
+                    // Production cancels an upcoming snooze only with both
+                    // times set to now.
+                    const now_s = wholeSecondsNs(ctx.now_ns);
+                    if (!set_start or @abs(start - now_s) > skew_ns) return fail(arena, 400, "INVALID_ARGUMENT", "An upcoming snooze's start and end time must be set to the current time to cancel it.");
+                    z.never_held = true;
+                } else if (end - start < min_snooze_ns) {
+                    return fail(arena, 400, "INVALID_ARGUMENT", "The snooze duration must be >= 1m, unless the snooze is being canceled, in which case it should be of length 0.");
+                }
+            } else {
+                if (start != z.start_ns) return notModelled(arena, "moving an active snooze's start");
+                if (end != start and end - start < min_snooze_ns) return fail(arena, 400, "INVALID_ARGUMENT", "The snooze duration must be >= 1m, unless the snooze is being canceled, in which case it should be of length 0.");
+            }
+        }
+        if (set_name) {
+            const name = stringIn(obj, "displayName") orelse "";
+            if (name.len == 0) return fail(arena, 400, "INVALID_ARGUMENT", "The Snooze must have a display name.");
+            z.display_name = try keep.dupe(u8, name);
+        }
+        z.start_ns = start;
+        z.end_ns = end;
+        return renderSnooze(arena, z, null);
     }
 
     /// Production's ids are 19 or 20 digits.
@@ -247,6 +518,140 @@ pub const Context = struct {
     caller: []const u8,
     now_ns: i96,
 };
+
+/// Production allows a snooze's start 15 s of clock skew.
+const skew_ns: i96 = 15 * std.time.ns_per_s;
+const min_snooze_ns: i96 = @as(i96, validate.min_snooze_seconds) * std.time.ns_per_s;
+
+fn wholeSecondsNs(ns: i96) i96 {
+    return @divFloor(ns, std.time.ns_per_s) * std.time.ns_per_s;
+}
+
+fn stringIn(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
+    return switch (obj.get(name) orelse return null) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+fn objectIn(obj: std.json.ObjectMap, name: []const u8) ?std.json.ObjectMap {
+    return switch (obj.get(name) orelse return null) {
+        .object => |o| o,
+        else => null,
+    };
+}
+
+fn timeIn(obj: std.json.ObjectMap, name: []const u8) ?std.Io.Timestamp {
+    return core.timestamp.parse(stringIn(obj, name) orelse return null) catch null;
+}
+
+/// A snooze filter's resource labels: `resource.labels.k="v"`, joined
+/// by AND. "" is none.
+fn labelsOfFilter(arena: Allocator, filter: []const u8) error{ OutOfMemory, NotModelled }![]const types.Label {
+    var labels: std.ArrayList(types.Label) = .empty;
+    if (filter.len == 0) return labels.items;
+    var parts = std.mem.splitSequence(u8, filter, " AND ");
+    while (parts.next()) |raw| {
+        const part = std.mem.trim(u8, raw, " ");
+        const prefix = "resource.labels.";
+        if (!std.mem.startsWith(u8, part, prefix)) return error.NotModelled;
+        const eq = std.mem.indexOfScalar(u8, part, '=') orelse return error.NotModelled;
+        const key = std.mem.trim(u8, part[prefix.len..eq], " ");
+        const value = quotedOf(std.mem.trim(u8, part[eq + 1 ..], " ")) orelse return error.NotModelled;
+        if (key.len == 0) return error.NotModelled;
+        try labels.append(arena, .{ .key = key, .value = value });
+    }
+    return labels.items;
+}
+
+fn labelsMeet(want: []const types.Label, have: []const types.Label) bool {
+    for (want) |w| {
+        for (have) |h| {
+            if (std.mem.eql(u8, w.key, h.key) and std.mem.eql(u8, w.value, h.value)) break;
+        } else return false;
+    }
+    return true;
+}
+
+const Bound = struct { start: bool, at_most: bool, t: i96 };
+
+fn parseSnoozeFilter(arena: Allocator, filter: []const u8) Allocator.Error!Parsed([]const Bound) {
+    if (std.mem.indexOf(u8, filter, " OR ") != null) return .{ .reply = try snoozeFilterRefusal(arena, filter, "Only restrictions and conjunctions are supported.") };
+    var bounds: std.ArrayList(Bound) = .empty;
+    var parts = std.mem.splitSequence(u8, filter, " AND ");
+    while (parts.next()) |raw| {
+        const part = std.mem.trim(u8, raw, " ");
+        const at = operatorAt(part) orelse return .{ .reply = try fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Field filter had an invalid value of \"{s}\": Invalid filter syntax.", .{filter})) };
+        const lhs = std.mem.trim(u8, part[0..at.index], " ");
+        const rhs = std.mem.trim(u8, part[at.index + at.len ..], " ");
+        const text = quotedOf(rhs) orelse return .{ .reply = try fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Field filter had an invalid value of \"{s}\": Invalid filter syntax.", .{filter})) };
+        const is_start = std.mem.eql(u8, lhs, "interval.start_time");
+        if (!is_start and !std.mem.eql(u8, lhs, "interval.end_time")) {
+            if (std.mem.startsWith(u8, lhs, "interval.")) return .{ .reply = try snoozeFilterRefusal(arena, filter, try arena.print("Not a valid left-hand value: \"{s}\"; expecting one of {{interval.start_time, interval.end_time}}.", .{lhs})) };
+            return .{ .reply = try snoozeFilterRefusal(arena, filter, try arena.print("Unrecognized filter property: {s}", .{lhs})) };
+        }
+        switch (at.op) {
+            .ge, .le => {},
+            // Production refused `=` on a time as it does a property it
+            // does not know.
+            .eq => return .{ .reply = try snoozeFilterRefusal(arena, filter, try arena.print("Unrecognized filter property: {s}", .{lhs})) },
+            else => return .{ .reply = try snoozeFilterRefusal(arena, filter, "Only equality, greater than or equals comparison and less than or equals comparison restrictions are supported.") },
+        }
+        const t = core.timestamp.parse(text) catch return .{ .reply = try fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Field filter had an invalid value of \"{s}\": Invalid filter syntax.", .{filter})) };
+        try bounds.append(arena, .{ .start = is_start, .at_most = at.op == .le, .t = t.nanoseconds });
+    }
+    return .{ .ok = bounds.items };
+}
+
+/// Production wrote its parse tree where this writes the filter; the
+/// reason after it is production's.
+fn snoozeFilterRefusal(arena: Allocator, filter: []const u8, reason: []const u8) Allocator.Error!Reply {
+    return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Field filter had an invalid value of \"{s}\": {s}", .{ filter, reason }));
+}
+
+fn meetsBounds(z: *const Snooze, bounds: []const Bound) bool {
+    for (bounds) |b| {
+        const v = if (b.start) z.start_ns else z.end_ns;
+        if (b.at_most and v > b.t) return false;
+        if (!b.at_most and v < b.t) return false;
+    }
+    return true;
+}
+
+fn renderSnooze(arena: Allocator, z: *const Snooze, sent: ?[2]i96) Allocator.Error!Reply {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeSnooze(&jw, z, sent) catch return error.OutOfMemory;
+    return .{ .status = 200, .body = out.written() };
+}
+
+/// In production's field order. `sent` is a create's times as sent,
+/// which its answer carries in place of the whole seconds kept.
+fn writeSnooze(jw: *Stringify, z: *const Snooze, sent: ?[2]i96) Stringify.Error!void {
+    var buf: [core.timestamp.max_len]u8 = undefined;
+    try jw.beginObject();
+    try jw.objectField("name");
+    try jw.write(z.name);
+    try jw.objectField("criteria");
+    try jw.beginObject();
+    try jw.objectField("policies");
+    try jw.write(z.policies);
+    if (z.filter.len > 0) {
+        try jw.objectField("filter");
+        try jw.write(z.filter);
+    }
+    try jw.endObject();
+    try jw.objectField("interval");
+    try jw.beginObject();
+    try jw.objectField("startTime");
+    try jw.write(core.timestamp.format(&buf, .{ .nanoseconds = if (sent) |t| t[0] else z.start_ns }));
+    try jw.objectField("endTime");
+    try jw.write(core.timestamp.format(&buf, .{ .nanoseconds = if (sent) |t| t[1] else z.end_ns }));
+    try jw.endObject();
+    try jw.objectField("displayName");
+    try jw.write(z.display_name);
+    try jw.endObject();
+}
 
 fn paramOf(params: []const Param, name: []const u8) ?[]const u8 {
     for (params) |p| if (std.mem.eql(u8, p.name, name)) return p.value;
@@ -1066,4 +1471,463 @@ test "faults on a patch: a dropped one is retried, and answers" {
     defer off.deinit();
     try testing.expect(!off.value.enabled);
     try testing.expectEqual(2, b.fake.callCount());
+}
+
+// Snoozes, held to what production answered in milestone 0.
+
+fn snoozeBody(arena: Allocator, name: []const u8, policies: []const u8, start: []const u8, end: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{{\"displayName\":\"{s}\",\"criteria\":{{\"policies\":{s}}},\"interval\":{{\"startTime\":\"{s}\",\"endTime\":\"{s}\"}}}}", .{ name, policies, start, end });
+}
+
+test "snoozes: made with the times as sent, read back in whole seconds, listed newest start first" {
+    var b: Bench = undefined;
+    try b.init();
+    defer b.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    b.clock.now_ns = ts("2026-10-20T18:56:15Z").nanoseconds;
+    const made = try b.raw(a, .POST, "snoozes", try snoozeBody(a, "zigps-d5b8f4-active", "[\"projects/extractctl/alertPolicies/9594883664150561401\"]", "2026-10-20T18:56:34.868813Z", "2026-10-20T18:58:34.868813Z"));
+    try testing.expectEqual(200, made.status);
+    const want = try codec.decodeSnooze(a, a, production.snooze_created_micros);
+    const got = try codec.decodeSnooze(a, a, made.body);
+    try testing.expectEqual(want.start.nanoseconds, got.start.nanoseconds);
+    try testing.expectEqual(want.end.nanoseconds, got.end.nanoseconds);
+    try testing.expectEqualStrings(want.display_name, got.display_name);
+    try testing.expectEqualStrings(want.policies[0], got.policies[0]);
+    var read = try b.client.getSnooze(got.id);
+    defer read.deinit();
+    const want_read = try codec.decodeSnooze(a, a, production.snooze_read);
+    try testing.expectEqual(want_read.start.nanoseconds, read.value.start.nanoseconds);
+    try testing.expectEqual(want_read.end.nanoseconds, read.value.end.nanoseconds);
+
+    // A policy nobody has is taken, as production took it.
+    var nobody = try b.client.createSnooze(.{ .display_name = "zigps-d5b8f4-nobody", .policies = &.{"1234567890"}, .start = ts("2026-10-20T19:11:14Z"), .end = ts("2026-10-20T19:12:14Z") });
+    nobody.deinit();
+    var upcoming = try b.client.createSnooze(.{ .display_name = "zigps-d5b8f4-upcoming", .policies = &.{ "9594883664150561401", "4294582767119635845" }, .start = ts("2026-10-20T19:06:14Z"), .end = ts("2026-10-20T19:07:14Z") });
+    upcoming.deinit();
+    // Ninety seconds long: production has no whole-minutes rule.
+    var odd = try b.client.createSnooze(.{ .display_name = "zigps-d5b8f4-odd", .policies = &.{"9594883664150561401"}, .start = ts("2026-10-20T19:11:14Z"), .end = ts("2026-10-20T19:12:44Z") });
+    odd.deinit();
+    try testing.expectEqual(4, b.fake.snoozeCount());
+    // Production's order: start, newest first; a later-made one first on
+    // a tie (odd made after nobody, both at 19:11:14).
+    var page = try b.client.listSnoozes(.{});
+    defer page.deinit();
+    const order = [_][]const u8{ "zigps-d5b8f4-odd", "zigps-d5b8f4-nobody", "zigps-d5b8f4-upcoming", "zigps-d5b8f4-active" };
+    try testing.expectEqual(order.len, page.value.snoozes.len);
+    for (order, page.value.snoozes) |w, g| try testing.expectEqualStrings(w, g.display_name);
+    const want_page = try codec.decodeSnoozePage(a, a, production.snooze_page);
+    for (want_page.snoozes, page.value.snoozes) |w, g| try testing.expectEqualStrings(w.display_name, g.display_name);
+    var paged = try b.client.listSnoozes(.{ .page_size = 1 });
+    defer paged.deinit();
+    try testing.expect(paged.value.next_page_token != null);
+}
+
+test "snoozes: creation refused in production's words" {
+    var b: Bench = undefined;
+    try b.init();
+    defer b.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    b.clock.now_ns = ts("2026-10-20T18:56:15Z").nanoseconds;
+    const one = "[\"projects/extractctl/alertPolicies/9594883664150561401\"]";
+    var seventeen: std.Io.Writer.Allocating = .init(a);
+    try seventeen.writer.writeByte('[');
+    for (0..17) |i| try seventeen.writer.print("{s}\"projects/extractctl/alertPolicies/9594883664150561401\"", .{if (i == 0) "" else ","});
+    try seventeen.writer.writeByte(']');
+    for ([_]struct { []const u8, []const u8 }{
+        .{ try snoozeBody(a, "zigps-d5b8f4-past", one, "2026-10-20T18:54:15Z", "2026-10-20T18:58:15Z"), production.snooze_past_start },
+        .{ try snoozeBody(a, "zigps-d5b8f4-17", seventeen.written(), "2026-10-20T19:11:15Z", "2026-10-20T19:12:15Z"), production.snooze_seventeen },
+        .{ "{\"displayName\":\"zigps-d5b8f4-filter\",\"criteria\":{\"policies\":[\"a\",\"b\"],\"filter\":\"resource.labels.topic_id=\\\"x\\\"\"},\"interval\":{\"startTime\":\"2026-10-20T19:11:15Z\",\"endTime\":\"2026-10-20T19:12:15Z\"}}", production.snooze_filter_two },
+        .{ "{\"criteria\":{\"policies\":[\"a\"]},\"interval\":{\"startTime\":\"2026-10-20T19:11:15Z\",\"endTime\":\"2026-10-20T19:12:15Z\"}}", production.snooze_no_name },
+        .{ try snoozeBody(a, "zigps-d5b8f4-backwards", one, "2026-10-20T19:12:15Z", "2026-10-20T19:11:15Z"), production.snooze_backwards },
+        // Under a minute, the same words: the rule production named.
+        .{ try snoozeBody(a, "zigps-d5b8f4-short", one, "2026-10-20T19:11:15Z", "2026-10-20T19:12:14Z"), production.snooze_backwards },
+    }) |case| {
+        const reply = try b.raw(a, .POST, "snoozes", case[0]);
+        try testing.expectEqual(400, reply.status);
+        try testing.expectEqualStrings(try messageOf(a, case[1]), try messageOf(a, reply.body));
+    }
+    try testing.expectEqual(0, b.fake.snoozeCount());
+    // 15 s of skew are allowed.
+    try testing.expectEqual(200, (try b.raw(a, .POST, "snoozes", try snoozeBody(a, "zigps-skew", one, "2026-10-20T18:56:01Z", "2026-10-20T18:58:01Z"))).status);
+    // What the fake does not model.
+    try testing.expectEqual(501, (try b.raw(a, .POST, "snoozes", try snoozeBody(a, "none", "[]", "2026-10-20T19:11:15Z", "2026-10-20T19:12:15Z"))).status);
+    try testing.expectEqual(501, (try b.raw(a, .POST, "snoozes", "{\"displayName\":\"f\",\"criteria\":{\"policies\":[\"a\"],\"filter\":\"metric.type=\\\"x\\\"\"},\"interval\":{\"startTime\":\"2026-10-20T19:11:15Z\",\"endTime\":\"2026-10-20T19:12:15Z\"}}")).status);
+    try testing.expectEqual(501, (try b.raw(a, .DELETE, "snoozes/1", null)).status);
+}
+
+test "snoozes: list filters as production took them, and refused them" {
+    var b: Bench = undefined;
+    try b.init();
+    defer b.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    b.clock.now_ns = ts("2026-10-20T18:58:29Z").nanoseconds;
+    for ([_]struct { []const u8, []const u8, []const u8 }{
+        .{ "late", "2026-10-20T19:28:29Z", "2026-10-20T19:29:29Z" },
+        .{ "early", "2026-10-20T19:18:29Z", "2026-10-20T19:19:29Z" },
+        .{ "active", "2026-10-20T18:58:49Z", "2026-10-20T19:08:29Z" },
+        .{ "young", "2026-10-20T18:58:49Z", "2026-10-20T19:08:29Z" },
+    }) |s| {
+        var made = try b.client.createSnooze(.{ .display_name = s[0], .policies = &.{"1234567890"}, .start = ts(s[1]), .end = ts(s[2]) });
+        made.deinit();
+    }
+    b.clock.now_ns = ts("2026-10-20T18:58:55Z").nanoseconds;
+    const Case = struct { ?[]const u8, ?std.Io.Timestamp, []const []const u8 };
+    for ([_]Case{
+        .{ null, ts("2026-10-20T18:58:55Z"), &.{ "young", "active" } },
+        .{ "interval.end_time >= \"2026-10-20T18:58:55Z\"", null, &.{ "late", "early", "young", "active" } },
+        .{ "interval.start_time >= \"2026-10-20T18:58:55Z\"", null, &.{ "late", "early" } },
+        .{ "interval.end_time >= \"2026-10-20T13:58:55-05:00\"", null, &.{ "late", "early", "young", "active" } },
+    }) |case| {
+        var page = try b.client.listSnoozes(.{ .filter = case[0], .active_at = case[1] });
+        defer page.deinit();
+        try testing.expectEqual(case[2].len, page.value.snoozes.len);
+        for (case[2], page.value.snoozes) |w, g| try testing.expectEqualStrings(w, g.display_name);
+    }
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "interval.end_time > \"2026-10-20T18:56:41.506362Z\"", production.snooze_filter_greater },
+        .{ "interval.start_time >= \"2026-10-20T18:58:55Z\" OR interval.end_time <= \"2026-10-20T18:58:55Z\"", production.snooze_filter_or },
+        .{ "display_name = \"zigps-d5b8f4-active\"", production.snooze_filter_display_name },
+    }) |case| {
+        try testing.expectError(error.InvalidArgument, b.client.listSnoozes(.{ .filter = case[0] }));
+        const want = try messageOf(a, case[1]);
+        // The reason after production's parse tree is production's.
+        const reason = want[std.mem.lastIndexOf(u8, want, "\": ").? + 3 ..];
+        try testing.expect(std.mem.endsWith(u8, b.diag.message(), reason));
+    }
+    try testing.expectError(error.InvalidArgument, b.client.listSnoozes(.{ .filter = "interval.end_time >= 2026-10-20T18:58:55Z" }));
+    try testing.expectEqualStrings(try messageOf(a, production.snooze_filter_unquoted), b.diag.message());
+    try testing.expectError(error.InvalidArgument, b.client.listSnoozes(.{ .filter = "interval.endTime >= \"2026-10-20T18:58:55Z\"" }));
+    try testing.expect(std.mem.endsWith(u8, b.diag.message(), "Not a valid left-hand value: \"interval.endTime\"; expecting one of {interval.start_time, interval.end_time}."));
+    try testing.expectError(error.InvalidArgument, b.client.listSnoozes(.{ .filter = "interval.end_time = \"2026-10-20T19:29:29Z\"" }));
+    try testing.expect(std.mem.endsWith(u8, b.diag.message(), "Unrecognized filter property: interval.end_time"));
+}
+
+test "snoozes: ended in each of production's forms, and every change after refused" {
+    var b: Bench = undefined;
+    try b.init();
+    defer b.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    b.clock.now_ns = ts("2026-10-20T18:58:29Z").nanoseconds;
+    var active = try b.client.createSnooze(.{ .display_name = "active", .policies = &.{"1"}, .start = ts("2026-10-20T18:58:49Z"), .end = ts("2026-10-20T19:08:29Z") });
+    defer active.deinit();
+    var young = try b.client.createSnooze(.{ .display_name = "young", .policies = &.{"1"}, .start = ts("2026-10-20T18:58:49Z"), .end = ts("2026-10-20T19:08:29Z") });
+    defer young.deinit();
+    var upcoming = try b.client.createSnooze(.{ .display_name = "late", .policies = &.{"1"}, .start = ts("2026-10-20T19:28:29Z"), .end = ts("2026-10-20T19:29:29Z") });
+    defer upcoming.deinit();
+
+    // Under a minute old, the end moved to now: production's 400.
+    b.clock.now_ns = ts("2026-10-20T18:58:58Z").nanoseconds;
+    const young_path = try std.fmt.allocPrint(a, "snoozes/{s}?updateMask=interval.end_time", .{young.value.id});
+    const short = try b.raw(a, .PATCH, young_path, "{\"interval\":{\"endTime\":\"2026-10-20T18:58:58Z\"}}");
+    try testing.expectEqualStrings(try messageOf(a, production.snooze_too_short), try messageOf(a, short.body));
+    // The client cancels it instead: its end its start.
+    var cancelled = try b.client.endSnooze(young.value, std.Io.Clock.real.now(b.clock.io()));
+    defer cancelled.deinit();
+    const want_cancelled = try codec.decodeSnooze(a, a, production.snooze_cancelled_active);
+    try testing.expect(cancelled.value.cancelled());
+    try testing.expectEqual(want_cancelled.start.nanoseconds, cancelled.value.end.nanoseconds);
+
+    // Upcoming: the end alone moved to the start is refused; both now
+    // cancels it.
+    const late_path = try std.fmt.allocPrint(a, "snoozes/{s}?updateMask=interval.end_time", .{upcoming.value.id});
+    const end_only = try b.raw(a, .PATCH, late_path, "{\"interval\":{\"endTime\":\"2026-10-20T19:28:29Z\"}}");
+    try testing.expectEqualStrings(try messageOf(a, production.snooze_cancel_upcoming_end_only), try messageOf(a, end_only.body));
+    var late_cancelled = try b.client.endSnooze(upcoming.value, std.Io.Clock.real.now(b.clock.io()));
+    defer late_cancelled.deinit();
+    try testing.expect(late_cancelled.value.cancelled());
+    try testing.expectEqual(ts("2026-10-20T18:58:58Z").nanoseconds, late_cancelled.value.start.nanoseconds);
+
+    // Over a minute old: its end now. A display name can change first.
+    b.clock.now_ns = ts("2026-10-20T19:00:03Z").nanoseconds;
+    const active_name_path = try std.fmt.allocPrint(a, "snoozes/{s}?updateMask=display_name", .{active.value.id});
+    const renamed = try b.raw(a, .PATCH, active_name_path, "{\"displayName\":\"renamed\"}");
+    try testing.expectEqual(200, renamed.status);
+    var ended = try b.client.endSnooze(active.value, std.Io.Clock.real.now(b.clock.io()));
+    defer ended.deinit();
+    const want_ended = try codec.decodeSnooze(a, a, production.snooze_ended);
+    try testing.expectEqual(want_ended.end.nanoseconds, ended.value.end.nanoseconds);
+    try testing.expectEqualStrings("renamed", ended.value.display_name);
+
+    // Every change after: production's FAILED_PRECONDITION, a repeat
+    // included.
+    b.clock.now_ns = ts("2026-10-20T19:00:07Z").nanoseconds;
+    for ([_][]const u8{ active.value.id, young.value.id, upcoming.value.id }) |id| {
+        const again = try b.raw(a, .PATCH, try std.fmt.allocPrint(a, "snoozes/{s}?updateMask=interval.end_time", .{id}), "{\"interval\":{\"endTime\":\"2026-10-20T19:00:03Z\"}}");
+        try testing.expectEqual(400, again.status);
+        try testing.expectEqualStrings(try messageOf(a, production.snooze_already_ended), try messageOf(a, again.body));
+    }
+    // Nobody's: production's 404 for a get and for a patch.
+    try testing.expectError(error.NotFound, b.client.getSnooze("1234567890"));
+    try testing.expectEqualStrings(try messageOf(a, production.snooze_unknown), b.diag.message());
+    const unknown = try b.raw(a, .PATCH, "snoozes/1234567890?updateMask=interval.end_time", "{\"interval\":{\"endTime\":\"2026-10-20T19:00:03Z\"}}");
+    try testing.expectEqualStrings(try messageOf(a, production.snooze_patch_unknown), try messageOf(a, unknown.body));
+    // Not modelled: another field, moving an active one's start.
+    b.clock.now_ns = ts("2026-10-20T19:10:00Z").nanoseconds;
+    var running = try b.client.createSnooze(.{ .display_name = "running", .policies = &.{"1"}, .start = ts("2026-10-20T19:10:00Z"), .end = ts("2026-10-20T19:20:00Z") });
+    defer running.deinit();
+    b.clock.now_ns = ts("2026-10-20T19:12:00Z").nanoseconds;
+    try testing.expectEqual(501, (try b.raw(a, .PATCH, try std.fmt.allocPrint(a, "snoozes/{s}?updateMask=criteria", .{running.value.id}), "{}")).status);
+    try testing.expectEqual(501, (try b.raw(a, .PATCH, try std.fmt.allocPrint(a, "snoozes/{s}?updateMask=interval.start_time", .{running.value.id}), "{\"interval\":{\"startTime\":\"2026-10-20T19:11:00Z\"}}")).status);
+}
+
+test "an active snooze closes its policies' open alerts at its start, and opens none until it ends" {
+    var b: Bench = undefined;
+    try b.init();
+    defer b.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const policy = "projects/extractctl/alertPolicies/42";
+    b.clock.now_ns = ts("2026-10-20T19:04:19Z").nanoseconds;
+    const open = try b.fake.putAlert(.{ .open_time = ts("2026-10-20T19:04:19Z"), .policy = .{ .name = policy, .display_name = "zigps-snooze" } });
+    const other = try b.fake.putAlert(.{ .open_time = ts("2026-10-20T19:04:19Z"), .policy = .{ .name = "projects/extractctl/alertPolicies/7", .display_name = "other" } });
+    var snooze = try b.client.createSnooze(.{ .display_name = "zigps-snooze", .policies = &.{"42"}, .start = ts("2026-10-20T19:04:39Z"), .end = ts("2026-10-20T19:14:39Z") });
+    defer snooze.deinit();
+    // Before the start, still open.
+    var before = try b.client.getAlert(open);
+    defer before.deinit();
+    try testing.expectEqual(types.AlertState.open, before.value.state);
+    b.clock.now_ns = ts("2026-10-20T19:04:41Z").nanoseconds;
+    var closed = try b.client.getAlert(open);
+    defer closed.deinit();
+    try testing.expectEqual(types.AlertState.closed, closed.value.state);
+    try testing.expectEqual(ts("2026-10-20T19:04:39Z").nanoseconds, closed.value.close_time.?.nanoseconds);
+    var untouched = try b.client.getAlert(other);
+    defer untouched.deinit();
+    try testing.expectEqual(types.AlertState.open, untouched.value.state);
+    // None opens while it holds.
+    try testing.expectError(error.InvalidEntry, b.fake.putAlert(.{ .open_time = ts("2026-10-20T19:05:00Z"), .policy = .{ .name = policy } }));
+    // Ended a minute in: the policy's alerts open again.
+    b.clock.now_ns = ts("2026-10-20T19:05:58Z").nanoseconds;
+    var ended = try b.client.endSnooze(snooze.value, std.Io.Clock.real.now(b.clock.io()));
+    ended.deinit();
+    _ = try b.fake.putAlert(.{ .open_time = ts("2026-10-20T19:07:15Z"), .policy = .{ .name = policy } });
+    b.clock.now_ns = ts("2026-10-20T19:07:16Z").nanoseconds;
+    var open_now = try b.client.listAlerts(.{ .open_only = true });
+    defer open_now.deinit();
+    try testing.expectEqual(2, open_now.value.alerts.len);
+}
+
+test "a snooze with a filter closes only the alerts whose resource labels meet it" {
+    var b: Bench = undefined;
+    try b.init();
+    defer b.deinit();
+    const policy = "projects/extractctl/alertPolicies/42";
+    b.clock.now_ns = ts("2026-10-20T19:00:00Z").nanoseconds;
+    const a_zone = try b.fake.putAlert(.{ .open_time = ts("2026-10-20T19:00:00Z"), .policy = .{ .name = policy }, .resource_labels = &.{.{ .key = "zone", .value = "us-central1-a" }} });
+    const b_zone = try b.fake.putAlert(.{ .open_time = ts("2026-10-20T19:00:00Z"), .policy = .{ .name = policy }, .resource_labels = &.{.{ .key = "zone", .value = "us-central1-b" }} });
+    var snooze = try b.client.createSnooze(.{ .display_name = "zone a", .policies = &.{"42"}, .filter = "resource.labels.zone=\"us-central1-a\"", .start = ts("2026-10-20T19:00:10Z"), .end = ts("2026-10-20T20:00:00Z") });
+    defer snooze.deinit();
+    try testing.expectEqualStrings("resource.labels.zone=\"us-central1-a\"", snooze.value.filter);
+    b.clock.now_ns = ts("2026-10-20T19:00:11Z").nanoseconds;
+    var x = try b.client.getAlert(a_zone);
+    defer x.deinit();
+    try testing.expectEqual(types.AlertState.closed, x.value.state);
+    var y = try b.client.getAlert(b_zone);
+    defer y.deinit();
+    try testing.expectEqual(types.AlertState.open, y.value.state);
+}
+
+test "regression: a snooze that starts and ends between two requests still closed the alert it held over" {
+    // The fake closed alerts only for a snooze holding at a request, so
+    // one that began and ended between two left its policy's alert open,
+    // where production would have closed it within a second of the start.
+    var b: Bench = undefined;
+    try b.init();
+    defer b.deinit();
+    const policy = "projects/extractctl/alertPolicies/42";
+    b.clock.now_ns = ts("2026-10-20T19:00:00Z").nanoseconds;
+    const held = try b.fake.putAlert(.{ .open_time = ts("2026-10-20T19:00:00Z"), .policy = .{ .name = policy } });
+    var snooze = try b.client.createSnooze(.{ .display_name = "brief", .policies = &.{"42"}, .start = ts("2026-10-20T19:01:00Z"), .end = ts("2026-10-20T19:02:00Z") });
+    snooze.deinit();
+    // The next request comes after the snooze has ended.
+    b.clock.now_ns = ts("2026-10-20T19:30:00Z").nanoseconds;
+    var got = try b.client.getAlert(held);
+    defer got.deinit();
+    try testing.expectEqual(types.AlertState.closed, got.value.state);
+    try testing.expectEqual(ts("2026-10-20T19:01:00Z").nanoseconds, got.value.close_time.?.nanoseconds);
+    // An alert opened after it ended is untouched.
+    const later = try b.fake.putAlert(.{ .open_time = ts("2026-10-20T19:03:00Z"), .policy = .{ .name = policy } });
+    var after = try b.client.getAlert(later);
+    defer after.deinit();
+    try testing.expectEqual(types.AlertState.open, after.value.state);
+}
+
+test "an upcoming snooze cancelled before its start never held, and closes nothing" {
+    var b: Bench = undefined;
+    try b.init();
+    defer b.deinit();
+    const policy = "projects/extractctl/alertPolicies/42";
+    b.clock.now_ns = ts("2026-10-20T19:00:00Z").nanoseconds;
+    const open = try b.fake.putAlert(.{ .open_time = ts("2026-10-20T19:00:00Z"), .policy = .{ .name = policy } });
+    var snooze = try b.client.createSnooze(.{ .display_name = "later", .policies = &.{"42"}, .start = ts("2026-10-20T19:30:00Z"), .end = ts("2026-10-20T19:40:00Z") });
+    defer snooze.deinit();
+    b.clock.now_ns = ts("2026-10-20T19:10:00Z").nanoseconds;
+    var cancelled = try b.client.endSnooze(snooze.value, std.Io.Clock.real.now(b.clock.io()));
+    defer cancelled.deinit();
+    try testing.expect(cancelled.value.cancelled());
+    b.clock.now_ns = ts("2026-10-20T19:50:00Z").nanoseconds;
+    var got = try b.client.getAlert(open);
+    defer got.deinit();
+    try testing.expectEqual(types.AlertState.open, got.value.state);
+    // And it keeps none from opening.
+    _ = try b.fake.putAlert(.{ .open_time = ts("2026-10-20T19:10:00Z"), .policy = .{ .name = policy } });
+}
+
+/// What the property holds the fake to: one policy's snoozes and alerts,
+/// written apart from the fake, as production moved them.
+const SnoozeModel = struct {
+    const max = 24;
+    enabled: bool = true,
+    snoozes: [max]Z = undefined,
+    snooze_count: usize = 0,
+    alerts: [max]A = undefined,
+    alert_count: usize = 0,
+
+    const Z = struct { id: []const u8, start: i96, end: i96, never_held: bool = false };
+    const A = struct { id: []const u8, open: i96, closed: ?i96 = null };
+
+    fn heldAt(z: Z, t: i96) bool {
+        return !z.never_held and z.start <= t and t < @max(z.end, z.start + 1);
+    }
+
+    /// Every open alert a snooze begun by `now` held over, closed at its
+    /// start or its opening, whichever came later.
+    fn settle(m: *SnoozeModel, now: i96) void {
+        for (m.alerts[0..m.alert_count]) |*a| {
+            if (a.closed != null) continue;
+            var first: ?i96 = null;
+            for (m.snoozes[0..m.snooze_count]) |z| {
+                if (z.never_held or z.start > now or a.open >= @max(z.end, z.start + 1)) continue;
+                const at = @max(z.start, a.open);
+                if (first == null or at < first.?) first = at;
+            }
+            a.closed = first;
+        }
+    }
+};
+
+fn snoozesProperty(_: void, input: []const u8) !void {
+    const gpa = test_util.propertyAllocator();
+    var g: test_util.ByteGen = .init(input);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var clock: core.testing.FakeClock = .{ .now_ns = ts("2026-10-20T19:00:00Z").nanoseconds };
+    var fake: FakeMonitoring = .init(gpa, clock.io(), .{ .project_id = "p" });
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "t" };
+    var diag: core.Diagnostics = .{};
+    var client = try Client.init(gpa, clock.io(), .{ .project_id = "p", .token_provider = token.provider(), .transport = fake.transport(), .diagnostics = &diag });
+    defer client.deinit();
+    const policy = "projects/p/alertPolicies/42";
+    _ = try fake.putAlertPolicy(.{ .id = "42", .display_name = "watched" });
+    var m: SnoozeModel = .{};
+
+    for (0..g.intRange(usize, 0, 40)) |_| {
+        const now = clock.now_ns;
+        switch (g.intRange(u8, 0, 6)) {
+            0 => if (m.snooze_count < SnoozeModel.max) {
+                const start = now + (@as(i96, g.intRange(u32, 0, 630)) - 30) * std.time.ns_per_s;
+                const end = start + @as(i96, g.intRange(u32, 0, 900)) * std.time.ns_per_s;
+                // The fake settles at every request it serves, before
+                // the request: a create the client sends included.
+                if (end - start >= 60 * std.time.ns_per_s) m.settle(now);
+                const made = client.createSnooze(.{ .display_name = "z", .policies = &.{"42"}, .start = .{ .nanoseconds = start }, .end = .{ .nanoseconds = end } });
+                if (end - start < 60 * std.time.ns_per_s) {
+                    try testing.expectError(error.InvalidOptions, made);
+                } else if (start < now - 15 * std.time.ns_per_s) {
+                    try testing.expectError(error.InvalidArgument, made);
+                } else {
+                    var z = try made;
+                    defer z.deinit();
+                    m.snoozes[m.snooze_count] = .{ .id = try a.dupe(u8, z.value.id), .start = start, .end = end };
+                    m.snooze_count += 1;
+                }
+            },
+            1 => if (m.snooze_count > 0) {
+                const z = &m.snoozes[g.intRange(usize, 0, m.snooze_count - 1)];
+                const value: types.Snooze = .{ .name = try std.fmt.allocPrint(a, "projects/p/snoozes/{s}", .{z.id}), .id = z.id, .start = .{ .nanoseconds = z.start }, .end = .{ .nanoseconds = z.end } };
+                // Refused before sending when it has ended: nothing served.
+                if (!(z.start == z.end or z.end <= now)) m.settle(now);
+                const ended = client.endSnooze(value, .{ .nanoseconds = now });
+                if (z.start == z.end or z.end <= now) {
+                    try testing.expectError(error.InvalidOptions, ended);
+                } else {
+                    var answer = try ended;
+                    defer answer.deinit();
+                    if (now < z.start) {
+                        z.start = now;
+                        z.end = now;
+                        z.never_held = true;
+                    } else if (now - z.start < 60 * std.time.ns_per_s) {
+                        z.end = z.start;
+                    } else {
+                        z.end = now;
+                    }
+                    try testing.expectEqual(z.start, answer.value.start.nanoseconds);
+                    try testing.expectEqual(z.end, answer.value.end.nanoseconds);
+                }
+            },
+            2 => {
+                m.settle(now);
+                var page = try client.listSnoozes(.{ .active_at = .{ .nanoseconds = now } });
+                defer page.deinit();
+                var want: usize = 0;
+                for (m.snoozes[0..m.snooze_count]) |z| want += @intFromBool(z.start <= now and z.end >= now);
+                try testing.expectEqual(want, page.value.snoozes.len);
+            },
+            3 => clock.now_ns += @as(i96, g.intRange(u32, 0, 120)) * std.time.ns_per_s,
+            4 => if (m.alert_count < SnoozeModel.max) {
+                const put = fake.putAlert(.{ .open_time = .{ .nanoseconds = now }, .policy = .{ .name = policy } });
+                var held = false;
+                for (m.snoozes[0..m.snooze_count]) |z| held = held or SnoozeModel.heldAt(z, now);
+                if (held) {
+                    try testing.expectError(error.InvalidEntry, put);
+                } else {
+                    m.alerts[m.alert_count] = .{ .id = try a.dupe(u8, try put), .open = now };
+                    m.alert_count += 1;
+                }
+            },
+            5 => {
+                m.settle(now);
+                for (m.alerts[0..m.alert_count]) |want| {
+                    var got = try client.getAlert(want.id);
+                    defer got.deinit();
+                    try testing.expectEqual(want.closed == null, got.value.state == .open);
+                    if (want.closed) |c| try testing.expectEqual(c, got.value.close_time.?.nanoseconds);
+                }
+            },
+            else => {
+                m.settle(now);
+                m.enabled = g.boolean();
+                var p = try client.setAlertPolicyEnabled("42", m.enabled);
+                defer p.deinit();
+                try testing.expectEqual(m.enabled, p.value.enabled);
+                try testing.expectEqual(now, p.value.mutated.time.?.nanoseconds);
+            },
+        }
+    }
+}
+
+const test_util = @import("test_util.zig");
+
+test "slow property policies: snoozes made, ended, listed and holding over alerts as production moved them" {
+    try test_util.fuzzBytes({}, snoozesProperty, .{
+        .corpus = &.{
+            // A snooze from now for two minutes, an alert, a minute, a read,
+            // the end, another alert.
+            "\x00\x1e\x00\x78\x00\x04\x03\x3c\x05\x01\x00\x03\x50\x04\x05",
+            // An upcoming snooze cancelled, then an alert.
+            "\x00\xff\xff\x40\x00\x01\x00\x04\x05\x02",
+            "",
+        },
+    });
 }

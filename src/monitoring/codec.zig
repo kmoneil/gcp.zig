@@ -324,6 +324,104 @@ pub fn decodeAlertPolicyPage(out: Allocator, scratch: Allocator, body: []const u
     };
 }
 
+/// One snooze, as a create, a get and a patch answer it.
+pub fn decodeSnooze(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.Snooze {
+    return snoozeOf(out, try parse(scratch, body));
+}
+
+/// A page of `snoozes.list`: `{}` is an empty last page.
+pub fn decodeSnoozePage(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.SnoozePage {
+    const obj = try object(try parse(scratch, body));
+    const list = try field(obj, "snoozes", .array);
+    const snoozes = try out.alloc(types.Snooze, if (list) |l| l.items.len else 0);
+    if (list) |l| for (l.items, snoozes) |v, *s| {
+        s.* = try snoozeOf(out, v);
+    };
+    return .{ .snoozes = snoozes, .next_page_token = try token(out, obj) };
+}
+
+fn snoozeOf(out: Allocator, v: Value) DecodeError!types.Snooze {
+    const obj = try object(v);
+    const name = try string(out, obj, "name") orelse return error.InvalidResponse;
+    const interval = try field(obj, "interval", .object) orelse return error.InvalidResponse;
+    var s: types.Snooze = .{
+        .name = name,
+        .id = if (std.mem.lastIndexOfScalar(u8, name, '/')) |i| name[i + 1 ..] else name,
+        .display_name = try string(out, obj, "displayName") orelse "",
+        .start = try time(interval, "startTime") orelse return error.InvalidResponse,
+        .end = try time(interval, "endTime") orelse return error.InvalidResponse,
+    };
+    if (try field(obj, "criteria", .object)) |c| {
+        if (try field(c, "policies", .array)) |list| {
+            const policies = try out.alloc([]const u8, list.items.len);
+            for (list.items, policies) |p, *dst| dst.* = switch (p) {
+                .string => |text| try out.dupe(u8, text),
+                else => return error.InvalidResponse,
+            };
+            s.policies = policies;
+        }
+        s.filter = try string(out, c, "filter") orelse "";
+    }
+    return s;
+}
+
+/// A snooze's create body, its policies full names already. Times go in
+/// whole seconds, the resolution production keeps.
+pub fn encodeSnooze(arena: Allocator, display_name: []const u8, policies: []const []const u8, filter: ?[]const u8, start: std.Io.Timestamp, end: std.Io.Timestamp) Allocator.Error![]u8 {
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &w.writer };
+    write: {
+        jw.beginObject() catch break :write;
+        jw.objectField("displayName") catch break :write;
+        jw.write(display_name) catch break :write;
+        jw.objectField("criteria") catch break :write;
+        jw.beginObject() catch break :write;
+        jw.objectField("policies") catch break :write;
+        jw.write(policies) catch break :write;
+        if (filter) |f| {
+            jw.objectField("filter") catch break :write;
+            jw.write(f) catch break :write;
+        }
+        jw.endObject() catch break :write;
+        writeInterval(&jw, start, end) catch break :write;
+        jw.endObject() catch break :write;
+        return w.toOwnedSlice() catch error.OutOfMemory;
+    }
+    return error.OutOfMemory;
+}
+
+/// A snooze patch's body: the interval's end, and its start when the
+/// mask names it.
+pub fn encodeSnoozeInterval(arena: Allocator, start: ?std.Io.Timestamp, end: std.Io.Timestamp) Allocator.Error![]u8 {
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &w.writer };
+    write: {
+        jw.beginObject() catch break :write;
+        writeInterval(&jw, start, end) catch break :write;
+        jw.endObject() catch break :write;
+        return w.toOwnedSlice() catch error.OutOfMemory;
+    }
+    return error.OutOfMemory;
+}
+
+fn writeInterval(jw: *Stringify, start: ?std.Io.Timestamp, end: std.Io.Timestamp) Stringify.Error!void {
+    try jw.objectField("interval");
+    try jw.beginObject();
+    if (start) |s| {
+        try jw.objectField("startTime");
+        try writeTimestamp(jw, wholeSeconds(s));
+    }
+    try jw.objectField("endTime");
+    try writeTimestamp(jw, wholeSeconds(end));
+    try jw.endObject();
+}
+
+/// `t` with its fraction of a second dropped, as production keeps a
+/// snooze's times.
+pub fn wholeSeconds(t: std.Io.Timestamp) std.Io.Timestamp {
+    return .{ .nanoseconds = @divFloor(t.nanoseconds, std.time.ns_per_s) * std.time.ns_per_s };
+}
+
 /// The body of a patch with `updateMask=enabled`. The field always goes
 /// on the wire: production reads an absent `enabled` as true (measured).
 pub fn encodeEnabled(arena: Allocator, enabled: bool) Allocator.Error![]u8 {
@@ -1041,7 +1139,7 @@ fn decodersProperty(_: void, input: []const u8) !void {
     if (decodeSummary(a, s, input)) |summary| {
         if (summary) |sum| try testing.expect(sum.written <= sum.total);
     } else |err| try testing.expectEqual(error.InvalidResponse, err);
-    inline for (.{ decodeMetricInfo, decodeMetricPage, decodeResourceType, decodeResourceTypePage, decodeSeriesPage, decodeAlert, decodeAlertPage, decodeAlertPolicy, decodeAlertPolicyPage }) |decode| {
+    inline for (.{ decodeMetricInfo, decodeMetricPage, decodeResourceType, decodeResourceTypePage, decodeSeriesPage, decodeAlert, decodeAlertPage, decodeAlertPolicy, decodeAlertPolicyPage, decodeSnooze, decodeSnoozePage }) |decode| {
         if (decode(a, s, input)) |_| {} else |err| try testing.expectEqual(error.InvalidResponse, err);
     }
 }
@@ -1064,7 +1162,56 @@ test "fuzz decoders: any body decodes or is InvalidResponse, never a crash or a 
         production.policy_page,
         production.policy_two,
         "{\"name\":\"projects/p/alertPolicies/1\",\"conditions\":[{\"conditionSql\":{\"query\":\"SELECT 1\"}},{\"conditionThreshold\":{\"thresholdValue\":\"NaN\",\"aggregations\":[{\"alignmentPeriod\":\"1.5s\",\"groupByFields\":[\"a\"]}]}}],\"validity\":{\"code\":3,\"message\":\"bad\"},\"notificationChannels\":[\"c\"]}",
+        production.snooze_created,
+        production.snooze_page,
+        "{\"snoozes\":[{\"name\":\"projects/p/snoozes/1\",\"criteria\":{\"policies\":[\"a\"],\"filter\":\"resource.labels.zone=\\\"z\\\"\"},\"interval\":{\"startTime\":\"2026-10-20T19:00:00Z\",\"endTime\":\"2026-10-20T19:00:00Z\"}}],\"nextPageToken\":\"t\"}",
     } });
+}
+
+test "snoozes: production's bodies decoded, whole seconds read back, a cancelled one" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = out.allocator();
+    const s = scratch.allocator();
+    const made = try decodeSnooze(a, s, production.snooze_created_micros);
+    try testing.expectEqualStrings("141366793827031231927670956031820956967", made.id);
+    try testing.expectEqualStrings("zigps-d5b8f4-active", made.display_name);
+    try testing.expectEqual(1, made.policies.len);
+    try testing.expect(std.mem.endsWith(u8, made.policies[0], "/alertPolicies/9594883664150561401"));
+    try testing.expect(@rem(made.start.nanoseconds, std.time.ns_per_s) != 0);
+    const read = try decodeSnooze(a, s, production.snooze_read);
+    try testing.expectEqual(0, @rem(read.start.nanoseconds, std.time.ns_per_s));
+    try testing.expectEqual(wholeSeconds(made.start).nanoseconds, read.start.nanoseconds);
+    try testing.expectEqual(120 * std.time.ns_per_s, read.end.nanoseconds - read.start.nanoseconds);
+    const cancelled = try decodeSnooze(a, s, production.snooze_cancelled_upcoming);
+    try testing.expect(cancelled.cancelled());
+    const page = try decodeSnoozePage(a, s, production.snooze_page);
+    try testing.expectEqual(4, page.snoozes.len);
+    // Newest start first.
+    for (page.snoozes[0 .. page.snoozes.len - 1], page.snoozes[1..]) |x, y| try testing.expect(x.start.nanoseconds >= y.start.nanoseconds);
+    try testing.expectEqual(null, page.next_page_token);
+    const empty = try decodeSnoozePage(a, s, "{}");
+    try testing.expectEqual(0, empty.snoozes.len);
+    try testing.expectError(error.InvalidResponse, decodeSnooze(a, s, "{\"name\":\"n\"}"));
+    try testing.expectError(error.InvalidResponse, decodeSnooze(a, s, "{\"interval\":{\"startTime\":\"2026-10-20T19:00:00Z\",\"endTime\":\"2026-10-20T19:00:00Z\"}}"));
+}
+
+test "snoozes: bodies in whole seconds, the filter only when given" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const start: std.Io.Timestamp = .{ .nanoseconds = 1_792_522_800 * std.time.ns_per_s + 868_813_000 };
+    const end: std.Io.Timestamp = .{ .nanoseconds = 1_792_526_400 * std.time.ns_per_s };
+    try testing.expectEqualStrings(
+        \\{"displayName":"deploy","criteria":{"policies":["projects/p/alertPolicies/1","projects/p/alertPolicies/2"]},"interval":{"startTime":"2026-10-20T19:00:00Z","endTime":"2026-10-20T20:00:00Z"}}
+    , try encodeSnooze(a, "deploy", &.{ "projects/p/alertPolicies/1", "projects/p/alertPolicies/2" }, null, start, end));
+    try testing.expectEqualStrings(
+        \\{"displayName":"z","criteria":{"policies":["projects/p/alertPolicies/1"],"filter":"resource.labels.zone=\"a\""},"interval":{"startTime":"2026-10-20T19:00:00Z","endTime":"2026-10-20T20:00:00Z"}}
+    , try encodeSnooze(a, "z", &.{"projects/p/alertPolicies/1"}, "resource.labels.zone=\"a\"", start, end));
+    try testing.expectEqualStrings("{\"interval\":{\"endTime\":\"2026-10-20T20:00:00Z\"}}", try encodeSnoozeInterval(a, null, end));
+    try testing.expectEqualStrings("{\"interval\":{\"startTime\":\"2026-10-20T19:00:00Z\",\"endTime\":\"2026-10-20T19:00:00Z\"}}", try encodeSnoozeInterval(a, start, start));
 }
 
 test "alert policies: each condition kind production answered, decoded, the raw kept" {

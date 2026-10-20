@@ -64,6 +64,7 @@ subscriber's counts into metrics through a `Recorder`.
 | [Reading](reading.md) | Filters, aligning and reducing, paging, incomplete answers, cost |
 | [Alerts](alerts.md) | The incidents open in the project, read only: their policy snapshots, the filter production really parses, what a real incident showed |
 | [Alert policies](policies.md) | The policies behind the incidents, every condition kind, and enabling or disabling one with its exact request first |
+| [Snoozes](snoozes.md) | Silencing policies for a while: making, listing and ending snoozes, production's three ways to end one, what a real alert did |
 | [The Recorder](recorder.md) | Counters, gauges, histograms and observers written every interval, stopping, descriptors, stats |
 | [Testing](testing.md) | An in-memory Cloud Monitoring for your own tests, held to production's answers (experimental) |
 
@@ -78,6 +79,7 @@ subscriber's counts into metrics through a `Recorder`.
 | `Client.resourceType(name)`, `Client.listResourceTypes(options)` | The monitored resource types and their labels |
 | `Client.listAlerts(options)`, `Client.getAlert(id)` | The alerting incidents open (or lately closed) in the project, read only |
 | `Client.listAlertPolicies(options)`, `Client.getAlertPolicy(id)`, `Client.setAlertPolicyEnabled(id, enabled)` | The alert policies, and enabling or disabling one; `setAlertPolicyEnabledRequest` builds its exact request first |
+| `Client.createSnooze(spec)`, `Client.listSnoozes(options)`, `Client.getSnooze(id)`, `Client.endSnooze(snooze, at)` | Snoozes: silencing policies for a while, and ending one early; the writes' exact requests built first |
 | `Recorder` | Counters, gauges, histograms and observers, written every interval |
 
 ## Who is writing

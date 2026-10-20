@@ -563,6 +563,10 @@ jobs:
         # decoders in one property took about 0.02 ms a run on the Mac
         # (2M in 40 s of fuzzing), so 8M, between scheduler's and run's,
         # to be priced by its first nights as its corpus grows.
+        # slow-monitoring gains a property in 0.52.0, FakeMonitoring's
+        # snoozes and alerts held to a model: about 0.29 ms a run on the
+        # Mac (300K in 88 s), so its 2M add about ten minutes there,
+        # about forty at four times the Mac, to its 25 of 10-20.
         # slow-scheduler (0.51.0) holds FakeScheduler's runs, pauses and
         # resumes to a model, the client against the fake for up to 40
         # steps a run: about 0.23 ms a run on the Mac (200K in 47 s), so

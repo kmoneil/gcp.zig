@@ -20,6 +20,23 @@ including the ones that did not change.
   policies in, read and patched as production answered, refusals in its
   words (`Options.project_number` and `Options.caller` are new).
   `Aligner.fromWire` and `Reducer.fromWire` are new.
+  Snoozes: `Client.createSnooze`, `listSnoozes` (newest start first;
+  `active_at` for the ones holding), `getSnooze` and `endSnooze`, with
+  `createSnoozeRequest` and `endSnoozeRequest` building the writes'
+  exact requests. **Experimental** on their own. Measured: a snooze
+  closed a real open alert a second after its start and opened none
+  while it held; production checks no policy exists and has no
+  whole-minutes rule; its list filter takes only `>=` and `<=` on the
+  interval's times; ending one takes a different patch by state (the
+  end at now once it has run a minute, the end at its start under a
+  minute, both times now while upcoming), which `endSnooze` chooses
+  from the snooze as read; any change to an ended snooze is refused,
+  so a lost end is read back. A create is never sent twice, since
+  snoozes cannot be deleted. `FakeMonitoring` takes snoozes through the
+  API in production's words, closes the alerts they hold over, and
+  refuses an open `putAlert` for a snoozed policy. A slow property
+  holds the fake's snoozes and alerts to a model in the
+  `slow-monitoring` nightly job.
 - auth, core, dataflow, error_reporting, firestore, kms, logging,
   pubsub, resource_manager, run, scheduler, secret_manager and storage:
   unchanged.

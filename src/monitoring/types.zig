@@ -869,6 +869,93 @@ pub const AlertPolicyPage = struct {
     total_size: ?i64 = null,
 };
 
+/// Where a snooze stands at a given time.
+pub const SnoozeState = enum {
+    /// Its start is still to come.
+    upcoming,
+    /// Its policies open no alerts, and the ones open were closed.
+    active,
+    /// Its end has passed, or it was cancelled (an end equal to its
+    /// start). Production refuses any change to it.
+    ended,
+};
+
+/// A snooze: alerts of the policies it names are closed when it starts
+/// and none open while it holds (measured 2026-10-20: the open alert
+/// closed within a second of the start). It cannot be deleted, and its
+/// policies and filter cannot change.
+pub const Snooze = struct {
+    /// `projects/P/snoozes/ID`, the id system-assigned.
+    name: []const u8,
+    /// The trailing segment of `name`.
+    id: []const u8,
+    display_name: []const u8 = "",
+    /// Full names, `projects/P/alertPolicies/ID`. Production does not
+    /// check that they exist.
+    policies: []const []const u8 = &.{},
+    /// Resource labels joined by AND, narrowing it to some of one
+    /// policy's alerts; empty for all of them.
+    filter: []const u8 = "",
+    /// Production keeps whole seconds.
+    start: std.Io.Timestamp,
+    end: std.Io.Timestamp,
+
+    /// Upcoming before its start, active from its start until its end,
+    /// ended from its end on. A cancelled snooze, start equal to end, is
+    /// ended.
+    pub fn stateAt(self: Snooze, now: std.Io.Timestamp) SnoozeState {
+        if (self.cancelled() or self.end.nanoseconds <= now.nanoseconds) return .ended;
+        if (now.nanoseconds < self.start.nanoseconds) return .upcoming;
+        return .active;
+    }
+
+    /// Whether it was cancelled: an interval of no length, which is what
+    /// cancelling one leaves.
+    pub fn cancelled(self: Snooze) bool {
+        return self.start.nanoseconds == self.end.nanoseconds;
+    }
+};
+
+/// A snooze to make, checked as production checks one.
+pub const NewSnooze = struct {
+    /// Required, at most 512 characters.
+    display_name: []const u8,
+    /// 1 to 16, each an id or this project's full
+    /// `projects/P/alertPolicies/ID` name.
+    policies: []const []const u8,
+    /// Resource labels joined by AND, such as
+    /// `resource.labels.zone="us-central1-a"`; only with exactly one
+    /// policy.
+    filter: ?[]const u8 = null,
+    /// Not in the past (production allows 15 s of skew). Sent in whole
+    /// seconds, production's resolution.
+    start: std.Io.Timestamp,
+    /// At least a minute after `start`.
+    end: std.Io.Timestamp,
+};
+
+pub const ListSnoozesOptions = struct {
+    /// The snoozes holding at this time: sends `interval.start_time <=
+    /// "T" AND interval.end_time >= "T"`, the filter production answers
+    /// that question with. Not beside `filter`.
+    active_at: ?std.Io.Timestamp = null,
+    /// Sent as written. Production takes only `interval.start_time` and
+    /// `interval.end_time`, compared with `=`, `>=` or `<=` to a quoted
+    /// RFC 3339 time, joined by AND (measured 2026-10-20: `>`, `<`, `OR`
+    /// and any other field refused).
+    filter: ?[]const u8 = null,
+    /// 0 for the server's default.
+    page_size: u32 = 0,
+    page_token: ?[]const u8 = null,
+};
+
+pub const SnoozePage = struct {
+    /// Newest start first, as production orders them.
+    snoozes: []const Snooze,
+    /// Null on the last page.
+    next_page_token: ?[]const u8 = null,
+};
+
 const testing = std.testing;
 
 test "Alert: states, severities and orders on the wire, and the label helpers" {
@@ -898,6 +985,18 @@ test "Alert: states, severities and orders on the wire, and the label helpers" {
     try testing.expectEqual(null, alert.resourceLabel("k"));
     try testing.expectEqualStrings("ingest", alert.policy.userLabel("team").?);
     try testing.expectEqual(null, alert.policy.userLabel("x"));
+}
+
+test "Snooze.stateAt and cancelled: production's interval, its end the turn to ended" {
+    const s: Snooze = .{ .name = "projects/p/snoozes/1", .id = "1", .start = .{ .nanoseconds = 100 * std.time.ns_per_s }, .end = .{ .nanoseconds = 200 * std.time.ns_per_s } };
+    try testing.expectEqual(SnoozeState.upcoming, s.stateAt(.{ .nanoseconds = 99 * std.time.ns_per_s }));
+    try testing.expectEqual(SnoozeState.active, s.stateAt(.{ .nanoseconds = 100 * std.time.ns_per_s }));
+    try testing.expectEqual(SnoozeState.active, s.stateAt(.{ .nanoseconds = 199 * std.time.ns_per_s }));
+    try testing.expectEqual(SnoozeState.ended, s.stateAt(.{ .nanoseconds = 200 * std.time.ns_per_s }));
+    try testing.expect(!s.cancelled());
+    const c: Snooze = .{ .name = "projects/p/snoozes/2", .id = "2", .start = s.start, .end = s.start };
+    try testing.expect(c.cancelled());
+    try testing.expectEqual(SnoozeState.ended, c.stateAt(.{ .nanoseconds = 50 * std.time.ns_per_s }));
 }
 
 test "Aligner, Reducer, Comparison and Combiner: wire names both ways, the unknown kept apart" {

@@ -102,6 +102,7 @@ Google, not only what Google documents, and where the emulators differ.
 | [Reading](monitoring/reading.md) | Filters, aligning and reducing, pages of points, incomplete answers, cost |
 | [Alerts](monitoring/alerts.md) | The incidents open in the project, read only: their policy snapshots, the filter production really parses, what a real incident showed |
 | [Alert policies](monitoring/policies.md) | The policies behind the incidents, every condition kind, and enabling or disabling one with its exact request first (experimental) |
+| [Snoozes](monitoring/snoozes.md) | Silencing policies for a while: making, listing and ending snoozes, and what a real alert did (experimental) |
 | [The Recorder](monitoring/recorder.md) | Counters, gauges, histograms and observers written every interval from a task of their own; stopping, descriptors, stats |
 | [Testing](monitoring/testing.md) | An in-memory Cloud Monitoring for your own tests, held to production's answers (experimental) |
 

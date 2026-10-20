@@ -89,5 +89,9 @@ Measured on 2026-10-20:
   get ("Failed to find alert policy 1234567890 in extractctl.") and the
   project's number on a patch ("... in 82150720798.").
 
+To silence a policy for a while rather than turn it off, a
+[snooze](snoozes.md) closes its open alerts and opens none until it
+ends.
+
 In tests, `monitoring.testing.FakeMonitoring.putAlertPolicy` puts
 policies in: [Testing](testing.md#alert-policies).

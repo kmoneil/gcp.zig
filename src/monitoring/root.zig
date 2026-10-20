@@ -73,6 +73,11 @@ pub const MutationRecord = @import("types.zig").MutationRecord;
 pub const AlertPolicy = @import("types.zig").AlertPolicy;
 pub const ListAlertPoliciesOptions = @import("types.zig").ListAlertPoliciesOptions;
 pub const AlertPolicyPage = @import("types.zig").AlertPolicyPage;
+pub const SnoozeState = @import("types.zig").SnoozeState;
+pub const Snooze = @import("types.zig").Snooze;
+pub const NewSnooze = @import("types.zig").NewSnooze;
+pub const ListSnoozesOptions = @import("types.zig").ListSnoozesOptions;
+pub const SnoozePage = @import("types.zig").SnoozePage;
 
 /// The fixed limits and naming rules the client checks before sending.
 pub const limits = @import("validate.zig");
