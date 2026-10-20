@@ -43,6 +43,45 @@ pub fn decodeJobPage(out: Allocator, scratch: Allocator, body: []const u8) Decod
     };
 }
 
+/// A page of `messages.list`: `{}` is a job with nothing to say, and
+/// the autoscaling events come regardless of the importance filter.
+pub fn decodeMessagePage(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.MessagePage {
+    const obj = try object(try parse(scratch, body));
+    var messages: []types.JobMessage = &.{};
+    if (try field(obj, "jobMessages", .array)) |list| {
+        messages = try out.alloc(types.JobMessage, list.items.len);
+        for (list.items, messages) |item, *m| {
+            const o = try object(item);
+            m.* = .{
+                .id = try string(out, o, "id") orelse "",
+                .time = try time(o, "time"),
+                .text = try string(out, o, "messageText") orelse "",
+                .importance = if (try field(o, "messageImportance", .string)) |name| types.MessageImportance.fromWire(name) else .unspecified,
+            };
+        }
+    }
+    var events: []types.AutoscalingEvent = &.{};
+    if (try field(obj, "autoscalingEvents", .array)) |list| {
+        events = try out.alloc(types.AutoscalingEvent, list.items.len);
+        for (list.items, events) |item, *e| {
+            const o = try object(item);
+            e.* = .{
+                .event_type = try string(out, o, "eventType") orelse "",
+                .time = try time(o, "time"),
+                .description = if (try field(o, "description", .object)) |d| try string(out, d, "messageText") orelse "" else "",
+                .current_num_workers = try integer(i64, o, "currentNumWorkers"),
+                .target_num_workers = try integer(i64, o, "targetNumWorkers"),
+                .worker_pool = try string(out, o, "workerPool") orelse "",
+            };
+        }
+    }
+    return .{
+        .messages = messages,
+        .autoscaling_events = events,
+        .next_page_token = try token(out, obj),
+    };
+}
+
 fn jobOf(out: Allocator, v: Value) DecodeError!types.Job {
     const obj = try object(v);
     const id = try string(out, obj, "id") orelse return error.InvalidResponse;
@@ -110,6 +149,18 @@ fn token(out: Allocator, obj: std.json.ObjectMap) DecodeError!?[]const u8 {
 fn time(obj: std.json.ObjectMap, name: []const u8) DecodeError!?std.Io.Timestamp {
     const text = try field(obj, name, .string) orelse return null;
     return core.timestamp.parse(text) catch error.InvalidResponse;
+}
+
+/// An integer that may arrive as a JSON number or a string, as proto3
+/// JSON sends int64s ("targetNumWorkers": "1").
+fn integer(comptime T: type, obj: std.json.ObjectMap, name: []const u8) DecodeError!?T {
+    const v = obj.get(name) orelse return null;
+    const text = switch (v) {
+        .null => return null,
+        .number_string, .string => |s| s,
+        else => return error.InvalidResponse,
+    };
+    return std.fmt.parseInt(T, text, 10) catch error.InvalidResponse;
 }
 
 /// A map of strings as pairs, in the order the server wrote them.
@@ -187,6 +238,24 @@ test "decodeJobPage: production's lists, the aggregated one, and the empty page"
     try testing.expectEqual(2, everywhere.jobs.len);
     try testing.expectEqualStrings("us-central1", everywhere.jobs[0].location);
 
+    const red = try decodeMessagePage(a, s, production.messages_error_failed);
+    try testing.expectEqual(1, red.messages.len);
+    try testing.expectEqual(types.MessageImportance.@"error", red.messages[0].importance);
+    try testing.expect(std.mem.indexOf(u8, red.messages[0].text, "service agent") != null);
+    try testing.expect(red.messages[0].time != null);
+
+    // The DONE job at ERROR: nothing to say, but the autoscaling
+    // events come regardless of the filter.
+    const quiet = try decodeMessagePage(a, s, production.messages_error_done);
+    try testing.expectEqual(0, quiet.messages.len);
+    try testing.expectEqual(6, quiet.autoscaling_events.len);
+    try testing.expectEqualStrings("TARGET_NUM_WORKERS_CHANGED", quiet.autoscaling_events[0].event_type);
+    try testing.expectEqual(1, quiet.autoscaling_events[0].target_num_workers.?);
+    try testing.expect(std.mem.indexOf(u8, quiet.autoscaling_events[0].description, "Starting a pool") != null);
+    const nothing = try decodeMessagePage(a, s, "{}");
+    try testing.expectEqual(0, nothing.messages.len);
+    try testing.expectEqual(0, nothing.autoscaling_events.len);
+
     // ACTIVE with nothing running answered a bare {}.
     const empty = try decodeJobPage(a, s, "{}");
     try testing.expectEqual(0, empty.jobs.len);
@@ -233,10 +302,15 @@ test "lenient where it can be, InvalidResponse where it cannot" {
         "{\"failedLocation\":[{}]}",
         "{\"failedLocation\":[1]}",
         "{\"jobs\":[],\"nextPageToken\":1}",
+        "{\"jobMessages\":[1]}",
+        "{\"jobMessages\":[{\"time\":\"soon\"}]}",
+        "{\"autoscalingEvents\":[{\"targetNumWorkers\":true}]}",
+        "{\"autoscalingEvents\":[{\"description\":1}]}",
     }) |body| {
         const job_err = decodeJob(a, s, body);
         const page_err = decodeJobPage(a, s, body);
-        try testing.expect(job_err == error.InvalidResponse or page_err == error.InvalidResponse);
+        const message_err = decodeMessagePage(a, s, body);
+        try testing.expect(job_err == error.InvalidResponse or page_err == error.InvalidResponse or message_err == error.InvalidResponse);
     }
 }
 
@@ -248,7 +322,7 @@ fn decodersProperty(_: void, input: []const u8) !void {
     defer scratch.deinit();
     const a = out.allocator();
     const s = scratch.allocator();
-    inline for (.{ decodeJob, decodeJobPage }) |decode| {
+    inline for (.{ decodeJob, decodeJobPage, decodeMessagePage }) |decode| {
         if (decode(a, s, input)) |_| {} else |err| try testing.expectEqual(error.InvalidResponse, err);
     }
 }
@@ -261,6 +335,8 @@ test "fuzz decoders: any body decodes or is InvalidResponse, never a crash or a 
         production.jobs_list,
         production.jobs_list_paged,
         production.jobs_aggregated,
+        production.messages_error_failed,
+        production.messages_error_done,
         "{\"jobs\":[{\"id\":\"j1\",\"stageStates\":[{\"executionStageName\":\"s01\",\"executionStageState\":\"JOB_STATE_DONE\",\"currentStateTime\":\"2026-10-20T14:20:00Z\"}]}],\"failedLocation\":[{\"name\":\"us-west1\"}],\"nextPageToken\":\"t\"}",
     } });
 }

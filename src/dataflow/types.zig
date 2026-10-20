@@ -202,6 +202,94 @@ pub const JobPage = struct {
     failed_locations: []const []const u8 = &.{},
 };
 
+/// A message's importance. The list's filter is a minimum, so the
+/// order here is the wire's, lowest first; `unknown` outranks them
+/// all, so a future importance is never silently dropped.
+pub const MessageImportance = enum {
+    unspecified,
+    debug,
+    detailed,
+    basic,
+    warning,
+    @"error",
+    /// An importance this library does not know, read back from the
+    /// server.
+    unknown,
+
+    pub fn fromWire(name: []const u8) MessageImportance {
+        inline for (.{
+            .{ "JOB_MESSAGE_ERROR", .@"error" },
+            .{ "JOB_MESSAGE_WARNING", .warning },
+            .{ "JOB_MESSAGE_BASIC", .basic },
+            .{ "JOB_MESSAGE_DETAILED", .detailed },
+            .{ "JOB_MESSAGE_DEBUG", .debug },
+            .{ "JOB_MESSAGE_IMPORTANCE_UNKNOWN", .unspecified },
+        }) |entry| {
+            if (std.mem.eql(u8, name, entry[0])) return entry[1];
+        }
+        return .unknown;
+    }
+
+    pub fn toWire(self: MessageImportance) []const u8 {
+        return switch (self) {
+            .debug => "JOB_MESSAGE_DEBUG",
+            .detailed => "JOB_MESSAGE_DETAILED",
+            .basic => "JOB_MESSAGE_BASIC",
+            .warning => "JOB_MESSAGE_WARNING",
+            .@"error" => "JOB_MESSAGE_ERROR",
+            .unspecified, .unknown => "JOB_MESSAGE_IMPORTANCE_UNKNOWN",
+        };
+    }
+
+    /// Whether a message at this importance passes a filter of `min`.
+    pub fn atLeast(self: MessageImportance, min: MessageImportance) bool {
+        return @backingInt(self) >= @backingInt(min);
+    }
+};
+
+/// One line of a job's story, as the messages list answers them.
+pub const JobMessage = struct {
+    id: []const u8 = "",
+    time: ?std.Io.Timestamp = null,
+    /// `messageText`.
+    text: []const u8 = "",
+    importance: MessageImportance = .unspecified,
+};
+
+/// A worker-count change. Production answers these regardless of the
+/// importance filter (measured 2026-10-20: ERROR still carried six).
+pub const AutoscalingEvent = struct {
+    /// The wire's name, such as `TARGET_NUM_WORKERS_CHANGED`, kept raw.
+    event_type: []const u8 = "",
+    time: ?std.Io.Timestamp = null,
+    /// The structured description's `messageText`.
+    description: []const u8 = "",
+    current_num_workers: ?i64 = null,
+    target_num_workers: ?i64 = null,
+    worker_pool: []const u8 = "",
+};
+
+pub const ListMessagesOptions = struct {
+    /// Unset sends nothing and production answers every importance;
+    /// `.@"error"` is the widget's "why is it red".
+    minimum_importance: ?MessageImportance = null,
+    /// Defaults to the job's creation when unset.
+    start_time: ?std.Io.Timestamp = null,
+    /// Defaults to now when unset.
+    end_time: ?std.Io.Timestamp = null,
+    /// 0 for the server's default, which is generous: production
+    /// answered every message past a pageSize of 5 when measured.
+    page_size: u32 = 0,
+    page_token: ?[]const u8 = null,
+};
+
+pub const MessagePage = struct {
+    messages: []const JobMessage,
+    autoscaling_events: []const AutoscalingEvent = &.{},
+    /// Null on the last page.
+    next_page_token: ?[]const u8 = null,
+};
+
 const testing = std.testing;
 
 test "states wire both ways, the terminal five, unknown for the rest" {
@@ -243,4 +331,17 @@ test "Job.terminal, failing and label answer the widget's questions" {
     try testing.expectEqualStrings("JOB_VIEW_SUMMARY", JobView.summary.toWire());
     try testing.expectEqualStrings("JOB_VIEW_ALL", JobView.all.toWire());
     try testing.expectEqualStrings("JOB_VIEW_DESCRIPTION", JobView.description.toWire());
+}
+
+test "message importances wire both ways and order as a minimum filter" {
+    try testing.expectEqual(MessageImportance.@"error", MessageImportance.fromWire("JOB_MESSAGE_ERROR"));
+    try testing.expectEqual(MessageImportance.basic, MessageImportance.fromWire("JOB_MESSAGE_BASIC"));
+    try testing.expectEqual(MessageImportance.unspecified, MessageImportance.fromWire("JOB_MESSAGE_IMPORTANCE_UNKNOWN"));
+    try testing.expectEqual(MessageImportance.unknown, MessageImportance.fromWire("JOB_MESSAGE_SHOUTED"));
+    try testing.expectEqualStrings("JOB_MESSAGE_ERROR", MessageImportance.@"error".toWire());
+    try testing.expectEqualStrings("JOB_MESSAGE_IMPORTANCE_UNKNOWN", MessageImportance.unknown.toWire());
+    try testing.expect(MessageImportance.@"error".atLeast(.basic));
+    try testing.expect(MessageImportance.basic.atLeast(.basic));
+    try testing.expect(!MessageImportance.detailed.atLeast(.basic));
+    try testing.expect(MessageImportance.unknown.atLeast(.@"error"));
 }

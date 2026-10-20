@@ -247,6 +247,40 @@ fn getChecked(self: *Client, location: []const u8, id: []const u8, view: ?types.
     return result;
 }
 
+/// One page of a job's story: the messages at or above
+/// `minimum_importance` (`.@"error"` is the widget's "why is it red"),
+/// and the autoscaling events, which production answers regardless of
+/// the filter.
+pub fn listMessages(self: *Client, location: []const u8, id: []const u8, options: types.ListMessagesOptions) Error!types.Owned(types.MessagePage) {
+    rpc.begin(self);
+    try self.checkLocation(location);
+    if (!validate.isJobId(id)) {
+        if (self.diagnostics) |d| d.print("invalid job id: visible ASCII without /, at most 1024", .{});
+        return error.InvalidName;
+    }
+    try self.checkToken(options.page_token);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var w: std.Io.Writer.Allocating = .init(a);
+    w.writer.writeAll(names.messages(a, self.project, location, id) catch return error.OutOfMemory) catch return error.OutOfMemory;
+    var params: core.query.Params = .init(&w.writer);
+    if (options.minimum_importance) |min| params.addOptional("minimumImportance", min.toWire()) catch return error.OutOfMemory;
+    var start_buf: [core.timestamp.max_len]u8 = undefined;
+    if (options.start_time) |t| params.addOptional("startTime", core.timestamp.format(&start_buf, t)) catch return error.OutOfMemory;
+    var end_buf: [core.timestamp.max_len]u8 = undefined;
+    if (options.end_time) |t| params.addOptional("endTime", core.timestamp.format(&end_buf, t)) catch return error.OutOfMemory;
+    params.addNonZero("pageSize", options.page_size) catch return error.OutOfMemory;
+    params.addOptional("pageToken", options.page_token) catch return error.OutOfMemory;
+
+    var result: types.Owned(types.MessagePage) = try .init(self.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(self, result.arena, .{ .method = .GET, .path = w.written() });
+    result.value = codec.decodeMessagePage(result.arena.allocator(), a, body) catch |err|
+        return rpc.decodeFailed(self, err, "message list");
+    return result;
+}
+
 fn checkLocation(self: *Client, location: []const u8) Error!void {
     if (!validate.isLocation(location)) {
         if (self.diagnostics) |d| d.print("invalid location: expected a region id such as us-central1", .{});
@@ -306,6 +340,25 @@ test "golden: jobs listed everywhere and per region, got plain and at a view" {
     try testing.expectEqual(types.JobState.running, described.value.current_state);
 }
 
+test "golden: a job's story, errors first, the events coming regardless" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = production.messages_error_failed } },
+        .{ .respond = .{ .body = production.messages_error_done } },
+    });
+    defer h.deinit();
+    var red = try h.client.listMessages("us-central1", "2026-10-20_07_09_34-8524524531325271694", .{ .minimum_importance = .@"error" });
+    defer red.deinit();
+    try h.expectRequest(0, .GET, "https://dataflow.googleapis.com/v1b3/projects/my-project/locations/us-central1/jobs/2026-10-20_07_09_34-8524524531325271694/messages?minimumImportance=JOB_MESSAGE_ERROR");
+    try testing.expectEqual(1, red.value.messages.len);
+    try testing.expect(std.mem.indexOf(u8, red.value.messages[0].text, "service agent") != null);
+    var quiet = try h.client.listMessages("us-central1", "2026-10-20_07_11_01-16829577348630633066", .{ .page_size = 5, .page_token = "t" });
+    defer quiet.deinit();
+    try h.expectRequest(1, .GET, "https://dataflow.googleapis.com/v1b3/projects/my-project/locations/us-central1/jobs/2026-10-20_07_11_01-16829577348630633066/messages?pageSize=5&pageToken=t");
+    try testing.expectEqual(0, quiet.value.messages.len);
+    try testing.expectEqual(6, quiet.value.autoscaling_events.len);
+}
+
 test "the calls refuse what they will not send" {
     var h: Harness = undefined;
     try h.init(&.{});
@@ -320,7 +373,10 @@ test "the calls refuse what they will not send" {
     try testing.expectError(error.InvalidName, c.getJob("us-central1", "a/b"));
     try testing.expectError(error.InvalidName, c.getJob("us-central1", ""));
     try testing.expectError(error.InvalidName, c.getJobView("us central1", "j", .all));
-    try testing.expectEqualStrings("invalid location: expected a region id such as us-central1", h.diag.message());
+    try testing.expectError(error.InvalidName, c.listMessages("us-central1", "a/b", .{}));
+    try testing.expectError(error.InvalidName, c.listMessages("", "j", .{}));
+    try testing.expectError(error.InvalidName, c.listMessages("us-central1", "j", .{ .page_token = "a b" }));
+    try testing.expectEqualStrings("invalid page token: expected printable ASCII", h.diag.message());
     try h.expectRequestCount(0);
 }
 
@@ -337,6 +393,16 @@ test "a response that cannot be decoded is InvalidResponse, named in Diagnostics
     try testing.expectError(error.InvalidResponse, h.client.getJob("us-central1", "j"));
     try testing.expectEqualStrings("the job response could not be decoded", h.diag.message());
     try testing.expectError(error.InvalidResponse, h.client.aggregatedJobs(.{}));
+}
+
+test "a message list that cannot be decoded is InvalidResponse too" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "{\"jobMessages\":1}" } },
+    });
+    defer h.deinit();
+    try testing.expectError(error.InvalidResponse, h.client.listMessages("us-central1", "j", .{}));
+    try testing.expectEqualStrings("the message list response could not be decoded", h.diag.message());
 }
 
 test "the server's refusals arrive as errors, production's words kept" {
@@ -376,6 +442,7 @@ test "every allocation failure is OutOfMemory without leaks" {
                 .{ .respond = .{ .body = production.jobs_list } },
                 .{ .respond = .{ .body = production.job_done } },
                 .{ .respond = .{ .body = production.job_failed } },
+                .{ .respond = .{ .body = production.messages_error_failed } },
             });
             defer fake.deinit();
             var tokens: test_util.FakeTokenProvider = .{};
@@ -390,6 +457,8 @@ test "every allocation failure is OutOfMemory without leaks" {
             done.deinit();
             var failed = try client.getJobView("us-central1", "2026-10-20_07_09_34-8524524531325271694", .description);
             failed.deinit();
+            var story = try client.listMessages("us-central1", "2026-10-20_07_09_34-8524524531325271694", .{ .minimum_importance = .@"error" });
+            story.deinit();
         }
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.calls, .{});

@@ -641,3 +641,94 @@ pub const job_failed_view_all =
     \\ }
     \\}
 ;
+/// The failed job's messages at minimumImportance=ERROR: the one error, the widget's "why is it red". HTTP 200.
+pub const messages_error_failed =
+    \\{
+    \\ "jobMessages": [
+    \\  {
+    \\   "id": "1792505377766",
+    \\   "messageImportance": "JOB_MESSAGE_ERROR",
+    \\   "messageText": "The Dataflow service agent cannot access the worker service account. Ensure that the Dataflow API is enabled for your project. In addition, verify that for the worker service account, the Dataflow service agent principal has the 'Cloud Dataflow Service Agent' role. To grant the role, see https://cloud.google.com/iam/docs/manage-access-service-accounts#view-access. On the Service Accounts page, select the worker service account, open the Permissions tab, and select 'Include Google-provided role grants' to verify roles. To learn more about service accounts, see https://cloud.google.com/dataflow/docs/concepts/security-and-permissions#permissions",
+    \\   "time": "2026-10-20T14:09:37.766Z"
+    \\  }
+    \\ ]
+    \\}
+;
+
+/// The DONE job's messages at minimumImportance=ERROR: no jobMessages key, and the autoscaling events come regardless of the filter. HTTP 200.
+pub const messages_error_done =
+    \\{
+    \\ "autoscalingEvents": [
+    \\  {
+    \\   "description": {
+    \\    "messageKey": "POOL_STARTUP_INITIATED",
+    \\    "messageText": "(4aa65aadddcff524): Starting a pool of 1 workers.",
+    \\    "parameters": [
+    \\     {
+    \\      "key": "num_workers",
+    \\      "value": 1
+    \\     }
+    \\    ]
+    \\   },
+    \\   "eventType": "TARGET_NUM_WORKERS_CHANGED",
+    \\   "targetNumWorkers": "1",
+    \\   "time": "2026-10-20T14:11:24.731653388Z",
+    \\   "workerPool": "Regular"
+    \\  },
+    \\  {
+    \\   "description": {
+    \\    "messageKey": "POOL_STARTUP_INITIATED",
+    \\    "messageText": "(4aa65aadddcffe6a): Starting a pool of 1 workers.",
+    \\    "parameters": [
+    \\     {
+    \\      "key": "num_workers",
+    \\      "value": 1
+    \\     }
+    \\    ]
+    \\   },
+    \\   "eventType": "CURRENT_NUM_WORKERS_CHANGED",
+    \\   "time": "2026-10-20T14:11:24.731653388Z",
+    \\   "workerPool": "Regular"
+    \\  },
+    \\  {
+    \\   "currentNumWorkers": "1",
+    \\   "description": {
+    \\    "messageKey": "POOL_STARTUP_COMPLETED",
+    \\    "messageText": "(e48784c4abcf277b): Worker pool started."
+    \\   },
+    \\   "eventType": "CURRENT_NUM_WORKERS_CHANGED",
+    \\   "time": "2026-10-20T14:12:15.108653190Z",
+    \\   "workerPool": "Regular"
+    \\  },
+    \\  {
+    \\   "currentNumWorkers": "1",
+    \\   "description": {
+    \\    "messageKey": "POOL_SHUTDOWN_INITIATED",
+    \\    "messageText": "(dc67ddf3489a59f): Stopping worker pool."
+    \\   },
+    \\   "eventType": "TARGET_NUM_WORKERS_CHANGED",
+    \\   "time": "2026-10-20T14:13:58.560009066Z",
+    \\   "workerPool": "Regular"
+    \\  },
+    \\  {
+    \\   "currentNumWorkers": "1",
+    \\   "description": {
+    \\    "messageKey": "POOL_SHUTDOWN_INITIATED",
+    \\    "messageText": "(dc67ddf3489a289): Stopping worker pool."
+    \\   },
+    \\   "eventType": "CURRENT_NUM_WORKERS_CHANGED",
+    \\   "time": "2026-10-20T14:13:58.560009066Z",
+    \\   "workerPool": "Regular"
+    \\  },
+    \\  {
+    \\   "description": {
+    \\    "messageKey": "POOL_SHUTDOWN_COMPLETED",
+    \\    "messageText": "(e48784c4abcf251e): Worker pool stopped."
+    \\   },
+    \\   "eventType": "CURRENT_NUM_WORKERS_CHANGED",
+    \\   "time": "2026-10-20T14:14:52.960442112Z",
+    \\   "workerPool": "Regular"
+    \\  }
+    \\ ]
+    \\}
+;
