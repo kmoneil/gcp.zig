@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.49.0 (unreleased)
+## 0.49.0 (2026-10-20)
 
 - storage: now **beta**, as `pubsub`, `firestore` and `core` are. No
   call changes. It earned the label on the rule firestore's promotion
