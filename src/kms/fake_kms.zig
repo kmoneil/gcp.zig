@@ -1012,7 +1012,7 @@ pub const FakeKms = struct {
         const key: []const u8 = if (format) |fmt| k: {
             if (std.mem.eql(u8, fmt, "PEM")) break :k try pemOf(arena, der);
             if (std.mem.eql(u8, fmt, "DER")) break :k der;
-            if (std.mem.eql(u8, fmt, "NIST_PQC") and v.algorithm.postQuantum()) break :k rawOf(v).?;
+            if (std.mem.eql(u8, fmt, "NIST_PQC") and v.algorithm.postQuantum()) break :k (try rawOf(arena, v)).?;
             return notModelled(arena, try arena.print("public key format {s} for {s}", .{ fmt, v.algorithm.wire() }));
         } else try pemOf(arena, der);
         // A public key's request carries no checksum to refuse.
@@ -1291,10 +1291,13 @@ fn macOf(a: types.Algorithm, key: []const u8, data: []const u8, buf: *[64]u8) []
     }
 }
 
-/// A post-quantum version's public key in its NIST encoding, or null.
-fn rawOf(v: *const FakeKms.Version) ?[]const u8 {
+/// A post-quantum version's public key in its NIST encoding, copied into
+/// `arena`, or null. `toBytes` answers an array by value, which lives in
+/// this function's frame: it was returned as a slice of that frame until
+/// zigvet's escape rule caught it.
+fn rawOf(arena: Allocator, v: *const FakeKms.Version) Allocator.Error!?[]const u8 {
     return switch (v.material.*) {
-        inline .mldsa44, .mldsa65, .mldsa87 => |*kp| &kp.public_key.toBytes(),
+        inline .mldsa44, .mldsa65, .mldsa87 => |*kp| try arena.dupe(u8, &kp.public_key.toBytes()),
         else => null,
     };
 }
@@ -2400,6 +2403,44 @@ test "sign and verify here: every signing algorithm the fake models, by message 
         } else {
             try testing.expectError(error.UnsupportedAlgorithm, pk.value.verifyDigest("0123456789abcdef0123456789abcdef", sig.value));
         }
+    }
+}
+
+test "regression: a post-quantum key's NIST_PQC encoding is the key itself, not a dead stack frame" {
+    // The fake returned a slice of `toBytes()`'s array from its own frame
+    // (zigvet, rule escape); the client reads PEM first, so no test had
+    // read a key in NIST_PQC, and the bytes held only by luck.
+    var r: Rig = undefined;
+    try ringRig(&r, testing.allocator, .{});
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]types.Algorithm{ .pq_sign_ml_dsa_44, .pq_sign_ml_dsa_65, .pq_sign_ml_dsa_87 }, 0..) |algorithm, i| {
+        const id = try std.fmt.allocPrint(a, "pq{d}", .{i});
+        const key = r.client.keyRing("r").key(id);
+        var info = try key.create(.{ .purpose = .asymmetric_sign, .algorithm = algorithm });
+        info.deinit();
+        const url = try std.fmt.allocPrint(a, "{s}/keyRings/r/cryptoKeys/{s}/cryptoKeyVersions/1/publicKey?publicKeyFormat=NIST_PQC", .{ test_util.base, id });
+        const reply = try r.fake.serve(.{ .method = .GET, .url = url, .bearer = "t" }, a);
+        try testing.expectEqual(200, reply.status);
+        const v = try std.json.parseFromSliceLeaky(std.json.Value, a, reply.body, .{});
+        const data = v.object.get("publicKey").?.object.get("data").?.string;
+        const raw = try a.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(data));
+        try std.base64.standard.Decoder.decode(raw, data);
+        // A signature the version makes verifies with exactly these bytes,
+        // as it does with the PEM the client reads.
+        var sig = try key.version(1).sign(algorithm, "the message");
+        defer sig.deinit();
+        const by_raw: types.PublicKey = .{ .name = "n", .algorithm = algorithm, .raw = raw };
+        try by_raw.verify("the message", sig.value);
+        var pem = try key.version(1).publicKey();
+        defer pem.deinit();
+        try pem.value.verify("the message", sig.value);
+        var flipped = try a.dupe(u8, raw);
+        flipped[flipped.len / 2] ^= 1;
+        const wrong: types.PublicKey = .{ .name = "n", .algorithm = algorithm, .raw = flipped };
+        try testing.expectError(error.SignatureInvalid, wrong.verify("the message", sig.value));
     }
 }
 

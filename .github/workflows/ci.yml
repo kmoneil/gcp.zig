@@ -46,6 +46,17 @@ jobs:
       - name: Tools
         run: python3 -I tools/await_pr.py --self-test
 
+      # zigvet (github.com/kmoneil/zigvet): code the compiler accepts that
+      # is almost certainly wrong, such as a pointer to stack memory that
+      # leaves its function. Pinned to a release and to its binary's
+      # digest; its first run here found one in the KMS fake.
+      - name: Vet
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/zigvet" https://github.com/kmoneil/zigvet/releases/download/v0.1.0/zigvet-linux-amd64
+          echo "15cb9bf70b47010302dec6ce75efcc979c7487f48bc298e04df2eefdd720f75d  $RUNNER_TEMP/zigvet" | sha256sum --check --strict
+          chmod +x "$RUNNER_TEMP/zigvet"
+          "$RUNNER_TEMP/zigvet" src tests examples tools build.zig
+
       - name: Unit, property and fuzz-corpus tests
         run: zig build test --summary all
 

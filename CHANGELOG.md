@@ -4,6 +4,21 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.52.1 (unreleased)
+
+- kms: `kms.testing.FakeKms` answered a post-quantum version's public
+  key in the NIST_PQC format with a slice of a temporary array in a
+  function's own stack frame (`&kp.public_key.toBytes()`), so the bytes
+  it sent were whatever later calls left there (#282). It copies them
+  into the request's memory now. The client was not affected (it reads
+  ML-DSA keys as PEM first), and no test had read a key in NIST_PQC;
+  one does now, for all three ML-DSA sizes, verifying a signature with
+  the bytes, and it fails on the old code in Debug, ReleaseSafe and
+  ReleaseFast. Found by zigvet's escape rule, which now runs in CI.
+- auth, core, dataflow, error_reporting, firestore, logging, monitoring,
+  pubsub, resource_manager, run, scheduler, secret_manager and storage:
+  unchanged.
+
 ## 0.52.0 (2026-10-20)
 
 - monitoring: alert policies, for issue #275: `Client.listAlertPolicies`
