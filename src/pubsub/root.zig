@@ -102,8 +102,7 @@ pub const limits = @import("validate.zig");
 pub const transport = core.transport;
 
 /// What a test of code that uses Pub/Sub can stand on, with no emulator
-/// and no network. **Experimental**: new in 0.37.0, and free to change
-/// between minor versions until it has been used for a while.
+/// and no network.
 pub const testing = struct {
     /// Pub/Sub in memory, behind `Client.Options.transport`. It answers
     /// and refuses as production did when measured, and says so where it

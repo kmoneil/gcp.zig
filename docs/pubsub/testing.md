@@ -9,9 +9,6 @@ emulator, no JVM, no network, no credentials. It answers and refuses as
 **production** did when measured, in production's words, which is where
 it parts from the emulator.
 
-> **Experimental.** New in 0.37.0. Its surface is small and may still
-> change between minor versions; what it models can only grow.
-
 **On this page:** [A first test](#a-first-test) ·
 [Time is the test's](#time-is-the-tests) · [Faults](#faults) ·
 [What only production knows](#what-only-production-knows) ·
