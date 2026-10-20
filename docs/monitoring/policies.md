@@ -95,3 +95,6 @@ ends.
 
 In tests, `monitoring.testing.FakeMonitoring.putAlertPolicy` puts
 policies in: [Testing](testing.md#alert-policies).
+`examples/monitoring_policies.zig --fake` draws the policy view
+offline, and with `--disable POLICY_ID` shows the request a
+confirmation would, sending it with `--yes`.

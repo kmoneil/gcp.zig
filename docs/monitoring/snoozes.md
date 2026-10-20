@@ -99,5 +99,12 @@ snooze held; ended by hand once it had run a minute, a new alert
 opened about 77 s later, the condition still true. A create's answer
 carries the times as sent; reads after keep whole seconds.
 
+**A new snooze reads back by get at once, but lists lag**: one showed
+in every list, filtered or not, 91 s after its create; others showed at
+once. A console should keep the create's answer (or get it by name)
+rather than re-list to find it.
+
 In tests, `FakeMonitoring` takes snoozes through the API and closes
 the alerts they hold over: [Testing](testing.md#snoozes).
+`examples/monitoring_policies.zig --fake --snooze POLICY_ID --yes`
+snoozes a policy for an hour and shows its open alert closing.

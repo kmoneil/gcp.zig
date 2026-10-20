@@ -646,10 +646,11 @@ pub fn build(b: *std.Build) void {
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "dataflow_jobs" }) |name| {
+    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "monitoring_policies", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "dataflow_jobs" }) |name| {
         // whoami, secret, gcs_cp, gcs_sign, gcs_notify, quickstart, iam,
         // secret_rotation, firestore, logs_read, logs_tail, projects_list,
-        // error_dashboard, monitoring, monitoring_alerts, pubsub_metrics,
+        // error_dashboard, monitoring, monitoring_alerts,
+        // monitoring_policies, pubsub_metrics,
         // kms, scheduler_jobs, scheduler_run, run_revisions and
         // dataflow_jobs pick their own credentials.
         const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
@@ -670,7 +671,7 @@ pub fn build(b: *std.Build) void {
             &.{ .{ .name = "resource_manager", .module = resource_manager }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "error_dashboard"))
             &.{ .{ .name = "error_reporting", .module = error_reporting }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "monitoring") or std.mem.eql(u8, name, "monitoring_alerts"))
+        else if (std.mem.eql(u8, name, "monitoring") or std.mem.eql(u8, name, "monitoring_alerts") or std.mem.eql(u8, name, "monitoring_policies"))
             &.{ .{ .name = "monitoring", .module = monitoring }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "pubsub_metrics"))
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "monitoring", .module = monitoring }, .{ .name = "auth", .module = auth } }
