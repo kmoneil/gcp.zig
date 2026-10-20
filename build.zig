@@ -646,12 +646,12 @@ pub fn build(b: *std.Build) void {
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "pubsub_metrics", "kms", "scheduler_jobs", "run_revisions", "dataflow_jobs" }) |name| {
+    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "dataflow_jobs" }) |name| {
         // whoami, secret, gcs_cp, gcs_sign, gcs_notify, quickstart, iam,
         // secret_rotation, firestore, logs_read, logs_tail, projects_list,
         // error_dashboard, monitoring, monitoring_alerts, pubsub_metrics,
-        // kms, scheduler_jobs, run_revisions and dataflow_jobs pick
-        // their own credentials.
+        // kms, scheduler_jobs, scheduler_run, run_revisions and
+        // dataflow_jobs pick their own credentials.
         const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "secret"))
@@ -676,7 +676,7 @@ pub fn build(b: *std.Build) void {
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "monitoring", .module = monitoring }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "kms"))
             &.{ .{ .name = "kms", .module = kms }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "scheduler_jobs"))
+        else if (std.mem.eql(u8, name, "scheduler_jobs") or std.mem.eql(u8, name, "scheduler_run"))
             &.{ .{ .name = "scheduler", .module = scheduler }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "run_revisions"))
             &.{ .{ .name = "run", .module = cloud_run }, .{ .name = "auth", .module = auth } }

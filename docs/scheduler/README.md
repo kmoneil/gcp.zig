@@ -189,5 +189,8 @@ for a resume. `roles/cloudscheduler.admin` holds all three.
 except through the run's own answer.
 
 In tests, `scheduler.testing.FakeScheduler` holds locations and jobs a
-test puts in: [Testing](testing.md). `examples/scheduler_jobs.zig
---fake` draws the failing-jobs widget offline.
+test puts in, and takes the three writes as production does:
+[Testing](testing.md). `examples/scheduler_jobs.zig --fake` draws the
+failing-jobs widget offline, and `examples/scheduler_run.zig --fake`
+shows a run's request, sends it with `--yes`, and reads the job until
+its attempt shows.

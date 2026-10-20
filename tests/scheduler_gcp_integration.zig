@@ -16,6 +16,13 @@
 //! first, and deletes its own at the end; a delete while a run settles
 //! answers 409 transiently (measured: one took minutes), so deletes
 //! retry patiently. About five minutes in all.
+//!
+//! The writes test (milestone 2 of the writes spec, issue #273) runs,
+//! pauses and resumes two more `zigps-<run>-` jobs through the client
+//! (an HTTP GET that succeeds, one that answers 404), holds each
+//! preview byte for byte to what was sent, and replays every step on a
+//! fake seeded from production, each attempt given the code production's
+//! showed, comparing what each answered. About two minutes more.
 
 const std = @import("std");
 const core = @import("core");
@@ -363,6 +370,228 @@ test "scheduler: real failing jobs, and the fake seeded with production's list a
         }
         try testing.expect(ours);
         fact("locations: production lists {d}, ours among them", .{page.value.locations.len});
+    }
+
+    try testing.expectEqual(0, differences);
+}
+
+/// A transport that keeps the last request it passed on, for holding a
+/// preview to what was sent.
+const Recorder = struct {
+    inner: core.transport.Transport,
+    arena: std.heap.ArenaAllocator,
+    method: core.transport.Method = .GET,
+    url: []const u8 = "",
+    body: []const u8 = "",
+
+    fn transport(r: *Recorder) core.transport.Transport {
+        return .{ .ptr = r, .vtable = &.{ .send = send } };
+    }
+
+    fn send(ptr: *anyopaque, req: core.transport.Request, arena: Allocator) core.transport.Error!core.transport.Response {
+        const r: *Recorder = @ptrCast(@alignCast(ptr));
+        r.method = req.method;
+        r.url = r.arena.allocator().dupe(u8, req.url) catch return error.OutOfMemory;
+        r.body = r.arena.allocator().dupe(u8, req.body orelse "") catch return error.OutOfMemory;
+        return r.inner.send(req, arena);
+    }
+};
+
+const Write = enum { run, pause, @"resume" };
+
+/// What a write answered, times left out (each side has its own clock):
+/// the state, the attempt, whether an attempt time and a next run show.
+fn writeOutcome(a: Allocator, client: *scheduler.Client, diag: *scheduler.Diagnostics, write: Write, id: []const u8) ![]const u8 {
+    var answer = switch (write) {
+        .run => client.runJob(location, id),
+        .pause => client.pauseJob(location, id),
+        .@"resume" => client.resumeJob(location, id),
+    } catch |err| return a.print("error.{t}: {s}", .{ err, diag.message() });
+    defer answer.deinit();
+    return shape(a, answer.value);
+}
+
+fn shape(a: Allocator, job: scheduler.Job) ![]const u8 {
+    return a.print("{t} attempt={s} at={} next={} failing={}", .{
+        job.state,
+        if (job.last_attempt) |at| try a.print("{d}", .{at.code}) else "none",
+        job.last_attempt_time != null,
+        job.schedule_time != null,
+        job.failing(),
+    });
+}
+
+/// Reads the job until its attempt time moves past `since`, up to a
+/// minute: what a console does after a run.
+fn awaitAttempt(client: *scheduler.Client, id: []const u8, since: ?i96) !scheduler.Owned(scheduler.Job) {
+    for (0..30) |_| {
+        var got = try client.getJob(location, id);
+        if (got.value.last_attempt_time) |t| if (since == null or t.nanoseconds != since.?) return got;
+        got.deinit();
+        try testing.io.sleep(.fromMilliseconds(2_000), .awake);
+    }
+    return error.AttemptNeverLanded;
+}
+
+test "scheduler writes: run, pause and resume through the client, and the fake replaying them agrees" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try sweep(&f, a);
+
+    const ok_id = try a.print("zigps-{s}-ok", .{f.run});
+    const nf_id = try a.print("zigps-{s}-nf", .{f.run});
+    const jobs_path = try a.print("/v1/projects/{s}/locations/{s}/jobs", .{ f.project, location });
+    var made: std.ArrayList([]const u8) = .empty;
+    defer {
+        var cleanup: std.heap.ArenaAllocator = .init(testing.allocator);
+        for (made.items) |name| {
+            const status = f.deleteJob(cleanup.allocator(), name) catch 0;
+            fact("cleanup {s}: HTTP {d}", .{ name, status });
+        }
+        cleanup.deinit();
+        made.deinit(a);
+    }
+    for ([_]struct { []const u8, []const u8 }{
+        .{ ok_id, "https://www.gstatic.com/generate_204" },
+        .{ nf_id, try a.print("https://www.google.com/{s}-nothing", .{nf_id}) },
+    }) |job| {
+        const body = try a.print(
+            \\{{"name":"projects/{s}/locations/{s}/jobs/{s}","schedule":"0 0 1 1 *","timeZone":"UTC","httpTarget":{{"uri":"{s}","httpMethod":"GET"}}}}
+        , .{ f.project, location, job[0], job[1] });
+        const res = try f.raw(a, .POST, jobs_path, body);
+        try testing.expectEqual(200, res.status);
+        try made.append(a, try a.print("projects/{s}/locations/{s}/jobs/{s}", .{ f.project, location, job[0] }));
+    }
+    fact("made {s} and {s}", .{ ok_id, nf_id });
+
+    // The writes go through a client whose transport keeps what it sent.
+    var recorder: Recorder = .{ .inner = f.client.transport, .arena = .init(testing.allocator) };
+    defer recorder.arena.deinit();
+    var wdiag: scheduler.Diagnostics = .{};
+    var wc = try scheduler.Client.init(testing.allocator, testing.io, .{
+        .project_id = f.project,
+        .token_provider = f.token.provider(),
+        .diagnostics = &wdiag,
+        .transport = recorder.transport(),
+        .user_agent = "zig-gcp-scheduler-gcp-integration/0.1",
+    });
+    defer wc.deinit();
+
+    // The fake, seeded before any write with what production lists.
+    var fake: scheduler.testing.FakeScheduler = .init(testing.allocator, testing.io, .{ .project_id = f.project });
+    defer fake.deinit();
+    try fake.putLocation(location);
+    var fake_diag: scheduler.Diagnostics = .{};
+    var fake_token: core.StaticToken = .{ .token = "t" };
+    var fake_client = try scheduler.Client.init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = fake_token.provider(), .transport = fake.transport(), .diagnostics = &fake_diag });
+    defer fake_client.deinit();
+    {
+        var all = try f.client.listJobs(location, .{});
+        defer all.deinit();
+        try seed(&fake, &all.value);
+    }
+
+    var differences: usize = 0;
+    var previews: usize = 0;
+    const Step = struct { []const u8, Write, []const u8 };
+    const nobody = "zigps-nobody";
+    const steps = [_]Step{
+        .{ "run ok", .run, ok_id },
+        .{ "run nf", .run, nf_id },
+        .{ "pause nf", .pause, nf_id },
+        .{ "pause nf again", .pause, nf_id },
+        .{ "run nf paused", .run, nf_id },
+        .{ "resume nf", .@"resume", nf_id },
+        .{ "resume nf again", .@"resume", nf_id },
+        .{ "run nobody", .run, nobody },
+        .{ "pause nobody", .pause, nobody },
+        .{ "resume nobody", .@"resume", nobody },
+    };
+    for (steps) |step| {
+        // The attempt and update times before the write.
+        var since: ?i96 = null;
+        var update_before: ?i96 = null;
+        if (!std.mem.eql(u8, step[2], nobody)) {
+            var job = try f.client.getJob(location, step[2]);
+            defer job.deinit();
+            if (job.value.last_attempt_time) |t| since = t.nanoseconds;
+            if (job.value.user_update_time) |t| update_before = t.nanoseconds;
+        }
+
+        // The preview, then the write it names: byte for byte the same.
+        var preview = try switch (step[1]) {
+            .run => wc.runJobRequest(location, step[2]),
+            .pause => wc.pauseJobRequest(location, step[2]),
+            .@"resume" => wc.resumeJobRequest(location, step[2]),
+        };
+        defer preview.deinit();
+        const in_production = try writeOutcome(a, &wc, &wdiag, step[1], step[2]);
+        try testing.expectEqual(preview.value.method, recorder.method);
+        try testing.expectEqualStrings(preview.value.url, recorder.url);
+        try testing.expectEqualStrings(preview.value.body, recorder.body);
+        previews += 1;
+
+        // A run that went: wait for its attempt, then give the fake's run
+        // the code production's attempt showed.
+        var code: i64 = 0;
+        if (step[1] == .run and !std.mem.startsWith(u8, in_production, "error.")) {
+            var landed = try awaitAttempt(&f.client, step[2], since);
+            defer landed.deinit();
+            code = if (landed.value.last_attempt) |at| at.code else -1;
+            fact("{s}: attempt code {d}", .{ step[0], code });
+            if (code >= 0) try fake.setRunOutcome(try a.print("projects/{s}/locations/{s}/jobs/{s}", .{ f.project, location, step[2] }), .{ .code = code });
+        }
+        const in_memory = try writeOutcome(a, &fake_client, &fake_diag, step[1], step[2]);
+        agree(&differences, step[0], in_production, in_memory);
+
+        // After it: the job read on both sides, and a repeat's update time.
+        if (!std.mem.eql(u8, step[2], nobody)) {
+            var prod_after = try f.client.getJob(location, step[2]);
+            defer prod_after.deinit();
+            var fake_after = try fake_client.getJob(location, step[2]);
+            defer fake_after.deinit();
+            agree(&differences, try a.print("{s}, read after", .{step[0]}), try shape(a, prod_after.value), try shape(a, fake_after.value));
+            if (std.mem.endsWith(u8, step[0], "again")) {
+                const update_after: ?i96 = if (prod_after.value.user_update_time) |t| t.nanoseconds else null;
+                try testing.expectEqual(update_before, update_after);
+                fact("{s}: production's userUpdateTime unchanged", .{step[0]});
+            }
+            if (step[1] == .@"resume" and prod_after.value.schedule_time != null and fake_after.value.schedule_time != null) {
+                agree(&differences, try a.print("{s}, next run", .{step[0]}), try a.print("{d}", .{prod_after.value.schedule_time.?.nanoseconds}), try a.print("{d}", .{fake_after.value.schedule_time.?.nanoseconds}));
+            }
+        }
+    }
+    fact("{d} previews held byte for byte to what was sent", .{previews});
+
+    // A location nobody has, all three writes.
+    for ([_]Write{ .run, .pause, .@"resume" }) |write| {
+        const label = try a.print("{t} in us-fake1", .{write});
+        var pdiag: scheduler.Diagnostics = .{};
+        var prod: scheduler.Client = try .init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = f.token.provider(), .diagnostics = &pdiag });
+        defer prod.deinit();
+        const p = switch (write) {
+            .run => prod.runJob("us-fake1", ok_id),
+            .pause => prod.pauseJob("us-fake1", ok_id),
+            .@"resume" => prod.resumeJob("us-fake1", ok_id),
+        };
+        const q = switch (write) {
+            .run => fake_client.runJob("us-fake1", ok_id),
+            .pause => fake_client.pauseJob("us-fake1", ok_id),
+            .@"resume" => fake_client.resumeJob("us-fake1", ok_id),
+        };
+        const pt = if (p) |*j| blk: {
+            var job = j.*;
+            job.deinit();
+            break :blk "ok";
+        } else |err| try a.print("error.{t}: {s}", .{ err, pdiag.message() });
+        const qt = if (q) |*j| blk: {
+            var job = j.*;
+            job.deinit();
+            break :blk "ok";
+        } else |err| try a.print("error.{t}: {s}", .{ err, fake_diag.message() });
+        agree(&differences, label, pt, qt);
     }
 
     try testing.expectEqual(0, differences);

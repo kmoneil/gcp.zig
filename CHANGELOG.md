@@ -23,6 +23,23 @@ including the ones that did not change.
   attempt carries a message, a pause clears the last attempt, and a
   run sent just before a pause can start on the paused job with no
   result, which a resume then answers as a success.
+  `scheduler.testing.FakeScheduler` takes the three writes as measured:
+  a run answers the job as it stood and its attempt shows once the
+  fake's clock passes the outcome's delay (`setRunOutcome`, success at
+  once by default), a run while one is still to show adds none, a paused
+  job's run is production's 400, a pause clears the next run and the
+  last attempt, a resume brings back the next run (`setNextRun`, the
+  fake having no cron engine), repeats change nothing, and production's
+  pause-during-run race is reproduced. A success is written as
+  production's `status: {}` (it was `{"code":0}`). A run, pause or
+  resume of a `disabled` or `update_failed` job is 501: no one can put
+  a job in either state, so production's answer is unmeasured.
+  `pendingAttempts` counts attempts still to show. The gated suite runs,
+  pauses and resumes real jobs through the client, holds each preview
+  to what was sent, and replays every step on a fake seeded from
+  production. A new nightly job, `slow-scheduler` (4M), holds the fake's
+  writes to a model. `examples/scheduler_run.zig` shows a run's request,
+  sends it with `--yes`, and reads the job until its attempt shows.
 - core: `core.PreparedRequest`, a request as a client would send it
   (method, URL, body), built without sending it with
   `PreparedRequest.fromCall` from the same `rpc.Call` the write sends;

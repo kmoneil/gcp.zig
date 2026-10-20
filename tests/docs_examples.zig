@@ -2261,6 +2261,48 @@ test "the exact request a run would send, for the user to confirm" {
 }
 // end snippet
 
+// snippet: sched-run-fake
+test "a confirmed run, and the poll that finds its attempt" {
+    var clock: scheduler.testing.FakeClock = .{ .now_ns = 1_792_436_660 * std.time.ns_per_s };
+    var fake: scheduler.testing.FakeScheduler = .init(std.testing.allocator, clock.io(), .{ .project_id = "my-project" });
+    defer fake.deinit();
+    try fake.putLocation("us-central1");
+    const name = try fake.putJob(.{
+        .location = "us-central1",
+        .id = "nightly-export",
+        .schedule = "0 3 * * *",
+        .target = .{ .http = .{ .uri = "https://example.com/export", .method = .post } },
+    });
+    // The target answers 404, which Scheduler records as code 5, six
+    // seconds after the run.
+    try fake.setRunOutcome(name, .{ .code = 5, .after_ms = 6_000 });
+
+    var token: scheduler.StaticToken = .{ .token = "none" };
+    var client = try scheduler.Client.init(std.testing.allocator, clock.io(), .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    var ran = try client.runJob("us-central1", "nightly-export");
+    defer ran.deinit();
+    try std.testing.expectEqual(null, ran.value.last_attempt);
+
+    // The console reads again after five seconds: not yet.
+    clock.now_ns += 5 * std.time.ns_per_s;
+    var early = try client.getJob("us-central1", "nightly-export");
+    defer early.deinit();
+    try std.testing.expectEqual(null, early.value.last_attempt);
+
+    // Two seconds later it has shown.
+    clock.now_ns += 2 * std.time.ns_per_s;
+    var landed = try client.getJob("us-central1", "nightly-export");
+    defer landed.deinit();
+    try std.testing.expectEqual(5, landed.value.last_attempt.?.code);
+    try std.testing.expect(landed.value.failing());
+}
+// end snippet
+
 const run = @import("run");
 
 // snippet: run-fake
