@@ -41,6 +41,11 @@ jobs:
       - name: Docs
         run: python3 tools/check_docs.py
 
+      # tools/await_pr.py waits on a pull request and checks that what
+      # merged is what CI tested; its decisions, on canned answers.
+      - name: Tools
+        run: python3 -I tools/await_pr.py --self-test
+
       - name: Unit, property and fuzz-corpus tests
         run: zig build test --summary all
 
