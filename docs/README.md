@@ -128,6 +128,13 @@ Google, not only what Google documents, and where the emulators differ.
 | [Overview](run/README.md) | The services and revisions a project runs, read only: conditions, traffic, `ready()`, deploy markers, and what production showed when measured (experimental) |
 | [Testing](run/testing.md) | An in-memory Cloud Run for your own tests, held to production's answers (experimental) |
 
+## 🌊 Dataflow
+
+| Guide | What's in it |
+| --- | --- |
+| [Overview](dataflow/README.md) | The jobs a project runs, read only: every region in one call, states and terminal states, `Job.failing`, error messages, and what production showed when measured (experimental) |
+| [Testing](dataflow/testing.md) | An in-memory Dataflow for your own tests, held to production's answers (experimental) |
+
 ## 🛠️ Working on zig-gcp
 
 | Guide | What's in it |

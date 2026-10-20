@@ -10,7 +10,8 @@
 //! jobs, each carrying the `location` a `getJob` of it needs, and
 //! `failed_locations` naming any region that did not answer, without
 //! which a partial page looks complete. `Job.terminal` and
-//! `Job.failing` answer the widget's questions. The OAuth scope is
+//! `Job.failing` answer the widget's questions; `Client.listMessages`
+//! at `.@"error"` answers "why is it red". The OAuth scope is
 //! `cloud-platform`: v1b3 has no read-only scope, so what a token may
 //! read is IAM's to decide.
 
@@ -37,9 +38,23 @@ pub const JobView = @import("types.zig").JobView;
 pub const ListJobsOptions = @import("types.zig").ListJobsOptions;
 pub const AggregatedOptions = @import("types.zig").AggregatedOptions;
 pub const JobPage = @import("types.zig").JobPage;
+pub const MessageImportance = @import("types.zig").MessageImportance;
+pub const JobMessage = @import("types.zig").JobMessage;
+pub const AutoscalingEvent = @import("types.zig").AutoscalingEvent;
+pub const ListMessagesOptions = @import("types.zig").ListMessagesOptions;
+pub const MessagePage = @import("types.zig").MessagePage;
 
 /// The fixed limits and naming rules the client checks before sending.
 pub const limits = @import("validate.zig");
+
+/// What a test of code that reads Dataflow can stand on, with no
+/// emulator and no network. **Experimental**, as the module is.
+pub const testing = struct {
+    /// Dataflow in memory, behind `Client.Options.transport`. It
+    /// answers and refuses as production did when measured, and says
+    /// so where it does not model something.
+    pub const FakeDataflow = @import("fake_dataflow.zig").FakeDataflow;
+};
 
 /// The HTTP seam: implement `transport.Transport` to send requests
 /// another way, or to fake the server in your own tests.
@@ -51,6 +66,7 @@ test {
     _ = @import("Client.zig");
     _ = @import("codec.zig");
     _ = @import("errors.zig");
+    _ = @import("fake_dataflow.zig");
     _ = @import("logging.zig");
     _ = @import("names.zig");
     _ = @import("rpc.zig");

@@ -2279,3 +2279,44 @@ test "the recent revisions, as a health view draws them" {
     try std.testing.expect(broken.create_time != null);
 }
 // end snippet
+
+const dataflow = @import("dataflow");
+
+// snippet: dataflow-fake
+test "the pipelines widget, a failed job called out with its error" {
+    var fake: dataflow.testing.FakeDataflow = .init(std.testing.allocator, std.testing.io, .{ .project_id = "my-project" });
+    defer fake.deinit();
+    try fake.putLocation("us-central1");
+    // The nightly batch that broke, standing in for whoever launched it.
+    _ = try fake.putJob(.{
+        .location = "us-central1",
+        .id = "2026-10-20_07_09_34-8524524531325271694",
+        .name = "nightly-wordcount",
+        .current_state = .failed,
+        .current_state_time = .{ .nanoseconds = 1_792_505_378 * std.time.ns_per_s },
+    });
+    try fake.putMessage(.{
+        .job = "2026-10-20_07_09_34-8524524531325271694",
+        .text = "The Dataflow service agent cannot access the worker service account.",
+        .importance = .@"error",
+    });
+
+    var token: dataflow.StaticToken = .{ .token = "none" };
+    var client = try dataflow.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    // The widget's one call: every region's jobs.
+    var jobs = try client.aggregatedJobs(.{ .filter = .all });
+    defer jobs.deinit();
+    try std.testing.expectEqual(1, jobs.value.jobs.len);
+    const job = jobs.value.jobs[0];
+    try std.testing.expect(job.failing());
+    // Why it is red: the first error of the job's story.
+    var story = try client.listMessages(job.location, job.id, .{ .minimum_importance = .@"error" });
+    defer story.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, story.value.messages[0].text, "service agent") != null);
+}
+// end snippet

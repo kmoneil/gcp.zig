@@ -25,7 +25,20 @@ including the ones that did not change.
   scope, so what a token may read is IAM's to decide. Measured against
   a real Word_Count template run: PENDING at launch, RUNNING at 30 s,
   DONE at 244 s; a made-up region answers us-central1's jobs rather
-  than a refusal.
+  than a refusal. `Client.listMessages` reads a job's story,
+  `minimum_importance = .@"error"` being the widget's "why is it red",
+  with the autoscaling events production answers regardless of the
+  filter. `dataflow.testing.FakeDataflow` holds locations, jobs,
+  messages and autoscaling events a test puts in (`putLocation`,
+  `putJob`, `setJobState`, `putMessage`, `putAutoscalingEvent`,
+  `setFailedLocations`), read back as production answered: lists are
+  summaries, a location nobody put is served by the default location
+  as production serves a made-up region, refusals in production's
+  words. A gated suite (`DATAFLOW_TEST=1`, a cent or two per run)
+  launches a real Word_Count job, seeds the fake from production's
+  lists and holds it to production's answer for every read. Guides in
+  docs/dataflow/, and `examples/dataflow_jobs.zig`, which draws the
+  pipelines widget offline with `--fake`.
 - auth, core, error_reporting, firestore, kms, logging, monitoring,
   pubsub, resource_manager, run, scheduler, secret_manager and
   storage: unchanged.
