@@ -46,6 +46,11 @@ pub const ListLocationsOptions = @import("types.zig").ListLocationsOptions;
 pub const ListConfigsOptions = @import("types.zig").ListConfigsOptions;
 pub const ListRunsOptions = @import("types.zig").ListRunsOptions;
 pub const ListMessagesOptions = @import("types.zig").ListMessagesOptions;
+pub const StartManualRunOptions = @import("types.zig").StartManualRunOptions;
+pub const StartedRuns = @import("types.zig").StartedRuns;
+/// A request as a call would send it, built without sending it: what
+/// `Client.startManualRunRequest` answers.
+pub const PreparedRequest = core.PreparedRequest;
 
 /// The fixed limits and naming rules the client checks before sending.
 pub const limits = @import("validate.zig");

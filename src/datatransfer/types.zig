@@ -257,6 +257,23 @@ pub const ListRunsOptions = struct {
     page_token: ?[]const u8 = null,
 };
 
+/// What `startManualRun` asks.
+pub const StartManualRunOptions = struct {
+    /// The moment to run for: a scheduled query's `@run_time` and
+    /// `@run_date`. Null for now, by the client's `std.Io` clock.
+    /// Production took a time 60 s ahead of its own as readily as a past
+    /// one (measured), so a clock running ahead is no refusal. Sent to
+    /// the microsecond. Give the same time to `startManualRunRequest` and
+    /// the call to send exactly what was shown.
+    run_time: ?std.Io.Timestamp = null,
+};
+
+/// What a run now answers: the runs it started, one for a run now
+/// (measured), `PENDING`.
+pub const StartedRuns = struct {
+    runs: []const TransferRun,
+};
+
 pub const ListMessagesOptions = struct {
     /// Only messages of these severities; empty for every one.
     severities: []const MessageSeverity = &.{},

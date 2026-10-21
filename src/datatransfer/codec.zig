@@ -58,6 +58,12 @@ pub fn decodeRunPage(out: Allocator, scratch: Allocator, body: []const u8) Decod
     return .{ .runs = runs, .next_page_token = try token(out, obj, "nextPageToken") };
 }
 
+/// A run now's answer: `{runs: [TransferRun]}`.
+pub fn decodeStarted(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.StartedRuns {
+    const obj = try object(try parse(scratch, body));
+    return .{ .runs = try runList(out, scratch, obj, "runs") };
+}
+
 /// A page of `transferLogs.list`, newest first as production lists them.
 pub fn decodeMessagePage(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.TransferMessagePage {
     const obj = try object(try parse(scratch, body));
@@ -392,6 +398,26 @@ test "decodeMessagePage: newest first, by severity" {
     try testing.expect((try decodeMessagePage(a, s, production.messages_page_token)).next_page_token != null);
 }
 
+test "decodeStarted: the run a run now started, PENDING" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = out.allocator();
+    const s = scratch.allocator();
+    const started = try decodeStarted(a, s, production.started);
+    try testing.expectEqual(1, started.runs.len);
+    const run = started.runs[0];
+    try testing.expectEqual(types.TransferState.pending, run.state);
+    try testing.expectEqual(at("2026-10-21T18:44:58.873464Z"), run.run_time.?);
+    // Production writes a schedule time to the nanosecond.
+    try testing.expectEqual(at("2026-10-21T18:44:59.019303638Z"), run.schedule_time.?);
+    try testing.expectEqual(null, run.start_time);
+    try testing.expectEqualStrings("6ae65981-0000-2805-bdde-883d24fa83a4", run.id);
+    try testing.expectEqual(0, (try decodeStarted(a, s, "{}")).runs.len);
+    try testing.expectError(error.InvalidResponse, decodeStarted(a, s, "{\"runs\":[{\"name\":\"x\"}]}"));
+}
+
 test "the shapes production may send that milestone 0 did not, and what cannot be decoded" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
@@ -463,7 +489,7 @@ fn decodersProperty(_: void, input: []const u8) !void {
     defer out.deinit();
     var scratch: std.heap.ArenaAllocator = .init(test_util.propertyAllocator());
     defer scratch.deinit();
-    inline for (.{ decodeLocationPage, decodeConfig, decodeConfigPage, decodeRun, decodeRunPage, decodeMessagePage }) |decode| {
+    inline for (.{ decodeLocationPage, decodeConfig, decodeConfigPage, decodeRun, decodeRunPage, decodeMessagePage, decodeStarted }) |decode| {
         if (decode(out.allocator(), scratch.allocator(), input)) |_| {} else |err| try testing.expectEqual(error.InvalidResponse, err);
     }
 }
@@ -479,5 +505,6 @@ test "fuzz decoders: any body decodes or is InvalidResponse, never a crash or a 
         production.runs_latest,
         production.messages_succeeded,
         production.messages_failed_error,
+        production.started,
     } });
 }

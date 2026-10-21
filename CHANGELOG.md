@@ -31,6 +31,22 @@ including the ones that did not change.
   one token serves both modules; `.cloud_platform`;
   `.cloud_platform_read_only`) picks the one OAuth scope a client asks
   for; each served every read (measured).
+
+  And one write, a run now: `Client.startManualRun(config_name, .{
+  .run_time })` runs a config now, or for a time given (a day's midnight
+  re-runs that day), answering the run it started, `PENDING`;
+  `startManualRunRequest` builds its exact request without sending it.
+  It is sent once: it has no request id, production started a second run
+  for the same time sent twice, and Google's clients never retry it, so
+  only a refused connection or a failed name lookup is tried again. A
+  `.cloud_platform_read_only` client refuses it before sending, as
+  production refuses it. New types: `StartManualRunOptions`,
+  `StartedRuns`; `datatransfer.PreparedRequest` is exported. Measured on
+  2026-10-21 and written in docs/datatransfer/README.md: a run read
+  `RUNNING` within 3 s and a scheduled query of literals `SUCCEEDED` 75 s
+  after it started; a time 60 s ahead of production's clock was taken; a
+  disabled config is refused ("Transfer is disabled. ..."); a success
+  carries an empty error; runs and messages list newest first.
 - auth, bigquery, core, dataflow, error_reporting, firestore, kms,
   logging, monitoring, pubsub, resource_manager, run, scheduler,
   secret_manager and storage: unchanged.
