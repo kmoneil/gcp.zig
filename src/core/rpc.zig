@@ -167,6 +167,13 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
         /// with `retry` off and waits with `RetryPolicy.waitMs`. A module
         /// points it at its client, which one task uses at a time.
         server_delay_out: ?*?u32 = null,
+        /// For a service whose refusals name their kind in the body more
+        /// truly than in the status, as BigQuery's `errors[].reason` does
+        /// (it may send a rate limit as 403): the error a refusal stands
+        /// for, or null to map it by its status as usual. What it returns
+        /// is the call's error, and decides the retry as any mapped error
+        /// does. `Diagnostics` keep the body's words either way.
+        classify_refusal: ?*const fn (scratch: Allocator, http_status: u16, body: []const u8) Allocator.Error!?Error = null,
 
         const Self = @This();
         const log = logging.Scoped(log_scope);
@@ -484,6 +491,9 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
             // page, is the best message there is.
             const message = if (body) |b| b.message else res.body;
             if (self.diagnostics) |d| d.set(res.status, status, message);
+            if (self.classify_refusal) |classify| {
+                if (try classify(scratch, res.status, res.body)) |classified| return classified;
+            }
             return errors.fromResponse(res.status, status);
         }
 
@@ -681,6 +691,51 @@ test "retry: 503, 503, 200 succeeds on the third attempt within the backoff boun
     // Every attempt asked for a token; none of them invalidated one.
     try testing.expectEqual(3, h.token.calls);
     try testing.expectEqual(0, h.token.invalidations);
+}
+
+test "classify_refusal: a refusal named by its body is that error, and retried as one" {
+    const rate_limited: FakeTransport.Reply = .{ .respond = .{
+        .status = 403,
+        .body = "{\"error\":{\"code\":403,\"message\":\"Exceeded rate limits\",\"errors\":[{\"reason\":\"rateLimitExceeded\"}],\"status\":\"PERMISSION_DENIED\"}}",
+    } };
+    const Classify = struct {
+        fn classify(scratch: Allocator, http_status: u16, body: []const u8) Allocator.Error!?Error {
+            _ = scratch;
+            if (http_status == 403 and std.mem.indexOf(u8, body, "\"rateLimitExceeded\"") != null) return @as(?Error, error.ResourceExhausted);
+            return null;
+        }
+    };
+    // Classified, the 403 is transient and the next attempt succeeds.
+    {
+        var h: Harness = undefined;
+        h.init(&.{ rate_limited, .{ .respond = .{ .body = "{}" } } });
+        defer h.deinit();
+        var e = h.engine();
+        e.classify_refusal = Classify.classify;
+        _ = try e.execute(&h.arena, .{ .method = .GET, .path = "/v1/things" });
+        try testing.expectEqual(2, h.fake.requests.items.len);
+    }
+    // Left to the status, the same 403 is a refusal, returned at once,
+    // its words kept either way.
+    {
+        var h: Harness = undefined;
+        h.init(&.{ rate_limited, .{ .respond = .{ .body = "{}" } } });
+        defer h.deinit();
+        var e = h.engine();
+        try testing.expectError(error.PermissionDenied, e.execute(&h.arena, .{ .method = .GET, .path = "/v1/things" }));
+        try testing.expectEqual(1, h.fake.requests.items.len);
+        try testing.expectEqualStrings("Exceeded rate limits", h.diag.message());
+    }
+    // A refusal it does not name maps by its status.
+    {
+        var h: Harness = undefined;
+        h.init(&.{.{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"Not found\",\"status\":\"NOT_FOUND\"}}" } }});
+        defer h.deinit();
+        var e = h.engine();
+        e.classify_refusal = Classify.classify;
+        try testing.expectError(error.NotFound, e.execute(&h.arena, .{ .method = .GET, .path = "/v1/things" }));
+        try testing.expectEqualStrings("Not found", h.diag.message());
+    }
 }
 
 test "retry: gives up after max_attempts and reports the last failure" {
