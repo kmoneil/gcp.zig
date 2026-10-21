@@ -26,6 +26,7 @@ zig build example-worker -- orders orders-worker
 zig build example-whoami               # which credentials, and the topics they see
 zig build fmt                          # zig fmt --check
 python3 tools/check_docs.py            # the docs' links, anchors and snippets
+python3 -I tools/discovery_drift.py OLD.json NEW.json  # what changed between two discovery documents
 ```
 
 `zig build test` also compiles every example and the suites that run
