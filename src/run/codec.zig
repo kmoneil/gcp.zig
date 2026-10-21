@@ -606,6 +606,16 @@ test "decodeExecution and its page: production's executions, running, cancelled 
     try testing.expectEqualStrings("Cancelled by user.", cancelled.condition("Completed").?.message);
     try testing.expect(!cancelled.cancellable());
 
+    // Cancelled as its task started: production failed it with no reason,
+    // a task counted cancelled; status() keeps production's word.
+    const raced = try decodeExecution(a, s, production.execution_cancel_raced);
+    try testing.expectEqual(types.ExecutionStatus.failed, raced.status());
+    try testing.expectEqual(1, raced.cancelled_count);
+    try testing.expectEqualStrings("", raced.condition("Completed").?.reason);
+    const raced_op = try decodeOperation(a, s, production.operation_cancel_raced);
+    try testing.expectEqual(2, raced_op.failure.?.code);
+    try testing.expectEqualStrings("Unspecified error.", raced_op.failure.?.message);
+
     // Cancelled before it started: ended, though it never got a
     // completion time.
     const early = try decodeExecution(a, s, production.execution_cancelled_pending);

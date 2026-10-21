@@ -57,6 +57,34 @@ including the ones that did not change.
   or is ready, and a change to a missing or failed revision is taken,
   its operation failing and the service keeping the asked traffic; the
   permission each write takes.
+
+  `run.testing.FakeRun` holds jobs and executions (`putJob`,
+  `putExecution`, `setExecutionStatus` standing in for a job's
+  container, `jobCount`, `executionCount`, `executionStatus`) and takes
+  the three writes as production did on 2026-10-21: a run makes an
+  execution as `PutJob.run_outcome` says (pending by default), its
+  operation done once the execution has ended and failing with code 10
+  for a failed one; a cancel makes a running execution cancelling, a
+  pending one cancelled at once without a completion time, and refuses
+  an ended one in production's words, and one the test moves to failed
+  after a cancel reads as production's did when a cancel met the task's
+  start (measured since, and written in docs/run/README.md: `Completed`
+  failed with no reason, a task counted cancelled, both its run's and
+  its cancel's operations failing with code 2, "Unspecified error.",
+  which `Execution.status()` reads as `.failed`); a traffic change sets
+  the one target with a new generation and etag, refuses a stale etag
+  under `updateMask=traffic,etag` (409 ABORTED) and ignores it under
+  `updateMask=traffic`, changes nothing for the traffic the service
+  already has, refuses another service's revision at once, and takes a
+  missing or failed revision, failing its operation and the service.
+  What was not measured answers 501 with the reason. Services now carry
+  an etag in the fake too. A slow property holds the fake to a model of
+  those rules in its own nightly job, `slow-run`. A gated suite
+  (`RUN_WRITES_TEST=1`) runs, cancels and routes traffic on real
+  `zigps-` jobs and a service, holds every preview to the bytes sent,
+  and replays the same script on a fake seeded from production's reads.
+  `examples/run_actions.zig` runs a job, cancels an execution or rolls a
+  service back, with the request shown first and sent only with `--yes`.
 - auth, core, dataflow, error_reporting, firestore, kms, logging,
   monitoring, pubsub, resource_manager, scheduler, secret_manager and
   storage: unchanged.

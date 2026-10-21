@@ -2439,6 +2439,52 @@ test "the recent revisions, as a health view draws them" {
 }
 // end snippet
 
+// snippet: run-fake-writes
+test "a rollback and a run, as a console confirms and sends them" {
+    var fake: run.testing.FakeRun = .init(std.testing.allocator, std.testing.io, .{ .project_id = "my-project" });
+    defer fake.deinit();
+    try fake.putLocation("us-central1");
+    _ = try fake.putService(.{ .location = "us-central1", .id = "checkout", .traffic = &.{.{ .type = .latest, .percent = 100 }} });
+    _ = try fake.putRevision(.{ .location = "us-central1", .service = "checkout", .id = "checkout-00007-abc", .conditions = &.{.{ .type = "Ready", .state = .succeeded }} });
+    _ = try fake.putJob(.{ .location = "us-central1", .id = "nightly-report" });
+
+    var token: run.StaticToken = .{ .token = "none" };
+    var client = try run.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .scope = .read_write,
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+
+    // The rollback, guarded by the etag the read gave.
+    var service = try client.getService("us-central1", "checkout");
+    defer service.deinit();
+    var request = try client.routeAllTrafficRequest("us-central1", "checkout", "checkout-00007-abc", .{ .etag = service.value.etag });
+    defer request.deinit();
+    try std.testing.expect(std.mem.endsWith(u8, request.value.url, "?updateMask=traffic,etag"));
+    var change = try client.routeAllTraffic("us-central1", "checkout", "checkout-00007-abc", .{ .etag = service.value.etag });
+    defer change.deinit();
+    var done = try client.getOperation(change.value.name);
+    defer done.deinit();
+    try std.testing.expectEqualStrings("checkout-00007-abc", done.value.subject.service.traffic[0].revision);
+    // The same read's etag is stale now.
+    try std.testing.expectError(error.Aborted, client.routeAllTraffic("us-central1", "checkout", "checkout-00008-def", .{ .etag = service.value.etag }));
+
+    // A run: pending at first, as production's were; the test stands in
+    // for the job's container.
+    var ran = try client.runJob("us-central1", "nightly-report");
+    defer ran.deinit();
+    const execution = ran.value.subject.execution.name;
+    try fake.setExecutionStatus(execution, .running);
+    try fake.setExecutionStatus(execution, .succeeded);
+    var finished = try client.getOperation(ran.value.name);
+    defer finished.deinit();
+    try std.testing.expect(finished.value.done);
+    try std.testing.expectEqual(run.ExecutionStatus.succeeded, finished.value.subject.execution.status());
+}
+// end snippet
+
 const dataflow = @import("dataflow");
 
 // snippet: dataflow-fake

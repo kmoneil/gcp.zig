@@ -89,7 +89,7 @@ showed them:
 | `.running` | `Started` succeeded, `Completed` not yet ended |
 | `.cancelling` | A task already cancelled, `Completed` not yet ended |
 | `.succeeded` | `Completed` succeeded |
-| `.failed` | `Completed` failed, for a reason other than a cancel (`NON_ZERO_EXIT_CODE` for a task that exited 1) |
+| `.failed` | `Completed` failed, for a reason other than a cancel (`NON_ZERO_EXIT_CODE` for a task that exited 1), or for none at all, as a cancel that met the task's start ended |
 | `.cancelled` | `Completed` failed with reason `CANCELLED`, "Cancelled by user." |
 
 `Execution.cancellable()` says whether production takes a cancel of it
@@ -148,6 +148,13 @@ Measured on 2026-10-21:
   without a completion time. An ended execution refuses a cancel,
   `error.FailedPrecondition`: "Execution '<id>' cannot be cancelled
   because it is not running."
+- **A cancel that meets the task's start ends failed.** Cancelled the
+  moment it first read running, an execution ended `Completed` failed
+  with no reason and no message, a task counted cancelled, and both its
+  run's and its cancel's operations failed with code 2, "Unspecified
+  error." Cancels 15 s and 45 s into a run ended cancelled. Seen in two
+  of five cancels of a running execution; `status()` keeps production's
+  word, `.failed`.
 - **A traffic change**'s operation was done 4 s later. Only `traffic`
   moved: no new revision, the template and labels as they were.
 - **The etag is the guard.** Production enforces it only when the update
@@ -226,6 +233,10 @@ it):
 - A location that is no region is a 400, "The request has errors".
 - An empty list is `{}`. Revisions are named `<service>-0000N-<suffix>`.
 
-In tests, `run.testing.FakeRun` holds locations, services and revisions
-a test puts in: [Testing](testing.md). `examples/run_revisions.zig
---fake` draws the recent-revisions widget offline.
+In tests, `run.testing.FakeRun` holds locations, services, revisions,
+jobs and executions a test puts in, and takes the three writes as
+production did: [Testing](testing.md). `examples/run_revisions.zig
+--fake` draws the recent-revisions widget offline, and
+`examples/run_actions.zig` runs a job, cancels an execution or rolls a
+service back, showing the exact request and sending it only with
+`--yes` (`--fake` for no network).
