@@ -16,6 +16,22 @@
 //! `-` location with its `unreachable` regions. The suite sweeps
 //! `zigps-` services of earlier runs first and deletes its own at the
 //! end. About two minutes.
+//!
+//! The writes (issue #272) have their own gate, so the read suite stays
+//! two minutes long:
+//!
+//!     GCP_TEST_PROJECT=extractctl GCP_TEST_TOKEN=$(cat run.tok) \
+//!     RUN_WRITES_TEST=1 zig build test-integration-gcp -Dtest-filter="run writes:"
+//!
+//! The token must carry the `run` or `cloud-platform` scope: production
+//! refuses every write to `run.readonly`. It makes three `zigps-` jobs on
+//! Google's sample job image (a quick one, a slow one to cancel, one that
+//! fails) and a `zigps-` hello service with two revisions, raw; runs,
+//! cancels and routes traffic through the client, every preview held
+//! byte for byte to what was sent; then replays the same script on a fake
+//! seeded from production's reads, every outcome and refusal held equal.
+//! Cleanup cancels what still runs and deletes every job and the service.
+//! About five minutes, inside Cloud Run's free tier.
 
 const std = @import("std");
 const core = @import("core");
@@ -35,13 +51,13 @@ const Fixture = struct {
     arena: std.heap.ArenaAllocator,
     run: []const u8,
 
-    fn init(f: *Fixture) !bool {
+    fn init(f: *Fixture, gate: []const u8, scope: run_mod.Scope) !bool {
         const gpa = testing.allocator;
         f.env = try testing.environ.createMap(gpa);
         errdefer f.env.deinit();
         f.project = f.env.get("GCP_TEST_PROJECT") orelse return f.skip();
         const token = f.env.get("GCP_TEST_TOKEN") orelse return f.skip();
-        if (f.env.get("RUN_TEST") == null) return f.skip();
+        if (f.env.get(gate) == null) return f.skip();
         f.token = .{ .token = std.mem.trim(u8, token, &std.ascii.whitespace) };
         f.diag = .{};
         f.arena = .init(gpa);
@@ -52,6 +68,7 @@ const Fixture = struct {
         f.client = try .init(gpa, testing.io, .{
             .project_id = f.project,
             .token_provider = f.token.provider(),
+            .scope = scope,
             .diagnostics = &f.diag,
             .user_agent = "zig-gcp-run-gcp-integration/0.1",
         });
@@ -273,7 +290,7 @@ fn seed(fake: *run_mod.testing.FakeRun, services: *const run_mod.ServicePage, re
 
 test "run: a real deploy and a real failed one, the fake seeded with production's lists answering alike" {
     var f: Fixture = undefined;
-    if (!try f.init()) return error.SkipZigTest;
+    if (!try f.init("RUN_TEST", .read_only)) return error.SkipZigTest;
     defer f.deinit();
     const a = f.arena.allocator();
     try sweep(&f, a);
@@ -378,5 +395,472 @@ test "run: a real deploy and a real failed one, the fake seeded with production'
         agree(&differences, "list services everywhere", in_production, in_memory);
     }
 
+    try testing.expectEqual(0, differences);
+}
+
+// The writes (issue #272).
+
+const job_image = "us-docker.pkg.dev/cloudrun/container/job";
+
+/// Records every request sent through it, then sends it on: what the
+/// suite holds each write's preview to.
+const Recorder = struct {
+    inner: core.transport.Transport,
+    sent: std.ArrayList(Sent) = .empty,
+    arena: std.heap.ArenaAllocator,
+
+    const Sent = struct { method: core.transport.Method, url: []const u8, body: []const u8 };
+
+    fn transport(r: *Recorder) core.transport.Transport {
+        return .{ .ptr = r, .vtable = &.{ .send = send } };
+    }
+
+    fn send(ptr: *anyopaque, req: core.transport.Request, arena: Allocator) core.transport.Error!core.transport.Response {
+        const r: *Recorder = @ptrCast(@alignCast(ptr));
+        const a = r.arena.allocator();
+        r.sent.append(a, .{
+            .method = req.method,
+            .url = a.dupe(u8, req.url) catch return error.OutOfMemory,
+            .body = a.dupe(u8, req.body orelse "") catch return error.OutOfMemory,
+        }) catch return error.OutOfMemory;
+        return r.inner.send(req, arena);
+    }
+
+    fn last(r: *const Recorder) Sent {
+        return r.sent.items[r.sent.items.len - 1];
+    }
+};
+
+/// Makes a job raw, labelled for the sweep: the client has no verb for it.
+fn makeJob(f: *Fixture, a: Allocator, id: []const u8, env: []const u8) !void {
+    const path = try a.print("/v2/projects/{s}/locations/{s}/jobs?jobId={s}", .{ f.project, location, id });
+    const body = try a.print(
+        \\{{"labels":{{"zigps":"suite"}},"template":{{"taskCount":1,"template":{{"maxRetries":0,"timeout":"900s","containers":[{{"image":"{s}","env":[{s}]}}]}}}}}}
+    , .{ job_image, env });
+    const res = try f.raw(a, .POST, path, body);
+    if (res.status != 200) std.debug.print("making job {s}: HTTP {d} {s}\n", .{ id, res.status, res.body });
+    try testing.expectEqual(200, res.status);
+    try testing.expect(try f.awaitOperation(a, res.body, 120));
+}
+
+/// Deletes a job raw, trying a 503 again (probe 3 met one), after
+/// cancelling whatever of it still runs.
+fn deleteJob(f: *Fixture, a: Allocator, id: []const u8) !void {
+    if (f.client.listExecutions(location, id, .{})) |page| {
+        var p = page;
+        defer p.deinit();
+        for (p.value.executions) |execution| {
+            if (!execution.cancellable()) continue;
+            var cancel = f.client.cancelExecution(location, id, execution.id) catch continue;
+            cancel.deinit();
+        }
+    } else |_| {}
+    const path = try a.print("/v2/projects/{s}/locations/{s}/jobs/{s}", .{ f.project, location, id });
+    for (0..5) |_| {
+        const res = try f.raw(a, .DELETE, path, null);
+        if (res.status == 200) {
+            _ = try f.awaitOperation(a, res.body, 120);
+            fact("delete job {s}: HTTP 200", .{id});
+            return;
+        }
+        if (res.status == 404) return;
+        fact("delete job {s}: HTTP {d}, trying again", .{ id, res.status });
+        try testing.io.sleep(.fromMilliseconds(10_000), .awake);
+    }
+}
+
+fn sweepJobs(f: *Fixture, a: Allocator) !void {
+    var page = f.client.listJobs(location, .{}) catch |err| {
+        fact("sweep: listing jobs failed: {t}", .{err});
+        return;
+    };
+    defer page.deinit();
+    for (page.value.jobs) |job| {
+        if (std.mem.startsWith(u8, job.id, "zigps-")) try deleteJob(f, a, job.id);
+    }
+}
+
+/// Reads the execution every 5 s until `until` says, within the budget;
+/// its status at the end.
+fn awaitExecution(client: *run_mod.Client, name: []const u8, budget_s: i64, until: *const fn (run_mod.ExecutionStatus) bool) !run_mod.ExecutionStatus {
+    const started = std.Io.Clock.real.now(testing.io).nanoseconds;
+    while (true) {
+        var read = try client.getExecutionNamed(name);
+        const status = read.value.status();
+        read.deinit();
+        if (until(status)) return status;
+        if (std.Io.Clock.real.now(testing.io).nanoseconds - started > @as(i96, budget_s) * std.time.ns_per_s) return status;
+        try testing.io.sleep(.fromMilliseconds(5_000), .awake);
+    }
+}
+
+fn ended(status: run_mod.ExecutionStatus) bool {
+    return status.ended();
+}
+
+fn runningOrEnded(status: run_mod.ExecutionStatus) bool {
+    return status == .running or status.ended();
+}
+
+/// Reads the operation every 2 s until it is done, within the budget.
+fn awaitDone(client: *run_mod.Client, name: []const u8, budget_s: i64) !run_mod.Owned(run_mod.Operation) {
+    const started = std.Io.Clock.real.now(testing.io).nanoseconds;
+    while (true) {
+        var read = try client.getOperation(name);
+        if (read.value.done or std.Io.Clock.real.now(testing.io).nanoseconds - started > @as(i96, budget_s) * std.time.ns_per_s) return read;
+        read.deinit();
+        try testing.io.sleep(.fromMilliseconds(2_000), .awake);
+    }
+}
+
+/// A preview, held byte for byte to the request its write last sent.
+fn holdPreview(recorder: *const Recorder, preview: run_mod.Owned(run_mod.PreparedRequest), label: []const u8) !void {
+    var p = preview;
+    defer p.deinit();
+    const sent = recorder.last();
+    try testing.expectEqual(sent.method, p.value.method);
+    try testing.expectEqualStrings(sent.url, p.value.url);
+    try testing.expectEqualStrings(sent.body, p.value.body);
+    fact("preview of {s} is what was sent: {t} {s}", .{ label, p.value.method, p.value.url });
+}
+
+/// `text` with each id replaced by the role it plays, so production's and
+/// the fake's compare. The newest first: the service's id begins every
+/// job's and execution's.
+fn withRoles(a: Allocator, text: []const u8, ids: []const [2][]const u8) ![]const u8 {
+    var out = text;
+    var i = ids.len;
+    while (i > 0) {
+        i -= 1;
+        out = try std.mem.replaceOwned(u8, a, out, ids[i][0], ids[i][1]);
+    }
+    return out;
+}
+
+/// Text that names an error and its words, the ids in it replaced by the
+/// role each plays.
+fn refusal(a: Allocator, err: anyerror, diag: *const run_mod.Diagnostics, ids: []const [2][]const u8) ![]const u8 {
+    var text = try withRoles(a, try a.print("error.{t}: {s}", .{ err, diag.message() }), ids);
+    // The versions in a stale etag's refusal are production's times and
+    // the fake's counters: only their places compare.
+    if (std.mem.indexOf(u8, text, "version '")) |at| text = text[0 .. at + "version '".len];
+    return text;
+}
+
+/// The script, run the same on production and on the fake. `settle`
+/// brings an execution to a status production reaches on its own: by
+/// waiting in production, where each status reached is kept, and by
+/// moving the fake's execution to the one production reached at the same
+/// step. A cancel that meets a task's start ends failed in production
+/// (measured), so the fake replays what production did, not a guess.
+const Script = struct {
+    client: *run_mod.Client,
+    diag: *run_mod.Diagnostics,
+    /// The fake, or null in production.
+    fake: ?*run_mod.testing.FakeRun,
+    svc: []const u8,
+    jobs: [3][]const u8,
+    lines: std.ArrayList([]const u8) = .empty,
+    ids: std.ArrayList([2][]const u8) = .empty,
+    /// In production, each status `settle` reached, in order.
+    outcomes: std.ArrayList(run_mod.ExecutionStatus) = .empty,
+    /// In the fake, production's outcomes to replay, and the next one.
+    replay: []const run_mod.ExecutionStatus = &.{},
+    next: usize = 0,
+
+    fn line(s: *Script, a: Allocator, comptime format: []const u8, args: anytype) !void {
+        try s.lines.append(a, try withRoles(a, try a.print(format, args), s.ids.items));
+    }
+
+    /// Waits for, or moves the fake's execution to, a status production
+    /// reaches on its own.
+    fn settle(s: *Script, a: Allocator, name: []const u8, wanted: *const fn (run_mod.ExecutionStatus) bool, budget_s: i64) !run_mod.ExecutionStatus {
+        if (s.fake) |fake| {
+            const target = s.replay[s.next];
+            s.next += 1;
+            if (fake.executionStatus(name).? != target) try fake.setExecutionStatus(name, target);
+            return fake.executionStatus(name).?;
+        }
+        const status = try awaitExecution(s.client, name, budget_s, wanted);
+        try s.outcomes.append(a, status);
+        return status;
+    }
+
+    fn run(s: *Script, a: Allocator, recorder: ?*Recorder) !void {
+        const c = s.client;
+        const quick, const slow, const failing = s.jobs;
+        // Three runs at once, as production took two of one job at once.
+        var runs: [4]run_mod.Owned(run_mod.Operation) = undefined;
+        var made: usize = 0;
+        defer for (runs[0..made]) |*r| r.deinit();
+        const roles = [_]struct { []const u8, []const u8 }{ .{ quick, "<quick>" }, .{ failing, "<failing>" }, .{ slow, "<slow-a>" }, .{ slow, "<slow-b>" } };
+        for (roles) |role| {
+            runs[made] = try c.runJob(location, role[0]);
+            made += 1;
+            const execution = runs[made - 1].value.subject.execution;
+            try s.ids.append(a, .{ try a.dupe(u8, execution.id), role[1] });
+            if (recorder) |r| try holdPreview(r, try c.runJobRequest(location, role[0]), "a run");
+            try s.line(a, "run {s}: done={} status={t}", .{ role[1], runs[made - 1].value.done, execution.status() });
+        }
+        const quick_name = runs[0].value.subject.execution.name;
+        const failing_name = runs[1].value.subject.execution.name;
+        const slow_a = runs[2].value.subject.execution;
+        const slow_b_name = runs[3].value.subject.execution.name;
+
+        // Cancelled while pending: ended at once, without a completion
+        // time, as probe 4 measured.
+        {
+            var cancel = try c.cancelExecution(location, slow, slow_a.id);
+            defer cancel.deinit();
+            if (recorder) |r| try holdPreview(r, try c.cancelExecutionRequest(location, slow, slow_a.id), "a cancel");
+            const status = try s.settle(a, slow_a.name, ended, 30);
+            var read = try c.getExecutionNamed(slow_a.name);
+            defer read.deinit();
+            try s.line(a, "cancel <slow-a> while pending: then {t}, completion time {s}", .{ status, if (read.value.completion_time == null) "none" else "set" });
+        }
+
+        // The quick one succeeds and the failing one fails; their
+        // operations say so.
+        for ([_]struct { []const u8, usize, []const u8 }{ .{ quick_name, 0, "<quick>" }, .{ failing_name, 1, "<failing>" } }) |each| {
+            const status = try s.settle(a, each[0], ended, 300);
+            var op = try c.getOperation(runs[each[1]].value.name);
+            defer op.deinit();
+            try s.line(a, "{s} ends {t}: operation done={} failure={?d}", .{ each[2], status, op.value.done, if (op.value.failure) |x| x.code else null });
+        }
+
+        // The second slow one, cancelled once running: cancelling, then
+        // cancelled; a cancel after it ended is refused.
+        {
+            const running = try s.settle(a, slow_b_name, runningOrEnded, 300);
+            const id = slow_b_name[std.mem.lastIndexOfScalar(u8, slow_b_name, '/').? + 1 ..];
+            var cancel = try c.cancelExecution(location, slow, id);
+            defer cancel.deinit();
+            const status = try s.settle(a, slow_b_name, ended, 120);
+            var op = try awaitDone(c, cancel.value.name, 60);
+            defer op.deinit();
+            try s.line(a, "cancel <slow-b> while {t}: then {t}, operation done={} failure={?d}", .{ running, status, op.value.done, if (op.value.failure) |x| x.code else null });
+            if (c.cancelExecution(location, slow, id)) |again| {
+                var x = again;
+                x.deinit();
+                try s.line(a, "cancel <slow-b> again: TAKEN", .{});
+            } else |err| try s.line(a, "cancel <slow-b> again: {s}", .{try refusal(a, err, s.diag, s.ids.items)});
+            if (c.cancelExecution(location, slow, "zigps-x-nobody")) |nobody| {
+                var x = nobody;
+                x.deinit();
+            } else |err| try s.line(a, "cancel nobody's: {s}", .{try refusal(a, err, s.diag, s.ids.items)});
+        }
+
+        var every = try c.listExecutions(location, "-", .{});
+        defer every.deinit();
+        try s.line(a, "executions of every job: {d}", .{every.value.executions.len});
+
+        // Traffic: checked, sent, refused when stale, and the same again.
+        var read = try c.getService(location, s.svc);
+        defer read.deinit();
+        const etag = try a.dupe(u8, read.value.etag);
+        const rev1 = try a.print("{s}-00001", .{s.svc});
+        var first: []const u8 = "";
+        var revisions = try c.listRevisions(location, s.svc, .{});
+        defer revisions.deinit();
+        for (revisions.value.revisions) |r| if (std.mem.startsWith(u8, r.id, rev1)) {
+            first = try a.dupe(u8, r.id);
+        };
+        try s.ids.append(a, .{ first, "<rev1>" });
+        {
+            var check = try c.routeAllTraffic(location, s.svc, first, .{ .etag = etag, .validate_only = true });
+            defer check.deinit();
+            if (recorder) |r| try holdPreview(r, try c.routeAllTrafficRequest(location, s.svc, first, .{ .etag = etag, .validate_only = true }), "a checked traffic change");
+            var after = try c.getService(location, s.svc);
+            defer after.deinit();
+            try s.line(a, "validate <rev1>: done={} asked={s}; etag kept={} traffic={t}", .{ check.value.done, check.value.subject.service.traffic[0].revision, std.mem.eql(u8, after.value.etag, etag), after.value.traffic[0].type });
+        }
+        {
+            var change = try c.routeAllTraffic(location, s.svc, first, .{ .etag = etag });
+            defer change.deinit();
+            if (recorder) |r| try holdPreview(r, try c.routeAllTrafficRequest(location, s.svc, first, .{ .etag = etag }), "a traffic change");
+            var op = try awaitDone(c, change.value.name, 60);
+            defer op.deinit();
+            const service = op.value.subject.service;
+            try s.line(a, "route <rev1>: first answer done={}; then done={} failure={?d} traffic={s} statuses={s} generation+{d} labels={d}", .{
+                change.value.done,           op.value.done,                        if (op.value.failure) |x| x.code else null,
+                service.traffic[0].revision, service.traffic_statuses[0].revision, (service.generation orelse 0) - (read.value.generation orelse 0),
+                service.labels.len,
+            });
+        }
+        if (c.routeAllTraffic(location, s.svc, try a.print("{s}-00002", .{s.svc}), .{ .etag = etag })) |stale| {
+            var x = stale;
+            x.deinit();
+            try s.line(a, "route with the stale etag: TAKEN", .{});
+        } else |err| try s.line(a, "route with the stale etag: {s}", .{try refusal(a, err, s.diag, s.ids.items)});
+        if (c.routeAllTraffic(location, s.svc, first, .{ .etag = etag })) |same| {
+            var x = same;
+            x.deinit();
+            var after = try c.getService(location, s.svc);
+            defer after.deinit();
+            var before = try c.getService(location, s.svc);
+            defer before.deinit();
+            try s.line(a, "route <rev1> again with the stale etag: taken, generation {s}", .{if (after.value.generation == before.value.generation) "kept" else "MOVED"});
+        } else |err| try s.line(a, "route <rev1> again with the stale etag: {s}", .{try refusal(a, err, s.diag, s.ids.items)});
+        if (c.routeAllTraffic(location, s.svc, "zigps-other-00001-abc", .{ .etag = etag })) |other| {
+            var x = other;
+            x.deinit();
+            try s.line(a, "route to another service's revision: TAKEN", .{});
+        } else |err| try s.line(a, "route to another service's revision: {s}", .{try refusal(a, err, s.diag, s.ids.items)});
+        {
+            var fresh = try c.getService(location, s.svc);
+            defer fresh.deinit();
+            const missing = try a.print("{s}-00009-zzz", .{s.svc});
+            var change = try c.routeAllTraffic(location, s.svc, missing, .{ .etag = fresh.value.etag });
+            defer change.deinit();
+            var op = try awaitDone(c, change.value.name, 60);
+            defer op.deinit();
+            var after = try c.getService(location, s.svc);
+            defer after.deinit();
+            try s.line(a, "route to a revision it lacks: done={} failure={?d} \"{s}\"; service ready={} traffic={s}", .{
+                op.value.done,       if (op.value.failure) |x| x.code else null, if (op.value.failure) |x| x.message else "",
+                after.value.ready(), after.value.traffic[0].revision,
+            });
+        }
+    }
+};
+
+test "run writes: real runs, cancels and a traffic change, the fake replaying them alike" {
+    var f: Fixture = undefined;
+    if (!try f.init("RUN_WRITES_TEST", .read_write)) return error.SkipZigTest;
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try sweepJobs(&f, a);
+    try sweep(&f, a);
+
+    // A read-only client refuses every write before sending.
+    {
+        var token: core.StaticToken = .{ .token = f.token.token };
+        var diag: run_mod.Diagnostics = .{};
+        var read_only = try run_mod.Client.init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = token.provider(), .diagnostics = &diag });
+        defer read_only.deinit();
+        try testing.expectError(error.InvalidOptions, read_only.runJob(location, "zigps-nobody"));
+        fact("a read-only client refuses a run before sending: {s}", .{diag.message()});
+    }
+
+    const jobs = [3][]const u8{ try a.print("zigps-{s}-quick", .{f.run}), try a.print("zigps-{s}-slow", .{f.run}), try a.print("zigps-{s}-fail", .{f.run}) };
+    const svc = try a.print("zigps-{s}", .{f.run});
+    var made_jobs: usize = 0;
+    var deployed = false;
+    defer {
+        var cleanup: std.heap.ArenaAllocator = .init(testing.allocator);
+        for (jobs[0..made_jobs]) |id| deleteJob(&f, cleanup.allocator(), id) catch |err| fact("cleanup of {s} failed: {t}", .{ id, err });
+        if (deployed) f.deleteService(cleanup.allocator(), svc) catch |err| fact("cleanup failed: {t}", .{err});
+        cleanup.deinit();
+    }
+    for (jobs, [_][]const u8{
+        \\{"name":"SLEEP_MS","value":"1000"}
+        ,
+        \\{"name":"SLEEP_MS","value":"600000"}
+        ,
+        \\{"name":"FAIL_RATE","value":"1"}
+    }) |id, env| {
+        try makeJob(&f, a, id, env);
+        made_jobs += 1;
+    }
+    {
+        const path = try a.print("/v2/projects/{s}/locations/{s}/services?serviceId={s}", .{ f.project, location, svc });
+        const res = try f.raw(a, .POST, path, try a.print(
+            \\{{"template":{{"containers":[{{"image":"{s}","env":[{{"name":"ZIGPS","value":"1"}}]}}]}},"labels":{{"zigps":"suite"}}}}
+        , .{hello}));
+        try testing.expectEqual(200, res.status);
+        deployed = true;
+        try testing.expect(try f.awaitOperation(a, res.body, 300));
+        const patch = try f.raw(a, .PATCH, try a.print("/v2/projects/{s}/locations/{s}/services/{s}", .{ f.project, location, svc }), try a.print(
+            \\{{"template":{{"containers":[{{"image":"{s}","env":[{{"name":"ZIGPS","value":"2"}}]}}]}},"labels":{{"zigps":"suite"}}}}
+        , .{hello}));
+        try testing.expectEqual(200, patch.status);
+        try testing.expect(try f.awaitOperation(a, patch.body, 300));
+        fact("made {s}, {s} and {s}, and {s} with two revisions", .{ jobs[0], jobs[1], jobs[2], svc });
+    }
+
+    // Production's state before the script, for the fake's seed.
+    var prod_jobs = try f.client.listJobs(location, .{});
+    defer prod_jobs.deinit();
+    var prod_service = try f.client.getService(location, svc);
+    defer prod_service.deinit();
+    var prod_revisions = try f.client.listRevisions(location, svc, .{});
+    defer prod_revisions.deinit();
+
+    // The script against production, through a client that records what
+    // it sends, so every preview is held to it.
+    var http: core.transport.HttpTransport = .init(testing.allocator, testing.io, "zig-gcp-run-gcp-integration/0.1");
+    defer http.deinit();
+    var recorder: Recorder = .{ .inner = http.transport(), .arena = .init(testing.allocator) };
+    defer recorder.arena.deinit();
+    var recorded_diag: run_mod.Diagnostics = .{};
+    var recorded = try run_mod.Client.init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = f.token.provider(), .scope = .read_write, .transport = recorder.transport(), .diagnostics = &recorded_diag });
+    defer recorded.deinit();
+    var in_production: Script = .{ .client = &recorded, .diag = &recorded_diag, .fake = null, .svc = svc, .jobs = jobs };
+    try in_production.ids.append(a, .{ svc, "<svc>" });
+    try in_production.run(a, &recorder);
+
+    // The same script on a fake seeded from production's reads.
+    var fake: run_mod.testing.FakeRun = .init(testing.allocator, testing.io, .{ .project_id = f.project });
+    defer fake.deinit();
+    try fake.putLocation(location);
+    for (prod_jobs.value.jobs) |job| {
+        if (!std.mem.startsWith(u8, job.id, "zigps-")) continue;
+        _ = try fake.putJob(.{
+            .location = job.location,
+            .id = job.id,
+            .task_count = job.task_count,
+            .parallelism = job.parallelism,
+            .task_timeout_s = job.task_timeout_s,
+            .max_retries = job.max_retries,
+            .containers = job.containers,
+            .service_account = job.service_account,
+            .labels = job.labels,
+            .create_time = job.create_time,
+            .update_time = job.update_time,
+            .terminal_condition = job.terminal_condition,
+        });
+    }
+    const service = prod_service.value;
+    _ = try fake.putService(.{
+        .location = service.location,
+        .id = service.id,
+        .uri = service.uri,
+        .urls = service.urls,
+        .latest_ready_revision = service.latest_ready_revision,
+        .latest_created_revision = service.latest_created_revision,
+        .traffic = service.traffic,
+        .traffic_statuses = service.traffic_statuses,
+        .terminal_condition = service.terminal_condition,
+        .conditions = service.conditions,
+        .create_time = service.create_time,
+        .update_time = service.update_time,
+        .generation = service.generation,
+        .observed_generation = service.observed_generation,
+        .labels = service.labels,
+    });
+    for (prod_revisions.value.revisions) |revision| {
+        _ = try fake.putRevision(.{
+            .location = revision.location,
+            .service = revision.service,
+            .id = revision.id,
+            .create_time = revision.create_time,
+            .generation = revision.generation,
+            .containers = revision.containers,
+            .conditions = revision.conditions,
+        });
+    }
+    var fake_token: core.StaticToken = .{ .token = "t" };
+    var fake_diag: run_mod.Diagnostics = .{};
+    var fake_client = try run_mod.Client.init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = fake_token.provider(), .scope = .read_write, .transport = fake.transport(), .diagnostics = &fake_diag });
+    defer fake_client.deinit();
+    var in_memory: Script = .{ .client = &fake_client, .diag = &fake_diag, .fake = &fake, .svc = svc, .jobs = jobs, .replay = in_production.outcomes.items };
+    try in_memory.ids.append(a, .{ svc, "<svc>" });
+    try in_memory.run(a, null);
+
+    var differences: usize = 0;
+    try testing.expectEqual(in_production.lines.items.len, in_memory.lines.items.len);
+    for (in_production.lines.items, in_memory.lines.items, 0..) |p, m, i| {
+        agree(&differences, try a.print("step {d}", .{i}), p, m);
+    }
     try testing.expectEqual(0, differences);
 }

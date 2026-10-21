@@ -2683,3 +2683,153 @@ pub const operation_traffic_validate =
     \\ }
     \\}
 ;
+/// An execution cancelled as its task started: Completed failed with no reason, a task counted cancelled. HTTP 200.
+pub const execution_cancel_raced_status = 200;
+pub const execution_cancel_raced =
+    \\{
+    \\ "name": "projects/extractctl/locations/us-central1/jobs/zigps-0b36f5-cancel/executions/zigps-0b36f5-cancel-vtff9",
+    \\ "uid": "29540b3c-839a-4c33-b599-e5e115dfce0b",
+    \\ "generation": "2",
+    \\ "createTime": "2026-10-21T13:38:04.405864Z",
+    \\ "completionTime": "2026-10-21T13:38:42.993701Z",
+    \\ "updateTime": "2026-10-21T13:38:35.072066Z",
+    \\ "launchStage": "GA",
+    \\ "job": "zigps-0b36f5-cancel",
+    \\ "parallelism": 1,
+    \\ "taskCount": 1,
+    \\ "template": {
+    \\  "containers": [
+    \\   {
+    \\    "image": "us-docker.pkg.dev/cloudrun/container/job@sha256:611099e80127f3c779e6fda0a5982818ff9fd03a228f9457cd3a1b1fed9f1589",
+    \\    "env": [
+    \\     {
+    \\      "name": "SLEEP_MS",
+    \\      "value": "600000"
+    \\     }
+    \\    ],
+    \\    "resources": {
+    \\     "limits": {
+    \\      "cpu": "1000m",
+    \\      "memory": "512Mi"
+    \\     }
+    \\    }
+    \\   }
+    \\  ],
+    \\  "maxRetries": 0,
+    \\  "timeout": "900s",
+    \\  "serviceAccount": "82150720798-compute@developer.gserviceaccount.com",
+    \\  "executionEnvironment": "EXECUTION_ENVIRONMENT_GEN2"
+    \\ },
+    \\ "conditions": [
+    \\  {
+    \\   "type": "Started",
+    \\   "state": "CONDITION_SUCCEEDED",
+    \\   "message": "Started deployed execution in 28.62s.",
+    \\   "lastTransitionTime": "2026-10-21T13:38:33.712202Z"
+    \\  },
+    \\  {
+    \\   "type": "Completed",
+    \\   "state": "CONDITION_FAILED",
+    \\   "lastTransitionTime": "2026-10-21T13:38:42.993701Z"
+    \\  },
+    \\  {
+    \\   "type": "ContainerReady",
+    \\   "state": "CONDITION_SUCCEEDED",
+    \\   "message": "Imported container image.",
+    \\   "lastTransitionTime": "2026-10-21T13:38:04.979021Z"
+    \\  },
+    \\  {
+    \\   "type": "ResourcesAvailable",
+    \\   "state": "CONDITION_SUCCEEDED",
+    \\   "message": "Provisioned imported containers.",
+    \\   "lastTransitionTime": "2026-10-21T13:38:05.088973Z"
+    \\  }
+    \\ ],
+    \\ "observedGeneration": "2",
+    \\ "startTime": "2026-10-21T13:38:14.426193Z",
+    \\ "cancelledCount": 1,
+    \\ "logUri": "https://console.cloud.google.com/logs/viewer?project=extractctl&advancedFilter=resource.type%3D%22cloud_run_job%22%0Aresource.labels.job_name%3D%22zigps-0b36f5-cancel%22%0Aresource.labels.location%3D%22us-central1%22%0Alabels.%22run.googleapis.com/execution_name%22%3D%22zigps-0b36f5-cancel-vtff9%22",
+    \\ "creator": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\ "etag": "\"CNuA49YGENDHriI/cHJvamVjdHMvZXh0cmFjdGN0bC9sb2NhdGlvbnMvdXMtY2VudHJhbDEvam9icy96aWdwcy0wYjM2ZjUtY2FuY2VsL2V4ZWN1dGlvbnMvemlncHMtMGIzNmY1LWNhbmNlbC12dGZmOQ\""
+    \\}
+;
+
+/// That cancel's operation: done, failing with code 2, as the run's did. HTTP 200.
+pub const operation_cancel_raced_status = 200;
+pub const operation_cancel_raced =
+    \\{
+    \\ "name": "projects/extractctl/locations/us-central1/operations/0f4e2a3a-bf02-4030-9daf-88d3b338b44b",
+    \\ "metadata": {
+    \\  "@type": "type.googleapis.com/google.cloud.run.v2.Execution",
+    \\  "name": "projects/extractctl/locations/us-central1/jobs/zigps-0b36f5-cancel/executions/zigps-0b36f5-cancel-vtff9",
+    \\  "uid": "29540b3c-839a-4c33-b599-e5e115dfce0b",
+    \\  "generation": "2",
+    \\  "createTime": "2026-10-21T13:38:04.405864Z",
+    \\  "completionTime": "2026-10-21T13:38:42.993701Z",
+    \\  "updateTime": "2026-10-21T13:38:35.072066Z",
+    \\  "launchStage": "GA",
+    \\  "job": "zigps-0b36f5-cancel",
+    \\  "parallelism": 1,
+    \\  "taskCount": 1,
+    \\  "template": {
+    \\   "containers": [
+    \\    {
+    \\     "image": "us-docker.pkg.dev/cloudrun/container/job@sha256:611099e80127f3c779e6fda0a5982818ff9fd03a228f9457cd3a1b1fed9f1589",
+    \\     "env": [
+    \\      {
+    \\       "name": "SLEEP_MS",
+    \\       "value": "600000"
+    \\      }
+    \\     ],
+    \\     "resources": {
+    \\      "limits": {
+    \\       "cpu": "1000m",
+    \\       "memory": "512Mi"
+    \\      }
+    \\     }
+    \\    }
+    \\   ],
+    \\   "maxRetries": 0,
+    \\   "timeout": "900s",
+    \\   "serviceAccount": "82150720798-compute@developer.gserviceaccount.com",
+    \\   "executionEnvironment": "EXECUTION_ENVIRONMENT_GEN2"
+    \\  },
+    \\  "conditions": [
+    \\   {
+    \\    "type": "Started",
+    \\    "state": "CONDITION_SUCCEEDED",
+    \\    "message": "Started deployed execution in 28.62s.",
+    \\    "lastTransitionTime": "2026-10-21T13:38:33.712202Z"
+    \\   },
+    \\   {
+    \\    "type": "Completed",
+    \\    "state": "CONDITION_FAILED",
+    \\    "lastTransitionTime": "2026-10-21T13:38:42.993701Z"
+    \\   },
+    \\   {
+    \\    "type": "ContainerReady",
+    \\    "state": "CONDITION_SUCCEEDED",
+    \\    "message": "Imported container image.",
+    \\    "lastTransitionTime": "2026-10-21T13:38:04.979021Z"
+    \\   },
+    \\   {
+    \\    "type": "ResourcesAvailable",
+    \\    "state": "CONDITION_SUCCEEDED",
+    \\    "message": "Provisioned imported containers.",
+    \\    "lastTransitionTime": "2026-10-21T13:38:05.088973Z"
+    \\   }
+    \\  ],
+    \\  "observedGeneration": "2",
+    \\  "startTime": "2026-10-21T13:38:14.426193Z",
+    \\  "cancelledCount": 1,
+    \\  "logUri": "https://console.cloud.google.com/logs/viewer?project=extractctl&advancedFilter=resource.type%3D%22cloud_run_job%22%0Aresource.labels.job_name%3D%22zigps-0b36f5-cancel%22%0Aresource.labels.location%3D%22us-central1%22%0Alabels.%22run.googleapis.com/execution_name%22%3D%22zigps-0b36f5-cancel-vtff9%22",
+    \\  "creator": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\  "etag": "\"CNuA49YGENDHriI/cHJvamVjdHMvZXh0cmFjdGN0bC9sb2NhdGlvbnMvdXMtY2VudHJhbDEvam9icy96aWdwcy0wYjM2ZjUtY2FuY2VsL2V4ZWN1dGlvbnMvemlncHMtMGIzNmY1LWNhbmNlbC12dGZmOQ\""
+    \\ },
+    \\ "done": true,
+    \\ "error": {
+    \\  "code": 2,
+    \\  "message": "Unspecified error."
+    \\ }
+    \\}
+;

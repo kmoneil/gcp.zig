@@ -3,15 +3,18 @@
 # Testing with the in-memory Cloud Run
 
 `run.testing.FakeRun` is Cloud Run in memory, behind
-`Client.Options.transport`, for tests of code that reads services and
-revisions: a health view's tests, say, with no network and no project.
-It answers the module's reads as production answered them when measured
-(experimental, as the module is).
+`Client.Options.transport`, for tests of code that reads services,
+revisions, jobs and executions, and of code that runs a job, cancels an
+execution or sends a service's traffic to one revision: a console's
+tests, say, with no network and no project. It answers the module's
+calls as production answered them when measured (experimental, as the
+module is; its jobs, executions and writes carry their own marker).
 
-The API here is read only, so the fake's write side is the test's:
-`putLocation`, `putService` and `putRevision` stand in for whoever
-deployed, and `setUnreachable` for the regions a `-` listing names as
-unreachable.
+What production holds is the test's to put in: `putLocation`,
+`putService`, `putRevision`, `putJob` and `putExecution` stand in for
+whoever deployed, `setUnreachable` for the regions a `-` listing names as
+unreachable, and `setExecutionStatus` for a job's container, moving an
+execution on: nothing moves on its own.
 
 <!-- snippet: tests/docs_examples.zig#run-fake -->
 ```zig
@@ -55,6 +58,55 @@ test "the recent revisions, as a health view draws them" {
 }
 ```
 
+And the writes a console confirms, against the same fake:
+
+<!-- snippet: tests/docs_examples.zig#run-fake-writes -->
+```zig
+test "a rollback and a run, as a console confirms and sends them" {
+    var fake: run.testing.FakeRun = .init(std.testing.allocator, std.testing.io, .{ .project_id = "my-project" });
+    defer fake.deinit();
+    try fake.putLocation("us-central1");
+    _ = try fake.putService(.{ .location = "us-central1", .id = "checkout", .traffic = &.{.{ .type = .latest, .percent = 100 }} });
+    _ = try fake.putRevision(.{ .location = "us-central1", .service = "checkout", .id = "checkout-00007-abc", .conditions = &.{.{ .type = "Ready", .state = .succeeded }} });
+    _ = try fake.putJob(.{ .location = "us-central1", .id = "nightly-report" });
+
+    var token: run.StaticToken = .{ .token = "none" };
+    var client = try run.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .scope = .read_write,
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+
+    // The rollback, guarded by the etag the read gave.
+    var service = try client.getService("us-central1", "checkout");
+    defer service.deinit();
+    var request = try client.routeAllTrafficRequest("us-central1", "checkout", "checkout-00007-abc", .{ .etag = service.value.etag });
+    defer request.deinit();
+    try std.testing.expect(std.mem.endsWith(u8, request.value.url, "?updateMask=traffic,etag"));
+    var change = try client.routeAllTraffic("us-central1", "checkout", "checkout-00007-abc", .{ .etag = service.value.etag });
+    defer change.deinit();
+    var done = try client.getOperation(change.value.name);
+    defer done.deinit();
+    try std.testing.expectEqualStrings("checkout-00007-abc", done.value.subject.service.traffic[0].revision);
+    // The same read's etag is stale now.
+    try std.testing.expectError(error.Aborted, client.routeAllTraffic("us-central1", "checkout", "checkout-00008-def", .{ .etag = service.value.etag }));
+
+    // A run: pending at first, as production's were; the test stands in
+    // for the job's container.
+    var ran = try client.runJob("us-central1", "nightly-report");
+    defer ran.deinit();
+    const execution = ran.value.subject.execution.name;
+    try fake.setExecutionStatus(execution, .running);
+    try fake.setExecutionStatus(execution, .succeeded);
+    var finished = try client.getOperation(ran.value.name);
+    defer finished.deinit();
+    try std.testing.expect(finished.value.done);
+    try std.testing.expectEqual(run.ExecutionStatus.succeeded, finished.value.subject.execution.status());
+}
+```
+
 ## What it models
 
 Each as production answered when measured on 2026-10-19:
@@ -79,11 +131,61 @@ Each as production answered when measured on 2026-10-19:
 production could not hold: a location or service nobody put, an id
 taken, malformed or `-`.
 
-Not modelled, answered 501 with the reason: writes of any kind
-(deploys, traffic, deletes, IAM), jobs, executions, operations, and
-another project's paths.
+### Jobs, executions and the writes
+
+Each as production answered when measured on 2026-10-21:
+
+- Jobs are listed one region at a time: `-` is 400 "Request contains an
+  invalid argument.", a region nobody put 403 "Permission denied on
+  'locations/<l>' (or it may not exist)". `jobs/-` lists every job's
+  executions; a job nobody has lists none. Both lists come newest first.
+- **A run** makes an execution named `<job>-<suffix>`, the suffix a
+  counter (`00001`, `00002`, ...) so a test can predict it, as
+  `PutJob.run_outcome` says: `.pending` (the default, as production's
+  were for their first 90 s) or `.running` until the test moves it, or
+  `.succeeded` or `.failed` already ended. Its operation is done once the
+  execution has ended, failing with code 10 and the task's words for a
+  failed one. Two runs of one job may run at once.
+- **A cancel** of a running execution makes it cancelling, and the test
+  moves it on to cancelled; of a pending one, cancelled at once without a
+  completion time, as production's was; of a cancelling one, nothing
+  changes. An ended one is 400 FAILED_PRECONDITION "Execution '<id>'
+  cannot be cancelled because it is not running." Moved to `.failed`
+  after a cancel, an execution reads as one production cancelled as its
+  task started: `Completed` failed with no reason, a task counted
+  cancelled, and both its operations failing with code 2, "Unspecified
+  error."
+- **A traffic change** sets the one target asked, a new generation and a
+  new etag (the fake's own form, `"v<version>"`). Under
+  `updateMask=traffic,etag` a stale etag is 409 ABORTED "Conflict for
+  resource '<s>': version '<a>' was specified but current version is
+  '<b>'." (the fake's versions are counters where production's are
+  times); under `updateMask=traffic` the etag is ignored; a change to the
+  traffic the service already has changes nothing and checks no etag. A
+  revision not prefixed with the service's id is 400 at once; one the
+  service does not have, or one not ready, is taken, and its operation
+  fails (code 9, or code 5 with the revision's own words) while the
+  service keeps the asked traffic and fails. `validateOnly` checks the
+  etag and the prefix, and changes nothing. Its operation is done from
+  its first read on.
+- Faults on the writes as on the reads: a lost answer to a run leaves the
+  execution made, as a real one would.
+
+`putJob` and `putExecution` refuse, with nothing kept, what production
+could not hold: a location or job nobody put, an id taken, malformed or
+`-`, a status of `.unspecified` or `.unknown`.
+
+Not modelled, answered 501 with the reason: other writes (deploys,
+deletes, IAM), run overrides, traffic other than one revision at 100 %,
+an update mask other than the two above, reading a `validateOnly`
+request's operation, an etag the fake did not make under the etag mask,
+`-` for a location in a jobs path other than the jobs list, and another
+project's paths.
 
 A gated production suite (`tests/run_gcp_integration.zig`, `RUN_TEST=1`)
 deploys a real `zigps-` hello service, breaks it with an image tag
 nobody has, seeds the fake with everything production lists, and holds
-the fake to production's answer for every read.
+the fake to production's answer for every read. Its writes suite
+(`RUN_WRITES_TEST=1`) runs, cancels and routes traffic on real `zigps-`
+jobs and a service, then replays the same script on a fake seeded from
+production's reads and holds every outcome and refusal equal.

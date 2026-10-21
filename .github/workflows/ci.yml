@@ -603,6 +603,13 @@ jobs:
         # its own job at 4M, about an hour at four times the Mac, to be
         # priced by its first nights. Its seven clean nights are the
         # writes' own week, as slow-scheduler's are.
+        # slow-run (0.54.0) holds FakeRun's runs, cancels, status moves
+        # and traffic changes to a model of what production took and
+        # refused, the client against the fake for up to 32 steps a run:
+        # about 0.69 ms a run on the Mac (100K in 69 s), too slow to
+        # share run's 6M, so its own job at 1200K, about 55 minutes at
+        # four times the Mac, to be priced by its first nights. Its seven
+        # clean nights are the jobs' and writes' own week.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 630K }
           - { job: auth, module: auth, filter: fuzz, iterations: 850K }
@@ -633,6 +640,7 @@ jobs:
           - { job: scheduler, module: scheduler, filter: fuzz, iterations: 10M }
           - { job: slow-scheduler, module: scheduler, filter: slow property, iterations: 4M }
           - { job: run, module: run, filter: fuzz, iterations: 6M }
+          - { job: slow-run, module: run, filter: slow property, iterations: 1200K }
           - { job: dataflow, module: dataflow, filter: fuzz, iterations: 8M }
           - { job: slow-dataflow, module: dataflow, filter: slow property, iterations: 4M }
     runs-on: ubuntu-latest

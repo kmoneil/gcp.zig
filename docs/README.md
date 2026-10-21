@@ -128,7 +128,7 @@ Google, not only what Google documents, and where the emulators differ.
 | Guide | What's in it |
 | --- | --- |
 | [Overview](run/README.md) | The services and revisions a project runs: conditions, traffic, `ready()`, deploy markers; jobs and executions with `Execution.status()`; run a job, cancel an execution and send all traffic to one revision with the exact request first; and what production showed when measured (experimental) |
-| [Testing](run/testing.md) | An in-memory Cloud Run for your own tests, held to production's answers (experimental) |
+| [Testing](run/testing.md) | An in-memory Cloud Run for your own tests: reads, runs, cancels and traffic changes held to production's answers (experimental) |
 
 ## 🌊 Dataflow
 
