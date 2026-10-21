@@ -42,9 +42,12 @@ jobs:
         run: python3 tools/check_docs.py
 
       # tools/await_pr.py waits on a pull request and checks that what
-      # merged is what CI tested; its decisions, on canned answers.
+      # merged is what CI tested; tools/discovery_drift.py says what
+      # changed between two discovery documents. Each on canned inputs.
       - name: Tools
-        run: python3 -I tools/await_pr.py --self-test
+        run: |
+          python3 -I tools/await_pr.py --self-test
+          python3 -I tools/discovery_drift.py --self-test
 
       # zigvet (github.com/kmoneil/zigvet): code the compiler accepts that
       # is almost certainly wrong, such as a pointer to stack memory that
