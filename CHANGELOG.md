@@ -4,6 +4,39 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.55.0 (unreleased)
+
+- bigquery: new module, **experimental**, for issue #270: the read
+  side of BigQuery's v2 API. `Client.listDatasets` (the client's
+  project or any other, `all` for hidden ones, a label filter),
+  `getDataset`, `listTables` (as a list carries them: no schema, no
+  row count), `getTable` (its schema with nested records, row count,
+  bytes, partitioning, clustering, and a view's or materialized
+  view's query), `listJobs` (newest first, the full projection so a
+  query's text comes back; `all_users`, state and creation-time
+  filters) and `getJob` (`JobRef.location` for a job outside the US).
+  Refs (`DatasetRef`, `TableRef`, `JobRef`) name their project, an
+  empty one being the client's own, so `bigquery-public-data` reads as
+  easily as one's own. `Client.Options.scope` (`bigquery.Scope`:
+  `.bigquery`, the default, `.cloud_platform` or
+  `.cloud_platform_read_only`) picks the one OAuth scope a client asks
+  for: BigQuery has no read-only scope of its own, and
+  `cloud-platform.read-only` served every read here (measured). A
+  refusal's `errors[].reason` decides its error over its status:
+  `rateLimitExceeded` (sent as a 403 at times), `backendError`,
+  `badGateway` and `internalError` are retried; `invalidQuery`,
+  `bytesBilledLimitExceeded`, `responseTooLarge` and `quotaExceeded`
+  are errors of their own (`error.InvalidQuery`,
+  `BytesBilledLimitExceeded`, `ResultTooLarge`, `QuotaExceeded`), for
+  the queries to come.
+- core: `rpc.Engine.classify_refusal`, for a service whose refusals
+  name their kind in the body: the error a refusal stands for, which
+  then decides the retry as any mapped error does. Null, the default,
+  keeps the mapping by status.
+- auth, dataflow, error_reporting, firestore, kms, logging, monitoring,
+  pubsub, resource_manager, run, scheduler, secret_manager and
+  storage: unchanged.
+
 ## 0.54.0 (2026-10-21)
 
 - run: jobs and their executions, read, for issue #272:

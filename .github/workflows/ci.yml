@@ -610,6 +610,12 @@ jobs:
         # share run's 6M, so its own job at 1200K, about 55 minutes at
         # four times the Mac, to be priced by its first nights. Its seven
         # clean nights are the jobs' and writes' own week.
+        # bigquery (0.55.0) starts at estimates from a local run: its seven
+        # decoders in one property took about 0.09 ms a run on the Mac
+        # (2M in 190 s of fuzzing; its corpus bodies are tables with
+        # their schemas), so 6M, as run's, about 36 minutes at four
+        # times the Mac, to be priced by its first nights. Its values
+        # and query pages join the property in 0.55.0's later steps.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 630K }
           - { job: auth, module: auth, filter: fuzz, iterations: 850K }
@@ -643,6 +649,7 @@ jobs:
           - { job: slow-run, module: run, filter: slow property, iterations: 1200K }
           - { job: dataflow, module: dataflow, filter: fuzz, iterations: 8M }
           - { job: slow-dataflow, module: dataflow, filter: slow property, iterations: 4M }
+          - { job: bigquery, module: bigquery, filter: fuzz, iterations: 6M }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     # actions: read finds and downloads the corpus an earlier run kept.
