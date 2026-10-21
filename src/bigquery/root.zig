@@ -53,6 +53,21 @@ pub const ListOptions = @import("types.zig").ListOptions;
 pub const ListDatasetsOptions = @import("types.zig").ListDatasetsOptions;
 pub const ListJobsOptions = @import("types.zig").ListJobsOptions;
 
+/// A query's rows, decoded against its schema.
+pub const Row = @import("values.zig").Row;
+pub const Cell = @import("values.zig").Cell;
+pub const Value = @import("values.zig").Value;
+pub const Decimal = @import("values.zig").Decimal;
+pub const Date = @import("values.zig").Date;
+pub const Time = @import("values.zig").Time;
+pub const DateTime = @import("values.zig").DateTime;
+pub const Interval = @import("values.zig").Interval;
+pub const Range = @import("values.zig").Range;
+pub const RangeBound = @import("values.zig").RangeBound;
+/// Where a query error points, `errorPosition`'s answer.
+pub const Position = @import("values.zig").Position;
+pub const errorPosition = @import("values.zig").errorPosition;
+
 /// The fixed limits and naming rules the client checks before sending.
 pub const limits = @import("validate.zig");
 
@@ -74,6 +89,7 @@ test {
     _ = @import("rpc.zig");
     _ = @import("types.zig");
     _ = @import("validate.zig");
+    _ = @import("values.zig");
 }
 
 test "every public declaration of types.zig is public here too" {

@@ -1489,3 +1489,1252 @@ pub const cancel_read_only =
     \\ }
     \\}
 ;
+
+/// The every-type row from jobs.query, timestamps asked as int64 microseconds (formatOptions.useInt64Timestamp), as this library asks. HTTP 200.
+pub const query_every_type_status = 200;
+pub const query_every_type =
+    \\{
+    \\ "kind": "bigquery#queryResponse",
+    \\ "schema": {
+    \\  "fields": [
+    \\   {
+    \\    "name": "int64",
+    \\    "type": "INTEGER",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "int64_min",
+    \\    "type": "INTEGER",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "float64",
+    \\    "type": "FLOAT",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "nan",
+    \\    "type": "FLOAT",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "inf",
+    \\    "type": "FLOAT",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "ninf",
+    \\    "type": "FLOAT",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "numeric",
+    \\    "type": "NUMERIC",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "bignumeric",
+    \\    "type": "BIGNUMERIC",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "bool",
+    \\    "type": "BOOLEAN",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "string",
+    \\    "type": "STRING",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "bytes",
+    \\    "type": "BYTES",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "date",
+    \\    "type": "DATE",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "time",
+    \\    "type": "TIME",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "datetime",
+    \\    "type": "DATETIME",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "timestamp",
+    \\    "type": "TIMESTAMP",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "geography",
+    \\    "type": "GEOGRAPHY",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "json",
+    \\    "type": "JSON",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "interval_sum",
+    \\    "type": "INTERVAL",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "range_date",
+    \\    "type": "RANGE",
+    \\    "mode": "NULLABLE",
+    \\    "rangeElementType": {
+    \\     "type": "DATE"
+    \\    }
+    \\   },
+    \\   {
+    \\    "name": "range_ts_open",
+    \\    "type": "RANGE",
+    \\    "mode": "NULLABLE",
+    \\    "rangeElementType": {
+    \\     "type": "TIMESTAMP"
+    \\    }
+    \\   },
+    \\   {
+    \\    "name": "range_datetime",
+    \\    "type": "RANGE",
+    \\    "mode": "NULLABLE",
+    \\    "rangeElementType": {
+    \\     "type": "DATETIME"
+    \\    }
+    \\   },
+    \\   {
+    \\    "name": "interval_full",
+    \\    "type": "INTERVAL",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "interval_negative",
+    \\    "type": "INTERVAL",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "interval_fraction",
+    \\    "type": "INTERVAL",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "numeric_trailing",
+    \\    "type": "NUMERIC",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "bool_false",
+    \\    "type": "BOOLEAN",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "time_whole",
+    \\    "type": "TIME",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "polygon",
+    \\    "type": "GEOGRAPHY",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "json_numbers",
+    \\    "type": "JSON",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "array_int",
+    \\    "type": "INTEGER",
+    \\    "mode": "REPEATED"
+    \\   },
+    \\   {
+    \\    "name": "array_empty",
+    \\    "type": "STRING",
+    \\    "mode": "REPEATED"
+    \\   },
+    \\   {
+    \\    "name": "record",
+    \\    "type": "RECORD",
+    \\    "mode": "NULLABLE",
+    \\    "fields": [
+    \\     {
+    \\      "name": "x",
+    \\      "type": "INTEGER",
+    \\      "mode": "NULLABLE"
+    \\     },
+    \\     {
+    \\      "name": "y",
+    \\      "type": "STRING",
+    \\      "mode": "NULLABLE"
+    \\     },
+    \\     {
+    \\      "name": "zs",
+    \\      "type": "RECORD",
+    \\      "mode": "REPEATED",
+    \\      "fields": [
+    \\       {
+    \\        "name": "z",
+    \\        "type": "INTEGER",
+    \\        "mode": "NULLABLE"
+    \\       }
+    \\      ]
+    \\     }
+    \\    ]
+    \\   },
+    \\   {
+    \\    "name": "array_record",
+    \\    "type": "RECORD",
+    \\    "mode": "REPEATED",
+    \\    "fields": [
+    \\     {
+    \\      "name": "a",
+    \\      "type": "INTEGER",
+    \\      "mode": "NULLABLE"
+    \\     }
+    \\    ]
+    \\   },
+    \\   {
+    \\    "name": "null_int",
+    \\    "type": "INTEGER",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "null_record",
+    \\    "type": "RECORD",
+    \\    "mode": "NULLABLE",
+    \\    "fields": [
+    \\     {
+    \\      "name": "q",
+    \\      "type": "INTEGER",
+    \\      "mode": "NULLABLE"
+    \\     }
+    \\    ]
+    \\   }
+    \\  ]
+    \\ },
+    \\ "jobReference": {
+    \\  "projectId": "extractctl",
+    \\  "jobId": "job_l6pMSV47fOfk6-gPmc6nJhNmRZ8h",
+    \\  "location": "US"
+    \\ },
+    \\ "totalRows": "1",
+    \\ "rows": [
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "1"
+    \\    },
+    \\    {
+    \\     "v": "-9223372036854775808"
+    \\    },
+    \\    {
+    \\     "v": "1.5"
+    \\    },
+    \\    {
+    \\     "v": "NaN"
+    \\    },
+    \\    {
+    \\     "v": "Infinity"
+    \\    },
+    \\    {
+    \\     "v": "-Infinity"
+    \\    },
+    \\    {
+    \\     "v": "123.456"
+    \\    },
+    \\    {
+    \\     "v": "1.23456789012345678901234567890123456789"
+    \\    },
+    \\    {
+    \\     "v": "true"
+    \\    },
+    \\    {
+    \\     "v": "héllo \"q\""
+    \\    },
+    \\    {
+    \\     "v": "AP9hYg=="
+    \\    },
+    \\    {
+    \\     "v": "2026-10-21"
+    \\    },
+    \\    {
+    \\     "v": "13:14:15.123456"
+    \\    },
+    \\    {
+    \\     "v": "2026-10-21T13:14:15.123456"
+    \\    },
+    \\    {
+    \\     "v": "1792588455123456"
+    \\    },
+    \\    {
+    \\     "v": "POINT(-122.35 47.62)"
+    \\    },
+    \\    {
+    \\     "v": "{\"a\":[1,2],\"b\":null}"
+    \\    },
+    \\    {
+    \\     "v": "1-0 2 3:0:0"
+    \\    },
+    \\    {
+    \\     "v": "[2024-01-01, 2024-02-01)"
+    \\    },
+    \\    {
+    \\     "v": "[1704067200000000, UNBOUNDED)"
+    \\    },
+    \\    {
+    \\     "v": "[2024-01-01T01:02:03.500000, 2024-01-02T00:00:00)"
+    \\    },
+    \\    {
+    \\     "v": "1-2 3 4:5:6"
+    \\    },
+    \\    {
+    \\     "v": "0-0 -3 0:0:0"
+    \\    },
+    \\    {
+    \\     "v": "0-0 0 0:0:0.250"
+    \\    },
+    \\    {
+    \\     "v": "1.5"
+    \\    },
+    \\    {
+    \\     "v": "false"
+    \\    },
+    \\    {
+    \\     "v": "01:02:03"
+    \\    },
+    \\    {
+    \\     "v": "POLYGON((1 1, 0 1, 0 0, 1 1))"
+    \\    },
+    \\    {
+    \\     "v": "{\"a\":10000000000000000000,\"s\":\"x\",\"z\":1.0}"
+    \\    },
+    \\    {
+    \\     "v": [
+    \\      {
+    \\       "v": "1"
+    \\      },
+    \\      {
+    \\       "v": "2"
+    \\      },
+    \\      {
+    \\       "v": "3"
+    \\      }
+    \\     ]
+    \\    },
+    \\    {
+    \\     "v": []
+    \\    },
+    \\    {
+    \\     "v": {
+    \\      "f": [
+    \\       {
+    \\        "v": "1"
+    \\       },
+    \\       {
+    \\        "v": "y"
+    \\       },
+    \\       {
+    \\        "v": [
+    \\         {
+    \\          "v": {
+    \\           "f": [
+    \\            {
+    \\             "v": "2"
+    \\            }
+    \\           ]
+    \\          }
+    \\         }
+    \\        ]
+    \\       }
+    \\      ]
+    \\     }
+    \\    },
+    \\    {
+    \\     "v": [
+    \\      {
+    \\       "v": {
+    \\        "f": [
+    \\         {
+    \\          "v": "1"
+    \\         }
+    \\        ]
+    \\       }
+    \\      },
+    \\      {
+    \\       "v": {
+    \\        "f": [
+    \\         {
+    \\          "v": "2"
+    \\         }
+    \\        ]
+    \\       }
+    \\      }
+    \\     ]
+    \\    },
+    \\    {
+    \\     "v": null
+    \\    },
+    \\    {
+    \\     "v": null
+    \\    }
+    \\   ]
+    \\  }
+    \\ ],
+    \\ "totalBytesProcessed": "0",
+    \\ "jobComplete": true,
+    \\ "cacheHit": true,
+    \\ "queryId": "job_l6pMSV47fOfk6-gPmc6nJhNmRZ8h",
+    \\ "jobCreationReason": {
+    \\  "code": "REQUESTED"
+    \\ },
+    \\ "totalBytesBilled": "0",
+    \\ "location": "US",
+    \\ "creationTime": "1792597451747",
+    \\ "startTime": "1792597451800",
+    \\ "endTime": "1792597451882",
+    \\ "pageRowCount": "1",
+    \\ "statementType": "SELECT"
+    \\}
+;
+
+/// The same row with the default formats: a timestamp as seconds in exponent notation, a timestamp range's ends as decimal seconds. HTTP 200.
+pub const query_every_type_float_status = 200;
+pub const query_every_type_float =
+    \\{
+    \\ "kind": "bigquery#queryResponse",
+    \\ "schema": {
+    \\  "fields": [
+    \\   {
+    \\    "name": "int64",
+    \\    "type": "INTEGER",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "int64_min",
+    \\    "type": "INTEGER",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "float64",
+    \\    "type": "FLOAT",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "nan",
+    \\    "type": "FLOAT",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "inf",
+    \\    "type": "FLOAT",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "ninf",
+    \\    "type": "FLOAT",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "numeric",
+    \\    "type": "NUMERIC",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "bignumeric",
+    \\    "type": "BIGNUMERIC",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "bool",
+    \\    "type": "BOOLEAN",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "string",
+    \\    "type": "STRING",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "bytes",
+    \\    "type": "BYTES",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "date",
+    \\    "type": "DATE",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "time",
+    \\    "type": "TIME",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "datetime",
+    \\    "type": "DATETIME",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "timestamp",
+    \\    "type": "TIMESTAMP",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "geography",
+    \\    "type": "GEOGRAPHY",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "json",
+    \\    "type": "JSON",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "interval_sum",
+    \\    "type": "INTERVAL",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "range_date",
+    \\    "type": "RANGE",
+    \\    "mode": "NULLABLE",
+    \\    "rangeElementType": {
+    \\     "type": "DATE"
+    \\    }
+    \\   },
+    \\   {
+    \\    "name": "range_ts_open",
+    \\    "type": "RANGE",
+    \\    "mode": "NULLABLE",
+    \\    "rangeElementType": {
+    \\     "type": "TIMESTAMP"
+    \\    }
+    \\   },
+    \\   {
+    \\    "name": "range_datetime",
+    \\    "type": "RANGE",
+    \\    "mode": "NULLABLE",
+    \\    "rangeElementType": {
+    \\     "type": "DATETIME"
+    \\    }
+    \\   },
+    \\   {
+    \\    "name": "interval_full",
+    \\    "type": "INTERVAL",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "interval_negative",
+    \\    "type": "INTERVAL",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "interval_fraction",
+    \\    "type": "INTERVAL",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "numeric_trailing",
+    \\    "type": "NUMERIC",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "bool_false",
+    \\    "type": "BOOLEAN",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "time_whole",
+    \\    "type": "TIME",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "polygon",
+    \\    "type": "GEOGRAPHY",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "json_numbers",
+    \\    "type": "JSON",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "array_int",
+    \\    "type": "INTEGER",
+    \\    "mode": "REPEATED"
+    \\   },
+    \\   {
+    \\    "name": "array_empty",
+    \\    "type": "STRING",
+    \\    "mode": "REPEATED"
+    \\   },
+    \\   {
+    \\    "name": "record",
+    \\    "type": "RECORD",
+    \\    "mode": "NULLABLE",
+    \\    "fields": [
+    \\     {
+    \\      "name": "x",
+    \\      "type": "INTEGER",
+    \\      "mode": "NULLABLE"
+    \\     },
+    \\     {
+    \\      "name": "y",
+    \\      "type": "STRING",
+    \\      "mode": "NULLABLE"
+    \\     },
+    \\     {
+    \\      "name": "zs",
+    \\      "type": "RECORD",
+    \\      "mode": "REPEATED",
+    \\      "fields": [
+    \\       {
+    \\        "name": "z",
+    \\        "type": "INTEGER",
+    \\        "mode": "NULLABLE"
+    \\       }
+    \\      ]
+    \\     }
+    \\    ]
+    \\   },
+    \\   {
+    \\    "name": "array_record",
+    \\    "type": "RECORD",
+    \\    "mode": "REPEATED",
+    \\    "fields": [
+    \\     {
+    \\      "name": "a",
+    \\      "type": "INTEGER",
+    \\      "mode": "NULLABLE"
+    \\     }
+    \\    ]
+    \\   },
+    \\   {
+    \\    "name": "null_int",
+    \\    "type": "INTEGER",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "null_record",
+    \\    "type": "RECORD",
+    \\    "mode": "NULLABLE",
+    \\    "fields": [
+    \\     {
+    \\      "name": "q",
+    \\      "type": "INTEGER",
+    \\      "mode": "NULLABLE"
+    \\     }
+    \\    ]
+    \\   }
+    \\  ]
+    \\ },
+    \\ "jobReference": {
+    \\  "projectId": "extractctl",
+    \\  "jobId": "job_QuU_EunlZPOr_5lR1nUOYym6939N",
+    \\  "location": "US"
+    \\ },
+    \\ "totalRows": "1",
+    \\ "rows": [
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "1"
+    \\    },
+    \\    {
+    \\     "v": "-9223372036854775808"
+    \\    },
+    \\    {
+    \\     "v": "1.5"
+    \\    },
+    \\    {
+    \\     "v": "NaN"
+    \\    },
+    \\    {
+    \\     "v": "Infinity"
+    \\    },
+    \\    {
+    \\     "v": "-Infinity"
+    \\    },
+    \\    {
+    \\     "v": "123.456"
+    \\    },
+    \\    {
+    \\     "v": "1.23456789012345678901234567890123456789"
+    \\    },
+    \\    {
+    \\     "v": "true"
+    \\    },
+    \\    {
+    \\     "v": "héllo \"q\""
+    \\    },
+    \\    {
+    \\     "v": "AP9hYg=="
+    \\    },
+    \\    {
+    \\     "v": "2026-10-21"
+    \\    },
+    \\    {
+    \\     "v": "13:14:15.123456"
+    \\    },
+    \\    {
+    \\     "v": "2026-10-21T13:14:15.123456"
+    \\    },
+    \\    {
+    \\     "v": "1.792588455123456E9"
+    \\    },
+    \\    {
+    \\     "v": "POINT(-122.35 47.62)"
+    \\    },
+    \\    {
+    \\     "v": "{\"a\":[1,2],\"b\":null}"
+    \\    },
+    \\    {
+    \\     "v": "1-0 2 3:0:0"
+    \\    },
+    \\    {
+    \\     "v": "[2024-01-01, 2024-02-01)"
+    \\    },
+    \\    {
+    \\     "v": "[1704067200.000000, UNBOUNDED)"
+    \\    },
+    \\    {
+    \\     "v": "[2024-01-01T01:02:03.500000, 2024-01-02T00:00:00)"
+    \\    },
+    \\    {
+    \\     "v": "1-2 3 4:5:6"
+    \\    },
+    \\    {
+    \\     "v": "0-0 -3 0:0:0"
+    \\    },
+    \\    {
+    \\     "v": "0-0 0 0:0:0.250"
+    \\    },
+    \\    {
+    \\     "v": "1.5"
+    \\    },
+    \\    {
+    \\     "v": "false"
+    \\    },
+    \\    {
+    \\     "v": "01:02:03"
+    \\    },
+    \\    {
+    \\     "v": "POLYGON((1 1, 0 1, 0 0, 1 1))"
+    \\    },
+    \\    {
+    \\     "v": "{\"a\":10000000000000000000,\"s\":\"x\",\"z\":1.0}"
+    \\    },
+    \\    {
+    \\     "v": [
+    \\      {
+    \\       "v": "1"
+    \\      },
+    \\      {
+    \\       "v": "2"
+    \\      },
+    \\      {
+    \\       "v": "3"
+    \\      }
+    \\     ]
+    \\    },
+    \\    {
+    \\     "v": []
+    \\    },
+    \\    {
+    \\     "v": {
+    \\      "f": [
+    \\       {
+    \\        "v": "1"
+    \\       },
+    \\       {
+    \\        "v": "y"
+    \\       },
+    \\       {
+    \\        "v": [
+    \\         {
+    \\          "v": {
+    \\           "f": [
+    \\            {
+    \\             "v": "2"
+    \\            }
+    \\           ]
+    \\          }
+    \\         }
+    \\        ]
+    \\       }
+    \\      ]
+    \\     }
+    \\    },
+    \\    {
+    \\     "v": [
+    \\      {
+    \\       "v": {
+    \\        "f": [
+    \\         {
+    \\          "v": "1"
+    \\         }
+    \\        ]
+    \\       }
+    \\      },
+    \\      {
+    \\       "v": {
+    \\        "f": [
+    \\         {
+    \\          "v": "2"
+    \\         }
+    \\        ]
+    \\       }
+    \\      }
+    \\     ]
+    \\    },
+    \\    {
+    \\     "v": null
+    \\    },
+    \\    {
+    \\     "v": null
+    \\    }
+    \\   ]
+    \\  }
+    \\ ],
+    \\ "totalBytesProcessed": "0",
+    \\ "jobComplete": true,
+    \\ "cacheHit": false,
+    \\ "queryId": "job_QuU_EunlZPOr_5lR1nUOYym6939N",
+    \\ "jobCreationReason": {
+    \\  "code": "REQUESTED"
+    \\ },
+    \\ "totalBytesBilled": "0",
+    \\ "totalSlotMs": "30",
+    \\ "location": "US",
+    \\ "creationTime": "1792597451282",
+    \\ "startTime": "1792597451330",
+    \\ "endTime": "1792597451533",
+    \\ "pageRowCount": "1",
+    \\ "statementType": "SELECT"
+    \\}
+;
+
+/// The same row with timestampOutputFormat ISO8601_STRING. HTTP 200.
+pub const query_every_type_iso_status = 200;
+pub const query_every_type_iso =
+    \\{
+    \\ "kind": "bigquery#queryResponse",
+    \\ "schema": {
+    \\  "fields": [
+    \\   {
+    \\    "name": "int64",
+    \\    "type": "INTEGER",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "int64_min",
+    \\    "type": "INTEGER",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "float64",
+    \\    "type": "FLOAT",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "nan",
+    \\    "type": "FLOAT",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "inf",
+    \\    "type": "FLOAT",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "ninf",
+    \\    "type": "FLOAT",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "numeric",
+    \\    "type": "NUMERIC",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "bignumeric",
+    \\    "type": "BIGNUMERIC",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "bool",
+    \\    "type": "BOOLEAN",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "string",
+    \\    "type": "STRING",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "bytes",
+    \\    "type": "BYTES",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "date",
+    \\    "type": "DATE",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "time",
+    \\    "type": "TIME",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "datetime",
+    \\    "type": "DATETIME",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "timestamp",
+    \\    "type": "TIMESTAMP",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "geography",
+    \\    "type": "GEOGRAPHY",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "json",
+    \\    "type": "JSON",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "interval_sum",
+    \\    "type": "INTERVAL",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "range_date",
+    \\    "type": "RANGE",
+    \\    "mode": "NULLABLE",
+    \\    "rangeElementType": {
+    \\     "type": "DATE"
+    \\    }
+    \\   },
+    \\   {
+    \\    "name": "range_ts_open",
+    \\    "type": "RANGE",
+    \\    "mode": "NULLABLE",
+    \\    "rangeElementType": {
+    \\     "type": "TIMESTAMP"
+    \\    }
+    \\   },
+    \\   {
+    \\    "name": "range_datetime",
+    \\    "type": "RANGE",
+    \\    "mode": "NULLABLE",
+    \\    "rangeElementType": {
+    \\     "type": "DATETIME"
+    \\    }
+    \\   },
+    \\   {
+    \\    "name": "interval_full",
+    \\    "type": "INTERVAL",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "interval_negative",
+    \\    "type": "INTERVAL",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "interval_fraction",
+    \\    "type": "INTERVAL",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "numeric_trailing",
+    \\    "type": "NUMERIC",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "bool_false",
+    \\    "type": "BOOLEAN",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "time_whole",
+    \\    "type": "TIME",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "polygon",
+    \\    "type": "GEOGRAPHY",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "json_numbers",
+    \\    "type": "JSON",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "array_int",
+    \\    "type": "INTEGER",
+    \\    "mode": "REPEATED"
+    \\   },
+    \\   {
+    \\    "name": "array_empty",
+    \\    "type": "STRING",
+    \\    "mode": "REPEATED"
+    \\   },
+    \\   {
+    \\    "name": "record",
+    \\    "type": "RECORD",
+    \\    "mode": "NULLABLE",
+    \\    "fields": [
+    \\     {
+    \\      "name": "x",
+    \\      "type": "INTEGER",
+    \\      "mode": "NULLABLE"
+    \\     },
+    \\     {
+    \\      "name": "y",
+    \\      "type": "STRING",
+    \\      "mode": "NULLABLE"
+    \\     },
+    \\     {
+    \\      "name": "zs",
+    \\      "type": "RECORD",
+    \\      "mode": "REPEATED",
+    \\      "fields": [
+    \\       {
+    \\        "name": "z",
+    \\        "type": "INTEGER",
+    \\        "mode": "NULLABLE"
+    \\       }
+    \\      ]
+    \\     }
+    \\    ]
+    \\   },
+    \\   {
+    \\    "name": "array_record",
+    \\    "type": "RECORD",
+    \\    "mode": "REPEATED",
+    \\    "fields": [
+    \\     {
+    \\      "name": "a",
+    \\      "type": "INTEGER",
+    \\      "mode": "NULLABLE"
+    \\     }
+    \\    ]
+    \\   },
+    \\   {
+    \\    "name": "null_int",
+    \\    "type": "INTEGER",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "null_record",
+    \\    "type": "RECORD",
+    \\    "mode": "NULLABLE",
+    \\    "fields": [
+    \\     {
+    \\      "name": "q",
+    \\      "type": "INTEGER",
+    \\      "mode": "NULLABLE"
+    \\     }
+    \\    ]
+    \\   }
+    \\  ]
+    \\ },
+    \\ "jobReference": {
+    \\  "projectId": "extractctl",
+    \\  "jobId": "job_Z1gi-GZLF0T3Q9bqijaPTrkVSc1w",
+    \\  "location": "US"
+    \\ },
+    \\ "totalRows": "1",
+    \\ "rows": [
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "1"
+    \\    },
+    \\    {
+    \\     "v": "-9223372036854775808"
+    \\    },
+    \\    {
+    \\     "v": "1.5"
+    \\    },
+    \\    {
+    \\     "v": "NaN"
+    \\    },
+    \\    {
+    \\     "v": "Infinity"
+    \\    },
+    \\    {
+    \\     "v": "-Infinity"
+    \\    },
+    \\    {
+    \\     "v": "123.456"
+    \\    },
+    \\    {
+    \\     "v": "1.23456789012345678901234567890123456789"
+    \\    },
+    \\    {
+    \\     "v": "true"
+    \\    },
+    \\    {
+    \\     "v": "héllo \"q\""
+    \\    },
+    \\    {
+    \\     "v": "AP9hYg=="
+    \\    },
+    \\    {
+    \\     "v": "2026-10-21"
+    \\    },
+    \\    {
+    \\     "v": "13:14:15.123456"
+    \\    },
+    \\    {
+    \\     "v": "2026-10-21T13:14:15.123456"
+    \\    },
+    \\    {
+    \\     "v": "2026-10-21T13:14:15.123456Z"
+    \\    },
+    \\    {
+    \\     "v": "POINT(-122.35 47.62)"
+    \\    },
+    \\    {
+    \\     "v": "{\"a\":[1,2],\"b\":null}"
+    \\    },
+    \\    {
+    \\     "v": "1-0 2 3:0:0"
+    \\    },
+    \\    {
+    \\     "v": "[2024-01-01, 2024-02-01)"
+    \\    },
+    \\    {
+    \\     "v": "[2024-01-01T00:00:00.000000Z, UNBOUNDED)"
+    \\    },
+    \\    {
+    \\     "v": "[2024-01-01T01:02:03.500000, 2024-01-02T00:00:00)"
+    \\    },
+    \\    {
+    \\     "v": "1-2 3 4:5:6"
+    \\    },
+    \\    {
+    \\     "v": "0-0 -3 0:0:0"
+    \\    },
+    \\    {
+    \\     "v": "0-0 0 0:0:0.250"
+    \\    },
+    \\    {
+    \\     "v": "1.5"
+    \\    },
+    \\    {
+    \\     "v": "false"
+    \\    },
+    \\    {
+    \\     "v": "01:02:03"
+    \\    },
+    \\    {
+    \\     "v": "POLYGON((1 1, 0 1, 0 0, 1 1))"
+    \\    },
+    \\    {
+    \\     "v": "{\"a\":10000000000000000000,\"s\":\"x\",\"z\":1.0}"
+    \\    },
+    \\    {
+    \\     "v": [
+    \\      {
+    \\       "v": "1"
+    \\      },
+    \\      {
+    \\       "v": "2"
+    \\      },
+    \\      {
+    \\       "v": "3"
+    \\      }
+    \\     ]
+    \\    },
+    \\    {
+    \\     "v": []
+    \\    },
+    \\    {
+    \\     "v": {
+    \\      "f": [
+    \\       {
+    \\        "v": "1"
+    \\       },
+    \\       {
+    \\        "v": "y"
+    \\       },
+    \\       {
+    \\        "v": [
+    \\         {
+    \\          "v": {
+    \\           "f": [
+    \\            {
+    \\             "v": "2"
+    \\            }
+    \\           ]
+    \\          }
+    \\         }
+    \\        ]
+    \\       }
+    \\      ]
+    \\     }
+    \\    },
+    \\    {
+    \\     "v": [
+    \\      {
+    \\       "v": {
+    \\        "f": [
+    \\         {
+    \\          "v": "1"
+    \\         }
+    \\        ]
+    \\       }
+    \\      },
+    \\      {
+    \\       "v": {
+    \\        "f": [
+    \\         {
+    \\          "v": "2"
+    \\         }
+    \\        ]
+    \\       }
+    \\      }
+    \\     ]
+    \\    },
+    \\    {
+    \\     "v": null
+    \\    },
+    \\    {
+    \\     "v": null
+    \\    }
+    \\   ]
+    \\  }
+    \\ ],
+    \\ "totalBytesProcessed": "0",
+    \\ "jobComplete": true,
+    \\ "cacheHit": true,
+    \\ "queryId": "job_Z1gi-GZLF0T3Q9bqijaPTrkVSc1w",
+    \\ "jobCreationReason": {
+    \\  "code": "REQUESTED"
+    \\ },
+    \\ "totalBytesBilled": "0",
+    \\ "location": "US",
+    \\ "creationTime": "1792597452180",
+    \\ "startTime": "1792597452246",
+    \\ "endTime": "1792597452318",
+    \\ "pageRowCount": "1",
+    \\ "statementType": "SELECT"
+    \\}
+;
