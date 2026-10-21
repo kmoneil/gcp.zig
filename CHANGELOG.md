@@ -30,6 +30,33 @@ including the ones that did not change.
   took about 90 s to start; one cancelled before it started never got a
   completion time; a job nobody has lists no executions; a region that
   does not exist is a permission refusal for jobs.
+
+  And three writes a console confirms before sending, each with a twin
+  that builds its exact request without sending it, after the same
+  checks with the same errors: `Client.runJob` (`POST :run`, no
+  overrides) and `runJobRequest`, `cancelExecution` and
+  `cancelExecutionRequest`, and `routeAllTraffic` (all of a service's
+  traffic to one revision, `run.RouteOptions` with the read's `etag`,
+  required, and `validate_only`) and `routeAllTrafficRequest`. Each
+  answers an `Operation`. The traffic change is a `PATCH` with
+  `updateMask=traffic,etag`: production enforced the etag only when the
+  mask named it, taking a stale one under `updateMask=traffic`, and a
+  stale etag is `error.Aborted` with production's words, for
+  `validate_only` too. A run is sent again only when it cannot have
+  reached the server, since each landing makes an execution; a cancel
+  and a traffic change are retried as the reads are, and a cancel's
+  resend refused because the execution already ended is followed by a
+  read, an execution cancelled meaning an earlier attempt landed. A
+  client whose scope is `.read_only` refuses every write and preview
+  before sending, as production refuses every write to `run.readonly`.
+  `run.PreparedRequest` is exported. Measured on 2026-10-21 and written
+  in docs/run/README.md: a run's operation is done only when its
+  execution ends; a cancel ended its execution in 16 s, and an ended
+  execution refuses one; a traffic change was done in 4 s and changes
+  nothing else; `validate_only` does not check that the revision exists
+  or is ready, and a change to a missing or failed revision is taken,
+  its operation failing and the service keeping the asked traffic; the
+  permission each write takes.
 - auth, core, dataflow, error_reporting, firestore, kms, logging,
   monitoring, pubsub, resource_manager, scheduler, secret_manager and
   storage: unchanged.

@@ -2,13 +2,14 @@
 
 # 🏃 Run
 
-A client for Cloud Run's v2 API, read only: the services a project runs
-and the revisions behind them, with their conditions, for a health
-view's "recent revisions" widget and a trend chart's deploy markers;
-and the jobs it runs, with their executions. Nothing here deploys,
-routes traffic or deletes anything. **Experimental**: new in 0.48.0;
-jobs, executions and operations are new in 0.54.0 and carry their own
-marker.
+A client for Cloud Run's v2 API: the services a project runs and the
+revisions behind them, with their conditions, for a health view's
+"recent revisions" widget and a trend chart's deploy markers; the jobs
+it runs, with their executions; and three writes a console confirms
+before sending: run a job, cancel an execution, send all of a service's
+traffic to one revision. Nothing here deploys, creates or deletes
+anything. **Experimental**: new in 0.48.0; jobs, executions,
+operations and the writes are new in 0.54.0 and carry their own marker.
 
 ```zig
 const std = @import("std");
@@ -111,15 +112,105 @@ What production showed, on 2026-10-21 with Google's sample job image:
 - The job names its latest execution by its id alone; the client makes
   the full name.
 
+## Writes
+
+**Experimental** on their own, new in 0.54.0.
+
+| Call | Sends | Answers |
+| --- | --- | --- |
+| `Client.runJob(location, id)` | `POST .../jobs/J:run`, `{}`: the job as configured, no overrides | The operation; its subject the new execution, by its full name |
+| `Client.cancelExecution(location, job, id)` | `POST .../jobs/J/executions/E:cancel`, `{}` | The operation; its subject the execution |
+| `Client.routeAllTraffic(location, service, revision, .{ .etag, .validate_only })` | `PATCH .../services/S?updateMask=traffic,etag` with one target, 100 % to the revision, and the etag | The operation; its subject the service |
+
+Each has a twin, `runJobRequest`, `cancelExecutionRequest` and
+`routeAllTrafficRequest`, that builds the exact request without sending
+it, after the same checks with the same errors, for a console to show
+before it asks. `getOperation` reads an operation again by its name.
+Every write needs a client whose scope is `.read_write` (see
+[The scope](#the-scope)); a `.read_only` client refuses them, and their
+previews, before sending.
+
+### What a run, a cancel and a traffic change come to
+
+Measured on 2026-10-21:
+
+- **A run** answered in 0.25 s with its operation, not done. The new
+  execution is the operation's subject: read it with
+  `getExecutionNamed`. It was pending for about 90 s, then running, then
+  ended, and the run's operation was done only then, so follow the
+  execution. A job that sleeps 2 s ended 100 s after its run. A failed
+  execution's operation fails with code 10 and the task's words ("Task
+  <id>-task0 failed with exit code: 1 and message: The container exited
+  with an error.").
+- **A cancel** answered at once. The execution read running for about
+  10 s more, then counted a task cancelled, and ended `.cancelled` 16 s
+  after the cancel; one cancelled before it started ended at once,
+  without a completion time. An ended execution refuses a cancel,
+  `error.FailedPrecondition`: "Execution '<id>' cannot be cancelled
+  because it is not running."
+- **A traffic change**'s operation was done 4 s later. Only `traffic`
+  moved: no new revision, the template and labels as they were.
+- **The etag is the guard.** Production enforces it only when the update
+  mask names it (with `updateMask=traffic` alone it took a stale etag,
+  a made-up one and none at all), so the client sends
+  `updateMask=traffic,etag`. A service changed since the read is then
+  refused, `error.Aborted`: "Conflict for resource '<service>': version
+  '<a>' was specified but current version is '<b>'.", for
+  `validate_only` too. Read the service again, and ask the user again.
+- **`validate_only` does not check the revision.** Production took a
+  change to a revision the service did not have, and one to a revision
+  whose `Ready` failed; the real change was then taken too, its
+  operation failing (code 9, "Revision '<r>' does not exist or is
+  deleted. Update all traffic to route to currently available
+  revisions.", or the revision's own error) while the service kept the
+  asked traffic and its terminal condition went failed. The old revision
+  went on serving. **Offer only revisions whose `ready()` is true, and
+  read the operation to its end.**
+- Another service's revision is refused at once, 400: "Revision target
+  '<r>' invalid. Expected a revision prefixed with '<service>-'." The
+  client refuses a full resource name (a `/`) before sending.
+
+How each is retried:
+
+- **A run is never sent twice** once it may have reached the server:
+  each landing makes an execution. Only a refused connection or a failed
+  name lookup is retried; after any other failure, list the job's
+  executions, newest first, to see whether it ran.
+- **A cancel** is retried as the reads are: a second cancel while the
+  execution is stopping is taken. A resend that arrives after it ended
+  is refused; the client then reads it, and cancelled means an earlier
+  attempt landed: the answer is an operation with an empty name, done,
+  the execution as its subject.
+- **A traffic change** is retried as the reads are: a resend of one that
+  landed is taken and changes nothing (measured). A stale etag is never
+  retried.
+
+The permissions each takes, from Google's roles reference (2026-10-20):
+
+| Write | Permission | Cloud Run roles that hold it |
+| --- | --- | --- |
+| Run a job | `run.jobs.run` | Admin, Developer, Source Developer, Invoker, Jobs Executor, Jobs Executor With Overrides |
+| Cancel an execution | `run.executions.cancel` | Admin, Developer, Source Developer, Jobs Executor, Jobs Executor With Overrides (not Invoker) |
+| Send all traffic to a revision | `run.services.update` | Admin, Developer, Source Developer |
+
+The basic Owner and Editor roles hold all three; Viewer holds none.
+Running a job needs no Service Account User, as Cloud Run's page on
+executing jobs says. Its page on rollbacks asks for Developer and
+Service Account User on the service identity "to manage Cloud Run
+services and revisions", without saying whether a change to traffic
+alone checks the second.
+
 ## The scope
 
 A client asks its token provider for one scope, `Options.scope`:
 `.read_only` (`run.readonly`, the default, the narrowest every read
-takes), `.read_write` (`run`) or `.cloud_platform`. A provider made from
-a key file, workload identity or impersonation is fixed to the scope its
-first token was minted for (`auth.Credentials.bindsScopes`), so a
-program that reads with one client and writes with another gives each
-its own credentials.
+takes), `.read_write` (`run`) or `.cloud_platform`. Production refuses
+every write to `run.readonly`, "Request had insufficient authentication
+scopes.", and takes them with `run` or `cloud-platform`. A provider made
+from a key file, workload identity or impersonation is fixed to the
+scope its first token was minted for (`auth.Credentials.bindsScopes`),
+so a program that reads with one client and writes with another gives
+each its own credentials.
 
 ## What production showed
 

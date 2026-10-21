@@ -1,12 +1,15 @@
-//! Cloud Run's v2 API, read only: the services a project runs and the
-//! revisions behind them, with their conditions, for a health view's
-//! "recent revisions" widget and a trend chart's deploy markers; and the
-//! jobs it runs, with their executions. Nothing here deploys, routes
-//! traffic or deletes anything.
+//! Cloud Run's v2 API: the services a project runs and the revisions
+//! behind them, with their conditions, for a health view's "recent
+//! revisions" widget and a trend chart's deploy markers; the jobs it
+//! runs, with their executions; and three writes a console confirms
+//! before sending, each with a twin that builds its exact request: run a
+//! job, cancel an execution, send all of a service's traffic to one
+//! revision. Nothing here deploys, creates or deletes anything.
 //!
 //! **Experimental**: new in 0.48.0, and free to change between minor
-//! versions until it has been used in anger. Jobs, executions and
-//! operations are new in 0.54.0 and carry their own marker.
+//! versions until it has been used in anger. Jobs, executions,
+//! operations and the writes are new in 0.54.0 and carry their own
+//! marker.
 //!
 //! Services live in a location, so a reader lists `listLocations` once
 //! (v1's list on the same host: v2 has none) and asks per location, or
@@ -16,7 +19,9 @@
 //! and `Revision.ready` answer the health view's question; a revision's
 //! `create_time` is the deploy marker; `Execution.status` says where a
 //! run stands. A client asks for one OAuth scope, `Client.Options.scope`:
-//! `run.readonly` by default, the narrowest every read takes.
+//! `run.readonly` by default, the narrowest every read takes, and
+//! `.read_write` for the writes, which production refuses to
+//! `run.readonly`.
 
 pub const Client = @import("Client.zig");
 
@@ -57,6 +62,10 @@ pub const JobPage = @import("types.zig").JobPage;
 pub const Execution = @import("types.zig").Execution;
 pub const ExecutionPage = @import("types.zig").ExecutionPage;
 pub const Operation = @import("types.zig").Operation;
+pub const RouteOptions = @import("types.zig").RouteOptions;
+/// A request as a write would send it, built without sending it: what
+/// `Client.runJobRequest` and the other previews answer.
+pub const PreparedRequest = core.PreparedRequest;
 
 /// The fixed limits and naming rules the client checks before sending.
 pub const limits = @import("validate.zig");

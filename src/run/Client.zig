@@ -1,8 +1,10 @@
-//! A Cloud Run client, read only: the locations services live in, the
-//! services with their traffic and conditions, the revisions with their
-//! create times and readiness, the jobs with their executions, and the
-//! operations Cloud Run's writes answer. Nothing here deploys, routes
-//! traffic or deletes anything.
+//! A Cloud Run client: the locations services live in, the services with
+//! their traffic and conditions, the revisions with their create times and
+//! readiness, the jobs with their executions; and three writes a console
+//! confirms before sending, each with a twin that builds its exact request
+//! without sending it: run a job, cancel an execution, send all of a
+//! service's traffic to one revision. Nothing here deploys, creates or
+//! deletes anything.
 //!
 //! Every call blocks the calling task until it completes, using the
 //! `std.Io` and allocator passed to `init`. A client must not be used from
@@ -16,6 +18,7 @@ const core = @import("core");
 
 const codec = @import("codec.zig");
 const errors = @import("errors.zig");
+const logging = @import("logging.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
 const types = @import("types.zig");
@@ -23,6 +26,7 @@ const validate = @import("validate.zig");
 const Diagnostics = core.Diagnostics;
 const Error = errors.Error;
 const HttpTransport = core.transport.HttpTransport;
+const PreparedRequest = core.PreparedRequest;
 const RetryPolicy = core.RetryPolicy;
 const TokenProvider = core.TokenProvider;
 const Transport = core.transport.Transport;
@@ -68,8 +72,9 @@ pub const Options = struct {
     /// Sends the credentials' quota project as `x-goog-user-project`, as
     /// every module does.
     send_quota_project: bool = true,
-    /// Every call here is a GET: 5xx, 429 and dropped connections are
-    /// retried.
+    /// The reads, and the writes that set a state, retry 5xx, 429 and
+    /// dropped connections; a run is sent again only when it cannot have
+    /// reached the server. Each write's doc says how.
     retry: RetryPolicy = .{},
     /// How long one request may take before it is `error.TimedOut`, which
     /// is retried. 0 removes the limit.
@@ -444,6 +449,225 @@ pub fn getOperation(self: *Client, name: []const u8) Error!types.Owned(types.Ope
     return result;
 }
 
+/// Starts a new execution of the job, as it is configured (no overrides).
+/// Answers its operation at once, not done: the operation's subject is the
+/// new execution, by its full name, to read with `getExecutionNamed`. The
+/// operation is done only when the execution ends, which took 100 s for a
+/// job that sleeps 2 s (a 90 s start, measured 2026-10-21), so follow the
+/// execution rather than the operation. Two executions of one job may run
+/// at once. Takes `run.jobs.run`, and a client whose scope is not
+/// `.read_only`.
+///
+/// Every run that lands makes an execution, so a run that may have
+/// reached the server is never sent again: only a refused connection or a
+/// failed name lookup is retried. Any other failure is returned; list the
+/// job's executions, newest first, to see whether it ran.
+pub fn runJob(self: *Client, location: []const u8, id: []const u8) Error!types.Owned(types.Operation) {
+    rpc.begin(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var call = try self.runJobCall(a, location, id);
+    call.retryable = core.rpc.unsentOnly;
+    return self.operationCall(a, call);
+}
+
+/// Asks the execution to stop. Answers its operation at once, not done.
+/// The execution read running for about 10 s more, then counted a task
+/// cancelled, and ended `.cancelled` 16 s after the cancel (measured); one
+/// cancelled before it started ended at once. Takes
+/// `run.executions.cancel`, which Cloud Run Invoker lacks, and a client
+/// whose scope is not `.read_only`.
+///
+/// A cancel that lands twice is taken twice while the execution is still
+/// stopping, so it is retried as the reads are. A resend that arrives
+/// after the execution ended is refused, `error.FailedPrecondition`
+/// ("cannot be cancelled because it is not running"); after an attempt
+/// that may have reached the server, the execution is then read, and
+/// cancelled or cancelling means an earlier attempt landed: the answer is
+/// an operation with an empty name, done, the execution read as its
+/// subject. A first attempt's refusal is returned as it is.
+pub fn cancelExecution(self: *Client, location: []const u8, job_id: []const u8, id: []const u8) Error!types.Owned(types.Operation) {
+    rpc.begin(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var call = try self.cancelCall(a, location, job_id, id);
+    call.retry = false;
+    var attempt: u32 = 0;
+    var sent_before = false;
+    while (true) {
+        attempt += 1;
+        if (self.operationCall(a, call)) |operation| {
+            return operation;
+        } else |err| {
+            if (sent_before and err == error.FailedPrecondition) return self.cancelLanded(location, job_id, id, err);
+            if (!core.isRetryable(err) or attempt >= self.retry.max_attempts) return err;
+            const delay_ms = rpc.waitMs(self, attempt) orelse return err;
+            logging.warn("cancelling an execution failed with {t}; trying again in {d} ms", .{ err, delay_ms });
+            try self.io.sleep(.fromMilliseconds(delay_ms), .awake);
+            if (!core.rpc.unsentOnly(err, 0)) sent_before = true;
+        }
+    }
+}
+
+/// After a resend refused because the execution was no longer running:
+/// reads it, and answers for an earlier attempt that landed, or returns
+/// `refused`.
+fn cancelLanded(self: *Client, location: []const u8, job_id: []const u8, id: []const u8, refused: Error) Error!types.Owned(types.Operation) {
+    var read = self.getExecutionChecked(location, job_id, id) catch |err| switch (err) {
+        error.OutOfMemory, error.Canceled => return err,
+        else => {
+            if (self.diagnostics) |d| d.print("cancelling the execution was refused with {t} after an attempt that may have landed, and reading it to see failed with {t}", .{ refused, err });
+            return refused;
+        },
+    };
+    switch (read.value.status()) {
+        .cancelled, .cancelling => {},
+        else => {
+            read.deinit();
+            if (self.diagnostics) |d| d.print("cancelling the execution was refused with {t}: it is no longer running, and not cancelled", .{refused});
+            return refused;
+        },
+    }
+    // The read's success has cleared the refusal from `Diagnostics`.
+    logging.debug("a cancel resent after a lost answer was refused, and the execution reads cancelled: an earlier attempt landed", .{});
+    return .{
+        .arena = read.arena,
+        .value = .{ .name = "", .done = true, .subject = .{ .execution = read.value } },
+    };
+}
+
+/// Sends all of the service's traffic to one revision, by its id as
+/// `Revision.id` holds it: `traffic` becomes that one target at 100 %, and
+/// nothing else of the service changes (no new revision, measured). The
+/// change is sent with `options.etag` and an update mask naming it, so a
+/// service changed since that read is refused with `error.Aborted`
+/// ("Conflict for resource '<s>': version '<a>' was specified but current
+/// version is '<b>'.") rather than overwritten: production enforces the
+/// etag only when the mask names it (measured). Answers its operation,
+/// done 4 s later when measured, its subject the service.
+///
+/// Production takes a change to a revision the service does not have, or
+/// one whose `Ready` failed, and the operation then fails (code 9 or the
+/// revision's own error) while the service keeps the asked traffic and
+/// its terminal condition goes failed; `validate_only` does not catch
+/// either. Offer only revisions whose `ready()` is true. Takes
+/// `run.services.update`, and a client whose scope is not `.read_only`.
+///
+/// Retried as the reads are: a resend of a change that landed is no
+/// refusal, production taking a change to the traffic the service already
+/// has as one that changes nothing (measured).
+pub fn routeAllTraffic(self: *Client, location: []const u8, service_id: []const u8, revision: []const u8, options: types.RouteOptions) Error!types.Owned(types.Operation) {
+    rpc.begin(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    return self.operationCall(a, try self.routeCall(a, location, service_id, revision, options));
+}
+
+/// The request `runJob` sends for the same arguments, built without
+/// sending it, after the same checks with the same errors: to show before
+/// the call, or to record after it. Credentials and other headers are not
+/// part of it.
+pub fn runJobRequest(self: *Client, location: []const u8, id: []const u8) Error!types.Owned(PreparedRequest) {
+    rpc.begin(self);
+    var result: types.Owned(PreparedRequest) = try .init(self.gpa);
+    errdefer result.deinit();
+    const a = result.arena.allocator();
+    result.value = try .fromCall(a, self.base_url, try self.runJobCall(a, location, id));
+    return result;
+}
+
+/// The request `cancelExecution` sends, as `runJobRequest` says. A cancel
+/// whose answer is lost may be followed by a read of the execution, which
+/// this does not show: it is the request a user confirms.
+pub fn cancelExecutionRequest(self: *Client, location: []const u8, job_id: []const u8, id: []const u8) Error!types.Owned(PreparedRequest) {
+    rpc.begin(self);
+    var result: types.Owned(PreparedRequest) = try .init(self.gpa);
+    errdefer result.deinit();
+    const a = result.arena.allocator();
+    result.value = try .fromCall(a, self.base_url, try self.cancelCall(a, location, job_id, id));
+    return result;
+}
+
+/// The request `routeAllTraffic` sends, as `runJobRequest` says.
+pub fn routeAllTrafficRequest(self: *Client, location: []const u8, service_id: []const u8, revision: []const u8, options: types.RouteOptions) Error!types.Owned(PreparedRequest) {
+    rpc.begin(self);
+    var result: types.Owned(PreparedRequest) = try .init(self.gpa);
+    errdefer result.deinit();
+    const a = result.arena.allocator();
+    result.value = try .fromCall(a, self.base_url, try self.routeCall(a, location, service_id, revision, options));
+    return result;
+}
+
+/// The call `runJob` sends: `POST .../jobs/J:run` with `{}`, no overrides.
+fn runJobCall(self: *Client, arena: Allocator, location: []const u8, id: []const u8) Error!rpc.Call {
+    try self.checkWrite();
+    try self.checkRegion(location);
+    try self.checkId(id, "job");
+    const path = try std.mem.concat(arena, u8, &.{ try names.job(arena, self.project, location, id), ":run" });
+    return .{ .method = .POST, .path = path, .body = "{}" };
+}
+
+/// The call `cancelExecution` sends: `POST .../executions/E:cancel` with
+/// `{}`.
+fn cancelCall(self: *Client, arena: Allocator, location: []const u8, job_id: []const u8, id: []const u8) Error!rpc.Call {
+    try self.checkWrite();
+    try self.checkRegion(location);
+    try self.checkId(job_id, "job");
+    try self.checkId(id, "execution");
+    const path = try std.mem.concat(arena, u8, &.{ try names.execution(arena, self.project, location, job_id, id), ":cancel" });
+    return .{ .method = .POST, .path = path, .body = "{}" };
+}
+
+/// The call `routeAllTraffic` sends: a `PATCH` of the service with
+/// `updateMask=traffic,etag` (written as production was measured with it)
+/// and a body of the one target and the etag, nothing else: a `PATCH`
+/// without a mask replaces the whole service.
+fn routeCall(self: *Client, arena: Allocator, location: []const u8, service_id: []const u8, revision: []const u8, options: types.RouteOptions) Error!rpc.Call {
+    try self.checkWrite();
+    try self.checkRegion(location);
+    try self.checkId(service_id, "service");
+    try self.checkId(revision, "revision");
+    if (!validate.isEtag(options.etag)) {
+        if (self.diagnostics) |d| d.print("invalid etag: expected Service.etag as read, printable ASCII; production takes a change without one unguarded", .{});
+        return error.InvalidOptions;
+    }
+    const service_path = try names.service(arena, self.project, location, service_id);
+    const query = if (options.validate_only) "?updateMask=traffic,etag&validateOnly=true" else "?updateMask=traffic,etag";
+    const body = std.json.Stringify.valueAlloc(arena, .{
+        .traffic = [_]struct { type: []const u8, revision: []const u8, percent: u8 }{.{
+            .type = "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION",
+            .revision = revision,
+            .percent = 100,
+        }},
+        .etag = options.etag,
+    }, .{}) catch return error.OutOfMemory;
+    return .{ .method = .PATCH, .path = try std.mem.concat(arena, u8, &.{ service_path, query }), .body = body };
+}
+
+/// Sends `call` and decodes the operation it answers into memory of its
+/// own.
+fn operationCall(self: *Client, scratch: Allocator, call: rpc.Call) Error!types.Owned(types.Operation) {
+    var result: types.Owned(types.Operation) = try .init(self.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(self, result.arena, call);
+    result.value = codec.decodeOperation(result.arena.allocator(), scratch, body) catch |err|
+        return rpc.decodeFailed(self, err, "operation");
+    return result;
+}
+
+/// A write needs a scope production takes writes with: every write to
+/// `run.readonly` was refused, "Request had insufficient authentication
+/// scopes." (measured).
+fn checkWrite(self: *Client) Error!void {
+    if (self.scope == .read_only) {
+        if (self.diagnostics) |d| d.print("this client asks for run.readonly, which production refuses every write; give Options.scope .read_write", .{});
+        return error.InvalidOptions;
+    }
+}
+
 /// A single region: jobs, executions and operations live in one, and
 /// production refuses `-` for a jobs list.
 fn checkRegion(self: *Client, location: []const u8) Error!void {
@@ -793,6 +1017,293 @@ test "every allocation failure is OutOfMemory without leaks" {
             traffic.deinit();
             var failed = try client.getOperation("projects/my-project/locations/us-central1/operations/o");
             failed.deinit();
+        }
+    };
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.calls, .{});
+}
+
+const job_url = "https://run.googleapis.com/v2/projects/my-project/locations/us-central1/jobs/zigps-6b8297-quick";
+const execution_url = "https://run.googleapis.com/v2/projects/my-project/locations/us-central1/jobs/zigps-6b8297-slow/executions/zigps-6b8297-slow-nlzdb";
+const service_url = "https://run.googleapis.com/v2/projects/my-project/locations/us-central1/services/zigps-6b8297";
+const etag = "\"CM_g2dYGEKjFt8wB/cHJvamVjdHMv\"";
+const route_body = "{\"traffic\":[{\"type\":\"TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION\",\"revision\":\"zigps-6b8297-00001-527\",\"percent\":100}],\"etag\":\"\\\"CM_g2dYGEKjFt8wB/cHJvamVjdHMv\\\"\"}";
+
+test "golden: the three writes, and their previews byte for byte what was sent" {
+    var h: Harness = undefined;
+    try h.initScope(&.{
+        .{ .respond = .{ .body = production.operation_run } },
+        .{ .respond = .{ .body = production.operation_cancel } },
+        .{ .respond = .{ .body = production.operation_traffic } },
+        .{ .respond = .{ .body = production.operation_traffic_validate } },
+    }, .read_write);
+    defer h.deinit();
+    const c = &h.client;
+
+    var run = try c.runJob("us-central1", "zigps-6b8297-quick");
+    defer run.deinit();
+    try h.expectSent(0, .POST, job_url ++ ":run", "{}");
+    try testing.expect(!run.value.done);
+    try testing.expectEqualStrings("projects/extractctl/locations/us-central1/jobs/zigps-6b8297-quick/executions/zigps-6b8297-quick-l4ffj", run.value.subject.execution.name);
+
+    var cancel = try c.cancelExecution("us-central1", "zigps-6b8297-slow", "zigps-6b8297-slow-nlzdb");
+    defer cancel.deinit();
+    try h.expectSent(1, .POST, execution_url ++ ":cancel", "{}");
+    try testing.expectEqualStrings("zigps-6b8297-slow-nlzdb", cancel.value.subject.execution.id);
+
+    var route = try c.routeAllTraffic("us-central1", "zigps-6b8297", "zigps-6b8297-00001-527", .{ .etag = etag });
+    defer route.deinit();
+    try h.expectSent(2, .PATCH, service_url ++ "?updateMask=traffic,etag", route_body);
+    try testing.expectEqualStrings("zigps-6b8297-00001-527", route.value.subject.service.traffic[0].revision);
+
+    var check = try c.routeAllTraffic("us-central1", "zigps-6b8297", "zigps-6b8297-00001-527", .{ .etag = etag, .validate_only = true });
+    defer check.deinit();
+    try h.expectSent(3, .PATCH, service_url ++ "?updateMask=traffic,etag&validateOnly=true", route_body);
+    try testing.expect(!check.value.done);
+
+    // Each preview is the request its write sent, byte for byte.
+    var previews: [4]types.Owned(PreparedRequest) = .{
+        try c.runJobRequest("us-central1", "zigps-6b8297-quick"),
+        try c.cancelExecutionRequest("us-central1", "zigps-6b8297-slow", "zigps-6b8297-slow-nlzdb"),
+        try c.routeAllTrafficRequest("us-central1", "zigps-6b8297", "zigps-6b8297-00001-527", .{ .etag = etag }),
+        try c.routeAllTrafficRequest("us-central1", "zigps-6b8297", "zigps-6b8297-00001-527", .{ .etag = etag, .validate_only = true }),
+    };
+    defer for (&previews) |*p| p.deinit();
+    for (previews, 0..) |p, i| {
+        const sent = try h.fake.request(i);
+        try testing.expectEqual(sent.method, p.value.method);
+        try testing.expectEqualStrings(sent.url, p.value.url);
+        try testing.expectEqualStrings(sent.body.?, p.value.body);
+    }
+    try h.expectRequestCount(4);
+}
+
+test "a read-only client refuses every write and its preview, before sending" {
+    var h: Harness = undefined;
+    try h.init(&.{});
+    defer h.deinit();
+    const c = &h.client;
+    try testing.expectError(error.InvalidOptions, c.runJob("us-central1", "j"));
+    try testing.expectEqualStrings("this client asks for run.readonly, which production refuses every write; give Options.scope .read_write", h.diag.message());
+    try testing.expectError(error.InvalidOptions, c.cancelExecution("us-central1", "j", "e"));
+    try testing.expectError(error.InvalidOptions, c.routeAllTraffic("us-central1", "s", "r", .{ .etag = etag }));
+    try testing.expectError(error.InvalidOptions, c.runJobRequest("us-central1", "j"));
+    try testing.expectError(error.InvalidOptions, c.cancelExecutionRequest("us-central1", "j", "e"));
+    try testing.expectError(error.InvalidOptions, c.routeAllTrafficRequest("us-central1", "s", "r", .{ .etag = etag }));
+    try h.expectRequestCount(0);
+
+    // cloud-platform takes the writes, as production did.
+    var cp: Harness = undefined;
+    try cp.initScope(&.{.{ .respond = .{ .body = production.operation_run } }}, .cloud_platform);
+    defer cp.deinit();
+    var run = try cp.client.runJob("us-central1", "zigps-6b8297-quick");
+    run.deinit();
+    try testing.expectEqualStrings("https://www.googleapis.com/auth/cloud-platform", cp.token.firstScope());
+}
+
+test "the writes refuse what they will not send, the previews alike" {
+    var h: Harness = undefined;
+    try h.initScope(&.{}, .read_write);
+    defer h.deinit();
+    const c = &h.client;
+    try testing.expectError(error.InvalidName, c.runJob("-", "j"));
+    try testing.expectError(error.InvalidName, c.runJob("us-central1", "-"));
+    try testing.expectError(error.InvalidName, c.runJobRequest("us-central1", "a/b"));
+    try testing.expectError(error.InvalidName, c.cancelExecution("us-central1", "-", "e"));
+    try testing.expectError(error.InvalidName, c.cancelExecution("us-central1", "j", "-"));
+    try testing.expectError(error.InvalidName, c.cancelExecutionRequest("US", "j", "e"));
+    try testing.expectError(error.InvalidName, c.routeAllTraffic("-", "s", "r", .{ .etag = etag }));
+    try testing.expectError(error.InvalidName, c.routeAllTraffic("us-central1", "-", "r", .{ .etag = etag }));
+    try testing.expectError(error.InvalidName, c.routeAllTraffic("us-central1", "s", "-", .{ .etag = etag }));
+    // A full name is refused here; production refuses it too, 400.
+    try testing.expectError(error.InvalidName, c.routeAllTraffic("us-central1", "s", "projects/p/locations/l/services/s/revisions/r", .{ .etag = etag }));
+    try testing.expectEqualStrings("invalid revision id: visible ASCII without /, at most 500, not -", h.diag.message());
+    // The etag is the guard: none, or one no read could have given, is
+    // refused, the preview alike.
+    try testing.expectError(error.InvalidOptions, c.routeAllTraffic("us-central1", "s", "r", .{ .etag = "" }));
+    try testing.expectEqualStrings("invalid etag: expected Service.etag as read, printable ASCII; production takes a change without one unguarded", h.diag.message());
+    try testing.expectError(error.InvalidOptions, c.routeAllTrafficRequest("us-central1", "s", "r", .{ .etag = "a\nb" }));
+    try testing.expectError(error.InvalidOptions, c.routeAllTraffic("us-central1", "s", "r", .{ .etag = core.testing.repeat("x", 1025) }));
+    try h.expectRequestCount(0);
+}
+
+test "the writes' refusals arrive as errors, production's words kept" {
+    var h: Harness = undefined;
+    try h.initScope(&.{
+        .{ .respond = .{ .status = production.write_scope_refused_status, .body = production.write_scope_refused } },
+        .{ .respond = .{ .status = production.cancel_not_running_status, .body = production.cancel_not_running } },
+        .{ .respond = .{ .status = production.traffic_stale_etag_status, .body = production.traffic_stale_etag } },
+        .{ .respond = .{ .status = production.traffic_other_service_status, .body = production.traffic_other_service } },
+    }, .read_write);
+    defer h.deinit();
+    const c = &h.client;
+    // A token minted for run.readonly in spite of the client's scope.
+    try testing.expectError(error.PermissionDenied, c.runJob("us-central1", "zigps-6b8297-quick"));
+    try testing.expectEqualStrings("Request had insufficient authentication scopes.", h.diag.message());
+    // A first attempt's refusal is returned as it is: nothing read.
+    try testing.expectError(error.FailedPrecondition, c.cancelExecution("us-central1", "zigps-6b8297-slow", "zigps-6b8297-slow-nlzdb"));
+    try testing.expectEqualStrings("Execution 'zigps-6b8297-slow-nlzdb' cannot be cancelled because it is not running.", h.diag.message());
+    // A service changed since the read: refused, never retried.
+    try testing.expectError(error.Aborted, c.routeAllTraffic("us-central1", "zigps-8e3f3f", "zigps-8e3f3f-00002-rgh", .{ .etag = etag }));
+    try testing.expectEqualStrings("Conflict for resource 'zigps-8e3f3f': version '1792585476717971' was specified but current version is '1792585482447477'.", h.diag.message());
+    try testing.expectError(error.InvalidArgument, c.routeAllTraffic("us-central1", "zigps-6b8297", "zigps-other-00001-abc", .{ .etag = etag }));
+    try testing.expectEqualStrings("spec.traffic.revision_name[0]: Revision target 'zigps-other-00001-abc' invalid. Expected a revision prefixed with 'zigps-6b8297-'.", h.diag.message());
+    try h.expectRequestCount(4);
+}
+
+test "a run is sent again only when it cannot have reached the server" {
+    var h: Harness = undefined;
+    try h.initScope(&.{
+        .{ .respond = .{ .status = 503, .body = "{\"error\":{\"code\":503,\"message\":\"down\",\"status\":\"UNAVAILABLE\"}}" } },
+        .{ .fail = error.ConnectionRefused },
+        .{ .respond = .{ .body = production.operation_run } },
+        .{ .fail = error.ConnectionResetByPeer },
+    }, .read_write);
+    defer h.deinit();
+    const c = &h.client;
+    // A 503 may follow a run that landed: returned after one send.
+    try testing.expectError(error.Unavailable, c.runJob("us-central1", "zigps-6b8297-quick"));
+    try h.expectRequestCount(1);
+    // A refused connection never left: sent again.
+    var run = try c.runJob("us-central1", "zigps-6b8297-quick");
+    run.deinit();
+    try h.expectRequestCount(3);
+    try h.expectSent(2, .POST, job_url ++ ":run", "{}");
+    // A dropped connection may follow one that landed.
+    try testing.expectError(error.ConnectionResetByPeer, c.runJob("us-central1", "zigps-6b8297-quick"));
+    try h.expectRequestCount(4);
+}
+
+test "a cancel is retried, and a resend refused as not running reads the execution" {
+    const unavailable: test_util.FakeTransport.Reply = .{ .respond = .{ .status = 503, .body = "{\"error\":{\"code\":503,\"message\":\"down\",\"status\":\"UNAVAILABLE\"}}" } };
+    const not_running: test_util.FakeTransport.Reply = .{ .respond = .{ .status = production.cancel_not_running_status, .body = production.cancel_not_running } };
+    const cancel_url = execution_url ++ ":cancel";
+
+    // A lost answer, then the resend taken.
+    {
+        var h: Harness = undefined;
+        try h.initScope(&.{ unavailable, .{ .respond = .{ .body = production.operation_cancel } } }, .read_write);
+        defer h.deinit();
+        var op = try h.client.cancelExecution("us-central1", "zigps-6b8297-slow", "zigps-6b8297-slow-nlzdb");
+        op.deinit();
+        try h.expectRequestCount(2);
+        try h.expectSent(1, .POST, cancel_url, "{}");
+    }
+    // A lost answer, the resend refused, the execution cancelled: the
+    // first one landed, and the read is the answer.
+    {
+        var h: Harness = undefined;
+        try h.initScope(&.{ unavailable, not_running, .{ .respond = .{ .body = production.execution_cancelled } } }, .read_write);
+        defer h.deinit();
+        var op = try h.client.cancelExecution("us-central1", "zigps-6b8297-slow", "zigps-6b8297-slow-nlzdb");
+        defer op.deinit();
+        try testing.expectEqualStrings("", op.value.name);
+        try testing.expect(op.value.done);
+        try testing.expectEqual(null, op.value.failure);
+        try testing.expectEqual(types.ExecutionStatus.cancelled, op.value.subject.execution.status());
+        try h.expectRequest(2, .GET, execution_url);
+        try testing.expectEqualStrings("", h.diag.message());
+    }
+    // Refused while the read shows it still stopping: landed too.
+    {
+        var h: Harness = undefined;
+        try h.initScope(&.{ unavailable, not_running, .{ .respond = .{ .body = cancelling_execution } } }, .read_write);
+        defer h.deinit();
+        var op = try h.client.cancelExecution("us-central1", "zigps-6b8297-slow", "zigps-6b8297-slow-nlzdb");
+        defer op.deinit();
+        try testing.expectEqualStrings("", op.value.name);
+        try testing.expectEqual(types.ExecutionStatus.cancelling, op.value.subject.execution.status());
+    }
+    // The same, but the execution ended on its own: the refusal stands.
+    {
+        var h: Harness = undefined;
+        try h.initScope(&.{ unavailable, not_running, .{ .respond = .{ .body = succeeded_execution } } }, .read_write);
+        defer h.deinit();
+        try testing.expectError(error.FailedPrecondition, h.client.cancelExecution("us-central1", "zigps-6b8297-slow", "zigps-6b8297-slow-nlzdb"));
+        try testing.expectEqualStrings("cancelling the execution was refused with FailedPrecondition: it is no longer running, and not cancelled", h.diag.message());
+        try h.expectRequestCount(3);
+    }
+    // The resend refused and the read failing: the refusal, both named.
+    {
+        var h: Harness = undefined;
+        try h.initScope(&.{ unavailable, not_running, .{ .respond = .{ .status = production.execution_unknown_status, .body = production.execution_unknown } } }, .read_write);
+        defer h.deinit();
+        try testing.expectError(error.FailedPrecondition, h.client.cancelExecution("us-central1", "zigps-6b8297-slow", "zigps-6b8297-slow-nlzdb"));
+        try testing.expectEqualStrings("cancelling the execution was refused with FailedPrecondition after an attempt that may have landed, and reading it to see failed with NotFound", h.diag.message());
+    }
+    // A refused connection never left: a refusal after it is the first.
+    {
+        var h: Harness = undefined;
+        try h.initScope(&.{ .{ .fail = error.ConnectionRefused }, not_running }, .read_write);
+        defer h.deinit();
+        try testing.expectError(error.FailedPrecondition, h.client.cancelExecution("us-central1", "zigps-6b8297-slow", "zigps-6b8297-slow-nlzdb"));
+        try h.expectRequestCount(2);
+    }
+    // The policy's attempts bound the resends.
+    {
+        var h: Harness = undefined;
+        try h.initScope(&.{ unavailable, unavailable, unavailable, unavailable }, .read_write);
+        defer h.deinit();
+        h.client.retry.max_attempts = 3;
+        try testing.expectError(error.Unavailable, h.client.cancelExecution("us-central1", "zigps-6b8297-slow", "zigps-6b8297-slow-nlzdb"));
+        try h.expectRequestCount(3);
+    }
+}
+
+/// An execution stopping: a task cancelled, `Completed` still reconciling,
+/// as production showed one 11 s after a cancel.
+const cancelling_execution =
+    \\{"name":"projects/my-project/locations/us-central1/jobs/zigps-6b8297-slow/executions/zigps-6b8297-slow-nlzdb",
+    \\ "job":"zigps-6b8297-slow","cancelledCount":1,
+    \\ "conditions":[{"type":"Started","state":"CONDITION_SUCCEEDED"},{"type":"Completed","state":"CONDITION_RECONCILING"}]}
+;
+
+/// An execution that ended on its own, for the cancel that found it so.
+const succeeded_execution =
+    \\{"name":"projects/my-project/locations/us-central1/jobs/zigps-6b8297-slow/executions/zigps-6b8297-slow-nlzdb",
+    \\ "job":"zigps-6b8297-slow","succeededCount":1,
+    \\ "conditions":[{"type":"Started","state":"CONDITION_SUCCEEDED"},{"type":"Completed","state":"CONDITION_SUCCEEDED"}]}
+;
+
+test "a traffic change is retried as sent, and a stale etag never" {
+    const unavailable: test_util.FakeTransport.Reply = .{ .respond = .{ .status = 503, .body = "{\"error\":{\"code\":503,\"message\":\"down\",\"status\":\"UNAVAILABLE\"}}" } };
+    const stale: test_util.FakeTransport.Reply = .{ .respond = .{ .status = production.traffic_stale_etag_status, .body = production.traffic_stale_etag } };
+    var h: Harness = undefined;
+    try h.initScope(&.{ unavailable, .{ .respond = .{ .body = production.operation_traffic } }, unavailable, stale }, .read_write);
+    defer h.deinit();
+    const c = &h.client;
+    var op = try c.routeAllTraffic("us-central1", "zigps-6b8297", "zigps-6b8297-00001-527", .{ .etag = etag });
+    op.deinit();
+    try h.expectSent(0, .PATCH, service_url ++ "?updateMask=traffic,etag", route_body);
+    try h.expectSent(1, .PATCH, service_url ++ "?updateMask=traffic,etag", route_body);
+    // A resend refused as stale: someone else changed the service between
+    // the two, and the refusal is returned.
+    try testing.expectError(error.Aborted, c.routeAllTraffic("us-central1", "zigps-6b8297", "zigps-6b8297-00001-527", .{ .etag = etag }));
+    try h.expectRequestCount(4);
+}
+
+test "every allocation failure in a write is OutOfMemory without leaks" {
+    const Run = struct {
+        fn calls(gpa: Allocator) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+                .{ .respond = .{ .body = production.operation_run } },
+                .{ .respond = .{ .status = 503, .body = "{\"error\":{\"code\":503,\"message\":\"down\",\"status\":\"UNAVAILABLE\"}}" } },
+                .{ .respond = .{ .status = production.cancel_not_running_status, .body = production.cancel_not_running } },
+                .{ .respond = .{ .body = production.execution_cancelled } },
+                .{ .respond = .{ .body = production.operation_traffic } },
+            });
+            defer fake.deinit();
+            var tokens: test_util.FakeTokenProvider = .{};
+            var clock: test_util.FakeClock = .{};
+            var client = try Client.init(gpa, clock.io(), .{ .project_id = "my-project", .token_provider = tokens.provider(), .scope = .read_write, .transport = fake.transport() });
+            defer client.deinit();
+            var run = try client.runJob("us-central1", "zigps-6b8297-quick");
+            run.deinit();
+            var cancel = try client.cancelExecution("us-central1", "zigps-6b8297-slow", "zigps-6b8297-slow-nlzdb");
+            cancel.deinit();
+            var route = try client.routeAllTraffic("us-central1", "zigps-6b8297", "zigps-6b8297-00001-527", .{ .etag = etag });
+            route.deinit();
+            var preview = try client.routeAllTrafficRequest("us-central1", "zigps-6b8297", "r", .{ .etag = etag, .validate_only = true });
+            preview.deinit();
         }
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.calls, .{});

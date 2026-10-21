@@ -1,7 +1,8 @@
 //! Runs one API call: core's request engine builds the URL, attaches
 //! credentials and the quota project, sends through the client's
 //! transport, maps failures to errors and keeps `Diagnostics` and the log
-//! current. Every call here is a GET, safe to repeat.
+//! current. The reads are GETs, safe to repeat; each write says how it is
+//! retried.
 
 const std = @import("std");
 const core = @import("core");
@@ -73,6 +74,13 @@ fn tooLarge(client: *Client, err: Error) Error {
         d.print("the response was larger than max_response_bytes ({d}); ask for a smaller page_size", .{client.max_response_bytes});
     };
     return err;
+}
+
+/// How long to wait before attempt `attempt + 1`, under the client's
+/// policy and the delay the last refusal asked for; null when the policy
+/// will not wait that long. For a write that retries on its own.
+pub fn waitMs(client: *Client, attempt: u32) ?u32 {
+    return client.retry.waitMs(attempt, core.rpc.entropy(client.io), client.server_delay_ms);
 }
 
 pub fn decodeFailed(client: *Client, err: @import("codec.zig").DecodeError, what: []const u8) Error {

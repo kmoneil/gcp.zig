@@ -33,6 +33,15 @@ pub fn isPageToken(token: []const u8) bool {
     return true;
 }
 
+/// An etag as Cloud Run sends it: printable ASCII, quote characters
+/// included (`"CM_g2.../cHJv..."`), passed back as read. Empty is refused:
+/// production takes a traffic change without one unguarded.
+pub fn isEtag(etag: []const u8) bool {
+    if (etag.len == 0 or etag.len > 1024) return false;
+    for (etag) |c| if (c < ' ' or c >= 0x7f) return false;
+    return true;
+}
+
 /// A user agent goes into a header, so it must be printable ASCII.
 pub fn isUserAgent(agent: []const u8) bool {
     if (agent.len == 0) return false;
