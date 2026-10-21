@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.55.0 (unreleased)
+## 0.55.0 (2026-10-21)
 
 - bigquery: new module, **experimental**, for issue #270: the read
   side of BigQuery's v2 API. `Client.listDatasets` (the client's
