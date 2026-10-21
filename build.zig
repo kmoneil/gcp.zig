@@ -607,6 +607,27 @@ pub fn build(b: *std.Build) void {
     });
     gcp_step.dependOn(&streamed(b, bigquery_gcp_tests).step);
     test_step.dependOn(&bigquery_gcp_tests.step);
+    // BigQuery Data Transfer against a real project: DATATRANSFER_TEST=1
+    // beside the usual two variables, a cloud-platform token. The suite
+    // makes a zigps_dt_ dataset and three scheduled queries raw, since the
+    // client writes no configs, runs two now through the client, holds the
+    // fake to production's answers, and deletes everything it made.
+    const datatransfer_gcp_tests = b.addTest(.{
+        .name = "datatransfer-gcp-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/datatransfer_gcp_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "datatransfer", .module = datatransfer },
+                .{ .name = "core", .module = core },
+            },
+        }),
+        .filters = test_filters,
+        .test_runner = test_runner,
+    });
+    gcp_step.dependOn(&streamed(b, datatransfer_gcp_tests).step);
+    test_step.dependOn(&datatransfer_gcp_tests.step);
     // Error Reporting against a real project with the API on:
     // GCP_TEST_PROJECT and GCP_TEST_TOKEN, a token that may report errors
     // and read and update groups. Each run reports a few errors of its own.
@@ -686,14 +707,14 @@ pub fn build(b: *std.Build) void {
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "monitoring_policies", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "run_actions", "dataflow_jobs", "dataflow_stop", "bigquery_query" }) |name| {
+    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "monitoring_policies", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "run_actions", "dataflow_jobs", "dataflow_stop", "bigquery_query", "datatransfer_runs" }) |name| {
         // whoami, secret, gcs_cp, gcs_sign, gcs_notify, quickstart, iam,
         // secret_rotation, firestore, logs_read, logs_tail, projects_list,
         // error_dashboard, monitoring, monitoring_alerts,
         // monitoring_policies, pubsub_metrics,
         // kms, scheduler_jobs, scheduler_run, run_revisions, run_actions,
-        // dataflow_jobs, dataflow_stop and bigquery_query pick their own
-        // credentials.
+        // dataflow_jobs, dataflow_stop, bigquery_query and
+        // datatransfer_runs pick their own credentials.
         const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "secret"))
@@ -726,6 +747,8 @@ pub fn build(b: *std.Build) void {
             &.{ .{ .name = "dataflow", .module = dataflow }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "bigquery_query"))
             &.{ .{ .name = "bigquery", .module = bigquery }, .{ .name = "auth", .module = auth } }
+        else if (std.mem.eql(u8, name, "datatransfer_runs"))
+            &.{ .{ .name = "datatransfer", .module = datatransfer }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "gcs_notify") or std.mem.eql(u8, name, "quickstart"))
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else

@@ -304,6 +304,24 @@ GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth print-access-token) \
     BIGQUERY_TEST=1 zig build test-integration-gcp -Dtest-filter="bigquery:"
 ```
 
+### BigQuery Data Transfer
+
+Data Transfer has no emulator, so its suite needs a project with the
+BigQuery and Data Transfer APIs on and a token for the `cloud-platform`
+scope whose principal may make a dataset and scheduled queries there
+(Editor, or BigQuery Admin). It makes a `zigps_dt_<run>` dataset and three
+scheduled queries raw (none scheduled to run on its own), runs two now
+through the client, follows them to their end, replays the script on
+`FakeDataTransfer` seeded from production's answers, failing on any
+outcome the two do not share, and deletes everything it made; a crashed
+run's leftovers are swept by the next once a day old. The queries read no
+table, so they bill nothing. About three minutes.
+
+```sh
+GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth print-access-token) \
+    DATATRANSFER_TEST=1 zig build test-integration-gcp -Dtest-filter="datatransfer:"
+```
+
 ### Secret Manager and bucket settings
 
 Secret Manager has no emulator, so its tests need a real project. They

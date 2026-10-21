@@ -47,6 +47,24 @@ including the ones that did not change.
   after it started; a time 60 s ahead of production's clock was taken; a
   disabled config is refused ("Transfer is disabled. ..."); a success
   carries an empty error; runs and messages list newest first.
+
+  And `datatransfer.testing.FakeDataTransfer`, Data Transfer in memory
+  behind `Client.Options.transport`: locations, configs (a scheduled
+  query's params typed), runs and messages a test puts in, and a run now
+  whose outcome the test says (`PutConfig.manual_run`: pending until
+  `setRunState` moves it, or succeeded or failed at once with
+  production's lines). Names by project number, configs listed one
+  location at a time by id, `-` and a made-up location refused, runs
+  newest run time first and `LATEST` one a run date, messages newest
+  first, the disabled refusal and the not-found words, and faults, all as
+  production answered; what it does not model it says, 501 with the
+  reason. A gated suite (`DATATRANSFER_TEST=1`) makes a `zigps_dt_`
+  dataset and three scheduled queries raw, runs two now through the
+  client, and replays the script on the fake seeded from production's
+  answers: 18 outcomes, every word, agree. Production showed there that
+  configs list by id. `examples/datatransfer_runs.zig` lists every
+  location's scheduled queries with their latest runs and runs one now
+  with `--run NAME --yes`; `--fake` needs no network.
 - auth, bigquery, core, dataflow, error_reporting, firestore, kms,
   logging, monitoring, pubsub, resource_manager, run, scheduler,
   secret_manager and storage: unchanged.
