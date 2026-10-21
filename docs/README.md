@@ -127,7 +127,7 @@ Google, not only what Google documents, and where the emulators differ.
 
 | Guide | What's in it |
 | --- | --- |
-| [Overview](run/README.md) | The services and revisions a project runs, read only: conditions, traffic, `ready()`, deploy markers, and what production showed when measured (experimental) |
+| [Overview](run/README.md) | The services and revisions a project runs, read only: conditions, traffic, `ready()`, deploy markers; jobs and executions with `Execution.status()`; and what production showed when measured (experimental) |
 | [Testing](run/testing.md) | An in-memory Cloud Run for your own tests, held to production's answers (experimental) |
 
 ## 🌊 Dataflow

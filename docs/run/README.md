@@ -4,9 +4,11 @@
 
 A client for Cloud Run's v2 API, read only: the services a project runs
 and the revisions behind them, with their conditions, for a health
-view's "recent revisions" widget and a trend chart's deploy markers.
-Nothing here deploys, routes traffic or deletes anything.
-**Experimental**: new in 0.48.0.
+view's "recent revisions" widget and a trend chart's deploy markers;
+and the jobs it runs, with their executions. Nothing here deploys,
+routes traffic or deletes anything. **Experimental**: new in 0.48.0;
+jobs, executions and operations are new in 0.54.0 and carry their own
+marker.
 
 ```zig
 const std = @import("std");
@@ -40,6 +42,11 @@ pub fn main(init: std.process.Init) !void {
 | `Client.getService(location, id)`, `getServiceNamed(name)` | One service, by its parts or its full name; another project's name is refused before sending |
 | `Client.listRevisions(location, service, options)` | One page of a service's revisions, newest first; the service may be `-`, every service in the location |
 | `Client.getRevision(location, service, id)`, `getRevisionNamed(name)` | One revision |
+| `Client.listJobs(location, options)` | One page of a region's jobs, newest first; production refuses `-` here, so the client does too, before sending |
+| `Client.getJob(location, id)`, `getJobNamed(name)` | One job |
+| `Client.listExecutions(location, job, options)` | One page of a job's executions, newest first; the job may be `-`, every job in the region |
+| `Client.getExecution(location, job, id)`, `getExecutionNamed(name)` | One execution |
+| `Client.getOperation(name)` | A long-running operation, by the full name a write's answer gives |
 
 A `Service` carries its `uri` and `urls`, the latest ready and created
 revision ids, `traffic` (what was asked) and `traffic_statuses` (what
@@ -57,10 +64,62 @@ words: the broken revision's `Ready` condition said "Image
 `CONDITION_FAILED`, reason `REVISION_FAILED`, while
 `latest_ready_revision` stayed on the last good revision.
 
+## Jobs and executions
+
+**Experimental** on their own, new in 0.54.0.
+
+A `Job` carries its `latest_created_execution` (name, times and a
+`status`), its `terminal_condition`, `execution_count`, and what each
+execution runs: `task_count`, `parallelism`, `task_timeout_s`,
+`max_retries`, `containers` and `service_account`, which production
+answers with its defaults filled in. `Job.ready()` is the job's own
+configuration, not its last run: a job stayed ready after a run failed.
+
+An `Execution` carries its create, start and completion times, its task
+counts (`running_count`, `succeeded_count`, `failed_count`,
+`cancelled_count`, `retried_count`), its `conditions` and the console's
+`log_uri`. The API has no status field for an execution, so
+**`Execution.status()`** reads one from its conditions as production
+showed them:
+
+| Status | When |
+| --- | --- |
+| `.pending` | Made, its container not started: `Started` still reconciling |
+| `.running` | `Started` succeeded, `Completed` not yet ended |
+| `.cancelling` | A task already cancelled, `Completed` not yet ended |
+| `.succeeded` | `Completed` succeeded |
+| `.failed` | `Completed` failed, for a reason other than a cancel (`NON_ZERO_EXIT_CODE` for a task that exited 1) |
+| `.cancelled` | `Completed` failed with reason `CANCELLED`, "Cancelled by user." |
+
+`Execution.cancellable()` says whether production takes a cancel of it
+as it stands: pending or running. `ExecutionStatus.ended()` says
+whether nothing more will happen to it.
+
+What production showed, on 2026-10-21 with Google's sample job image:
+
+- **An execution took about 90 s to start** ("Started deployed
+  execution in 1m27.38s."): a job that sleeps 2 s ended 100 s after
+  its run. Two executions of one job may run at once.
+- **An execution cancelled before it started never got a completion
+  time** (watched for five minutes), so read `status()`, not
+  `completion_time`, to know it has ended.
+- A job nobody has lists no executions (`{}`), not a 404; a get is a
+  404 in plain words ("Resource '<id>' of kind 'JOB' in region '<l>' in
+  project '<p>' does not exist."). A region that does not exist is a
+  permission refusal for jobs: "Permission denied on 'locations/<l>' (or
+  it may not exist)".
+- The job names its latest execution by its id alone; the client makes
+  the full name.
+
 ## The scope
 
-Every call asks its token provider for `run.readonly`, the narrowest
-scope every read takes.
+A client asks its token provider for one scope, `Options.scope`:
+`.read_only` (`run.readonly`, the default, the narrowest every read
+takes), `.read_write` (`run`) or `.cloud_platform`. A provider made from
+a key file, workload identity or impersonation is fixed to the scope its
+first token was minted for (`auth.Credentials.bindsScopes`), so a
+program that reads with one client and writes with another gives each
+its own credentials.
 
 ## What production showed
 

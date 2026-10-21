@@ -10,9 +10,29 @@ const Client = @import("Client.zig");
 const errors = @import("errors.zig");
 const Error = errors.Error;
 
-/// The OAuth scope the client asks its token provider for: the narrowest
-/// one every read here takes.
-pub const scope = "https://www.googleapis.com/auth/run.readonly";
+/// The OAuth scopes a client can ask its token provider for. Every read
+/// takes any of them; Cloud Run's writes take `run` or `cloud-platform`
+/// only.
+pub const Scope = enum {
+    /// `run.readonly`, the default: every read, and no write.
+    read_only,
+    /// `run`: every read and every write.
+    read_write,
+    /// `cloud-platform`, for credentials already fixed to it.
+    cloud_platform,
+
+    pub fn url(self: Scope) []const u8 {
+        return switch (self) {
+            .read_only => "https://www.googleapis.com/auth/run.readonly",
+            .read_write => "https://www.googleapis.com/auth/run",
+            .cloud_platform => "https://www.googleapis.com/auth/cloud-platform",
+        };
+    }
+};
+
+/// The default scope's URL, `run.readonly`, the narrowest every read
+/// takes.
+pub const scope = Scope.read_only.url();
 
 /// The shared engine, logging under this module's scope.
 const Engine = core.rpc.Engine(.gcp_run);
@@ -27,7 +47,7 @@ fn engine(client: *Client) Engine {
         .io = client.io,
         .transport = client.transport,
         .base_url = client.base_url,
-        .auth_scope = scope,
+        .auth_scope = client.scope.url(),
         .token_provider = client.token_provider,
         .send_quota_project = client.send_quota_project,
         .retry = client.retry,

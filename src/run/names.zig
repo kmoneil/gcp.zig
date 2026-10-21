@@ -18,47 +18,66 @@ pub fn locations(arena: Allocator, project: []const u8) Allocator.Error![]const 
 
 /// `/v2/projects/P/locations/L/services`.
 pub fn services(arena: Allocator, project: []const u8, location: []const u8) Allocator.Error![]const u8 {
-    var w: Writer.Allocating = .init(arena);
-    writeServices(&w.writer, project, location) catch return error.OutOfMemory;
-    return w.written();
+    return path(arena, project, location, &.{"services"});
 }
 
 /// `/v2/projects/P/locations/L/services/S`.
 pub fn service(arena: Allocator, project: []const u8, location: []const u8, id: []const u8) Allocator.Error![]const u8 {
-    var w: Writer.Allocating = .init(arena);
-    writeServices(&w.writer, project, location) catch return error.OutOfMemory;
-    w.writer.writeByte('/') catch return error.OutOfMemory;
-    core.query.writeSegment(&w.writer, id) catch return error.OutOfMemory;
-    return w.written();
+    return path(arena, project, location, &.{ "services", id });
 }
 
 /// `/v2/projects/P/locations/L/services/S/revisions`, `S` may be `-`.
 pub fn revisions(arena: Allocator, project: []const u8, location: []const u8, service_id: []const u8) Allocator.Error![]const u8 {
-    var w: Writer.Allocating = .init(arena);
-    writeServices(&w.writer, project, location) catch return error.OutOfMemory;
-    w.writer.writeByte('/') catch return error.OutOfMemory;
-    core.query.writeSegment(&w.writer, service_id) catch return error.OutOfMemory;
-    w.writer.writeAll("/revisions") catch return error.OutOfMemory;
-    return w.written();
+    return path(arena, project, location, &.{ "services", service_id, "revisions" });
 }
 
 /// `/v2/projects/P/locations/L/services/S/revisions/R`.
 pub fn revision(arena: Allocator, project: []const u8, location: []const u8, service_id: []const u8, id: []const u8) Allocator.Error![]const u8 {
+    return path(arena, project, location, &.{ "services", service_id, "revisions", id });
+}
+
+/// `/v2/projects/P/locations/L/jobs`.
+pub fn jobs(arena: Allocator, project: []const u8, location: []const u8) Allocator.Error![]const u8 {
+    return path(arena, project, location, &.{"jobs"});
+}
+
+/// `/v2/projects/P/locations/L/jobs/J`.
+pub fn job(arena: Allocator, project: []const u8, location: []const u8, id: []const u8) Allocator.Error![]const u8 {
+    return path(arena, project, location, &.{ "jobs", id });
+}
+
+/// `/v2/projects/P/locations/L/jobs/J/executions`, `J` may be `-`.
+pub fn executions(arena: Allocator, project: []const u8, location: []const u8, job_id: []const u8) Allocator.Error![]const u8 {
+    return path(arena, project, location, &.{ "jobs", job_id, "executions" });
+}
+
+/// `/v2/projects/P/locations/L/jobs/J/executions/E`.
+pub fn execution(arena: Allocator, project: []const u8, location: []const u8, job_id: []const u8, id: []const u8) Allocator.Error![]const u8 {
+    return path(arena, project, location, &.{ "jobs", job_id, "executions", id });
+}
+
+/// `/v2/projects/P/locations/L/operations/O`.
+pub fn operation(arena: Allocator, project: []const u8, location: []const u8, id: []const u8) Allocator.Error![]const u8 {
+    return path(arena, project, location, &.{ "operations", id });
+}
+
+/// `/v2/projects/P/locations/L` and then `segments`, each one escaped
+/// path segment: collection names and ids, alternating.
+fn path(arena: Allocator, project: []const u8, location: []const u8, segments: []const []const u8) Allocator.Error![]const u8 {
     var w: Writer.Allocating = .init(arena);
-    writeServices(&w.writer, project, location) catch return error.OutOfMemory;
-    w.writer.writeByte('/') catch return error.OutOfMemory;
-    core.query.writeSegment(&w.writer, service_id) catch return error.OutOfMemory;
-    w.writer.writeAll("/revisions/") catch return error.OutOfMemory;
-    core.query.writeSegment(&w.writer, id) catch return error.OutOfMemory;
+    writePath(&w.writer, project, location, segments) catch return error.OutOfMemory;
     return w.written();
 }
 
-fn writeServices(w: *Writer, project: []const u8, location: []const u8) Writer.Error!void {
+fn writePath(w: *Writer, project: []const u8, location: []const u8, segments: []const []const u8) Writer.Error!void {
     try w.writeAll("/v2/projects/");
     try core.query.writeSegment(w, project);
     try w.writeAll("/locations/");
     try core.query.writeSegment(w, location);
-    try w.writeAll("/services");
+    for (segments) |segment| {
+        try w.writeByte('/');
+        try core.query.writeSegment(w, segment);
+    }
 }
 
 pub const ServiceName = struct {
@@ -69,16 +88,8 @@ pub const ServiceName = struct {
 /// The parts of `projects/<project>/locations/L/services/S`, pointing
 /// into it. Null for another project's name or a malformed one.
 pub fn serviceName(name: []const u8, project: []const u8) ?ServiceName {
-    var parts = std.mem.splitScalar(u8, name, '/');
-    if (!std.mem.eql(u8, parts.next() orelse return null, "projects")) return null;
-    const p = parts.next() orelse return null;
-    if (!std.mem.eql(u8, parts.next() orelse return null, "locations")) return null;
-    const location = parts.next() orelse return null;
-    if (!std.mem.eql(u8, parts.next() orelse return null, "services")) return null;
-    const id = parts.next() orelse return null;
-    if (parts.next() != null) return null;
-    if (!std.mem.eql(u8, p, project) or location.len == 0 or id.len == 0) return null;
-    return .{ .location = location, .id = id };
+    const parts = split(1, name, project, .{"services"}) orelse return null;
+    return .{ .location = parts[0], .id = parts[1] };
 }
 
 pub const RevisionName = struct {
@@ -89,18 +100,62 @@ pub const RevisionName = struct {
 
 /// The parts of `projects/<project>/locations/L/services/S/revisions/R`.
 pub fn revisionName(name: []const u8, project: []const u8) ?RevisionName {
+    const parts = split(2, name, project, .{ "services", "revisions" }) orelse return null;
+    return .{ .location = parts[0], .service = parts[1], .id = parts[2] };
+}
+
+pub const JobName = struct {
+    location: []const u8,
+    id: []const u8,
+};
+
+/// The parts of `projects/<project>/locations/L/jobs/J`.
+pub fn jobName(name: []const u8, project: []const u8) ?JobName {
+    const parts = split(1, name, project, .{"jobs"}) orelse return null;
+    return .{ .location = parts[0], .id = parts[1] };
+}
+
+pub const ExecutionName = struct {
+    location: []const u8,
+    job: []const u8,
+    id: []const u8,
+};
+
+/// The parts of `projects/<project>/locations/L/jobs/J/executions/E`.
+pub fn executionName(name: []const u8, project: []const u8) ?ExecutionName {
+    const parts = split(2, name, project, .{ "jobs", "executions" }) orelse return null;
+    return .{ .location = parts[0], .job = parts[1], .id = parts[2] };
+}
+
+pub const OperationName = struct {
+    location: []const u8,
+    id: []const u8,
+};
+
+/// The parts of `projects/<project>/locations/L/operations/O`.
+pub fn operationName(name: []const u8, project: []const u8) ?OperationName {
+    const parts = split(1, name, project, .{"operations"}) orelse return null;
+    return .{ .location = parts[0], .id = parts[1] };
+}
+
+/// The location and then each id of
+/// `projects/<project>/locations/L/<collections[0]>/X0/...`, pointing into
+/// `name`. Null for another project's name, another shape, or an empty
+/// segment.
+fn split(comptime n: usize, name: []const u8, project: []const u8, collections: [n][]const u8) ?[n + 1][]const u8 {
     var parts = std.mem.splitScalar(u8, name, '/');
     if (!std.mem.eql(u8, parts.next() orelse return null, "projects")) return null;
-    const p = parts.next() orelse return null;
+    if (!std.mem.eql(u8, parts.next() orelse return null, project)) return null;
     if (!std.mem.eql(u8, parts.next() orelse return null, "locations")) return null;
-    const location = parts.next() orelse return null;
-    if (!std.mem.eql(u8, parts.next() orelse return null, "services")) return null;
-    const service_id = parts.next() orelse return null;
-    if (!std.mem.eql(u8, parts.next() orelse return null, "revisions")) return null;
-    const id = parts.next() orelse return null;
+    var out: [n + 1][]const u8 = undefined;
+    out[0] = parts.next() orelse return null;
+    for (collections, 1..) |collection, i| {
+        if (!std.mem.eql(u8, parts.next() orelse return null, collection)) return null;
+        out[i] = parts.next() orelse return null;
+    }
     if (parts.next() != null) return null;
-    if (!std.mem.eql(u8, p, project) or location.len == 0 or service_id.len == 0 or id.len == 0) return null;
-    return .{ .location = location, .service = service_id, .id = id };
+    for (out) |segment| if (segment.len == 0) return null;
+    return out;
 }
 
 const testing = std.testing;
@@ -132,4 +187,39 @@ test "paths and full names: this project's services and revisions, nobody else's
     try testing.expectEqual(null, revisionName("projects/p/locations/l/services/s/revisions/", "p"));
     try testing.expectEqual(null, revisionName("projects/p/locations/l/services/s", "p"));
     try testing.expectEqual(null, revisionName("projects/p/locations/l/services/s/revisions/r/x", "p"));
+}
+
+test "paths and full names: jobs, executions and operations" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("/v2/projects/p/locations/us-central1/jobs", try jobs(a, "p", "us-central1"));
+    try testing.expectEqualStrings("/v2/projects/p/locations/us-central1/jobs/j", try job(a, "p", "us-central1", "j"));
+    try testing.expectEqualStrings("/v2/projects/p/locations/us-central1/jobs/-/executions", try executions(a, "p", "us-central1", "-"));
+    try testing.expectEqualStrings("/v2/projects/p/locations/us-central1/jobs/j/executions/j-x7k2p", try execution(a, "p", "us-central1", "j", "j-x7k2p"));
+    try testing.expectEqualStrings("/v2/projects/p/locations/us-central1/operations/a6062a44-2b3b", try operation(a, "p", "us-central1", "a6062a44-2b3b"));
+    // Every segment is escaped on its own.
+    try testing.expectEqualStrings("/v2/projects/p/locations/l/jobs/a%20b/executions/c%3Fd", try execution(a, "p", "l", "a b", "c?d"));
+
+    const j = jobName("projects/p/locations/l/jobs/j", "p").?;
+    try testing.expectEqualStrings("l", j.location);
+    try testing.expectEqualStrings("j", j.id);
+    try testing.expectEqual(null, jobName("projects/p/locations/l/services/j", "p"));
+    try testing.expectEqual(null, jobName("projects/q/locations/l/jobs/j", "p"));
+    try testing.expectEqual(null, jobName("projects/p/locations//jobs/j", "p"));
+
+    const e = executionName("projects/p/locations/l/jobs/j/executions/j-x7k2p", "p").?;
+    try testing.expectEqualStrings("l", e.location);
+    try testing.expectEqualStrings("j", e.job);
+    try testing.expectEqualStrings("j-x7k2p", e.id);
+    try testing.expectEqual(null, executionName("projects/p/locations/l/jobs/j/executions/", "p"));
+    try testing.expectEqual(null, executionName("projects/p/locations/l/jobs/j/tasks/t", "p"));
+    try testing.expectEqual(null, executionName("projects/p/locations/l/jobs/j/executions/e/tasks/t", "p"));
+
+    const o = operationName("projects/p/locations/us-central1/operations/a6062a44", "p").?;
+    try testing.expectEqualStrings("us-central1", o.location);
+    try testing.expectEqualStrings("a6062a44", o.id);
+    try testing.expectEqual(null, operationName("projects/p/locations/l/operations", "p"));
+    try testing.expectEqual(null, operationName("projects/q/locations/l/operations/o", "p"));
+    try testing.expectEqual(null, operationName("operations/o", "p"));
 }
