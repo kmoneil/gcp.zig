@@ -4,6 +4,36 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.54.0 (unreleased)
+
+- run: jobs and their executions, read, for issue #272:
+  `Client.listJobs` (one region; production refuses `-` for jobs, so
+  the client does before sending), `getJob` and `getJobNamed`,
+  `listExecutions` (newest first; job `-` for every job in the region),
+  `getExecution` and `getExecutionNamed`, and `getOperation` for the
+  operation a write answers. A `Job` carries its latest execution with
+  a status, its terminal condition, its execution count, and its
+  template's task count, parallelism, task timeout, retries, images and
+  service account; an `Execution` its times, task counts, conditions
+  and log URI, with `status()` (pending, running, cancelling,
+  succeeded, failed or cancelled, read from its conditions as
+  production showed them, since the API has no status field) and
+  `cancellable()`. An `Operation` carries its name, whether it is done,
+  its failure, and its subject (an `Execution` or a `Service`). New
+  types: `Job`, `JobPage`, `Execution`, `ExecutionPage`,
+  `ExecutionStatus`, `ExecutionReference`, `Operation`; all
+  **Experimental** on their own. `Service.etag` is now decoded.
+  `Client.Options.scope` (`run.Scope`: `.read_only`, the default,
+  `.read_write` or `.cloud_platform`) picks the one OAuth scope a
+  client asks for; `run.auth_scope` stays the default's. Measured on
+  2026-10-21 and written in docs/run/README.md: a small job's execution
+  took about 90 s to start; one cancelled before it started never got a
+  completion time; a job nobody has lists no executions; a region that
+  does not exist is a permission refusal for jobs.
+- auth, core, dataflow, error_reporting, firestore, kms, logging,
+  monitoring, pubsub, resource_manager, scheduler, secret_manager and
+  storage: unchanged.
+
 ## 0.53.0 (2026-10-20)
 
 - dataflow: two writes a console confirms before sending, for issue

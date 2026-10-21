@@ -565,7 +565,10 @@ jobs:
         # first nights as its corpus grows. run (0.48.0) the same: its
         # five decoders in one property took about 0.04 ms a run on the
         # Mac (2M in 85 s of fuzzing; its corpus bodies are bigger), so
-        # 6M, to be priced by its first nights. The nightlies of 10-16
+        # 6M, to be priced by its first nights. In 0.54.0 the property
+        # decodes jobs, executions and operations too, ten decoders: 2M
+        # in 199 s on the Mac, so 6M stays, about 40 minutes at four
+        # times the Mac. The nightlies of 10-16
         # to 10-19 (runs 38871479649, 39014731663, 39109651208 and
         # 39225264813) price three jobs over the aim. fake-pubsub,
         # dropped to 800K on 10-18, took 108 minutes at that count on its
