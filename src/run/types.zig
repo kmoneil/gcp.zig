@@ -387,6 +387,19 @@ pub const Operation = struct {
     };
 };
 
+/// How `Client.routeAllTraffic` sends its change.
+pub const RouteOptions = struct {
+    /// Required: `Service.etag` from the read the change was decided on.
+    /// Production refuses the change once the service has changed since,
+    /// with `error.Aborted`, rather than overwrite it. Empty is refused
+    /// before sending: production takes a change with no etag unguarded.
+    etag: []const u8,
+    /// Checks the change without making it. Production checks the etag
+    /// and the target's form, but not that the revision exists or is
+    /// ready (measured).
+    validate_only: bool = false,
+};
+
 pub const ListOptions = struct {
     /// 0 for the server's default.
     page_size: u32 = 0,

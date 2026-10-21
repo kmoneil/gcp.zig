@@ -33,6 +33,11 @@ pub const Harness = struct {
     client: Client,
 
     pub fn init(h: *Harness, script: []const FakeTransport.Reply) !void {
+        return h.initScope(script, .read_only);
+    }
+
+    /// `init`, the client asking for `scope`: `.read_write` for the writes.
+    pub fn initScope(h: *Harness, script: []const FakeTransport.Reply, scope: @import("rpc.zig").Scope) !void {
         h.* = .{
             .fake = .init(std.testing.allocator, script),
             .clock = .{},
@@ -44,6 +49,7 @@ pub const Harness = struct {
         h.client = try .init(std.testing.allocator, h.clock.io(), .{
             .project_id = "my-project",
             .token_provider = h.token.provider(),
+            .scope = scope,
             .diagnostics = &h.diag,
             .transport = h.fake.transport(),
         });
@@ -60,6 +66,14 @@ pub const Harness = struct {
         try std.testing.expectEqual(method, r.method);
         try std.testing.expectEqualStrings(url, r.url);
         try std.testing.expectEqual(null, r.body);
+    }
+
+    /// Asserts the method, URL and body of the request at `index`, a write.
+    pub fn expectSent(h: *const Harness, index: usize, method: Method, url: []const u8, body: []const u8) !void {
+        const r = try h.fake.request(index);
+        try std.testing.expectEqual(method, r.method);
+        try std.testing.expectEqualStrings(url, r.url);
+        try std.testing.expectEqualStrings(body, r.body orelse "");
     }
 
     pub fn expectRequestCount(h: *const Harness, count: usize) !void {

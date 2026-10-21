@@ -2402,3 +2402,284 @@ pub const operation_unknown =
     \\ }
     \\}
 ;
+/// A run with a run.readonly token: every write was refused so. HTTP 403.
+pub const write_scope_refused_status = 403;
+pub const write_scope_refused =
+    \\{
+    \\ "error": {
+    \\  "code": 403,
+    \\  "message": "Request had insufficient authentication scopes.",
+    \\  "status": "PERMISSION_DENIED",
+    \\  "details": [
+    \\   {
+    \\    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+    \\    "reason": "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+    \\    "domain": "googleapis.com",
+    \\    "metadata": {
+    \\     "service": "run.googleapis.com",
+    \\     "method": "google.cloud.run.v2.Jobs.RunJob"
+    \\    }
+    \\   }
+    \\  ]
+    \\ }
+    \\}
+;
+
+/// A cancel of an execution already cancelled; succeeded and failed ones answered the same. HTTP 400.
+pub const cancel_not_running_status = 400;
+pub const cancel_not_running =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Execution 'zigps-6b8297-slow-nlzdb' cannot be cancelled because it is not running.",
+    \\  "status": "FAILED_PRECONDITION"
+    \\ }
+    \\}
+;
+
+/// A traffic change under updateMask=traffic,etag with a stale etag. HTTP 409.
+pub const traffic_stale_etag_status = 409;
+pub const traffic_stale_etag =
+    \\{
+    \\ "error": {
+    \\  "code": 409,
+    \\  "message": "Conflict for resource 'zigps-8e3f3f': version '1792585476717971' was specified but current version is '1792585482447477'.",
+    \\  "status": "ABORTED"
+    \\ }
+    \\}
+;
+
+/// A traffic change to another service's revision, refused at once. HTTP 400.
+pub const traffic_other_service_status = 400;
+pub const traffic_other_service =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "spec.traffic.revision_name[0]: Revision target 'zigps-other-00001-abc' invalid. Expected a revision prefixed with 'zigps-6b8297-'.",
+    \\  "status": "INVALID_ARGUMENT",
+    \\  "details": [
+    \\   {
+    \\    "@type": "type.googleapis.com/google.rpc.BadRequest",
+    \\    "fieldViolations": [
+    \\     {
+    \\      "field": "spec.traffic.revision_name[0]",
+    \\      "description": "Revision target 'zigps-other-00001-abc' invalid. Expected a revision prefixed with 'zigps-6b8297-'."
+    \\     }
+    \\    ]
+    \\   }
+    \\  ]
+    \\ }
+    \\}
+;
+
+/// A traffic change's answer: an operation, not done, its metadata the Service with the asked traffic. HTTP 200.
+pub const operation_traffic_status = 200;
+pub const operation_traffic =
+    \\{
+    \\ "name": "projects/extractctl/locations/us-central1/operations/93cc9a58-a067-49d0-a318-74faf477cf18",
+    \\ "metadata": {
+    \\  "@type": "type.googleapis.com/google.cloud.run.v2.Service",
+    \\  "name": "projects/extractctl/locations/us-central1/services/zigps-6b8297",
+    \\  "uid": "d086478c-38dd-4518-8819-1e5a6effbaab",
+    \\  "generation": "3",
+    \\  "labels": {
+    \\   "zigps": "probe"
+    \\  },
+    \\  "createTime": "2026-10-21T12:22:26.679350Z",
+    \\  "updateTime": "2026-10-21T12:22:45.008189Z",
+    \\  "creator": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\  "lastModifier": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\  "ingress": "INGRESS_TRAFFIC_ALL",
+    \\  "launchStage": "GA",
+    \\  "template": {
+    \\   "timeout": "300s",
+    \\   "serviceAccount": "82150720798-compute@developer.gserviceaccount.com",
+    \\   "containers": [
+    \\    {
+    \\     "image": "us-docker.pkg.dev/cloudrun/container/hello",
+    \\     "env": [
+    \\      {
+    \\       "name": "ZIGPS",
+    \\       "value": "2"
+    \\      }
+    \\     ],
+    \\     "resources": {
+    \\      "limits": {
+    \\       "memory": "512Mi",
+    \\       "cpu": "1000m"
+    \\      },
+    \\      "cpuIdle": true
+    \\     },
+    \\     "ports": [
+    \\      {
+    \\       "name": "http1",
+    \\       "containerPort": 8080
+    \\      }
+    \\     ],
+    \\     "startupProbe": {
+    \\      "timeoutSeconds": 240,
+    \\      "periodSeconds": 240,
+    \\      "failureThreshold": 1,
+    \\      "tcpSocket": {
+    \\       "port": 8080
+    \\      }
+    \\     }
+    \\    }
+    \\   ],
+    \\   "maxInstanceRequestConcurrency": 80
+    \\  },
+    \\  "traffic": [
+    \\   {
+    \\    "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION",
+    \\    "revision": "zigps-6b8297-00001-527",
+    \\    "percent": 100
+    \\   }
+    \\  ],
+    \\  "scaling": {
+    \\   "maxInstanceCount": 20
+    \\  },
+    \\  "urls": [
+    \\   "https://zigps-6b8297-82150720798.us-central1.run.app",
+    \\   "https://zigps-6b8297-el44yx5gia-uc.a.run.app"
+    \\  ],
+    \\  "sshEnabled": false,
+    \\  "observedGeneration": "2",
+    \\  "terminalCondition": {
+    \\   "type": "Ready",
+    \\   "state": "CONDITION_PENDING",
+    \\   "lastTransitionTime": "2026-10-21T12:22:43.169189Z"
+    \\  },
+    \\  "conditions": [
+    \\   {
+    \\    "type": "RoutesReady",
+    \\    "state": "CONDITION_SUCCEEDED",
+    \\    "lastTransitionTime": "2026-10-21T12:22:43.092203Z"
+    \\   },
+    \\   {
+    \\    "type": "ConfigurationsReady",
+    \\    "state": "CONDITION_SUCCEEDED",
+    \\    "lastTransitionTime": "2026-10-21T12:22:34.050655Z"
+    \\   }
+    \\  ],
+    \\  "latestReadyRevision": "projects/extractctl/locations/us-central1/services/zigps-6b8297/revisions/zigps-6b8297-00002-v7z",
+    \\  "latestCreatedRevision": "projects/extractctl/locations/us-central1/services/zigps-6b8297/revisions/zigps-6b8297-00002-v7z",
+    \\  "trafficStatuses": [
+    \\   {
+    \\    "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST",
+    \\    "revision": "zigps-6b8297-00002-v7z",
+    \\    "percent": 100
+    \\   }
+    \\  ],
+    \\  "uri": "https://zigps-6b8297-el44yx5gia-uc.a.run.app",
+    \\  "reconciling": true,
+    \\  "etag": "\"CJXd4tYGEMjo8wM/cHJvamVjdHMvZXh0cmFjdGN0bC9sb2NhdGlvbnMvdXMtY2VudHJhbDEvc2VydmljZXMvemlncHMtNmI4Mjk3\""
+    \\ }
+    \\}
+;
+
+/// A validateOnly traffic change under the etag mask: an operation, nothing changed. HTTP 200.
+pub const operation_traffic_validate_status = 200;
+pub const operation_traffic_validate =
+    \\{
+    \\ "name": "projects/extractctl/locations/us-central1/operations/f6d4e600-8967-4ba0-8ad0-ff90c3e9021f",
+    \\ "metadata": {
+    \\  "@type": "type.googleapis.com/google.cloud.run.v2.Service",
+    \\  "name": "projects/extractctl/locations/us-central1/services/zigps-6ff401",
+    \\  "uid": "1d56f452-e8a3-4ed1-98fe-6b33e7740e0c",
+    \\  "generation": "4",
+    \\  "labels": {
+    \\   "zigps": "probe2"
+    \\  },
+    \\  "createTime": "2026-10-21T12:25:45.674930Z",
+    \\  "updateTime": "2026-10-21T12:26:08.774121Z",
+    \\  "creator": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\  "lastModifier": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\  "ingress": "INGRESS_TRAFFIC_ALL",
+    \\  "launchStage": "GA",
+    \\  "template": {
+    \\   "timeout": "300s",
+    \\   "serviceAccount": "82150720798-compute@developer.gserviceaccount.com",
+    \\   "containers": [
+    \\    {
+    \\     "image": "us-docker.pkg.dev/cloudrun/container/hello",
+    \\     "env": [
+    \\      {
+    \\       "name": "ZIGPS",
+    \\       "value": "2"
+    \\      }
+    \\     ],
+    \\     "resources": {
+    \\      "limits": {
+    \\       "memory": "512Mi",
+    \\       "cpu": "1000m"
+    \\      },
+    \\      "cpuIdle": true
+    \\     },
+    \\     "ports": [
+    \\      {
+    \\       "name": "http1",
+    \\       "containerPort": 8080
+    \\      }
+    \\     ],
+    \\     "startupProbe": {
+    \\      "timeoutSeconds": 240,
+    \\      "periodSeconds": 240,
+    \\      "failureThreshold": 1,
+    \\      "tcpSocket": {
+    \\       "port": 8080
+    \\      }
+    \\     }
+    \\    }
+    \\   ],
+    \\   "maxInstanceRequestConcurrency": 80
+    \\  },
+    \\  "traffic": [
+    \\   {
+    \\    "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION",
+    \\    "revision": "zigps-6ff401-00002-wwm",
+    \\    "percent": 100
+    \\   }
+    \\  ],
+    \\  "scaling": {
+    \\   "maxInstanceCount": 20
+    \\  },
+    \\  "urls": [
+    \\   "https://zigps-6ff401-82150720798.us-central1.run.app",
+    \\   "https://zigps-6ff401-el44yx5gia-uc.a.run.app"
+    \\  ],
+    \\  "sshEnabled": false,
+    \\  "observedGeneration": "3",
+    \\  "terminalCondition": {
+    \\   "type": "Ready",
+    \\   "state": "CONDITION_PENDING",
+    \\   "lastTransitionTime": "2026-10-21T12:26:07.207261Z"
+    \\  },
+    \\  "conditions": [
+    \\   {
+    \\    "type": "RoutesReady",
+    \\    "state": "CONDITION_SUCCEEDED",
+    \\    "lastTransitionTime": "2026-10-21T12:26:07.151978Z"
+    \\   },
+    \\   {
+    \\    "type": "ConfigurationsReady",
+    \\    "state": "CONDITION_SUCCEEDED",
+    \\    "message": "Deploying revision succeeded in 7.36s.",
+    \\    "lastTransitionTime": "2026-10-21T12:26:07.306654Z",
+    \\    "revisionReason": "RETIRED"
+    \\   }
+    \\  ],
+    \\  "latestReadyRevision": "projects/extractctl/locations/us-central1/services/zigps-6ff401/revisions/zigps-6ff401-00002-wwm",
+    \\  "latestCreatedRevision": "projects/extractctl/locations/us-central1/services/zigps-6ff401/revisions/zigps-6ff401-00002-wwm",
+    \\  "trafficStatuses": [
+    \\   {
+    \\    "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION",
+    \\    "revision": "zigps-6ff401-00001-g5f",
+    \\    "percent": 100
+    \\   }
+    \\  ],
+    \\  "uri": "https://zigps-6ff401-el44yx5gia-uc.a.run.app",
+    \\  "reconciling": true,
+    \\  "etag": "\"CODe4tYGEKjMkPEC/cHJvamVjdHMvZXh0cmFjdGN0bC9sb2NhdGlvbnMvdXMtY2VudHJhbDEvc2VydmljZXMvemlncHMtNmZmNDAx\""
+    \\ }
+    \\}
+;
