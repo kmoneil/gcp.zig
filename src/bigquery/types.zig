@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const core = @import("core");
+const values = @import("values.zig");
 
 pub const Owned = core.Owned;
 
@@ -366,6 +367,101 @@ pub const ListJobsOptions = struct {
     max_creation_time: ?std.Io.Timestamp = null,
     page_size: u32 = 0,
     page_token: ?[]const u8 = null,
+};
+
+/// What `dryRun` and `query` ask. Every query this library sends is
+/// GoogleSQL: it sends `useLegacySql` false, BigQuery's default being
+/// legacy SQL still.
+pub const QueryOptions = struct {
+    /// The GoogleSQL text: UTF-8, and not empty.
+    query: []const u8,
+    /// The most the query may bill: one that would bill more fails,
+    /// billing nothing, `error.BytesBilledLimitExceeded`. Null for the
+    /// project's default. A query that reads a table bills at least 10 MiB
+    /// (10,485,760 bytes), so a lower limit refuses every such query
+    /// (measured); a query of literals alone billed 0.
+    maximum_bytes_billed: ?u64 = null,
+    /// Where the job runs: `US`, `EU` or a region. Empty lets BigQuery
+    /// choose from the tables the query reads.
+    location: []const u8 = "",
+    /// The dataset unqualified table names resolve in.
+    default_dataset: ?DatasetRef = null,
+    /// False to run the query even when the same one ran recently and an
+    /// answer is cached, which bills nothing.
+    use_query_cache: bool = true,
+    /// How long `query` holds the call for the job to finish before
+    /// answering it incomplete. Production returns after about 200 s,
+    /// whatever this asks. `dryRun` ignores it.
+    timeout_ms: u32 = 10_000,
+    /// Rows on the first page: null for as many as fit in production's
+    /// 10 MB, 0 for none. `dryRun` ignores it.
+    page_size: ?u32 = null,
+    /// The job's labels: keys and values of lowercase letters, digits, _
+    /// and -, at most 63 characters, a key starting with a letter; at
+    /// most 64 of them.
+    labels: []const Label = &.{},
+    /// Makes a repeat of the same query, within 15 minutes, answer the
+    /// first job rather than run it again: at most 36 ASCII characters.
+    /// Null: `query` makes one, a UUID, for the call, so its own retries
+    /// are safe. Give one (`Client.newRequestId`) to make a repeat of your
+    /// own safe too, or to send exactly what `queryRequest` showed. `dryRun`
+    /// ignores it: production never takes a dry run as a repeat.
+    request_id: ?[]const u8 = null,
+};
+
+/// What `getQueryResults` asks.
+pub const ResultsOptions = struct {
+    page_token: ?[]const u8 = null,
+    /// Rows on the page: null for as many as fit in production's 10 MB,
+    /// 0 for none, to wait for the job without reading rows, as Google's
+    /// clients do.
+    page_size: ?u32 = null,
+    /// How long the call is held for a job that has not finished: about
+    /// this long (measured), and production returns after about 200 s
+    /// whatever this asks.
+    timeout_ms: u32 = 10_000,
+    /// The first row to read, from 0, to jump into the results; not with
+    /// `page_token`.
+    start_index: ?u64 = null,
+};
+
+/// What a dry run says of a query, without running it.
+pub const DryRun = struct {
+    /// The bytes the query would read. What it would bill is at least
+    /// 10 MiB for a query that reads a table, and 0 from the cache.
+    total_bytes_processed: ?u64 = null,
+    total_bytes_billed: ?u64 = null,
+    cache_hit: ?bool = null,
+    /// The columns it would answer.
+    schema: []const Field = &.{},
+    /// `SELECT`, `INSERT`, `CREATE_TABLE` and the like.
+    statement_type: []const u8 = "",
+    location: []const u8 = "",
+};
+
+/// A query's answer, or one page of its results.
+pub const QueryPage = struct {
+    /// The job, to read more pages of and to cancel. Null only for a
+    /// query production answered without making one.
+    job: ?JobRef = null,
+    query_id: []const u8 = "",
+    /// False: the job has not finished, and the page has no schema and
+    /// no rows. Ask `getQueryResults` again.
+    complete: bool = false,
+    schema: []const Field = &.{},
+    rows: []const values.Row = &.{},
+    /// Every row the query answered, across all pages.
+    total_rows: ?u64 = null,
+    /// Null on the last page.
+    page_token: ?[]const u8 = null,
+    total_bytes_processed: ?u64 = null,
+    total_bytes_billed: ?u64 = null,
+    cache_hit: ?bool = null,
+    /// On the first page only.
+    statement_type: []const u8 = "",
+    num_dml_affected_rows: ?u64 = null,
+    /// Errors that did not stop the query, if any.
+    errors: []const JobError = &.{},
 };
 
 const testing = std.testing;

@@ -617,7 +617,9 @@ jobs:
         # times the Mac, to be priced by its first nights. The values'
         # round trip and the row decode join it in 0.55.0's second
         # step: 2M in 294 s on the Mac, so 6M stays, about an hour at
-        # four times the Mac. Query pages join it in the third.
+        # four times the Mac. Query pages and dry runs join it in the
+        # third: 2M in 328 s, so 6M stays, about 66 minutes at four
+        # times the Mac.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 630K }
           - { job: auth, module: auth, filter: fuzz, iterations: 850K }

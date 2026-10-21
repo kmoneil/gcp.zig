@@ -52,6 +52,13 @@ pub const JobPage = @import("types.zig").JobPage;
 pub const ListOptions = @import("types.zig").ListOptions;
 pub const ListDatasetsOptions = @import("types.zig").ListDatasetsOptions;
 pub const ListJobsOptions = @import("types.zig").ListJobsOptions;
+pub const QueryOptions = @import("types.zig").QueryOptions;
+pub const ResultsOptions = @import("types.zig").ResultsOptions;
+pub const DryRun = @import("types.zig").DryRun;
+pub const QueryPage = @import("types.zig").QueryPage;
+/// A request as a call would send it, built without sending it: what
+/// `Client.queryRequest` and the other previews answer.
+pub const PreparedRequest = core.PreparedRequest;
 
 /// A query's rows, decoded against its schema.
 pub const Row = @import("values.zig").Row;

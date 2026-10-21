@@ -2738,3 +2738,802 @@ pub const query_every_type_iso =
     \\ "statementType": "SELECT"
     \\}
 ;
+
+/// jobs.query of five Hamlet words from the public samples, under a 100 MB limit: complete, five rows. HTTP 200.
+pub const query_run_status = 200;
+pub const query_run =
+    \\{
+    \\ "kind": "bigquery#queryResponse",
+    \\ "schema": {
+    \\  "fields": [
+    \\   {
+    \\    "name": "word",
+    \\    "type": "STRING",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "word_count",
+    \\    "type": "INTEGER",
+    \\    "mode": "NULLABLE"
+    \\   }
+    \\  ]
+    \\ },
+    \\ "jobReference": {
+    \\  "projectId": "extractctl",
+    \\  "jobId": "job_3xSjRB7aLm3FIgAkBpq9X-aA5EZx",
+    \\  "location": "US"
+    \\ },
+    \\ "totalRows": "5",
+    \\ "rows": [
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "the"
+    \\    },
+    \\    {
+    \\     "v": "995"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "and"
+    \\    },
+    \\    {
+    \\     "v": "706"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "to"
+    \\    },
+    \\    {
+    \\     "v": "635"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "of"
+    \\    },
+    \\    {
+    \\     "v": "630"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "I"
+    \\    },
+    \\    {
+    \\     "v": "546"
+    \\    }
+    \\   ]
+    \\  }
+    \\ ],
+    \\ "totalBytesProcessed": "0",
+    \\ "jobComplete": true,
+    \\ "cacheHit": true,
+    \\ "queryId": "job_3xSjRB7aLm3FIgAkBpq9X-aA5EZx",
+    \\ "jobCreationReason": {
+    \\  "code": "REQUESTED"
+    \\ },
+    \\ "totalBytesBilled": "0",
+    \\ "location": "US",
+    \\ "creationTime": "1792597448912",
+    \\ "startTime": "1792597449094",
+    \\ "endTime": "1792597449180",
+    \\ "pageRowCount": "5",
+    \\ "statementType": "SELECT"
+    \\}
+;
+
+/// The same query as a dry run: complete, a job reference without a jobId, the bytes and the schema. HTTP 200.
+pub const query_dry_run_status = 200;
+pub const query_dry_run =
+    \\{
+    \\ "kind": "bigquery#queryResponse",
+    \\ "schema": {
+    \\  "fields": [
+    \\   {
+    \\    "name": "word",
+    \\    "type": "STRING",
+    \\    "mode": "NULLABLE"
+    \\   },
+    \\   {
+    \\    "name": "word_count",
+    \\    "type": "INTEGER",
+    \\    "mode": "NULLABLE"
+    \\   }
+    \\  ]
+    \\ },
+    \\ "jobReference": {
+    \\  "projectId": "extractctl",
+    \\  "location": "US"
+    \\ },
+    \\ "totalBytesProcessed": "5114816",
+    \\ "jobComplete": true,
+    \\ "cacheHit": true,
+    \\ "totalBytesBilled": "0",
+    \\ "location": "US",
+    \\ "creationTime": "1792597445907",
+    \\ "endTime": "1792597446132",
+    \\ "statementType": "SELECT"
+    \\}
+;
+
+/// A query that outlived timeoutMs 10: unfinished, its job and nothing else. HTTP 200.
+pub const query_slow_status = 200;
+pub const query_slow =
+    \\{
+    \\ "kind": "bigquery#queryResponse",
+    \\ "jobReference": {
+    \\  "projectId": "extractctl",
+    \\  "jobId": "job_yqKr7l89vGwL2TIqWdhA7sDltZ8O",
+    \\  "location": "US"
+    \\ },
+    \\ "jobComplete": false,
+    \\ "queryId": "job_yqKr7l89vGwL2TIqWdhA7sDltZ8O",
+    \\ "jobCreationReason": {
+    \\  "code": "REQUESTED"
+    \\ },
+    \\ "location": "US",
+    \\ "creationTime": "1792597455053",
+    \\ "startTime": "1792597455129",
+    \\ "statementType": "SELECT"
+    \\}
+;
+
+/// A second jobs.query with the first's requestId: the same job, answered unfinished and without rows although it had ended. HTTP 200.
+pub const query_repeat_status = 200;
+pub const query_repeat =
+    \\{
+    \\ "kind": "bigquery#queryResponse",
+    \\ "jobReference": {
+    \\  "projectId": "extractctl",
+    \\  "jobId": "job_Sorr4TiYD0h32C31IK3GGXkQXsEn",
+    \\  "location": "US"
+    \\ },
+    \\ "totalBytesProcessed": "0",
+    \\ "jobComplete": false,
+    \\ "cacheHit": false,
+    \\ "queryId": "job_Sorr4TiYD0h32C31IK3GGXkQXsEn",
+    \\ "jobCreationReason": {
+    \\  "code": "REQUESTED"
+    \\ },
+    \\ "totalBytesBilled": "0",
+    \\ "totalSlotMs": "1",
+    \\ "location": "US",
+    \\ "creationTime": "1792597562975",
+    \\ "startTime": "1792597563030",
+    \\ "endTime": "1792597563508",
+    \\ "statementType": "SELECT"
+    \\}
+;
+
+/// jobs.query with JOB_CREATION_OPTIONAL: complete, no jobReference, a queryId. HTTP 200.
+pub const query_optional_job_status = 200;
+pub const query_optional_job =
+    \\{
+    \\ "kind": "bigquery#queryResponse",
+    \\ "schema": {
+    \\  "fields": [
+    \\   {
+    \\    "name": "f0_",
+    \\    "type": "INTEGER",
+    \\    "mode": "NULLABLE"
+    \\   }
+    \\  ]
+    \\ },
+    \\ "totalRows": "1",
+    \\ "rows": [
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "1"
+    \\    }
+    \\   ]
+    \\  }
+    \\ ],
+    \\ "totalBytesProcessed": "0",
+    \\ "jobComplete": true,
+    \\ "cacheHit": false,
+    \\ "queryId": "0QzAcZxdxSiJOmtNYg913SXyrfI4@1a15f241c57",
+    \\ "totalBytesBilled": "0",
+    \\ "totalSlotMs": "1",
+    \\ "location": "US",
+    \\ "creationTime": "1792597564461",
+    \\ "startTime": "1792597564503",
+    \\ "endTime": "1792597564544",
+    \\ "statementType": "SELECT"
+    \\}
+;
+
+/// An INSERT of two rows: numDmlAffectedRows, no rows. HTTP 200.
+pub const query_insert_status = 200;
+pub const query_insert =
+    \\{
+    \\ "kind": "bigquery#queryResponse",
+    \\ "schema": {
+    \\  "fields": [
+    \\   {
+    \\    "name": "ts",
+    \\    "type": "TIMESTAMP"
+    \\   },
+    \\   {
+    \\    "name": "user",
+    \\    "type": "STRING"
+    \\   },
+    \\   {
+    \\    "name": "n",
+    \\    "type": "INTEGER"
+    \\   }
+    \\  ]
+    \\ },
+    \\ "jobReference": {
+    \\  "projectId": "extractctl",
+    \\  "jobId": "job_ZNzGxPC8ET6hZveu0Tg5Z-GEsITz",
+    \\  "location": "US"
+    \\ },
+    \\ "totalBytesProcessed": "0",
+    \\ "jobComplete": true,
+    \\ "cacheHit": false,
+    \\ "numDmlAffectedRows": "2",
+    \\ "dmlStats": {
+    \\  "insertedRowCount": "2",
+    \\  "dmlMode": "COARSE_GRAINED_DML"
+    \\ },
+    \\ "queryId": "job_ZNzGxPC8ET6hZveu0Tg5Z-GEsITz",
+    \\ "jobCreationReason": {
+    \\  "code": "REQUESTED"
+    \\ },
+    \\ "totalBytesBilled": "0",
+    \\ "totalSlotMs": "3290",
+    \\ "location": "US",
+    \\ "creationTime": "1792597664935",
+    \\ "startTime": "1792597665356",
+    \\ "endTime": "1792597666441",
+    \\ "statementType": "INSERT"
+    \\}
+;
+
+/// getQueryResults, a page of ten with a pageToken. HTTP 200.
+pub const results_page_status = 200;
+pub const results_page =
+    \\{
+    \\ "kind": "bigquery#getQueryResultsResponse",
+    \\ "etag": "XgUBuLHDeWGRTUP05PJ8fA==",
+    \\ "schema": {
+    \\  "fields": [
+    \\   {
+    \\    "name": "n",
+    \\    "type": "INTEGER",
+    \\    "mode": "NULLABLE"
+    \\   }
+    \\  ]
+    \\ },
+    \\ "jobReference": {
+    \\  "projectId": "extractctl",
+    \\  "jobId": "job_zuWkgIS8xmg5cnX_F1jDBhKLWyA4",
+    \\  "location": "US"
+    \\ },
+    \\ "totalRows": "50",
+    \\ "pageToken": "BGYGOIS7UEAQAAASA4EAAEEAQCAAKGQEBAKBACRAWCXBKSVBAIFGQCQVBIFGK6DUOJQWG5DDORWBCHUFSAQBGAAAAAJCSX3EMU2WEYJQMI3TGMZVHAYGKOLEGE2TCMZSGI2DGZDBGAYTAN3FGU2WKY3BHBTDQNQ2EQ4DOOBUGZSGIYRNMY2TMYRNGRTDANZNHEYDCOBNGI2WIMZWMMZDSYJZGZSBERDBNZXW4OBZGVTGCZBWGEYGCMJVGI3WCOLFMZQTAYRQMEYTEMJXMMYGKYRTGFRDEOJVGMZDQYTFG5RDEOLDMI2GEN3GGE3DEZRXGQ2WKYTFHBSBU3ZYHE2WMYLEGYYTAYJRGUZDOYJZMVTGCMDCGBQTCMRRG5RTAZLCGMYWEMRZGUZTEODCMU3WEMRZMNRDIYRXMYYTMMTGG42DKZLCMU4GII3FOZPWMRZZIRMG4RRVMJ4FE4RSORIWY43XIV2E46TLJBBEE3KDJUZFKMTMNJ4XSTBZG5DTSRCB",
+    \\ "rows": [
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "11"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "12"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "13"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "14"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "15"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "16"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "17"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "18"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "19"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "20"
+    \\    }
+    \\   ]
+    \\  }
+    \\ ],
+    \\ "totalBytesProcessed": "0",
+    \\ "jobComplete": true,
+    \\ "cacheHit": true
+    \\}
+;
+
+/// The last page: no pageToken. HTTP 200.
+pub const results_last_status = 200;
+pub const results_last =
+    \\{
+    \\ "kind": "bigquery#getQueryResultsResponse",
+    \\ "etag": "q9RjyEQLEb8+dwWECGsc0Q==",
+    \\ "schema": {
+    \\  "fields": [
+    \\   {
+    \\    "name": "n",
+    \\    "type": "INTEGER",
+    \\    "mode": "NULLABLE"
+    \\   }
+    \\  ]
+    \\ },
+    \\ "jobReference": {
+    \\  "projectId": "extractctl",
+    \\  "jobId": "job_zuWkgIS8xmg5cnX_F1jDBhKLWyA4",
+    \\  "location": "US"
+    \\ },
+    \\ "totalRows": "50",
+    \\ "rows": [
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "41"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "42"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "43"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "44"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "45"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "46"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "47"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "48"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "49"
+    \\    }
+    \\   ]
+    \\  },
+    \\  {
+    \\   "f": [
+    \\    {
+    \\     "v": "50"
+    \\    }
+    \\   ]
+    \\  }
+    \\ ],
+    \\ "totalBytesProcessed": "0",
+    \\ "jobComplete": true,
+    \\ "cacheHit": true
+    \\}
+;
+
+/// getQueryResults of a running job with timeoutMs 2000: held about 2 s, unfinished. HTTP 200.
+pub const results_unfinished_status = 200;
+pub const results_unfinished =
+    \\{
+    \\ "kind": "bigquery#getQueryResultsResponse",
+    \\ "etag": "BIMbqCBOUxHmRDHax2fneA==",
+    \\ "jobReference": {
+    \\  "projectId": "extractctl",
+    \\  "jobId": "job_yqKr7l89vGwL2TIqWdhA7sDltZ8O",
+    \\  "location": "US"
+    \\ },
+    \\ "jobComplete": false
+    \\}
+;
+
+/// getQueryResults with maxResults=0 and timeoutMs 60000: held 53 s to the job's end, the schema, the row count and a pageToken, no rows. HTTP 200.
+pub const results_wait_status = 200;
+pub const results_wait =
+    \\{
+    \\ "kind": "bigquery#getQueryResultsResponse",
+    \\ "etag": "pZFch9EzPsLb5c5jvaRCug==",
+    \\ "schema": {
+    \\  "fields": [
+    \\   {
+    \\    "name": "f0_",
+    \\    "type": "INTEGER",
+    \\    "mode": "NULLABLE"
+    \\   }
+    \\  ]
+    \\ },
+    \\ "jobReference": {
+    \\  "projectId": "extractctl",
+    \\  "jobId": "job_5aP-2fB2ZnFmxumu9Gzyjx_d4D7k",
+    \\  "location": "US"
+    \\ },
+    \\ "totalRows": "1",
+    \\ "pageToken": "BHGOEI27UEAQAAASA4EAAEEAQCAAKGQIBAABB7X7777QOIFQVYKUVTQBBJUAUFIKBJSXQ5DSMFRXIY3UNQIR5BMQEAJQAAAACIUV6ZDFGVRGCMDCG4ZTGNJYGBSTSZBRGUYTGMRSGQZWIYJQGEYDOZJVGVSWGYJYMY4DMGREHA3TQNBWMRSGELLGGU3GELJUMYYDOLJZGAYTQLJSGVSDGNTDGI4WCOJWMQJDEYLON5XGK5S7NZZGQR2WNBRV63KJGJFUETLLHBIVKYSGGEZVEN2HIJ2FAQZWK5UU2QKMLBVHGUCYPJJVKGROMV3F63TSNBDVM2DDL5WUSMSLIJGWWOCRKVREMMJTKI3UOQTUKBBTMV3JJVAUYWDKONIFQ6STKU======",
+    \\ "totalBytesProcessed": "0",
+    \\ "jobComplete": true,
+    \\ "cacheHit": false
+    \\}
+;
+
+/// jobs.query of a syntax error. HTTP 400.
+pub const query_syntax_status = 400;
+pub const query_syntax =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Syntax error: Unexpected keyword WHERE at [2:3]",
+    \\  "errors": [
+    \\   {
+    \\    "message": "Syntax error: Unexpected keyword WHERE at [2:3]",
+    \\    "domain": "global",
+    \\    "reason": "invalidQuery",
+    \\    "location": "q",
+    \\    "locationType": "parameter"
+    \\   }
+    \\  ],
+    \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// A dry run of the same syntax error. HTTP 400.
+pub const dry_run_syntax_status = 400;
+pub const dry_run_syntax =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Syntax error: Unexpected keyword WHERE at [2:3]",
+    \\  "errors": [
+    \\   {
+    \\    "message": "Syntax error: Unexpected keyword WHERE at [2:3]",
+    \\    "domain": "global",
+    \\    "reason": "invalidQuery",
+    \\    "location": "q",
+    \\    "locationType": "parameter"
+    \\   }
+    \\  ],
+    \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// jobs.query over maximumBytesBilled 1000. HTTP 400.
+pub const query_over_limit_status = 400;
+pub const query_over_limit =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Query exceeded limit for bytes billed: 1000. 10485760 or higher required.",
+    \\  "errors": [
+    \\   {
+    \\    "message": "Query exceeded limit for bytes billed: 1000. 10485760 or higher required.",
+    \\    "domain": "global",
+    \\    "reason": "bytesBilledLimitExceeded"
+    \\   }
+    \\  ],
+    \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// jobs.query of SELECT 1 / 0. HTTP 400.
+pub const query_runtime_error_status = 400;
+pub const query_runtime_error =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "division by zero: 1 / 0",
+    \\  "errors": [
+    \\   {
+    \\    "message": "division by zero: 1 / 0",
+    \\    "domain": "global",
+    \\    "reason": "invalidQuery",
+    \\    "location": "q",
+    \\    "locationType": "parameter"
+    \\   }
+    \\  ],
+    \\  "status": "INVALID_ARGUMENT"
+    \\ }
+    \\}
+;
+
+/// A US table queried with location EU. HTTP 403.
+pub const query_location_eu_status = 403;
+pub const query_location_eu =
+    \\{
+    \\ "error": {
+    \\  "code": 403,
+    \\  "message": "Access Denied: Table bigquery-public-data:samples.shakespeare: User does not have permission to query table bigquery-public-data:samples.shakespeare, or perhaps it does not exist.",
+    \\  "errors": [
+    \\   {
+    \\    "message": "Access Denied: Table bigquery-public-data:samples.shakespeare: User does not have permission to query table bigquery-public-data:samples.shakespeare, or perhaps it does not exist.",
+    \\    "domain": "global",
+    \\    "reason": "accessDenied"
+    \\   }
+    \\  ],
+    \\  "status": "PERMISSION_DENIED"
+    \\ }
+    \\}
+;
+
+/// A dry run reading a dataset nobody has. HTTP 404.
+pub const dry_run_missing_table_status = 404;
+pub const dry_run_missing_table =
+    \\{
+    \\ "error": {
+    \\  "code": 404,
+    \\  "message": "Not found: Dataset extractctl:zigps_nobody was not found in location US",
+    \\  "errors": [
+    \\   {
+    \\    "message": "Not found: Dataset extractctl:zigps_nobody was not found in location US",
+    \\    "domain": "global",
+    \\    "reason": "notFound"
+    \\   }
+    \\  ],
+    \\  "status": "NOT_FOUND"
+    \\ }
+    \\}
+;
+
+/// A cancel of a job already done: no refusal, the job DONE. HTTP 200.
+pub const cancel_done_status = 200;
+pub const cancel_done =
+    \\{
+    \\ "kind": "bigquery#jobCancelResponse",
+    \\ "job": {
+    \\  "kind": "bigquery#job",
+    \\  "etag": "Lxb3TdGsmvxp9mjhFOKrMg==",
+    \\  "id": "extractctl:US.job_uJJN89pQ9cqYnDKc4Z_VpBpHsSqC",
+    \\  "selfLink": "https://bigquery.googleapis.com/bigquery/v2/projects/extractctl/jobs/job_uJJN89pQ9cqYnDKc4Z_VpBpHsSqC?location=US",
+    \\  "configuration": {
+    \\   "query": {
+    \\    "query": "SELECT COUNT(*) FROM UNNEST(GENERATE_ARRAY(1, 1000000)) AS a CROSS JOIN UNNEST(GENERATE_ARRAY(1, 3000)) AS b",
+    \\    "destinationTable": {
+    \\     "projectId": "extractctl",
+    \\     "datasetId": "_de5ba0b733580e9d15132243da0107e55eca8f86",
+    \\     "tableId": "anonev_ibGMFUhJ98UV6eZEsXfVDSkzcIxslZ0nEUscKmooTOk"
+    \\    },
+    \\    "writeDisposition": "WRITE_TRUNCATE",
+    \\    "priority": "INTERACTIVE",
+    \\    "useQueryCache": false,
+    \\    "useLegacySql": false
+    \\   },
+    \\   "jobType": "QUERY"
+    \\  },
+    \\  "jobReference": {
+    \\   "projectId": "extractctl",
+    \\   "jobId": "job_uJJN89pQ9cqYnDKc4Z_VpBpHsSqC",
+    \\   "location": "US"
+    \\  },
+    \\  "statistics": {
+    \\   "creationTime": "1792597550138",
+    \\   "startTime": "1792597550188",
+    \\   "endTime": "1792597561013",
+    \\   "totalBytesProcessed": "0",
+    \\   "query": {
+    \\    "queryPlan": [
+    \\     {
+    \\      "name": "S00: Input",
+    \\      "id": "0",
+    \\      "startMs": "1792597550519",
+    \\      "endMs": "1792597550592",
+    \\      "waitMsAvg": "0",
+    \\      "waitMsMax": "0",
+    \\      "readMsAvg": "0",
+    \\      "readMsMax": "0",
+    \\      "computeMsAvg": "109",
+    \\      "computeMsMax": "109",
+    \\      "writeMsAvg": "4",
+    \\      "writeMsMax": "4",
+    \\      "shuffleOutputBytes": "0",
+    \\      "shuffleOutputBytesSpilled": "0",
+    \\      "recordsRead": "0",
+    \\      "recordsWritten": "1",
+    \\      "parallelInputs": "1",
+    \\      "completedParallelInputs": "1",
+    \\      "status": "COMPLETE",
+    \\      "steps": [
+    \\       {
+    \\        "kind": "COMPUTE",
+    \\        "substeps": [
+    \\         "$10 := generate_array(1, 1000000)"
+    \\        ]
+    \\       },
+    \\       {
+    \\        "kind": "WRITE",
+    \\        "substeps": [
+    \\         "$10",
+    \\         "TO __stage00_output"
+    \\        ]
+    \\       }
+    \\      ],
+    \\      "slotMs": "136",
+    \\      "computeMode": "BIGQUERY"
+    \\     },
+    \\     {
+    \\      "name": "S01: Output",
+    \\      "id": "1",
+    \\      "startMs": "1792597550598",
+    \\      "inputStages": [
+    \\       "0"
+    \\      ],
+    \\      "waitMsAvg": "0",
+    \\      "waitMsMax": "0",
+    \\      "readMsAvg": "0",
+    \\      "readMsMax": "0",
+    \\      "computeMsAvg": "0",
+    \\      "computeMsMax": "0",
+    \\      "writeMsAvg": "0",
+    \\      "writeMsMax": "0",
+    \\      "shuffleOutputBytes": "0",
+    \\      "shuffleOutputBytesSpilled": "0",
+    \\      "recordsRead": "0",
+    \\      "recordsWritten": "0",
+    \\      "parallelInputs": "1",
+    \\      "completedParallelInputs": "0",
+    \\      "status": "RUNNING",
+    \\      "steps": [
+    \\       {
+    \\        "kind": "READ",
+    \\        "substeps": [
+    \\         "$10",
+    \\         "FROM __stage00_output"
+    \\        ]
+    \\       },
+    \\       {
+    \\        "kind": "AGGREGATE",
+    \\        "substeps": [
+    \\         "$1 := SUM_OF_COUNTS($20)"
+    \\        ]
+    \\       },
+    \\       {
+    \\        "kind": "AGGREGATE",
+    \\        "substeps": [
+    \\         "$20 := COUNT_STAR()"
+    \\        ]
+    \\       },
+    \\       {
+    \\        "kind": "COMPUTE",
+    \\        "substeps": [
+    \\         "$30 := generate_array(1, 3000)"
+    \\        ]
+    \\       },
+    \\       {
+    \\        "kind": "WRITE",
+    \\        "substeps": [
+    \\         "$1",
+    \\         "TO __stage01_output"
+    \\        ]
+    \\       }
+    \\      ],
+    \\      "slotMs": "0",
+    \\      "computeMode": "BIGQUERY"
+    \\     }
+    \\    ],
+    \\    "estimatedBytesProcessed": "0",
+    \\    "timeline": [
+    \\     {
+    \\      "elapsedMs": "812",
+    \\      "totalSlotMs": "6238",
+    \\      "pendingUnits": "1",
+    \\      "completedUnits": "1",
+    \\      "activeUnits": "1",
+    \\      "estimatedRunnableUnits": "0"
+    \\     }
+    \\    ],
+    \\    "totalBytesProcessed": "0",
+    \\    "totalBytesBilled": "0",
+    \\    "billingTier": 1,
+    \\    "totalSlotMs": "6238",
+    \\    "cacheHit": false,
+    \\    "statementType": "SELECT"
+    \\   },
+    \\   "totalSlotMs": "6238"
+    \\  },
+    \\  "status": {
+    \\   "errorResult": {
+    \\    "reason": "stopped",
+    \\    "debugInfo": "[CANCELLED] message=[CANCELLED] errorProto=code: \"JOB_CANCELLED\"\nargument: \"User requested cancel or job timed out\"\n errorProto=code: \"JOB_CANCELLED\"\nargument: \"User requested cancellation\"\n\n\tat com.google.cloud.helix.common.Exceptions$Public.jobCancelled(Exceptions.java:978)\n\tat com.google.cloud.helix.common.Exceptions.fromCancelRequest(Exceptions.java:2013)\n\tat com.google.cloud.helix.common.CancelState.wrapException(CancelState.java:31)\n\tat com.google.cloud.helix.server.job.LocalJobController.handleJobDone(LocalJobController.java:446)\n\tat com.google.cloud.helix.server.job.LocalJobController.lambda$runThread$0(LocalJobController.java:350)\n\tat com.google.common.util.concurrent.CombinedFuture$CallableInterruptibleTask.runInterruptibly(CombinedFuture.java:196)\n\tat com.google.common.util.concurrent.InterruptibleTask.run(InterruptibleTask.java:72)\n\tat com.google.common.context.ContextRunnable.runInContext(ContextRunnable.java:83)\n\tat io.grpc.Context.run(Context.java:537)\n\tat com.google.common.context.ContextCallback.runInInheritedContext(ContextCallback.java:56)\n\tat com.google.common.context.ContextRunnable.run(ContextRunnable.java:74)\n\tat java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(Unknown Source)\n\tat java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(Unknown Source)\n\tat java.base/java.lang.Thread.run(Unknown Source)\nCaused by: [CANCELLED] errorProto=code: \"JOB_CANCELLED\"\nargument: \"User requested cancel or job timed out\"\n\n\tat com.google.cloud.helix.common.HelixException.withExtension(HelixException.java:496)\n\tat com.google.cloud.helix.server.job.LocalQueryJobController.handleQueryException(LocalQueryJobController.java:3086)\n\tat com.google.cloud.helix.server.job.LocalQueryJobController.handleQueryDone(LocalQueryJobController.java:2664)\n\tat com.google.cloud.helix.server.job.LocalQueryJobController.lambda$runJob$0(LocalQueryJobController.java:2481)\n\t... 9 more\n\tSuppressed: java.lang.Exception: Including call stack from HelixFutures\n\t\tat com.google.cloud.helix.common.HelixFutures.getHelixException(HelixFutures.java:76)\n\t\tat com.google.cloud.helix.common.HelixFutures.get(HelixFutures.java:42)\n\t\tat com.google.cloud.helix.server.job.LocalJobController.handleJobDone(LocalJobController.java:414)\n\t\tat com.google.cloud.helix.server.job.LocalJobController.lambda$runThread$0(LocalJobController.java:350)\n\t\t... 9 more\nCaused by: [CANCELLED] errorProto=code: \"JOB_CANCELLED\"\nargument: \"User requested cancel or job timed out\"\n\n\tat com.google.cloud.helix.common.Exceptions$Public.jobCancelled(Exceptions.java:986)\n\tat com.google.cloud.helix.server.job.DremelErrorUtil.createHelixErrorFromDremelRpcException(DremelErrorUtil.java:76)\n\tat com.google.cloud.helix.common.dremel.QueryExecutorImpl$ConfiguredQueryMigration$StreamHandler.onMessage(QueryExecutorImpl.java:824)\n\tat com.google.cloud.helix.common.dremel.QueryExecutorImpl$ConfiguredQueryMigration$StreamHandler.onMessage(QueryExecutorImpl.java:736)\n\tat com.google.net.rpc3.stream.RpcMessageCallback$ForwardingRpcMessageCallback.onMessage(RpcMessageCallback.java:128)\n\tat com.google.net.rpc3.impl.RpcStreamInternalContext.processMessageUnlocked(RpcStreamInternalContext.java:1862)\n\tat com.google.net.rpc3.impl.RpcStreamInternalContext.invokeCallbacksInternalUnlocked(RpcStreamInternalContext.java:2915)\n\tat com.google.net.rpc3.impl.RpcStreamInternalContext.invokeCallbacksUnlocked(RpcStreamInternalContext.java:2841)\n\tat com.google.net.eventmanager.AbstractFutureTask$Sync.innerRun(AbstractFutureTask.java:259)\n\tat com.google.net.eventmanager.AbstractFutureTask.run(AbstractFutureTask.java:120)\n\tat com.google.net.eventmanager.EventManagerImpl.runTaskTraced(EventManagerImpl.java:903)\n\tat com.google.net.eventmanager.EventManagerImpl.runTask(EventManagerImpl.java:895)\n\tat com.google.net.eventmanager.EventManagerImpl.internalRunWorkerLoop(EventManagerImpl.java:1322)\n\tat com.google.net.eventmanager.EventManagerImpl.runWorkerLoop(EventManagerImpl.java:1213)\n\tat com.google.net.eventmanager.WorkerThreadInfo.runWorkerLoop(WorkerThreadInfo.java:153)\n\tat com.google.net.eventmanager.EventManagerImpl$WorkerThread.run(EventManagerImpl.java:2006)\n"
+    \\   },
+    \\   "errors": [
+    \\    {
+    \\     "reason": "stopped"
+    \\    }
+    \\   ],
+    \\   "state": "DONE"
+    \\  },
+    \\  "jobCreationReason": {
+    \\   "code": "REQUESTED"
+    \\  }
+    \\ }
+    \\}
+;

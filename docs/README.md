@@ -137,6 +137,12 @@ Google, not only what Google documents, and where the emulators differ.
 | [Overview](dataflow/README.md) | The jobs a project runs: every region in one call, states and terminal states, `Job.failing`, error messages, cancelling and draining with the request shown first, and what production showed when measured (experimental) |
 | [Testing](dataflow/testing.md) | An in-memory Dataflow for your own tests, cancels and drains included, held to production's answers (experimental) |
 
+## 🔎 BigQuery
+
+| Guide | What's in it |
+| --- | --- |
+| [Overview](bigquery/README.md) | Datasets, tables with their schemas, and the job history, from any project; queries dry-run for their cost, run under a bytes limit, read a page at a time with every type decoded exactly, and cancelled, with the exact request first; errors by reason and the editor's error position; and what production showed when measured (experimental) |
+
 ## 🛠️ Working on zig-gcp
 
 | Guide | What's in it |

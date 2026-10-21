@@ -10,6 +10,7 @@ const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const ObjectMap = std.json.ObjectMap;
 const types = @import("types.zig");
+const values = @import("values.zig");
 
 pub const DecodeError = error{ OutOfMemory, InvalidResponse };
 
@@ -77,6 +78,55 @@ pub fn decodeJobPage(out: Allocator, scratch: Allocator, body: []const u8) Decod
         .next_page_token = try token(out, obj, "nextPageToken"),
         .unreachable_locations = try stringList(out, obj, "unreachable"),
     };
+}
+
+/// A dry run's answer from `jobs.query`: complete, a job reference
+/// without an id, the bytes, the schema and the statement type
+/// (measured).
+pub fn decodeDryRun(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.DryRun {
+    const obj = try object(try parse(scratch, body));
+    return .{
+        .total_bytes_processed = try integer(u64, obj, "totalBytesProcessed"),
+        .total_bytes_billed = try integer(u64, obj, "totalBytesBilled"),
+        .cache_hit = try boolean(obj, "cacheHit"),
+        .schema = if (try field(obj, "schema", .object)) |s| try fieldList(out, s) else &.{},
+        .statement_type = try string(out, obj, "statementType") orelse "",
+        .location = try string(out, obj, "location") orelse "",
+    };
+}
+
+/// A `jobs.query` answer or a `getQueryResults` page. An unfinished one
+/// has its job and nothing else (measured); one that names no job must be
+/// finished, or nothing could read it further.
+pub fn decodeQueryPage(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.QueryPage {
+    const obj = try object(try parse(scratch, body));
+    var page: types.QueryPage = .{
+        .complete = try boolean(obj, "jobComplete") orelse false,
+        .query_id = try string(out, obj, "queryId") orelse "",
+        .total_rows = try integer(u64, obj, "totalRows"),
+        .page_token = try token(out, obj, "pageToken"),
+        .total_bytes_processed = try integer(u64, obj, "totalBytesProcessed"),
+        .total_bytes_billed = try integer(u64, obj, "totalBytesBilled"),
+        .cache_hit = try boolean(obj, "cacheHit"),
+        .statement_type = try string(out, obj, "statementType") orelse "",
+        .num_dml_affected_rows = try integer(u64, obj, "numDmlAffectedRows"),
+    };
+    if (try field(obj, "jobReference", .object)) |ref| {
+        if (try string(out, ref, "jobId")) |id| page.job = .{
+            .project = try string(out, ref, "projectId") orelse return error.InvalidResponse,
+            .id = id,
+            .location = try string(out, ref, "location") orelse "",
+        };
+    }
+    if (!page.complete and page.job == null) return error.InvalidResponse;
+    if (try field(obj, "schema", .object)) |s| page.schema = try fieldList(out, s);
+    if (try field(obj, "rows", .array)) |rows| page.rows = try values.decodeRows(out, page.schema, rows);
+    if (try field(obj, "errors", .array)) |list| {
+        const errs = try out.alloc(types.JobError, list.items.len);
+        for (list.items, errs) |item, *e| e.* = try jobError(out, try object(item));
+        page.errors = errs;
+    }
+    return page;
 }
 
 fn datasetOf(out: Allocator, obj: ObjectMap) DecodeError!types.Dataset {
@@ -425,6 +475,42 @@ test "decodeTable and its page: every type in a schema, partitioning, views" {
     try testing.expect(public.next_page_token != null);
 }
 
+test "decodeQueryPage: a job to read further, or a finished answer" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = out.allocator();
+    const s = scratch.allocator();
+
+    // A dry run's reference names no job: finished, so no job is needed.
+    const dry = try decodeQueryPage(a, s, production.query_dry_run);
+    try testing.expectEqual(null, dry.job);
+    try testing.expect(dry.complete);
+    const warned = try decodeQueryPage(a, s,
+        \\{"jobComplete":true,"jobReference":{"projectId":"p","jobId":"j"},"errors":[{"reason":"warning","message":"w"}],
+        \\ "pageToken":"","schema":{"fields":[{"name":"n","type":"INTEGER"}]},"rows":[{"f":[{"v":"7"}]}]}
+    );
+    try testing.expectEqualStrings("w", warned.errors[0].message);
+    try testing.expectEqual(null, warned.page_token);
+    try testing.expectEqualStrings("", warned.job.?.location);
+    try testing.expectEqual(7, warned.rows[0].cells[0].value.int64);
+    for ([_][]const u8{
+        // Unfinished, and nothing to read it by.
+        "{\"jobComplete\":false}",
+        "{\"jobComplete\":false,\"jobReference\":{\"projectId\":\"p\"}}",
+        "{}",
+        "{\"jobComplete\":true,\"jobReference\":{\"jobId\":\"j\"}}",
+        "{\"jobComplete\":\"true\"}",
+        "{\"jobComplete\":true,\"errors\":[1]}",
+        "{\"jobComplete\":true,\"totalRows\":\"-1\"}",
+        // A row with no column to read it by.
+        "{\"jobComplete\":true,\"rows\":[{\"f\":[{\"v\":\"1\"}]}]}",
+    }) |body| try testing.expectError(error.InvalidResponse, decodeQueryPage(a, s, body));
+    try testing.expectError(error.InvalidResponse, decodeDryRun(a, s, "{\"schema\":{\"fields\":[{}]}}"));
+    try testing.expectError(error.InvalidResponse, decodeDryRun(a, s, "[]"));
+}
+
 test "decodeJob and its page: the history, a cancelled job, a refused one, a dry run" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
@@ -665,7 +751,7 @@ fn decodersProperty(_: void, input: []const u8) !void {
     defer scratch.deinit();
     const a = out.allocator();
     const s = scratch.allocator();
-    inline for (.{ decodeDataset, decodeDatasetPage, decodeTable, decodeTablePage, decodeJob, decodeCancel, decodeJobPage }) |decode| {
+    inline for (.{ decodeDataset, decodeDatasetPage, decodeTable, decodeTablePage, decodeJob, decodeCancel, decodeJobPage, decodeDryRun, decodeQueryPage }) |decode| {
         if (decode(a, s, input)) |_| {} else |err| try testing.expectEqual(error.InvalidResponse, err);
     }
 }
@@ -682,5 +768,10 @@ test "fuzz decoders: any body decodes or is InvalidResponse, never a crash or a 
         production.jobs_page,
         production.job_cancelled,
         production.cancel_running,
+        production.query_run,
+        production.query_dry_run,
+        production.query_slow,
+        production.query_insert,
+        production.results_wait,
     } });
 }

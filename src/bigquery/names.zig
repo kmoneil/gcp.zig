@@ -53,6 +53,16 @@ pub fn job(arena: Allocator, project: []const u8, id: []const u8) Allocator.Erro
     return path(arena, project, &.{ "jobs", id });
 }
 
+/// `.../queries`, where `jobs.query` runs one.
+pub fn queries(arena: Allocator, project: []const u8) Allocator.Error![]const u8 {
+    return path(arena, project, &.{"queries"});
+}
+
+/// `.../queries/J`, a job's results.
+pub fn queryResults(arena: Allocator, project: []const u8, job_id: []const u8) Allocator.Error![]const u8 {
+    return path(arena, project, &.{ "queries", job_id });
+}
+
 const testing = std.testing;
 
 test "paths: every id one escaped segment" {
@@ -65,6 +75,8 @@ test "paths: every id one escaped segment" {
     try testing.expectEqualStrings("/bigquery/v2/projects/p/datasets/d/tables/t", try table(a, "p", "d", "t"));
     try testing.expectEqualStrings("/bigquery/v2/projects/p/jobs", try jobs(a, "p"));
     try testing.expectEqualStrings("/bigquery/v2/projects/p/jobs/job_x-1", try job(a, "p", "job_x-1"));
+    try testing.expectEqualStrings("/bigquery/v2/projects/p/queries", try queries(a, "p"));
+    try testing.expectEqualStrings("/bigquery/v2/projects/p/queries/job_x-1", try queryResults(a, "p", "job_x-1"));
     // A table id may hold spaces and other letters: escaped, never split.
     try testing.expectEqualStrings("/bigquery/v2/projects/p/datasets/d/tables/a%20b%2Fc", try table(a, "p", "d", "a b/c"));
 }
