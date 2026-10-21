@@ -624,6 +624,10 @@ jobs:
         # the client against the fake for up to 24 steps a run: about
         # 0.61 ms a run on the Mac (1M in 612 s, clean), so 1400K, about
         # an hour at four times the Mac, to be priced by its first
+        # nights. datatransfer (0.56.0) starts at estimates from a local
+        # run: its six decoders in one property took about 0.04 ms a run
+        # on the Mac (2M in 81 s of fuzzing), so 8M, as dataflow's, about
+        # 22 minutes at four times the Mac, to be priced by its first
         # nights.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 630K }
@@ -660,6 +664,7 @@ jobs:
           - { job: slow-dataflow, module: dataflow, filter: slow property, iterations: 4M }
           - { job: bigquery, module: bigquery, filter: fuzz, iterations: 6M }
           - { job: slow-bigquery, module: bigquery, filter: slow property, iterations: 1400K }
+          - { job: datatransfer, module: datatransfer, filter: fuzz, iterations: 8M }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     # actions: read finds and downloads the corpus an earlier run kept.
