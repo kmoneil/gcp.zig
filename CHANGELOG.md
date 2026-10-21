@@ -29,10 +29,26 @@ including the ones that did not change.
   are errors of their own (`error.InvalidQuery`,
   `BytesBilledLimitExceeded`, `ResultTooLarge`, `QuotaExceeded`), for
   the queries to come.
+
+  Rows decode against their schema: `bigquery.Row`, `Cell` (the value
+  and production's wire text beside it) and `Value`, every type
+  BigQuery has: INT64 as `i64`, never a float; FLOAT64 with NaN and
+  the infinities; NUMERIC and BIGNUMERIC as exact `Decimal` text
+  (`toF64` for a chart); BYTES decoded from base64; `Date`, `Time` and
+  `DateTime`; TIMESTAMP to the microsecond from any of the three forms
+  production writes (microseconds, which this library will ask for,
+  decimal seconds such as `1.792588455123456E9`, read exactly, or RFC
+  3339); GEOGRAPHY and JSON as their text; `Interval` in BigQuery's
+  three signed parts; `Range` with `UNBOUNDED` ends as null; arrays
+  and records. A type this library does not know decodes as a string,
+  its text kept. `Value.format` writes a value as BigQuery's console
+  shows it (a timestamp as `2026-10-21 13:14:15.123456 UTC`), and
+  `bigquery.errorPosition` reads the `at [line:column]` a query
+  error's message ends with.
 - core: `rpc.Engine.classify_refusal`, for a service whose refusals
   name their kind in the body: the error a refusal stands for, which
   then decides the retry as any mapped error does. Null, the default,
-  keeps the mapping by status.
+  keeps the mapping by status. `timestamp.civilFromDays` is public.
 - auth, dataflow, error_reporting, firestore, kms, logging, monitoring,
   pubsub, resource_manager, run, scheduler, secret_manager and
   storage: unchanged.

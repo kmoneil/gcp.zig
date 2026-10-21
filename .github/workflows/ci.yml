@@ -614,8 +614,10 @@ jobs:
         # decoders in one property took about 0.09 ms a run on the Mac
         # (2M in 190 s of fuzzing; its corpus bodies are tables with
         # their schemas), so 6M, as run's, about 36 minutes at four
-        # times the Mac, to be priced by its first nights. Its values
-        # and query pages join the property in 0.55.0's later steps.
+        # times the Mac, to be priced by its first nights. The values'
+        # round trip and the row decode join it in 0.55.0's second
+        # step: 2M in 294 s on the Mac, so 6M stays, about an hour at
+        # four times the Mac. Query pages join it in the third.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 630K }
           - { job: auth, module: auth, filter: fuzz, iterations: 850K }

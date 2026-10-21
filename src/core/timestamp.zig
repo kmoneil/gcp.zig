@@ -115,8 +115,9 @@ fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
     return era * 146097 + doe - 719468;
 }
 
-/// The inverse of `daysFromCivil`.
-fn civilFromDays(days: i64) struct { year: i64, month: i64, day: i64 } {
+/// The inverse of `daysFromCivil`: the proleptic Gregorian date `days`
+/// after 1970-01-01.
+pub fn civilFromDays(days: i64) struct { year: i64, month: i64, day: i64 } {
     const z = days + 719468;
     const era = @divFloor(z, 146097);
     const doe = z - era * 146097;
