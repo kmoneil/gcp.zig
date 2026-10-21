@@ -4,6 +4,37 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.56.0 (unreleased)
+
+- datatransfer: new module, **experimental**, for issue #271: the read
+  side of BigQuery Data Transfer's v1 API, for a console's scheduled
+  queries and Data Transfers views. `Client.listLocations` (54
+  locations on one page when measured, BigQuery Omni's among them; a
+  page size is refused, so none is sent), `listTransferConfigs` (one
+  location, by data source: `scheduled_query` alone), `getTransferConfig`,
+  `listRuns` (by state, every attempt or `latest_only`, one a run date),
+  `getRun`, and `listMessages` (a run's messages, by severity). Calls
+  take a config's or a run's name as a list or get gave it, which names
+  the project by number; `Client.configName` builds one for this project
+  from a location and an id. A `TransferConfig` carries its `Schedule`
+  (one union for both of the API's shapes: time-based, manual,
+  event-driven, default), next run time, the latest run's state,
+  disabled, destination dataset and region, the owner (from a get), its
+  params as JSON text per key, and a typed `ScheduledQuery` view (query,
+  destination table template, write disposition, partitioning field). A
+  `TransferRun` its state, schedule, run, start and end times and error;
+  `ended()`, `succeeded()`, `failed()`. Production has no location for
+  every location (`-` is refused: "BigQuery Data Transfer Service does
+  not yet support location: unknown"), so the client refuses `-` before
+  sending and a console walks `listLocations`. `Client.Options.scope`
+  (`datatransfer.Scope`: `.bigquery`, the default, as `bigquery`'s, so
+  one token serves both modules; `.cloud_platform`;
+  `.cloud_platform_read_only`) picks the one OAuth scope a client asks
+  for; each served every read (measured).
+- auth, bigquery, core, dataflow, error_reporting, firestore, kms,
+  logging, monitoring, pubsub, resource_manager, run, scheduler,
+  secret_manager and storage: unchanged.
+
 ## 0.55.0 (2026-10-21)
 
 - bigquery: new module, **experimental**, for issue #270: the read
