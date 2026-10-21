@@ -71,6 +71,24 @@ including the ones that did not change.
   at once; a query reading a table bills at least 10 MiB; a repeated
   request id answers the first job, unfinished; a cancel answers the
   job running, and a cancel of a done job is no refusal.
+
+  And `bigquery.testing.FakeBigQuery`, BigQuery in memory behind
+  `Client.Options.transport`: no SQL engine, so a test gives each
+  query text its `Answer` (schema and rows, the tables it reads, bytes,
+  polls, the cache, or a refusal in BigQuery's words), and puts in
+  datasets, tables and jobs as a get answers them. Dry runs, runs and
+  their jobs, billing with the 10 MiB minimum and the bytes limit's
+  refusal, request ids, unfinished reads, pages by token, size and
+  index, cancels, job locations, lists, not-found refusals and faults
+  are held to production's answers; what it does not model it says, 501
+  with the reason. A gated suite (`BIGQUERY_TEST=1`) runs one script
+  against production in a `zigps_` dataset it makes through the
+  client's own DDL and drops, and replays it on the fake seeded from
+  production's answers: 39 outcomes, every word, agree. Production
+  showed there that DDL and DML answer no row count.
+  `examples/bigquery_query.zig` dry-runs a query, shows the request,
+  runs it with `--yes`, waits, and prints the results a page at a time;
+  `--fake` needs no network.
 - core: `rpc.Engine.classify_refusal`, for a service whose refusals
   name their kind in the body: the error a refusal stands for, which
   then decides the retry as any mapped error does. Null, the default,

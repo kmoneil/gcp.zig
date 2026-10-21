@@ -142,6 +142,7 @@ Google, not only what Google documents, and where the emulators differ.
 | Guide | What's in it |
 | --- | --- |
 | [Overview](bigquery/README.md) | Datasets, tables with their schemas, and the job history, from any project; queries dry-run for their cost, run under a bytes limit, read a page at a time with every type decoded exactly, and cancelled, with the exact request first; errors by reason and the editor's error position; and what production showed when measured (experimental) |
+| [Testing](bigquery/testing.md) | An in-memory BigQuery for your own tests: an answer per query text (no SQL engine), billing, repeats, polls, pages and cancels held to production's answers (experimental) |
 
 ## 🛠️ Working on zig-gcp
 

@@ -2621,3 +2621,46 @@ test "the exact query a console would run, for the user to confirm" {
     try std.testing.expectEqual(0, fake.requests.items.len);
 }
 // end snippet
+
+// snippet: bigquery-fake
+test "a query editor's run, against the in-memory BigQuery" {
+    var fake: bigquery.testing.FakeBigQuery = .init(std.testing.allocator, std.testing.io, .{ .project_id = "my-project" });
+    defer fake.deinit();
+    // No SQL engine: the test says what each query text answers.
+    const text = "SELECT word, word_count FROM `bigquery-public-data.samples.shakespeare` WHERE corpus = 'hamlet' ORDER BY word_count DESC LIMIT 2";
+    try fake.answer(text, .{
+        .schema = &.{ .{ .name = "word", .type = .string }, .{ .name = "word_count", .type = .int64 } },
+        .rows = &.{
+            .{ .cells = &.{ .{ .value = .{ .string = "the" } }, .{ .value = .{ .int64 = 995 } } } },
+            .{ .cells = &.{ .{ .value = .{ .string = "and" } }, .{ .value = .{ .int64 = 706 } } } },
+        },
+        .tables = &.{.{ .project = "bigquery-public-data", .dataset = "samples", .table = "shakespeare" }},
+        .bytes_processed = 5_114_816,
+        // Unfinished for the first read, as a slow job answers.
+        .polls = 1,
+    });
+    var token: bigquery.StaticToken = .{ .token = "none" };
+    var client = try bigquery.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+
+    var dry = try client.dryRun(.{ .query = text });
+    defer dry.deinit();
+    try std.testing.expectEqual(5_114_816, dry.value.total_bytes_processed.?);
+    // Under its bill: a table read bills at least 10 MiB.
+    try std.testing.expectError(error.BytesBilledLimitExceeded, client.query(.{ .query = text, .maximum_bytes_billed = 1_000_000 }));
+
+    var page = try client.query(.{ .query = text, .maximum_bytes_billed = 100_000_000 });
+    defer page.deinit();
+    try std.testing.expect(!page.value.complete);
+    var done = try client.getQueryResults(page.value.job.?, .{});
+    defer done.deinit();
+    try std.testing.expect(done.value.complete);
+    try std.testing.expectEqualStrings("the", done.value.rows[0].cells[0].value.string);
+    try std.testing.expectEqual(995, done.value.rows[0].cells[1].value.int64);
+    try std.testing.expectEqual(1, fake.queryCount());
+}
+// end snippet

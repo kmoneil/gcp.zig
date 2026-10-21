@@ -138,6 +138,11 @@ A job that failed is answered as it is, never run again: Google's
 clients run such a job again under a new id, but a new run can bill
 again, and that is the caller's call.
 
+`examples/bigquery_query.zig` is the whole loop: a dry run, the
+request shown, the run only with `--yes`, the wait, and the results as
+a table, a page at a time; `--fake` runs it with no network. For tests
+of code like it, see [Testing](testing.md).
+
 ## Values
 
 A `QueryPage` carries its `schema` and its `rows`, each `Row` a
@@ -257,6 +262,12 @@ Measured on 2026-10-21, in the project the tests run in:
 - Paging walked five pages of ten by token, and `start_index` 45 read
   the last five. The history lists newest first; without a page size
   production answered all 34 jobs on one page.
+- **DDL and DML answer no row count**: CREATE SCHEMA, CREATE TABLE (AS
+  SELECT), CREATE VIEW and INSERT came back complete, billing nothing,
+  with their statement type and, for the INSERT, the rows it changed.
+- A query of three billion generated rows (no table, so free) took
+  about 50 s: polled with `timeout_ms` 2000, it answered unfinished 21
+  to 25 times.
 - **TIMESTAMP comes as float seconds by default**
   (`1.792588455123456E9`), which loses digits through a float; this
   library asks for microseconds, as Google's clients do, and decodes

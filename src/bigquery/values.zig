@@ -470,6 +470,53 @@ pub fn writeRows(w: *Writer, schema: []const types.Field, rows: []const Row) Wri
     try w.writeByte(']');
 }
 
+/// One row as a query page carries it, `{"f":[...]}`. The row must
+/// `fit` the schema.
+pub fn writeRow(w: *Writer, schema: []const types.Field, row: Row) Writer.Error!void {
+    return writeRecord(w, schema, row.cells);
+}
+
+/// Whether `row` has a cell for each field of `schema`, each a value of
+/// its field's type: an array of them for a REPEATED field, its fields'
+/// for a RECORD, NULL only where the field is NULLABLE, never inside an
+/// array (BigQuery has no NULL element), and a range's ends of its
+/// element type. What a value holds is not checked here: a written row
+/// that decodes is one production could have sent.
+pub fn fits(schema: []const types.Field, row: Row) bool {
+    return recordFits(schema, row.cells);
+}
+
+fn recordFits(fields: []const types.Field, cells: []const Cell) bool {
+    if (fields.len != cells.len) return false;
+    for (fields, cells) |f, cell| if (!valueFits(f, cell.value, false)) return false;
+    return true;
+}
+
+fn valueFits(field: types.Field, value: Value, element: bool) bool {
+    if (value == .null) return field.mode == .nullable and !element;
+    if (field.mode == .repeated and !element) {
+        if (value != .array) return false;
+        for (value.array) |cell| if (!valueFits(field, cell.value, true)) return false;
+        return true;
+    }
+    return switch (field.type) {
+        .record => value == .record and recordFits(field.fields, value.record),
+        .range => value == .range and boundFits(field.range_element, value.range.start) and boundFits(field.range_element, value.range.end),
+        .unknown => value == .string,
+        inline else => |t| value == @field(std.meta.Tag(Value), @tagName(t)),
+    };
+}
+
+fn boundFits(element: ?types.FieldType, b: ?RangeBound) bool {
+    const bound_value = b orelse return true;
+    const e = element orelse return false;
+    return switch (bound_value) {
+        .date => e == .date,
+        .datetime => e == .datetime,
+        .timestamp => e == .timestamp,
+    };
+}
+
 fn writeRecord(w: *Writer, fields: []const types.Field, cells: []const Cell) Writer.Error!void {
     try w.writeAll("{\"f\":[");
     for (fields, cells, 0..) |f, cell, i| {
@@ -940,6 +987,49 @@ test "errorPosition reads a query error's at [line:column]" {
     try testing.expectEqual(null, errorPosition("at [a:b]"));
     try testing.expectEqual(null, errorPosition("at [12]"));
     try testing.expectEqual(null, errorPosition(""));
+}
+
+test "fits: a cell per field, each of its type, NULL where nullable" {
+    const schema = [_]types.Field{
+        .{ .name = "n", .type = .int64, .mode = .required },
+        .{ .name = "xs", .type = .string, .mode = .repeated },
+        .{ .name = "r", .type = .record, .fields = &.{.{ .name = "d", .type = .date }} },
+        .{ .name = "span", .type = .range, .range_element = .timestamp },
+        .{ .name = "u", .type = .unknown, .type_name = "UUID" },
+    };
+    const d: Date = .{ .year = 2026, .month = 10, .day = 21 };
+    const ok = [_]Cell{
+        .{ .value = .{ .int64 = 1 } },
+        .{ .value = .{ .array = &.{.{ .value = .{ .string = "a" } }} } },
+        .{ .value = .{ .record = &.{.{ .value = .{ .date = d } }} } },
+        .{ .value = .{ .range = .{ .start = .{ .timestamp = atMicros(0) }, .end = null } } },
+        .{ .value = .{ .string = "x" } },
+    };
+    try testing.expect(fits(&schema, .{ .cells = &ok }));
+    var cells = ok;
+    cells[2] = .{ .value = .null };
+    try testing.expect(fits(&schema, .{ .cells = &cells }));
+    const Case = struct { usize, Value };
+    for ([_]Case{
+        .{ 0, .null },
+        .{ 0, .{ .float64 = 1 } },
+        .{ 1, .{ .string = "a" } },
+        .{ 1, .{ .array = &.{.{ .value = .null }} } },
+        .{ 1, .{ .array = &.{.{ .value = .{ .int64 = 1 } }} } },
+        .{ 2, .{ .record = &.{} } },
+        .{ 2, .{ .record = &.{.{ .value = .{ .string = "2026-10-21" } }} } },
+        .{ 3, .{ .range = .{ .start = .{ .date = d }, .end = null } } },
+        .{ 4, .{ .int64 = 1 } },
+    }) |case| {
+        cells = ok;
+        cells[case[0]] = .{ .value = case[1] };
+        try testing.expect(!fits(&schema, .{ .cells = &cells }));
+    }
+    try testing.expect(!fits(&schema, .{ .cells = ok[0..4] }));
+    // A range without its element type fits only unbounded.
+    const loose = [_]types.Field{.{ .name = "r", .type = .range }};
+    try testing.expect(fits(&loose, .{ .cells = &.{.{ .value = .{ .range = .{ .start = null, .end = null } } }} }));
+    try testing.expect(!fits(&loose, .{ .cells = &.{.{ .value = .{ .range = .{ .start = .{ .date = d }, .end = null } } }} }));
 }
 
 test "Decimal.toF64 is the nearest float, and NaN for none" {
