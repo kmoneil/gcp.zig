@@ -129,6 +129,11 @@ test "the exact run now a console would send, for the user to confirm" {
   "Transfer is disabled. Please enable the transfer config before
   starting transfer runs."
 
+`examples/datatransfer_runs.zig` lists every location's scheduled
+queries with their latest runs, and with `--run NAME --yes` runs one now
+and follows it to its end; `--fake` needs no network. For tests of code
+like it, see [Testing](testing.md).
+
 ## The scope
 
 A client asks its token provider for one scope, `Client.Options.scope`:
@@ -168,7 +173,7 @@ the measurement and deleted after:
   with error INVALID_ARGUMENT: division by zero: 1 / 0; JobID: <job>.
   Check BigQuery job details for more information."
 - **Runs list newest run time first**; `latest_only` gave one run per run
-  date, the latest of each.
+  date, the latest of each. **Configs list by id.**
 - A config's `state` is its latest run's (`SUCCEEDED`, `FAILED`), absent
   before its first; its `error` stayed empty after its run failed, so the
   runs say why.

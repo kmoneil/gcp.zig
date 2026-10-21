@@ -2691,3 +2691,43 @@ test "the exact run now a console would send, for the user to confirm" {
     try std.testing.expectEqual(0, fake.requests.items.len);
 }
 // end snippet
+
+// snippet: datatransfer-fake
+test "a scheduled query's run now, against the in-memory Data Transfer" {
+    var fake: datatransfer.testing.FakeDataTransfer = .init(std.testing.allocator, std.testing.io, .{ .project_id = "my-project" });
+    defer fake.deinit();
+    try fake.putLocation("us");
+    // What production holds is the test's to put in; how a run now ends
+    // is the test's to say.
+    const config = try fake.putConfig(.{
+        .location = "us",
+        .display_name = "Daily orders",
+        .destination_dataset_id = "reporting",
+        .schedule = .{ .time_based = .{ .schedule = "every 24 hours" } },
+        .scheduled_query = .{ .query = "SELECT COUNT(*) AS orders FROM shop.orders", .destination_table_name_template = "orders_{run_date}", .write_disposition = "WRITE_TRUNCATE" },
+        .manual_run = .{ .failed = .{ .code = 3, .message = "Unrecognized name: created at [1:44]" } },
+    });
+    var token: datatransfer.StaticToken = .{ .token = "none" };
+    var client = try datatransfer.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+
+    var page = try client.listTransferConfigs("us", .{ .data_sources = &.{"scheduled_query"} });
+    defer page.deinit();
+    try std.testing.expectEqualStrings("every 24 hours", page.value.configs[0].schedule.time_based.schedule);
+    var started = try client.startManualRun(config, .{});
+    defer started.deinit();
+    try std.testing.expectEqual(.pending, started.value.runs[0].state);
+    // This config's runs fail at once, with production's lines.
+    var ended = try client.getRun(started.value.runs[0].name);
+    defer ended.deinit();
+    try std.testing.expect(ended.value.failed());
+    var errors_only = try client.listMessages(ended.value.name, .{ .severities = &.{.@"error"} });
+    defer errors_only.deinit();
+    try std.testing.expectEqual(1, errors_only.value.messages.len);
+    try std.testing.expectEqual(1, fake.runsStarted());
+}
+// end snippet
