@@ -21,6 +21,7 @@ const validate = @import("validate.zig");
 const Diagnostics = core.Diagnostics;
 const Error = errors.Error;
 const HttpTransport = core.transport.HttpTransport;
+const PreparedRequest = core.PreparedRequest;
 const RetryPolicy = core.RetryPolicy;
 const TokenProvider = core.TokenProvider;
 const Transport = core.transport.Transport;
@@ -267,6 +268,72 @@ pub fn listMessages(self: *Client, run_name: []const u8, options: types.ListMess
     params.addNonZero("pageSize", options.page_size) catch return error.OutOfMemory;
     params.addOptional("pageToken", options.page_token) catch return error.OutOfMemory;
     return self.call(types.TransferMessagePage, a, w.written(), codec.decodeMessagePage, "message list");
+}
+
+/// Runs the config now (`startManualRuns`): answers the run it started,
+/// `PENDING`. When measured, a run read `RUNNING` within 3 s and a
+/// scheduled query of literals `SUCCEEDED` 75 s after it started; follow
+/// it with `getRun` until `ended()`. A disabled config is refused, 400
+/// `error.InvalidArgument`: "Transfer is disabled. Please enable the
+/// transfer config before starting transfer runs." Takes
+/// `bigquery.transfers.update` (Editor, BigQuery Admin; not BigQuery
+/// User), and a client whose scope is not `.cloud_platform_read_only`,
+/// which production refuses a run now.
+///
+/// Sent once: a run now has no request id, and production made a second
+/// run of the same time when asked twice (measured), as Google's clients,
+/// which never retry it, expect. Only a refused connection or a failed
+/// name lookup is tried again. After any other failure, list the config's
+/// runs, newest run time first, to see whether it started.
+pub fn startManualRun(self: *Client, config_name: []const u8, options: types.StartManualRunOptions) Error!types.Owned(types.StartedRuns) {
+    rpc.begin(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var request = try self.startCall(a, config_name, options);
+    request.retryable = core.rpc.unsentOnly;
+    var result: types.Owned(types.StartedRuns) = try .init(self.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(self, result.arena, request);
+    result.value = codec.decodeStarted(result.arena.allocator(), a, body) catch |err|
+        return rpc.decodeFailed(self, err, "run now");
+    return result;
+}
+
+/// The request `startManualRun` sends for the same arguments, built
+/// without sending it, after the same checks with the same errors: to
+/// show before the call, or to record after it. Credentials and other
+/// headers are not part of it. With `options.run_time` null each reads
+/// the clock, so give both the same time to send exactly what was shown.
+pub fn startManualRunRequest(self: *Client, config_name: []const u8, options: types.StartManualRunOptions) Error!types.Owned(PreparedRequest) {
+    rpc.begin(self);
+    var result: types.Owned(PreparedRequest) = try .init(self.gpa);
+    errdefer result.deinit();
+    const a = result.arena.allocator();
+    result.value = try .fromCall(a, self.base_url, try self.startCall(a, config_name, options));
+    return result;
+}
+
+/// The call `startManualRun` sends: `POST {name}:startManualRuns` with
+/// `{"requestedRunTime": "<RFC 3339>"}`.
+fn startCall(self: *Client, arena: Allocator, config_name: []const u8, options: types.StartManualRunOptions) Error!rpc.Call {
+    if (self.scope == .cloud_platform_read_only) {
+        if (self.diagnostics) |d| d.print("this client asks for cloud-platform.read-only, which production refuses a run now; give Options.scope .bigquery or .cloud_platform", .{});
+        return error.InvalidOptions;
+    }
+    const config = try self.configOf(config_name);
+    const when = options.run_time orelse std.Io.Clock.real.now(self.io);
+    // To the microsecond, as production echoes a run time.
+    const micros: std.Io.Timestamp = .{ .nanoseconds = when.nanoseconds - @mod(when.nanoseconds, std.time.ns_per_us) };
+    if (!core.timestamp.inRange(micros)) {
+        if (self.diagnostics) |d| d.print("invalid run time: outside the years 1 to 9999", .{});
+        return error.InvalidOptions;
+    }
+    var buf: [core.timestamp.max_len]u8 = undefined;
+    const text = core.timestamp.format(&buf, micros);
+    const path = try std.mem.concat(arena, u8, &.{ try names.configPath(arena, config, &.{}), ":startManualRuns" });
+    const body = try std.fmt.allocPrint(arena, "{{\"requestedRunTime\":\"{s}\"}}", .{text});
+    return .{ .method = .POST, .path = path, .body = body };
 }
 
 /// A config's name in this client's project, for a caller that has its
@@ -589,6 +656,119 @@ test "every allocation failure is OutOfMemory without leaks" {
                 u.deinit();
                 return error.TestUnexpectedResult;
             } else |err| if (err != error.NotFound) return err;
+        }
+    };
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.calls, .{});
+}
+
+test "golden: a run now, now or at a time given, and its answer" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = production.started } },
+        .{ .respond = .{ .body = production.started } },
+    });
+    defer h.deinit();
+    h.clock.now_ns = 1_792_608_298_873_464_789;
+    var started = try h.client.startManualRun(manual, .{});
+    defer started.deinit();
+    // The clock's reading, to the microsecond.
+    try h.expectSent(0, .POST, base ++ manual ++ ":startManualRuns", "{\"requestedRunTime\":\"2026-10-21T18:44:58.873464Z\"}");
+    try testing.expectEqual(1, started.value.runs.len);
+    try testing.expectEqual(types.TransferState.pending, started.value.runs[0].state);
+    var again = try h.client.startManualRun(manual, .{ .run_time = core.timestamp.parse("2026-10-20T00:00:00Z") catch unreachable });
+    defer again.deinit();
+    try h.expectSent(1, .POST, base ++ manual ++ ":startManualRuns", "{\"requestedRunTime\":\"2026-10-20T00:00:00Z\"}");
+}
+
+test "a run now is sent once: refused or lost, it is not sent again" {
+    const unavailable: test_util.FakeTransport.Reply = .{ .respond = .{ .status = 503, .body = "{\"error\":{\"code\":503,\"message\":\"The service is currently unavailable.\",\"status\":\"UNAVAILABLE\"}}" } };
+    var h: Harness = undefined;
+    try h.init(&.{
+        unavailable,
+        .{ .fail = error.ConnectionResetByPeer },
+        .{ .fail = error.TimedOut },
+        .{ .fail = error.ConnectionRefused },
+        .{ .respond = .{ .body = production.started } },
+    });
+    defer h.deinit();
+    const c = &h.client;
+    try testing.expectError(error.Unavailable, c.startManualRun(manual, .{}));
+    try testing.expectError(error.ConnectionResetByPeer, c.startManualRun(manual, .{}));
+    try testing.expectError(error.TimedOut, c.startManualRun(manual, .{}));
+    try h.expectRequestCount(3);
+    // A connection refused never reached the server: tried again.
+    var started = try c.startManualRun(manual, .{});
+    started.deinit();
+    try h.expectRequestCount(5);
+}
+
+test "a run now's refusals, production's words kept, and what is refused before sending" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = production.start_disabled_status, .body = production.start_disabled } },
+        .{ .respond = .{ .status = production.start_read_only_status, .body = production.start_read_only } },
+        .{ .respond = .{ .status = production.config_unknown_status, .body = production.config_unknown } },
+    });
+    defer h.deinit();
+    const c = &h.client;
+    try testing.expectError(error.InvalidArgument, c.startManualRun(manual, .{}));
+    try testing.expectEqualStrings("Transfer is disabled. Please enable the transfer config before starting transfer runs.", h.diag.message());
+    // A scope refusal that reached production all the same.
+    try testing.expectError(error.PermissionDenied, c.startManualRun(manual, .{}));
+    try testing.expectEqualStrings("Request had insufficient authentication scopes.", h.diag.message());
+    try testing.expectError(error.NotFound, c.startManualRun("projects/extractctl/locations/us/transferConfigs/zigps-nobody", .{}));
+    try h.expectRequestCount(3);
+    try testing.expectError(error.InvalidName, c.startManualRun("projects/p/transferConfigs/x", .{}));
+    try testing.expectError(error.InvalidName, c.startManualRunRequest(manual ++ "/runs/r", .{}));
+    try testing.expectError(error.InvalidOptions, c.startManualRun(manual, .{ .run_time = .{ .nanoseconds = core.timestamp.max.nanoseconds + std.time.ns_per_s } }));
+    try testing.expectEqualStrings("invalid run time: outside the years 1 to 9999", h.diag.message());
+    try h.expectRequestCount(3);
+
+    var reader: Harness = undefined;
+    try reader.initScope(&.{}, .cloud_platform_read_only);
+    defer reader.deinit();
+    try testing.expectError(error.InvalidOptions, reader.client.startManualRun(manual, .{}));
+    try testing.expectEqualStrings("this client asks for cloud-platform.read-only, which production refuses a run now; give Options.scope .bigquery or .cloud_platform", reader.diag.message());
+    try testing.expectError(error.InvalidOptions, reader.client.startManualRunRequest(manual, .{}));
+    try reader.expectRequestCount(0);
+}
+
+test "the preview is byte for byte what the run now sends" {
+    var h: Harness = undefined;
+    try h.init(&.{.{ .respond = .{ .body = production.started } }});
+    defer h.deinit();
+    const options: types.StartManualRunOptions = .{ .run_time = core.timestamp.parse("2026-10-21T18:44:58.873464Z") catch unreachable };
+    var preview = try h.client.startManualRunRequest(manual, options);
+    defer preview.deinit();
+    try h.expectRequestCount(0);
+    var started = try h.client.startManualRun(manual, options);
+    started.deinit();
+    const sent = try h.fake.request(0);
+    try testing.expectEqual(preview.value.method, sent.method);
+    try testing.expectEqualStrings(preview.value.url, sent.url);
+    try testing.expectEqualStrings(preview.value.body, sent.body.?);
+    try testing.expectEqualStrings("https://bigquerydatatransfer.googleapis.com/v1/" ++ manual ++ ":startManualRuns", preview.value.url);
+}
+
+test "a run now's answer that cannot be decoded, and its allocation failures" {
+    var h: Harness = undefined;
+    try h.init(&.{.{ .respond = .{ .body = "{\"runs\":7}" } }});
+    defer h.deinit();
+    try testing.expectError(error.InvalidResponse, h.client.startManualRun(manual, .{}));
+    try testing.expectEqualStrings("the run now response could not be decoded", h.diag.message());
+
+    const Run = struct {
+        fn calls(gpa: Allocator) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, &.{.{ .respond = .{ .body = production.started } }});
+            defer fake.deinit();
+            var tokens: test_util.FakeTokenProvider = .{};
+            var clock: test_util.FakeClock = .{};
+            var client = try Client.init(gpa, clock.io(), .{ .project_id = "extractctl", .token_provider = tokens.provider(), .transport = fake.transport() });
+            defer client.deinit();
+            var preview = try client.startManualRunRequest(manual, .{});
+            preview.deinit();
+            var started = try client.startManualRun(manual, .{});
+            started.deinit();
         }
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.calls, .{});

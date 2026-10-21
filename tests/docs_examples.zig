@@ -2664,3 +2664,30 @@ test "a query editor's run, against the in-memory BigQuery" {
     try std.testing.expectEqual(1, fake.queryCount());
 }
 // end snippet
+
+const datatransfer = @import("datatransfer");
+
+// snippet: datatransfer-confirm
+test "the exact run now a console would send, for the user to confirm" {
+    var fake: core.testing.FakeTransport = .init(std.testing.allocator, &.{});
+    defer fake.deinit();
+    var token: datatransfer.StaticToken = .{ .token = "none" };
+    var client = try datatransfer.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    // The config's name as the list gave it; one time for the preview and
+    // the run, so the run sends byte for byte what the user confirmed.
+    const config = "projects/82150720798/locations/us/transferConfigs/6ad99c4e-0000-2bb7-b042-14223bbd2862";
+    const options: datatransfer.StartManualRunOptions = .{ .run_time = std.Io.Clock.real.now(std.testing.io) };
+    var request = try client.startManualRunRequest(config, options);
+    defer request.deinit();
+    try std.testing.expectEqual(.POST, request.value.method);
+    try std.testing.expectEqualStrings("https://bigquerydatatransfer.googleapis.com/v1/" ++ config ++ ":startManualRuns", request.value.url);
+    try std.testing.expect(std.mem.startsWith(u8, request.value.body, "{\"requestedRunTime\":\""));
+    // Built, not sent.
+    try std.testing.expectEqual(0, fake.requests.items.len);
+}
+// end snippet

@@ -251,6 +251,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "run", .module = cloud_run },
                 .{ .name = "dataflow", .module = dataflow },
                 .{ .name = "bigquery", .module = bigquery },
+                .{ .name = "datatransfer", .module = datatransfer },
                 .{ .name = "core", .module = core },
             },
         }),
