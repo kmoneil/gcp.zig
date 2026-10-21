@@ -45,6 +45,32 @@ including the ones that did not change.
   shows it (a timestamp as `2026-10-21 13:14:15.123456 UTC`), and
   `bigquery.errorPosition` reads the `at [line:column]` a query
   error's message ends with.
+
+  And queries: `Client.dryRun` (what a query would read and bill, its
+  columns and statement type; free, never in the history), `query`
+  (`jobs.query`: the first page when the job ends within
+  `QueryOptions.timeout_ms`, or `complete` false and the job),
+  `getQueryResults` (held up to its `timeout_ms` for a running job,
+  then a page at a time by token or from `start_index`; `page_size` 0
+  waits without reading rows) and `cancelJob`, with `dryRunRequest`,
+  `queryRequest` and `cancelJobRequest` building each exact request
+  without sending it. Every query is GoogleSQL (`useLegacySql` false)
+  and asks timestamps as microseconds; `QueryOptions` takes
+  `maximum_bytes_billed` (as a JSON string, an int64), `location`,
+  `default_dataset`, `use_query_cache`, `page_size` and `labels`.
+  Every query carries a request id, a UUID made per call unless
+  `request_id` gives one (`Client.newRequestId`), so it is retried as
+  the reads are, within 10 minutes of its first attempt, inside the 15
+  production remembers an id for. A held call's request may take its
+  `timeout_ms` and 30 s more. A `.cloud_platform_read_only` client
+  refuses a cancel before sending (`error.InvalidOptions`), as
+  production does. New types: `QueryOptions`, `ResultsOptions`,
+  `DryRun`, `QueryPage`; `bigquery.PreparedRequest` is exported.
+  Measured on 2026-10-21 and written in docs/bigquery/README.md: a
+  syntax error, a runtime error and a query over its limit are refused
+  at once; a query reading a table bills at least 10 MiB; a repeated
+  request id answers the first job, unfinished; a cancel answers the
+  job running, and a cancel of a done job is no refusal.
 - core: `rpc.Engine.classify_refusal`, for a service whose refusals
   name their kind in the body: the error a refusal stands for, which
   then decides the retry as any mapped error does. Null, the default,

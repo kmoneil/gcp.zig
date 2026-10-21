@@ -2590,3 +2590,34 @@ test "a confirmed drain, and the reads that watch the job end" {
     try std.testing.expectError(error.FailedPrecondition, client.cancelJob("us-central1", id));
 }
 // end snippet
+
+const bigquery = @import("bigquery");
+
+// snippet: bigquery-confirm
+test "the exact query a console would run, for the user to confirm" {
+    var fake: core.testing.FakeTransport = .init(std.testing.allocator, &.{});
+    defer fake.deinit();
+    var token: bigquery.StaticToken = .{ .token = "none" };
+    var client = try bigquery.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    // One request id for the preview and the run, so the run sends
+    // byte for byte what the user confirmed.
+    var id: [36]u8 = undefined;
+    const options: bigquery.QueryOptions = .{
+        .query = "SELECT word, word_count FROM `bigquery-public-data.samples.shakespeare` LIMIT 10",
+        .maximum_bytes_billed = 100 * 1024 * 1024,
+        .request_id = client.newRequestId(&id),
+    };
+    var request = try client.queryRequest(options);
+    defer request.deinit();
+    try std.testing.expectEqual(.POST, request.value.method);
+    try std.testing.expectEqualStrings("https://bigquery.googleapis.com/bigquery/v2/projects/my-project/queries", request.value.url);
+    try std.testing.expect(std.mem.indexOf(u8, request.value.body, "\"maximumBytesBilled\":\"104857600\"") != null);
+    // Built, not sent.
+    try std.testing.expectEqual(0, fake.requests.items.len);
+}
+// end snippet

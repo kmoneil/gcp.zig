@@ -71,11 +71,25 @@ pub fn begin(client: *Client) void {
 /// first 2xx response, which lives in `response`. A refusal whose reason a
 /// console acts on is that reason's error.
 pub fn execute(client: *Client, response: *std.heap.ArenaAllocator, call: Call) Error![]const u8 {
+    return executeHeld(client, response, call, 0);
+}
+
+/// How much longer than the server is asked to hold a call the request
+/// may take before it is `error.TimedOut`.
+pub const hold_margin_ms = 30_000;
+
+/// `execute` for a call the server holds up to `hold_ms` for a job to
+/// finish (`timeoutMs`): the request's timeout rises to `hold_ms` and a
+/// margin when the client's is shorter, so the call is never cut while the
+/// server is waiting as asked.
+pub fn executeHeld(client: *Client, response: *std.heap.ArenaAllocator, call: Call, hold_ms: u32) Error![]const u8 {
+    var e = engine(client);
+    if (e.request_timeout_ms != 0) e.request_timeout_ms = @max(e.request_timeout_ms, hold_ms +| hold_margin_ms);
     var local: ?[]const u8 = null;
     var with_body = call;
     const out = call.error_body_out orelse &local;
     with_body.error_body_out = out;
-    return engine(client).execute(response, with_body) catch |err| return refined(client, err, out.*);
+    return e.execute(response, with_body) catch |err| return refined(client, err, out.*);
 }
 
 /// The first `error.errors[].reason` of a refusal's body, or null for a

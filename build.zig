@@ -241,6 +241,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "scheduler", .module = scheduler },
                 .{ .name = "run", .module = cloud_run },
                 .{ .name = "dataflow", .module = dataflow },
+                .{ .name = "bigquery", .module = bigquery },
                 .{ .name = "core", .module = core },
             },
         }),
