@@ -2649,9 +2649,11 @@ fn cancelBusyRounds(rounds: usize, done: *std.atomic.Value(bool)) anyerror!void 
             try h.fake.publish(try std.fmt.bufPrint(&buf, "round {d} message {d}", .{ round, i }));
         }
         var running = try io.concurrent(Subscriber.run, .{ &h.subscriber, h.handler.handler() });
+        // Canceled before h.deinit frees what it runs on, on every way out,
+        // a cancel of this task (which the sleep returns) included.
+        defer running.cancel(io) catch {};
         const pause_us: i64 = @intCast(100 + round % 7 * 150);
-        io.sleep(.fromMicroseconds(pause_us), .awake) catch {};
-        running.cancel(io) catch {};
+        try io.sleep(.fromMicroseconds(pause_us), .awake);
     }
 }
 
