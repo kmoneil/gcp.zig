@@ -619,7 +619,12 @@ jobs:
         # step: 2M in 294 s on the Mac, so 6M stays, about an hour at
         # four times the Mac. Query pages and dry runs join it in the
         # third: 2M in 328 s, so 6M stays, about 66 minutes at four
-        # times the Mac.
+        # times the Mac. slow-bigquery (0.55.0) holds FakeBigQuery's
+        # queries, repeats, polls, pages, cancels and faults to a model,
+        # the client against the fake for up to 24 steps a run: about
+        # 0.61 ms a run on the Mac (1M in 612 s, clean), so 1400K, about
+        # an hour at four times the Mac, to be priced by its first
+        # nights.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 630K }
           - { job: auth, module: auth, filter: fuzz, iterations: 850K }
@@ -654,6 +659,7 @@ jobs:
           - { job: dataflow, module: dataflow, filter: fuzz, iterations: 8M }
           - { job: slow-dataflow, module: dataflow, filter: slow property, iterations: 4M }
           - { job: bigquery, module: bigquery, filter: fuzz, iterations: 6M }
+          - { job: slow-bigquery, module: bigquery, filter: slow property, iterations: 1400K }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     # actions: read finds and downloads the corpus an earlier run kept.

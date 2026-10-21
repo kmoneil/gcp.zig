@@ -284,6 +284,26 @@ GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth print-access-token) \
     KMS_TEST_KEY_RING=my-test-ring zig build test-integration-gcp -Dtest-filter=kms
 ```
 
+### BigQuery
+
+BigQuery has no emulator, so its suite needs a project with the API on
+and a token for the `bigquery` or `cloud-platform` scope whose principal
+may run queries and make a dataset there (BigQuery Job User and Data
+Editor, or Editor). It
+reads the public samples, makes a `zigps_<run>` dataset labelled
+`zigps=suite` through the client's own DDL, runs the script described
+in [the BigQuery testing guide](bigquery/testing.md) against production
+and then against `FakeBigQuery` seeded from production's answers,
+failing on any outcome the two do not share, and drops the dataset; a
+crashed run's is dropped by the next once a day old. Every query sets a
+bytes limit of 100 MB or less: about 100 MiB billed a run, inside the
+free tier. About two minutes.
+
+```sh
+GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth print-access-token) \
+    BIGQUERY_TEST=1 zig build test-integration-gcp -Dtest-filter="bigquery:"
+```
+
 ### Secret Manager and bucket settings
 
 Secret Manager has no emulator, so its tests need a real project. They

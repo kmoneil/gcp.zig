@@ -82,6 +82,19 @@ pub const limits = @import("validate.zig");
 /// another way, or to fake the server in your own tests.
 pub const transport = core.transport;
 
+/// What a test of code that browses datasets and runs queries can stand
+/// on, with no network. **Experimental**, as the module is.
+pub const testing = struct {
+    /// BigQuery in memory, behind `Client.Options.transport`: datasets,
+    /// tables and jobs a test puts in, and an answer per query text (no
+    /// SQL engine), served as production answered when measured,
+    /// refusals in its words. It says so where it does not model
+    /// something.
+    pub const FakeBigQuery = @import("fake_bigquery.zig").FakeBigQuery;
+    /// An `Io` whose clock a test moves.
+    pub const FakeClock = core.testing.FakeClock;
+};
+
 const core = @import("core");
 
 test {
@@ -91,6 +104,7 @@ test {
     _ = @import("Client.zig");
     _ = @import("codec.zig");
     _ = @import("errors.zig");
+    _ = @import("fake_bigquery.zig");
     _ = @import("logging.zig");
     _ = @import("names.zig");
     _ = @import("rpc.zig");
