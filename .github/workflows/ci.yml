@@ -53,13 +53,14 @@ jobs:
       # is almost certainly wrong, such as a pointer to stack memory that
       # leaves its function. Pinned to a release and to its binary's
       # digest; its first run here found one in the KMS fake. Reports land
-      # on the pull request's diff as annotations.
+      # on the pull request's diff as annotations, and the log says how
+      # many files were checked, so a clean run is not an empty one.
       - name: Vet
         run: |
-          curl -fsSLo "$RUNNER_TEMP/zigvet" https://github.com/kmoneil/zigvet/releases/download/v0.2.1/zigvet-linux-amd64
-          echo "2784d6b5fb75f7de035e42ceaaf4e6808a2df9ed76017fdb40ba119d2997dcc9  $RUNNER_TEMP/zigvet" | sha256sum --check --strict
+          curl -fsSLo "$RUNNER_TEMP/zigvet" https://github.com/kmoneil/zigvet/releases/download/v0.5.1/zigvet-linux-amd64
+          echo "734bf9deac0165ae1b95857180d4b1fbe423a984b9de8167ca04d2c963df1074  $RUNNER_TEMP/zigvet" | sha256sum --check --strict
           chmod +x "$RUNNER_TEMP/zigvet"
-          "$RUNNER_TEMP/zigvet" --format github src tests examples tools build.zig
+          "$RUNNER_TEMP/zigvet" --summary --format github src tests examples tools build.zig
 
       - name: Unit, property and fuzz-corpus tests
         run: zig build test --summary all
