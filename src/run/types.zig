@@ -888,10 +888,13 @@ test "Job.ready reads the job's own terminal condition" {
 
 test "Resources.cpuMillis: millicores and cores, as production keeps them" {
     const cases = [_]struct { []const u8, ?u64 }{
-        .{ "1000m", 1000 },                                 .{ "500m", 500 },               .{ "1", 1000 },      .{ "2", 2000 }, .{ "4", 4000 },
-        .{ "0.5", 500 },                                    .{ "1.25", 1250 },              .{ "0.0005", null }, .{ "", null },  .{ "m", null },
-        .{ "1e3", null },                                   .{ "-1", null },                .{ "1.", 1000 },     .{ ".5", 500 }, .{ ".", null },
+        .{ "1000m", 1000 },                                 .{ "500m", 500 },               .{ "1", 1000 },      .{ "2", 2000 },     .{ "4", 4000 },
+        .{ "0.5", 500 },                                    .{ "1.25", 1250 },              .{ "0.0005", null }, .{ "", null },      .{ "m", null },
+        .{ "1e3", null },                                   .{ "-1", null },                .{ "1.", 1000 },     .{ ".5", 500 },     .{ ".", null },
         .{ "18446744073709551615m", 18446744073709551615 }, .{ "18446744073709552", null },
+        // std's integer parser takes a sign and underscores; production's
+        // quantities have neither.
+        .{ "+1", null },     .{ "1_000", null }, .{ "+0.5", null },
     };
     for (cases) |c| try std.testing.expectEqual(c[1], (Resources{ .cpu = c[0] }).cpuMillis());
 }
@@ -903,6 +906,7 @@ test "Resources.memoryBytes: binary and decimal suffixes, plain bytes, nothing e
         .{ "1k", 1000 },          .{ "1M", 1_000_000 },    .{ "1Ti", 1 << 40 },        .{ "1T", 1_000_000_000_000 },
         .{ "1048576", 1 << 20 },  .{ "0.5", null },        .{ "1e9", null },           .{ "", null },
         .{ "512m", null },        .{ "Mi", null },         .{ "17179869184Gi", null }, .{ "1.1Ki", null },
+        .{ "+1Gi", null },        .{ "1_0Mi", null },
     };
     for (cases) |c| try std.testing.expectEqual(c[1], (Resources{ .memory = c[0] }).memoryBytes());
 }

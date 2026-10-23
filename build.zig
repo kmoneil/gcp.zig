@@ -731,12 +731,12 @@ pub fn build(b: *std.Build) void {
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "monitoring_policies", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "run_actions", "dataflow_jobs", "dataflow_stop", "bigquery_query", "datatransfer_runs", "permissions" }) |name| {
+    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "monitoring_policies", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "run_actions", "dataflow_jobs", "dataflow_stop", "bigquery_query", "datatransfer_runs", "permissions", "run_service" }) |name| {
         // whoami, secret, gcs_cp, gcs_sign, gcs_notify, quickstart, iam,
         // secret_rotation, firestore, logs_read, logs_tail, projects_list,
         // error_dashboard, monitoring, monitoring_alerts,
         // monitoring_policies, pubsub_metrics,
-        // kms, scheduler_jobs, scheduler_run, run_revisions, run_actions,
+        // kms, scheduler_jobs, scheduler_run, run_revisions, run_actions, run_service,
         // dataflow_jobs, dataflow_stop, bigquery_query, datatransfer_runs
         // and permissions pick their own credentials.
         const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
@@ -765,7 +765,7 @@ pub fn build(b: *std.Build) void {
             &.{ .{ .name = "kms", .module = kms }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "scheduler_jobs") or std.mem.eql(u8, name, "scheduler_run"))
             &.{ .{ .name = "scheduler", .module = scheduler }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "run_revisions") or std.mem.eql(u8, name, "run_actions"))
+        else if (std.mem.eql(u8, name, "run_revisions") or std.mem.eql(u8, name, "run_actions") or std.mem.eql(u8, name, "run_service"))
             &.{ .{ .name = "run", .module = cloud_run }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "dataflow_jobs") or std.mem.eql(u8, name, "dataflow_stop"))
             &.{ .{ .name = "dataflow", .module = dataflow }, .{ .name = "auth", .module = auth } }

@@ -56,6 +56,20 @@
 //!   and its terminal condition fails. `validateOnly` checks the etag and
 //!   the prefix and changes nothing. Its operation is done from its first
 //!   read on.
+//! - What a deploy set, as measured on 2026-10-23: a service's template,
+//!   a revision's settings and a job's task template, each as the test
+//!   puts it, with production's defaults filled in where the test gave
+//!   none: per container 1000m of CPU and 512Mi of memory (with
+//!   `cpuIdle` for a service's or revision's, without for a job's), and
+//!   port 8080 as `http1` for a service's or revision's; a 300 s
+//!   timeout and a concurrency of 80 for a service or revision; GEN2 for
+//!   a job; a service scaling with a maximum of 20; ingress `.all`. A
+//!   revision's unnamed container is named for its image (`hello-1`), as
+//!   production named one. Every false and zero is left out of an
+//!   answer, as production leaves them out; a service whose default URL
+//!   is disabled answers no `uri` or `urls`. Probes are not written: a
+//!   production answer carries a default startup probe this library
+//!   does not read.
 //! - IAM reads, as measured on 2026-10-23: a service's or job's policy is
 //!   what `setIamPolicy` set, else none, `{"etag":"ACAB"}`, and a service
 //!   or job nobody put is answered the same, as production answered one
@@ -166,6 +180,12 @@ pub const FakeRun = struct {
         labels: []const types.Label,
         /// The etag's version: `"v<version>"`, new on every change.
         version: u64,
+        /// With production's defaults filled in.
+        template: ?types.RevisionTemplate,
+        ingress: types.Ingress,
+        invoker_iam_disabled: bool,
+        default_uri_disabled: bool,
+        scaling: ?types.ServiceScaling,
     };
 
     const FakeRevision = struct {
@@ -176,11 +196,12 @@ pub const FakeRun = struct {
         create_time: ?std.Io.Timestamp,
         update_time: ?std.Io.Timestamp,
         generation: ?i64,
-        containers: []const types.Container,
         conditions: []const types.Condition,
         log_uri: []const u8,
-        service_account: []const u8,
         labels: []const types.Label,
+        /// Its containers, service account and settings, with
+        /// production's defaults filled in.
+        settings: types.RevisionTemplate,
     };
 
     const FakeJob = struct {
@@ -193,6 +214,9 @@ pub const FakeRun = struct {
         max_retries: ?i32,
         containers: []const types.Container,
         service_account: []const u8,
+        volumes: []const types.Volume,
+        vpc_access: ?types.VpcAccess,
+        execution_environment: types.ExecutionEnvironment,
         labels: []const types.Label,
         create_time: ?std.Io.Timestamp,
         update_time: ?std.Io.Timestamp,
@@ -442,18 +466,30 @@ pub const FakeRun = struct {
         observed_generation: ?i64 = null,
         reconciling: bool = false,
         labels: []const types.Label = &.{},
+        /// The next revision's settings; production's defaults fill what
+        /// it leaves out. Null answers no template, which production
+        /// never does: give one where a test reads it.
+        template: ?types.RevisionTemplate = null,
+        ingress: types.Ingress = .all,
+        invoker_iam_disabled: bool = false,
+        /// Answers no `uri` or `urls` while set, whatever was put.
+        default_uri_disabled: bool = false,
+        /// Production's for a service that set none.
+        scaling: ?types.ServiceScaling = .{ .max_instances = 20 },
     };
 
     /// Puts a service in and returns its full name, owned by the fake.
     ///
     /// `error.InvalidEntry`, with nothing kept, for: a location nobody
     /// put; an id taken or malformed (or `-`, which Cloud Run reads as
-    /// every service).
+    /// every service); an env var, volume or volume mount with no name, a
+    /// secret reference with no secret.
     pub fn putService(f: *FakeRun, service: PutService) PutError![]const u8 {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         if (!f.locations.contains(service.location)) return error.InvalidEntry;
         if (!validate.isResourceId(service.id) or std.mem.eql(u8, service.id, "-")) return error.InvalidEntry;
+        if (service.template) |t| try checkSettings(t.containers, t.volumes);
         const s = f.store.allocator();
         const name = try std.fmt.allocPrint(s, "projects/{s}/locations/{s}/services/{s}", .{ f.options.project_id, service.location, service.id });
         if (f.services.contains(name)) return error.InvalidEntry;
@@ -480,6 +516,11 @@ pub const FakeRun = struct {
             .reconciling = service.reconciling,
             .labels = try dupeLabels(s, service.labels),
             .version = f.version + 1,
+            .template = if (service.template) |t| try filledSettings(s, t, .template) else null,
+            .ingress = service.ingress,
+            .invoker_iam_disabled = service.invoker_iam_disabled,
+            .default_uri_disabled = service.default_uri_disabled,
+            .scaling = service.scaling,
         };
         try f.services.put(f.gpa, held.name, held);
         f.version += 1;
@@ -497,17 +538,31 @@ pub const FakeRun = struct {
         create_time: ?std.Io.Timestamp = null,
         update_time: ?std.Io.Timestamp = null,
         generation: ?i64 = null,
+        /// Production's defaults fill what each leaves out; an unnamed one
+        /// is named for its image (`hello-1`).
         containers: []const types.Container = &.{},
         conditions: []const types.Condition = &.{},
         log_uri: []const u8 = "",
         service_account: []const u8 = "",
         labels: []const types.Label = &.{},
+        volumes: []const types.Volume = &.{},
+        min_instances: ?i32 = null,
+        max_instances: ?i32 = null,
+        /// Null is production's 80.
+        concurrency: ?i32 = null,
+        /// Null is production's 300 s.
+        timeout_s: ?f64 = null,
+        execution_environment: types.ExecutionEnvironment = .unspecified,
+        vpc_access: ?types.VpcAccess = null,
+        session_affinity: bool = false,
+        encryption_key: []const u8 = "",
     };
 
     /// Puts a revision in and returns its full name, owned by the fake.
     ///
     /// `error.InvalidEntry`, with nothing kept, for: a service nobody
-    /// put; an id taken, malformed or `-`.
+    /// put; an id taken, malformed or `-`; an env var, volume or volume
+    /// mount with no name, a secret reference with no secret.
     pub fn putRevision(f: *FakeRun, revision: PutRevision) PutError![]const u8 {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
@@ -515,6 +570,7 @@ pub const FakeRun = struct {
         const service_name = try std.fmt.allocPrint(s, "projects/{s}/locations/{s}/services/{s}", .{ f.options.project_id, revision.location, revision.service });
         if (!f.services.contains(service_name)) return error.InvalidEntry;
         if (!validate.isResourceId(revision.id) or std.mem.eql(u8, revision.id, "-")) return error.InvalidEntry;
+        try checkSettings(revision.containers, revision.volumes);
         const name = try std.fmt.allocPrint(s, "{s}/revisions/{s}", .{ service_name, revision.id });
         if (f.revisions.contains(name)) return error.InvalidEntry;
         const held = try s.create(FakeRevision);
@@ -526,11 +582,22 @@ pub const FakeRun = struct {
             .create_time = revision.create_time,
             .update_time = revision.update_time,
             .generation = revision.generation,
-            .containers = try dupeContainers(s, revision.containers),
             .conditions = try dupeConditions(s, revision.conditions),
             .log_uri = try s.dupe(u8, revision.log_uri),
-            .service_account = try s.dupe(u8, revision.service_account),
             .labels = try dupeLabels(s, revision.labels),
+            .settings = try filledSettings(s, .{
+                .containers = revision.containers,
+                .volumes = revision.volumes,
+                .service_account = revision.service_account,
+                .min_instances = revision.min_instances,
+                .max_instances = revision.max_instances,
+                .concurrency = revision.concurrency,
+                .timeout_s = revision.timeout_s,
+                .execution_environment = revision.execution_environment,
+                .vpc_access = revision.vpc_access,
+                .session_affinity = revision.session_affinity,
+                .encryption_key = revision.encryption_key,
+            }, .revision),
         };
         try f.revisions.put(f.gpa, held.name, held);
         return held.name;
@@ -560,8 +627,14 @@ pub const FakeRun = struct {
         parallelism: i32 = 0,
         task_timeout_s: ?f64 = 600,
         max_retries: ?i32 = 3,
+        /// Production's defaults fill what each leaves out: 1000m and
+        /// 512Mi, no ports.
         containers: []const types.Container = &.{},
         service_account: []const u8 = "",
+        volumes: []const types.Volume = &.{},
+        vpc_access: ?types.VpcAccess = null,
+        /// Production's default for a job.
+        execution_environment: types.ExecutionEnvironment = .gen2,
         labels: []const types.Label = &.{},
         create_time: ?std.Io.Timestamp = null,
         update_time: ?std.Io.Timestamp = null,
@@ -580,6 +653,7 @@ pub const FakeRun = struct {
         defer f.mutex.unlock(f.io);
         if (!f.locations.contains(job.location)) return error.InvalidEntry;
         if (!validate.isResourceId(job.id) or std.mem.eql(u8, job.id, "-")) return error.InvalidEntry;
+        try checkSettings(job.containers, job.volumes);
         const s = f.store.allocator();
         const name = try std.fmt.allocPrint(s, "projects/{s}/locations/{s}/jobs/{s}", .{ f.options.project_id, job.location, job.id });
         if (f.jobs.contains(name)) return error.InvalidEntry;
@@ -592,8 +666,11 @@ pub const FakeRun = struct {
             .parallelism = job.parallelism,
             .task_timeout_s = job.task_timeout_s,
             .max_retries = job.max_retries,
-            .containers = try dupeContainers(s, job.containers),
+            .containers = try filledContainers(s, job.containers, .job),
             .service_account = try s.dupe(u8, job.service_account),
+            .volumes = try dupeVolumes(s, job.volumes),
+            .vpc_access = if (job.vpc_access) |v| try dupeVpc(s, v) else null,
+            .execution_environment = job.execution_environment,
             .labels = try dupeLabels(s, job.labels),
             .create_time = job.create_time,
             .update_time = job.update_time,
@@ -760,10 +837,114 @@ pub const FakeRun = struct {
         return out;
     }
 
-    fn dupeContainers(s: Allocator, containers: []const types.Container) Allocator.Error![]const types.Container {
+    /// What production refused or could not hold, checked before anything
+    /// is kept.
+    fn checkSettings(containers: []const types.Container, volumes: []const types.Volume) PutError!void {
+        for (containers) |c| {
+            for (c.env) |e| {
+                if (e.name.len == 0) return error.InvalidEntry;
+                if (e.source == .secret and e.source.secret.secret.len == 0) return error.InvalidEntry;
+            }
+            for (c.volume_mounts) |m| if (m.name.len == 0) return error.InvalidEntry;
+        }
+        for (volumes) |v| {
+            if (v.name.len == 0) return error.InvalidEntry;
+            if (v.source == .secret and v.source.secret.secret.len == 0) return error.InvalidEntry;
+        }
+    }
+
+    const SettingsKind = enum { template, revision, job };
+
+    /// `settings` in the store, production's defaults filled in where it
+    /// gave none: a service's or revision's 300 s and 80.
+    fn filledSettings(s: Allocator, settings: types.RevisionTemplate, kind: SettingsKind) Allocator.Error!types.RevisionTemplate {
+        return .{
+            .containers = try filledContainers(s, settings.containers, kind),
+            .volumes = try dupeVolumes(s, settings.volumes),
+            .service_account = try s.dupe(u8, settings.service_account),
+            .min_instances = settings.min_instances,
+            .max_instances = settings.max_instances,
+            .concurrency = settings.concurrency orelse 80,
+            .timeout_s = settings.timeout_s orelse 300,
+            .execution_environment = settings.execution_environment,
+            .vpc_access = if (settings.vpc_access) |v| try dupeVpc(s, v) else null,
+            .session_affinity = settings.session_affinity,
+            .encryption_key = try s.dupe(u8, settings.encryption_key),
+        };
+    }
+
+    /// Each container in the store, production's defaults filled in: 1000m
+    /// and 512Mi (with `cpuIdle` but for a job's), port 8080 as `http1`
+    /// (but for a job's), and a revision's name from its image.
+    fn filledContainers(s: Allocator, containers: []const types.Container, kind: SettingsKind) Allocator.Error![]const types.Container {
         const out = try s.alloc(types.Container, containers.len);
-        for (containers, out) |c, *o| o.* = .{ .name = try s.dupe(u8, c.name), .image = try s.dupe(u8, c.image) };
+        for (containers, out, 1..) |c, *o, n| {
+            var resources = c.resources orelse types.Resources{ .cpu = "1000m", .memory = "512Mi", .cpu_idle = kind != .job };
+            resources.cpu = try s.dupe(u8, resources.cpu);
+            resources.memory = try s.dupe(u8, resources.memory);
+            resources.gpu = try s.dupe(u8, resources.gpu);
+            const ports: []const types.Port = if (c.ports.len == 0 and kind != .job) &.{.{ .name = "http1", .container_port = 8080 }} else c.ports;
+            const name = if (c.name.len == 0 and kind == .revision) try std.fmt.allocPrint(s, "{s}-{d}", .{ imageBase(c.image), n }) else try s.dupe(u8, c.name);
+            const env = try s.alloc(types.EnvVar, c.env.len);
+            for (c.env, env) |e, *oe| oe.* = .{ .name = try s.dupe(u8, e.name), .source = switch (e.source) {
+                .value => |v| .{ .value = try s.dupe(u8, v) },
+                .secret => |ref| .{ .secret = .{ .secret = try s.dupe(u8, ref.secret), .version = try s.dupe(u8, ref.version) } },
+            } };
+            const out_ports = try s.alloc(types.Port, ports.len);
+            for (ports, out_ports) |port, *op| op.* = .{ .name = try s.dupe(u8, port.name), .container_port = port.container_port };
+            const mounts = try s.alloc(types.VolumeMount, c.volume_mounts.len);
+            for (c.volume_mounts, mounts) |m, *om| om.* = .{ .name = try s.dupe(u8, m.name), .mount_path = try s.dupe(u8, m.mount_path), .sub_path = try s.dupe(u8, m.sub_path) };
+            o.* = .{
+                .name = name,
+                .image = try s.dupe(u8, c.image),
+                .command = try dupeStrings(s, c.command),
+                .args = try dupeStrings(s, c.args),
+                .working_dir = try s.dupe(u8, c.working_dir),
+                .env = env,
+                .resources = resources,
+                .ports = out_ports,
+                .volume_mounts = mounts,
+                .depends_on = try dupeStrings(s, c.depends_on),
+            };
+        }
         return out;
+    }
+
+    /// An image's last path segment without its tag or digest: `hello`
+    /// for `us-docker.pkg.dev/cloudrun/container/hello@sha256:...`.
+    fn imageBase(image: []const u8) []const u8 {
+        const no_digest = image[0 .. std.mem.indexOfScalar(u8, image, '@') orelse image.len];
+        const slash = if (std.mem.lastIndexOfScalar(u8, no_digest, '/')) |i| i + 1 else 0;
+        const last = no_digest[slash..];
+        const colon = std.mem.indexOfScalar(u8, last, ':') orelse last.len;
+        return if (colon == 0) "container" else last[0..colon];
+    }
+
+    fn dupeVolumes(s: Allocator, volumes: []const types.Volume) Allocator.Error![]const types.Volume {
+        const out = try s.alloc(types.Volume, volumes.len);
+        for (volumes, out) |v, *o| o.* = .{ .name = try s.dupe(u8, v.name), .source = switch (v.source) {
+            .secret => |sv| blk: {
+                const items = try s.alloc(types.SecretItem, sv.items.len);
+                for (sv.items, items) |it, *oi| oi.* = .{ .path = try s.dupe(u8, it.path), .version = try s.dupe(u8, it.version), .mode = it.mode };
+                break :blk .{ .secret = .{ .secret = try s.dupe(u8, sv.secret), .default_mode = sv.default_mode, .items = items } };
+            },
+            .empty_dir => |ed| .{ .empty_dir = .{ .medium = try s.dupe(u8, ed.medium), .size_limit = try s.dupe(u8, ed.size_limit) } },
+            .cloud_sql => |sql| .{ .cloud_sql = .{ .instances = try dupeStrings(s, sql.instances) } },
+            .gcs => |g| .{ .gcs = .{ .bucket = try s.dupe(u8, g.bucket), .read_only = g.read_only, .mount_options = try dupeStrings(s, g.mount_options) } },
+            .nfs => |nfs| .{ .nfs = .{ .server = try s.dupe(u8, nfs.server), .path = try s.dupe(u8, nfs.path), .read_only = nfs.read_only } },
+            .other => |key| .{ .other = try s.dupe(u8, key) },
+        } };
+        return out;
+    }
+
+    fn dupeVpc(s: Allocator, vpc: types.VpcAccess) Allocator.Error!types.VpcAccess {
+        const interfaces = try s.alloc(types.NetworkInterface, vpc.network_interfaces.len);
+        for (vpc.network_interfaces, interfaces) |ni, *o| o.* = .{
+            .network = try s.dupe(u8, ni.network),
+            .subnetwork = try s.dupe(u8, ni.subnetwork),
+            .tags = try dupeStrings(s, ni.tags),
+        };
+        return .{ .connector = try s.dupe(u8, vpc.connector), .egress = vpc.egress, .network_interfaces = interfaces };
     }
 
     // The transport.
@@ -1360,18 +1541,11 @@ pub const FakeRun = struct {
         try jw.objectField("template");
         try jw.beginObject();
         try jw.objectField("containers");
-        try jw.beginArray();
-        for (job.containers) |container| {
-            try jw.beginObject();
-            if (container.name.len > 0) {
-                try jw.objectField("name");
-                try jw.write(container.name);
-            }
-            try jw.objectField("image");
-            try jw.write(container.image);
-            try jw.endObject();
+        try writeContainers(jw, job.containers);
+        if (job.volumes.len > 0) {
+            try jw.objectField("volumes");
+            try writeVolumes(jw, job.volumes);
         }
-        try jw.endArray();
         if (job.max_retries) |n| {
             try jw.objectField("maxRetries");
             try jw.write(n);
@@ -1383,6 +1557,14 @@ pub const FakeRun = struct {
         if (job.service_account.len > 0) {
             try jw.objectField("serviceAccount");
             try jw.write(job.service_account);
+        }
+        if (job.execution_environment != .unspecified) {
+            try jw.objectField("executionEnvironment");
+            try jw.write(executionEnvironmentName(job.execution_environment));
+        }
+        if (job.vpc_access) |vpc| {
+            try jw.objectField("vpcAccess");
+            try writeVpc(jw, vpc);
         }
         try jw.endObject();
         try jw.endObject();
@@ -1651,11 +1833,53 @@ pub const FakeRun = struct {
             try jw.objectField("lastModifier");
             try jw.write(service.last_modifier);
         }
+        try jw.objectField("ingress");
+        try jw.write(ingressName(service.ingress));
+        if (service.template) |t| {
+            try jw.objectField("template");
+            try jw.beginObject();
+            try writeSettingsHead(jw, t);
+            try writeSettingsTail(jw, t);
+            try jw.endObject();
+        }
         if (service.traffic.len > 0) {
             try jw.objectField("traffic");
             try writeTraffic(jw, service.traffic, false);
         }
-        if (service.urls.len > 0) {
+        if (service.scaling) |sc| {
+            try jw.objectField("scaling");
+            try jw.beginObject();
+            if (sc.mode != .unspecified) {
+                try jw.objectField("scalingMode");
+                try jw.write(switch (sc.mode) {
+                    .automatic => "AUTOMATIC",
+                    .manual => "MANUAL",
+                    else => "SCALING_MODE_UNSPECIFIED",
+                });
+            }
+            if (sc.min_instances) |n| if (n != 0) {
+                try jw.objectField("minInstanceCount");
+                try jw.write(n);
+            };
+            if (sc.max_instances) |n| if (n != 0) {
+                try jw.objectField("maxInstanceCount");
+                try jw.write(n);
+            };
+            if (sc.manual_instances) |n| if (n != 0) {
+                try jw.objectField("manualInstanceCount");
+                try jw.write(n);
+            };
+            try jw.endObject();
+        }
+        if (service.invoker_iam_disabled) {
+            try jw.objectField("invokerIamDisabled");
+            try jw.write(true);
+        }
+        if (service.default_uri_disabled) {
+            try jw.objectField("defaultUriDisabled");
+            try jw.write(true);
+        }
+        if (service.urls.len > 0 and !service.default_uri_disabled) {
             try jw.objectField("urls");
             try jw.beginArray();
             for (service.urls) |url| try jw.write(url);
@@ -1687,7 +1911,7 @@ pub const FakeRun = struct {
             try jw.objectField("trafficStatuses");
             try writeTraffic(jw, service.traffic_statuses, true);
         }
-        if (service.uri.len > 0) {
+        if (service.uri.len > 0 and !service.default_uri_disabled) {
             try jw.objectField("uri");
             try jw.write(service.uri);
         }
@@ -1723,25 +1947,7 @@ pub const FakeRun = struct {
         }
         try jw.objectField("service");
         try jw.write(revision.service);
-        if (revision.service_account.len > 0) {
-            try jw.objectField("serviceAccount");
-            try jw.write(revision.service_account);
-        }
-        if (revision.containers.len > 0) {
-            try jw.objectField("containers");
-            try jw.beginArray();
-            for (revision.containers) |container| {
-                try jw.beginObject();
-                if (container.name.len > 0) {
-                    try jw.objectField("name");
-                    try jw.write(container.name);
-                }
-                try jw.objectField("image");
-                try jw.write(container.image);
-                try jw.endObject();
-            }
-            try jw.endArray();
-        }
+        try writeSettingsHead(jw, revision.settings);
         if (revision.conditions.len > 0) {
             try jw.objectField("conditions");
             try jw.beginArray();
@@ -1752,7 +1958,347 @@ pub const FakeRun = struct {
             try jw.objectField("logUri");
             try jw.write(revision.log_uri);
         }
+        try writeSettingsTail(jw, revision.settings);
         try jw.endObject();
+    }
+
+    /// A template's or revision's settings up to its execution
+    /// environment, in production's order; every false and zero left out.
+    fn writeSettingsHead(jw: *Stringify, t: types.RevisionTemplate) Stringify.Error!void {
+        const min = t.min_instances orelse 0;
+        const max = t.max_instances orelse 0;
+        if (min != 0 or max != 0) {
+            try jw.objectField("scaling");
+            try jw.beginObject();
+            if (min != 0) {
+                try jw.objectField("minInstanceCount");
+                try jw.write(min);
+            }
+            if (max != 0) {
+                try jw.objectField("maxInstanceCount");
+                try jw.write(max);
+            }
+            try jw.endObject();
+        }
+        if (t.vpc_access) |vpc| {
+            try jw.objectField("vpcAccess");
+            try writeVpc(jw, vpc);
+        }
+        if (t.timeout_s) |seconds| {
+            try jw.objectField("timeout");
+            try jw.print("\"{d}s\"", .{seconds});
+        }
+        if (t.service_account.len > 0) {
+            try jw.objectField("serviceAccount");
+            try jw.write(t.service_account);
+        }
+        if (t.containers.len > 0) {
+            try jw.objectField("containers");
+            try writeContainers(jw, t.containers);
+        }
+        if (t.volumes.len > 0) {
+            try jw.objectField("volumes");
+            try writeVolumes(jw, t.volumes);
+        }
+        if (t.execution_environment != .unspecified) {
+            try jw.objectField("executionEnvironment");
+            try jw.write(executionEnvironmentName(t.execution_environment));
+        }
+    }
+
+    /// The rest of a template's or revision's settings, which production
+    /// writes after a revision's conditions and log link.
+    fn writeSettingsTail(jw: *Stringify, t: types.RevisionTemplate) Stringify.Error!void {
+        if (t.concurrency) |n| if (n != 0) {
+            try jw.objectField("maxInstanceRequestConcurrency");
+            try jw.write(n);
+        };
+        if (t.session_affinity) {
+            try jw.objectField("sessionAffinity");
+            try jw.write(true);
+        }
+        if (t.encryption_key.len > 0) {
+            try jw.objectField("encryptionKey");
+            try jw.write(t.encryption_key);
+        }
+    }
+
+    fn writeContainers(jw: *Stringify, containers: []const types.Container) Stringify.Error!void {
+        try jw.beginArray();
+        for (containers) |c| {
+            try jw.beginObject();
+            if (c.name.len > 0) {
+                try jw.objectField("name");
+                try jw.write(c.name);
+            }
+            try jw.objectField("image");
+            try jw.write(c.image);
+            if (c.command.len > 0) {
+                try jw.objectField("command");
+                try jw.write(c.command);
+            }
+            if (c.args.len > 0) {
+                try jw.objectField("args");
+                try jw.write(c.args);
+            }
+            if (c.env.len > 0) {
+                try jw.objectField("env");
+                try jw.beginArray();
+                for (c.env) |e| {
+                    try jw.beginObject();
+                    try jw.objectField("name");
+                    try jw.write(e.name);
+                    switch (e.source) {
+                        .value => |v| {
+                            try jw.objectField("value");
+                            try jw.write(v);
+                        },
+                        .secret => |ref| {
+                            try jw.objectField("valueSource");
+                            try jw.beginObject();
+                            try jw.objectField("secretKeyRef");
+                            try jw.beginObject();
+                            try jw.objectField("secret");
+                            try jw.write(ref.secret);
+                            if (ref.version.len > 0) {
+                                try jw.objectField("version");
+                                try jw.write(ref.version);
+                            }
+                            try jw.endObject();
+                            try jw.endObject();
+                        },
+                    }
+                    try jw.endObject();
+                }
+                try jw.endArray();
+            }
+            if (c.resources) |r| {
+                try jw.objectField("resources");
+                try jw.beginObject();
+                if (r.cpu.len > 0 or r.memory.len > 0 or r.gpu.len > 0) {
+                    try jw.objectField("limits");
+                    try jw.beginObject();
+                    if (r.cpu.len > 0) {
+                        try jw.objectField("cpu");
+                        try jw.write(r.cpu);
+                    }
+                    if (r.memory.len > 0) {
+                        try jw.objectField("memory");
+                        try jw.write(r.memory);
+                    }
+                    if (r.gpu.len > 0) {
+                        try jw.objectField("nvidia.com/gpu");
+                        try jw.write(r.gpu);
+                    }
+                    try jw.endObject();
+                }
+                if (r.cpu_idle) {
+                    try jw.objectField("cpuIdle");
+                    try jw.write(true);
+                }
+                if (r.startup_cpu_boost) {
+                    try jw.objectField("startupCpuBoost");
+                    try jw.write(true);
+                }
+                try jw.endObject();
+            }
+            if (c.ports.len > 0) {
+                try jw.objectField("ports");
+                try jw.beginArray();
+                for (c.ports) |port| {
+                    try jw.beginObject();
+                    if (port.name.len > 0) {
+                        try jw.objectField("name");
+                        try jw.write(port.name);
+                    }
+                    if (port.container_port != 0) {
+                        try jw.objectField("containerPort");
+                        try jw.write(port.container_port);
+                    }
+                    try jw.endObject();
+                }
+                try jw.endArray();
+            }
+            if (c.volume_mounts.len > 0) {
+                try jw.objectField("volumeMounts");
+                try jw.beginArray();
+                for (c.volume_mounts) |m| {
+                    try jw.beginObject();
+                    try jw.objectField("name");
+                    try jw.write(m.name);
+                    if (m.mount_path.len > 0) {
+                        try jw.objectField("mountPath");
+                        try jw.write(m.mount_path);
+                    }
+                    if (m.sub_path.len > 0) {
+                        try jw.objectField("subPath");
+                        try jw.write(m.sub_path);
+                    }
+                    try jw.endObject();
+                }
+                try jw.endArray();
+            }
+            if (c.working_dir.len > 0) {
+                try jw.objectField("workingDir");
+                try jw.write(c.working_dir);
+            }
+            if (c.depends_on.len > 0) {
+                try jw.objectField("dependsOn");
+                try jw.write(c.depends_on);
+            }
+            try jw.endObject();
+        }
+        try jw.endArray();
+    }
+
+    fn writeVolumes(jw: *Stringify, volumes: []const types.Volume) Stringify.Error!void {
+        try jw.beginArray();
+        for (volumes) |v| {
+            try jw.beginObject();
+            try jw.objectField("name");
+            try jw.write(v.name);
+            switch (v.source) {
+                .secret => |sv| {
+                    try jw.objectField("secret");
+                    try jw.beginObject();
+                    try jw.objectField("secret");
+                    try jw.write(sv.secret);
+                    if (sv.items.len > 0) {
+                        try jw.objectField("items");
+                        try jw.beginArray();
+                        for (sv.items) |it| {
+                            try jw.beginObject();
+                            try jw.objectField("path");
+                            try jw.write(it.path);
+                            if (it.version.len > 0) {
+                                try jw.objectField("version");
+                                try jw.write(it.version);
+                            }
+                            if (it.mode) |m| {
+                                try jw.objectField("mode");
+                                try jw.write(m);
+                            }
+                            try jw.endObject();
+                        }
+                        try jw.endArray();
+                    }
+                    if (sv.default_mode) |m| {
+                        try jw.objectField("defaultMode");
+                        try jw.write(m);
+                    }
+                    try jw.endObject();
+                },
+                .empty_dir => |ed| {
+                    try jw.objectField("emptyDir");
+                    try jw.beginObject();
+                    if (ed.medium.len > 0) {
+                        try jw.objectField("medium");
+                        try jw.write(ed.medium);
+                    }
+                    if (ed.size_limit.len > 0) {
+                        try jw.objectField("sizeLimit");
+                        try jw.write(ed.size_limit);
+                    }
+                    try jw.endObject();
+                },
+                .cloud_sql => |sql| {
+                    try jw.objectField("cloudSqlInstance");
+                    try jw.beginObject();
+                    if (sql.instances.len > 0) {
+                        try jw.objectField("instances");
+                        try jw.write(sql.instances);
+                    }
+                    try jw.endObject();
+                },
+                .gcs => |g| {
+                    try jw.objectField("gcs");
+                    try jw.beginObject();
+                    try jw.objectField("bucket");
+                    try jw.write(g.bucket);
+                    if (g.read_only) {
+                        try jw.objectField("readOnly");
+                        try jw.write(true);
+                    }
+                    if (g.mount_options.len > 0) {
+                        try jw.objectField("mountOptions");
+                        try jw.write(g.mount_options);
+                    }
+                    try jw.endObject();
+                },
+                .nfs => |nfs| {
+                    try jw.objectField("nfs");
+                    try jw.beginObject();
+                    try jw.objectField("server");
+                    try jw.write(nfs.server);
+                    try jw.objectField("path");
+                    try jw.write(nfs.path);
+                    if (nfs.read_only) {
+                        try jw.objectField("readOnly");
+                        try jw.write(true);
+                    }
+                    try jw.endObject();
+                },
+                .other => |key| if (key.len > 0) {
+                    try jw.objectField(key);
+                    try jw.beginObject();
+                    try jw.endObject();
+                },
+            }
+            try jw.endObject();
+        }
+        try jw.endArray();
+    }
+
+    fn writeVpc(jw: *Stringify, vpc: types.VpcAccess) Stringify.Error!void {
+        try jw.beginObject();
+        if (vpc.connector.len > 0) {
+            try jw.objectField("connector");
+            try jw.write(vpc.connector);
+        }
+        if (vpc.egress != .unspecified and vpc.egress != .unknown) {
+            try jw.objectField("egress");
+            try jw.write(if (vpc.egress == .all_traffic) "ALL_TRAFFIC" else "PRIVATE_RANGES_ONLY");
+        }
+        if (vpc.network_interfaces.len > 0) {
+            try jw.objectField("networkInterfaces");
+            try jw.beginArray();
+            for (vpc.network_interfaces) |ni| {
+                try jw.beginObject();
+                if (ni.network.len > 0) {
+                    try jw.objectField("network");
+                    try jw.write(ni.network);
+                }
+                if (ni.subnetwork.len > 0) {
+                    try jw.objectField("subnetwork");
+                    try jw.write(ni.subnetwork);
+                }
+                if (ni.tags.len > 0) {
+                    try jw.objectField("tags");
+                    try jw.write(ni.tags);
+                }
+                try jw.endObject();
+            }
+            try jw.endArray();
+        }
+        try jw.endObject();
+    }
+
+    fn executionEnvironmentName(e: types.ExecutionEnvironment) []const u8 {
+        return switch (e) {
+            .gen1 => "EXECUTION_ENVIRONMENT_GEN1",
+            .gen2 => "EXECUTION_ENVIRONMENT_GEN2",
+            else => "EXECUTION_ENVIRONMENT_UNSPECIFIED",
+        };
+    }
+
+    fn ingressName(i: types.Ingress) []const u8 {
+        return switch (i) {
+            .all => "INGRESS_TRAFFIC_ALL",
+            .internal_only => "INGRESS_TRAFFIC_INTERNAL_ONLY",
+            .internal_load_balancer => "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER",
+            .none => "INGRESS_TRAFFIC_NONE",
+            else => "INGRESS_TRAFFIC_UNSPECIFIED",
+        };
     }
 
     fn writeTraffic(jw: *Stringify, targets: []const types.TrafficTarget, with_uri: bool) Stringify.Error!void {
@@ -3260,5 +3806,281 @@ test "fuzz IAM: the fake's policies and permission tests agree with a plain mode
         .corpus = &.{ "", "\x08\x00\xff\x01\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x0c", "\x03\x01\x01\x01\x00\x01\x01\x00\x02\x00\x01\x01\x00\x01\x00\x01" },
         .random_runs = 200,
         .max_len = 400,
+    });
+}
+
+test "settings: the fake given what milestone 0 deployed answers production's settings" {
+    var b: Bench = undefined;
+    try b.init(.{ .project_id = "extractctl" });
+    defer b.deinit();
+    try b.fake.putLocation("us-central1");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Every setting: production's template put back in, answered alike.
+    const full = try codec.decodeService(a, a, production.settings_service_full);
+    _ = try b.fake.putService(.{ .location = "us-central1", .id = "zigps-3c3b48-full", .template = full.template, .ingress = full.ingress, .default_uri_disabled = true, .scaling = full.scaling, .uri = "https://ignored.example", .urls = &.{"https://ignored.example"} });
+    var got = try b.client.getService("us-central1", "zigps-3c3b48-full");
+    defer got.deinit();
+    try testing.expectEqualDeep(full.template.?, got.value.template.?);
+    try testing.expectEqual(full.ingress, got.value.ingress);
+    try testing.expectEqualDeep(full.scaling.?, got.value.scaling.?);
+    try testing.expect(got.value.default_uri_disabled);
+    // A disabled default URL answers no uri and no urls, whatever was put.
+    try testing.expectEqualStrings("", got.value.uri);
+    try testing.expectEqual(0, got.value.urls.len);
+
+    // Its revision, put as decoded: the same settings by the same names.
+    const rev = try codec.decodeRevision(a, a, production.settings_revision_full);
+    _ = try b.fake.putRevision(.{
+        .location = "us-central1",
+        .service = "zigps-3c3b48-full",
+        .id = rev.id,
+        .containers = rev.containers,
+        .service_account = rev.service_account,
+        .volumes = rev.volumes,
+        .min_instances = rev.min_instances,
+        .max_instances = rev.max_instances,
+        .concurrency = rev.concurrency,
+        .timeout_s = rev.timeout_s,
+        .execution_environment = rev.execution_environment,
+        .vpc_access = rev.vpc_access,
+        .session_affinity = rev.session_affinity,
+    });
+    var got_rev = try b.client.getRevision("us-central1", "zigps-3c3b48-full", rev.id);
+    defer got_rev.deinit();
+    try testing.expectEqualDeep(rev.containers, got_rev.value.containers);
+    try testing.expectEqualDeep(rev.volumes, got_rev.value.volumes);
+    try testing.expectEqualDeep(rev.vpc_access, got_rev.value.vpc_access);
+    inline for (.{ "min_instances", "max_instances", "concurrency", "timeout_s", "execution_environment", "session_affinity" }) |field| {
+        try testing.expectEqual(@field(rev, field), @field(got_rev.value, field));
+    }
+
+    // An image alone: production's defaults, filled in by the fake.
+    const plain = try codec.decodeService(a, a, production.settings_service_plain);
+    _ = try b.fake.putService(.{ .location = "us-central1", .id = "zigps-3c3b48-plain", .template = .{
+        .containers = &.{.{ .image = plain.template.?.containers[0].image }},
+        .service_account = plain.template.?.service_account,
+    } });
+    var got_plain = try b.client.getService("us-central1", "zigps-3c3b48-plain");
+    defer got_plain.deinit();
+    try testing.expectEqualDeep(plain.template.?, got_plain.value.template.?);
+    try testing.expectEqualDeep(plain.scaling.?, got_plain.value.scaling.?);
+    try testing.expectEqual(plain.ingress, got_plain.value.ingress);
+
+    // Its first revision: the container named for its image.
+    const plain_rev = try codec.decodeRevision(a, a, production.settings_revision_plain);
+    _ = try b.fake.putRevision(.{ .location = "us-central1", .service = "zigps-3c3b48-plain", .id = plain_rev.id, .containers = &.{.{ .image = plain_rev.containers[0].image }}, .service_account = plain_rev.service_account });
+    var got_plain_rev = try b.client.getRevision("us-central1", "zigps-3c3b48-plain", plain_rev.id);
+    defer got_plain_rev.deinit();
+    try testing.expectEqualDeep(plain_rev.containers, got_plain_rev.value.containers);
+    try testing.expectEqual(plain_rev.max_instances, got_plain_rev.value.max_instances);
+    try testing.expectEqual(plain_rev.concurrency, got_plain_rev.value.concurrency);
+    try testing.expectEqual(plain_rev.timeout_s, got_plain_rev.value.timeout_s);
+    try testing.expectEqual(plain_rev.vpc_access, got_plain_rev.value.vpc_access);
+
+    // The job's task template.
+    const job = try codec.decodeJob(a, a, production.settings_job);
+    _ = try b.fake.putJob(.{ .location = "us-central1", .id = "zigps-3c3b48-job", .containers = job.containers, .service_account = job.service_account, .volumes = job.volumes, .vpc_access = job.vpc_access, .max_retries = job.max_retries, .task_timeout_s = job.task_timeout_s });
+    var got_job = try b.client.getJob("us-central1", "zigps-3c3b48-job");
+    defer got_job.deinit();
+    try testing.expectEqualDeep(job.containers, got_job.value.containers);
+    try testing.expectEqualDeep(job.volumes, got_job.value.volumes);
+    try testing.expectEqualDeep(job.vpc_access, got_job.value.vpc_access);
+    try testing.expectEqual(job.execution_environment, got_job.value.execution_environment);
+}
+
+test "settings: production's defaults for a job, and what a put refuses" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    try b.fake.putLocation("us-central1");
+    _ = try b.fake.putJob(.{ .location = "us-central1", .id = "plain", .containers = &.{.{ .image = "us-docker.pkg.dev/cloudrun/container/job" }} });
+    var job = try b.client.getJob("us-central1", "plain");
+    defer job.deinit();
+    const r = job.value.containers[0].resources.?;
+    try testing.expectEqualStrings("1000m", r.cpu);
+    try testing.expectEqualStrings("512Mi", r.memory);
+    try testing.expect(!r.cpu_idle);
+    try testing.expectEqual(0, job.value.containers[0].ports.len);
+    try testing.expectEqual(.gen2, job.value.execution_environment);
+    try testing.expectEqual(600, job.value.task_timeout_s.?);
+
+    // A service with no template answers none, as no production service
+    // does; with an empty one, the defaults alone.
+    _ = try b.fake.putService(.{ .location = "us-central1", .id = "bare" });
+    var bare = try b.client.getService("us-central1", "bare");
+    defer bare.deinit();
+    try testing.expectEqual(null, bare.value.template);
+    try testing.expectEqual(.all, bare.value.ingress);
+    try testing.expectEqual(20, bare.value.scaling.?.max_instances.?);
+    _ = try b.fake.putService(.{ .location = "us-central1", .id = "empty", .template = .{}, .scaling = null, .ingress = .internal_only });
+    var empty = try b.client.getService("us-central1", "empty");
+    defer empty.deinit();
+    try testing.expectEqual(300, empty.value.template.?.timeout_s.?);
+    try testing.expectEqual(80, empty.value.template.?.concurrency.?);
+    try testing.expectEqual(null, empty.value.scaling);
+    try testing.expectEqual(.internal_only, empty.value.ingress);
+
+    const bad = [_]FakeRun.PutService{
+        .{ .location = "us-central1", .id = "a", .template = .{ .containers = &.{.{ .image = "i", .env = &.{.{ .name = "" }} }} } },
+        .{ .location = "us-central1", .id = "b", .template = .{ .containers = &.{.{ .image = "i", .env = &.{.{ .name = "S", .source = .{ .secret = .{ .secret = "" } } }} }} } },
+        .{ .location = "us-central1", .id = "c", .template = .{ .containers = &.{.{ .image = "i", .volume_mounts = &.{.{ .name = "" }} }} } },
+        .{ .location = "us-central1", .id = "d", .template = .{ .volumes = &.{.{ .name = "" }} } },
+        .{ .location = "us-central1", .id = "e", .template = .{ .volumes = &.{.{ .name = "v", .source = .{ .secret = .{ .secret = "" } } }} } },
+    };
+    for (bad) |put| try testing.expectError(error.InvalidEntry, b.fake.putService(put));
+    try testing.expectEqual(2, b.fake.serviceCount());
+    try testing.expectError(error.InvalidEntry, b.fake.putJob(.{ .location = "us-central1", .id = "j", .volumes = &.{.{ .name = "" }} }));
+    try testing.expectError(error.InvalidEntry, b.fake.putRevision(.{ .location = "us-central1", .service = "bare", .id = "r", .containers = &.{.{ .image = "i", .env = &.{.{ .name = "" }} }} }));
+}
+
+fn settingsProperty(_: void, input: []const u8) !void {
+    const gpa = test_util.propertyAllocator();
+    var g: test_util.ByteGen = .init(input);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const words = [_][]const u8{ "", "a", "hello", "zigps-x", "projects/p/secrets/s", "/data", "latest", "1", "MEMORY", "64Mi" };
+    const word = struct {
+        fn word(gen: *test_util.ByteGen) []const u8 {
+            return gen.pick([]const u8, &words);
+        }
+    }.word;
+    const strings = struct {
+        fn strings(al: Allocator, gen: *test_util.ByteGen) ![]const []const u8 {
+            const out = try al.alloc([]const u8, gen.intRange(usize, 0, 2));
+            for (out) |*o| o.* = word(gen);
+            return out;
+        }
+    }.strings;
+
+    const kind: FakeRun.SettingsKind = if (g.boolean()) .template else .revision;
+    const containers = try a.alloc(types.Container, g.intRange(usize, 0, 2));
+    for (containers) |*c| {
+        const env = try a.alloc(types.EnvVar, g.intRange(usize, 0, 3));
+        for (env, 0..) |*e, i| e.* = .{ .name = try std.fmt.allocPrint(a, "E{d}", .{i}), .source = if (g.boolean()) .{ .value = word(&g) } else .{ .secret = .{ .secret = "s", .version = word(&g) } } };
+        const ports = try a.alloc(types.Port, g.intRange(usize, 0, 1));
+        for (ports) |*p| p.* = .{ .name = g.pick([]const u8, &.{ "", "http1", "h2c" }), .container_port = g.int(u16) };
+        const mounts = try a.alloc(types.VolumeMount, g.intRange(usize, 0, 2));
+        for (mounts) |*m| m.* = .{ .name = "v", .mount_path = word(&g), .sub_path = word(&g) };
+        c.* = .{
+            .name = if (g.boolean()) "" else "main",
+            .image = g.pick([]const u8, &.{ "us-docker.pkg.dev/cloudrun/container/hello", "gcr.io/p/app:v1", "app@sha256:00" }),
+            .command = try strings(a, &g),
+            .args = try strings(a, &g),
+            .working_dir = word(&g),
+            .env = env,
+            .resources = if (g.boolean()) null else .{ .cpu = g.pick([]const u8, &.{ "", "1", "1000m", "2" }), .memory = g.pick([]const u8, &.{ "", "512Mi", "1Gi" }), .gpu = g.pick([]const u8, &.{ "", "1" }), .cpu_idle = g.boolean(), .startup_cpu_boost = g.boolean() },
+            .ports = ports,
+            .volume_mounts = mounts,
+            .depends_on = try strings(a, &g),
+        };
+    }
+    const volumes = try a.alloc(types.Volume, g.intRange(usize, 0, 3));
+    for (volumes, 0..) |*v, i| {
+        const name = try std.fmt.allocPrint(a, "v{d}", .{i});
+        v.* = .{ .name = name, .source = switch (g.intRange(u8, 0, 5)) {
+            0 => .{ .secret = .{ .secret = "s", .default_mode = if (g.boolean()) 292 else null, .items = if (g.boolean()) &.{.{ .path = "p", .version = "latest" }} else &.{} } },
+            1 => .{ .empty_dir = .{ .medium = g.pick([]const u8, &.{ "", "MEMORY" }), .size_limit = g.pick([]const u8, &.{ "", "64Mi" }) } },
+            2 => .{ .cloud_sql = .{ .instances = try strings(a, &g) } },
+            3 => .{ .gcs = .{ .bucket = "b", .read_only = g.boolean(), .mount_options = try strings(a, &g) } },
+            4 => .{ .nfs = .{ .server = "10.0.0.2", .path = "/x", .read_only = g.boolean() } },
+            else => .{ .other = g.pick([]const u8, &.{ "", "somethingNew" }) },
+        } };
+    }
+    const settings: types.RevisionTemplate = .{
+        .containers = containers,
+        .volumes = volumes,
+        .service_account = word(&g),
+        .min_instances = if (g.boolean()) @as(i32, g.intRange(u8, 0, 5)) else null,
+        .max_instances = if (g.boolean()) @as(i32, g.intRange(u8, 0, 100)) else null,
+        .concurrency = if (g.boolean()) @as(i32, g.intRange(u16, 1, 1000)) else null,
+        .timeout_s = if (g.boolean()) @as(f64, @floatFromInt(g.intRange(u16, 1, 3600))) / g.pick(f64, &.{ 1, 2 }) else null,
+        .execution_environment = g.pick(types.ExecutionEnvironment, &.{ .unspecified, .gen1, .gen2 }),
+        .vpc_access = if (g.boolean()) null else .{
+            .connector = g.pick([]const u8, &.{ "", "projects/p/locations/l/connectors/c" }),
+            .egress = g.pick(types.Egress, &.{ .unspecified, .all_traffic, .private_ranges_only }),
+            .network_interfaces = if (g.boolean()) &.{} else &.{.{ .network = "default", .subnetwork = word(&g), .tags = try strings(a, &g) }},
+        },
+        .session_affinity = g.boolean(),
+        .encryption_key = g.pick([]const u8, &.{ "", "projects/p/locations/l/keyRings/r/cryptoKeys/k" }),
+    };
+
+    var clock: core.testing.FakeClock = .{};
+    var fake: FakeRun = .init(gpa, clock.io(), .{});
+    defer fake.deinit();
+    try fake.putLocation("us-central1");
+    var token = core.StaticToken{ .token = "t" };
+    var client = try Client.init(gpa, clock.io(), .{ .project_id = "my-project", .token_provider = token.provider(), .transport = fake.transport() });
+    defer client.deinit();
+
+    // The plain model: production's defaults where the put gave none,
+    // every false and zero read back as absent.
+    var want = settings;
+    want.concurrency = settings.concurrency orelse 80;
+    want.timeout_s = settings.timeout_s orelse 300;
+    if ((settings.min_instances orelse 0) == 0) want.min_instances = null;
+    if ((settings.max_instances orelse 0) == 0) want.max_instances = null;
+    const want_containers = try a.alloc(types.Container, containers.len);
+    for (containers, want_containers, 1..) |c, *w, n| {
+        w.* = c;
+        if (c.resources == null) w.resources = .{ .cpu = "1000m", .memory = "512Mi", .cpu_idle = true };
+        if (c.ports.len == 0) w.ports = &.{.{ .name = "http1", .container_port = 8080 }};
+        if (c.name.len == 0 and kind == .revision) w.name = try std.fmt.allocPrint(a, "{s}-{d}", .{ FakeRun.imageBase(c.image), n });
+    }
+    want.containers = want_containers;
+
+    var got: types.RevisionTemplate = undefined;
+    if (kind == .template) {
+        _ = try fake.putService(.{ .location = "us-central1", .id = "s", .template = settings });
+        var service = try client.getService("us-central1", "s");
+        defer service.deinit();
+        got = service.value.template.?;
+        try testing.expectEqualDeep(want, got);
+    } else {
+        _ = try fake.putService(.{ .location = "us-central1", .id = "s" });
+        _ = try fake.putRevision(.{
+            .location = "us-central1",
+            .service = "s",
+            .id = "s-00001-abc",
+            .containers = settings.containers,
+            .volumes = settings.volumes,
+            .service_account = settings.service_account,
+            .min_instances = settings.min_instances,
+            .max_instances = settings.max_instances,
+            .concurrency = settings.concurrency,
+            .timeout_s = settings.timeout_s,
+            .execution_environment = settings.execution_environment,
+            .vpc_access = settings.vpc_access,
+            .session_affinity = settings.session_affinity,
+            .encryption_key = settings.encryption_key,
+        });
+        var revision = try client.getRevision("us-central1", "s", "s-00001-abc");
+        defer revision.deinit();
+        const r = revision.value;
+        got = .{
+            .containers = r.containers,
+            .volumes = r.volumes,
+            .service_account = r.service_account,
+            .min_instances = r.min_instances,
+            .max_instances = r.max_instances,
+            .concurrency = r.concurrency,
+            .timeout_s = r.timeout_s,
+            .execution_environment = r.execution_environment,
+            .vpc_access = r.vpc_access,
+            .session_affinity = r.session_affinity,
+            .encryption_key = r.encryption_key,
+        };
+        try testing.expectEqualDeep(want, got);
+    }
+}
+
+test "slow property settings: what a test puts in reads back through the client, production's defaults filled and every false and zero left out" {
+    try test_util.fuzzBytes({}, settingsProperty, .{
+        .corpus = &.{ "", "\x01\x02\x01\x00\x01\x00\x01\x00\x01\x00\x02\x01\x00\x00\x01\xff\x10\x00", "\x00\x01\x00\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01" },
+        .random_runs = 200,
+        .max_len = 300,
     });
 }

@@ -175,6 +175,29 @@ Each as production answered when measured on 2026-10-21:
 could not hold: a location or job nobody put, an id taken, malformed or
 `-`, a status of `.unspecified` or `.unknown`.
 
+### What a deploy set
+
+Each as production answered when measured on 2026-10-23:
+
+- `putService(.{ .template = ... })`, `putRevision` and `putJob` take
+  the settings `Service.template`, `Revision` and `Job` read, and the
+  fake fills production's defaults where a test gives none: for each
+  container of a service or revision 1000m of CPU and 512Mi of memory
+  with `cpu_idle`, and port 8080 as `http1`; for a job's 1000m and
+  512Mi without `cpu_idle` and no port; a service's or revision's 300 s
+  timeout and concurrency of 80; a job's GEN2; a service's scaling with
+  a maximum of 20 and ingress `.all`. A revision's unnamed container is
+  named for its image and place (`hello-1`), as production named one.
+- Every false and zero is left out of an answer, as production leaves
+  them out, so it reads back as absent: a minimum of 0, `cpu_idle`
+  false, `session_affinity` false.
+- `default_uri_disabled` answers no `uri` and no `urls`, whatever was
+  put.
+- A service put with no template answers none, which no production
+  service does: give one where a test reads it. Probes are not written.
+- A put with an env var, volume or volume mount without a name, or a
+  secret reference without a secret, is `error.InvalidEntry`.
+
 ### Who has access
 
 Each as production answered when measured on 2026-10-23:
@@ -215,7 +238,12 @@ nobody has, seeds the fake with everything production lists, and holds
 the fake to production's answer for every read. Its writes suite
 (`RUN_WRITES_TEST=1`) runs, cancels and routes traffic on real `zigps-`
 jobs and a service, then replays the same script on a fake seeded from
-production's reads and holds every outcome and refusal equal. The IAM
+production's reads and holds every outcome and refusal equal. Its
+settings test (`RUN_SETTINGS_TEST=1`) deploys a service with every
+setting, a plain one and a job, and replays them on a fake seeded from
+production's answers, the plain ones with an image alone so that the
+fake's defaults answer for production's: on 2026-10-23 all seven
+answers agreed. The IAM
 reads' suite (`tests/iam_gcp_integration.zig`, `IAM_READS_TEST=1`) reads
 a real service's and job's policies and permissions, and those of ones
 nobody has, then replays the eight calls on a fake seeded from

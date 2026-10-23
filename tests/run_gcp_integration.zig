@@ -864,3 +864,170 @@ test "run writes: real runs, cancels and a traffic change, the fake replaying th
     }
     try testing.expectEqual(0, differences);
 }
+
+/// A secret raw beside the client, for the settings to name; the
+/// runtime account is never granted it, so the revisions that read it
+/// fail to start and their settings are read all the same.
+fn secretCall(f: *Fixture, a: Allocator, method: core.transport.Method, path: []const u8, body: ?[]const u8) !core.transport.Response {
+    const url = try a.print("https://secretmanager.googleapis.com/v1/projects/{s}/secrets{s}", .{ f.project, path });
+    return f.client.transport.send(.{ .method = method, .url = url, .bearer = f.token.token, .body = body, .timeout_ms = 60_000 }, a);
+}
+
+fn settingsLine(a: Allocator, settings: run_mod.RevisionTemplate) ![]const u8 {
+    return std.json.Stringify.valueAlloc(a, settings, .{});
+}
+
+fn revisionSettings(r: run_mod.Revision) run_mod.RevisionTemplate {
+    return .{
+        .containers = r.containers,
+        .volumes = r.volumes,
+        .service_account = r.service_account,
+        .min_instances = r.min_instances,
+        .max_instances = r.max_instances,
+        .concurrency = r.concurrency,
+        .timeout_s = r.timeout_s,
+        .execution_environment = r.execution_environment,
+        .vpc_access = r.vpc_access,
+        .session_affinity = r.session_affinity,
+        .encryption_key = r.encryption_key,
+    };
+}
+
+test "run settings: services, revisions and a job deployed with every setting, the fake answering alike" {
+    var f: Fixture = undefined;
+    if (!try f.init("RUN_SETTINGS_TEST", .cloud_platform)) return error.SkipZigTest;
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try sweepJobs(&f, a);
+    try sweep(&f, a);
+
+    const secret = try a.print("zigps-{s}", .{f.run});
+    const full_id = try a.print("zigps-{s}-full", .{f.run});
+    const plain_id = try a.print("zigps-{s}-plain", .{f.run});
+    const job_id = try a.print("zigps-{s}-job", .{f.run});
+    var made_secret = false;
+    var made: [2]bool = .{ false, false };
+    var made_job = false;
+    defer {
+        var cleanup: std.heap.ArenaAllocator = .init(testing.allocator);
+        const ca = cleanup.allocator();
+        for ([_][]const u8{ full_id, plain_id }, made) |id, was| if (was) f.deleteService(ca, id) catch |err| fact("cleanup of {s} failed: {t}", .{ id, err });
+        if (made_job) deleteJob(&f, ca, job_id) catch |err| fact("cleanup of {s} failed: {t}", .{ job_id, err });
+        if (made_secret) if (secretCall(&f, ca, .DELETE, std.fmt.allocPrint(ca, "/{s}", .{secret}) catch "", null)) |res| fact("delete secret {s}: HTTP {d}", .{ secret, res.status }) else |err| fact("delete secret: {t}", .{err});
+        cleanup.deinit();
+    }
+
+    const made_s = try secretCall(&f, a, .POST, try a.print("?secretId={s}", .{secret}), "{\"replication\":{\"automatic\":{}}}");
+    try testing.expectEqual(200, made_s.status);
+    made_secret = true;
+    const version = try secretCall(&f, a, .POST, try a.print("/{s}:addVersion", .{secret}), "{\"payload\":{\"data\":\"emlncHM=\"}}");
+    try testing.expectEqual(200, version.status);
+
+    const base = try a.print("/v2/projects/{s}/locations/{s}", .{ f.project, location });
+    {
+        const res = try f.raw(a, .POST, try a.print("{s}/services?serviceId={s}", .{ base, full_id }), try a.print(
+            \\{{"labels":{{"zigps":"suite"}},"ingress":"INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER","defaultUriDisabled":true,
+            \\"scaling":{{"maxInstanceCount":5,"scalingMode":"AUTOMATIC"}},"template":{{
+            \\"containers":[{{"image":"{s}","env":[{{"name":"PLAIN","value":"hello"}},{{"name":"EMPTY","value":""}},
+            \\{{"name":"FROM_SECRET","valueSource":{{"secretKeyRef":{{"secret":"{s}","version":"latest"}}}}}}],
+            \\"resources":{{"limits":{{"cpu":"2","memory":"1Gi"}},"startupCpuBoost":true}},
+            \\"ports":[{{"name":"http1","containerPort":8080}}],
+            \\"volumeMounts":[{{"name":"sec","mountPath":"/secrets"}},{{"name":"scratch","mountPath":"/scratch"}}]}}],
+            \\"volumes":[{{"name":"sec","secret":{{"secret":"{s}","items":[{{"version":"latest","path":"value"}}],"defaultMode":292}}}},
+            \\{{"name":"scratch","emptyDir":{{"medium":"MEMORY","sizeLimit":"64Mi"}}}}],
+            \\"scaling":{{"maxInstanceCount":3}},"maxInstanceRequestConcurrency":40,"timeout":"120s",
+            \\"executionEnvironment":"EXECUTION_ENVIRONMENT_GEN2","sessionAffinity":true,
+            \\"vpcAccess":{{"networkInterfaces":[{{"network":"default","subnetwork":"default","tags":["zigps"]}}],"egress":"PRIVATE_RANGES_ONLY"}}}}}}
+        , .{ hello, secret, secret }));
+        try testing.expectEqual(200, res.status);
+        made[0] = true;
+        _ = try f.awaitOperation(a, res.body, 300);
+    }
+    {
+        const res = try f.raw(a, .POST, try a.print("{s}/services?serviceId={s}", .{ base, plain_id }), try a.print(
+            \\{{"labels":{{"zigps":"suite"}},"template":{{"containers":[{{"image":"{s}"}}]}}}}
+        , .{hello}));
+        try testing.expectEqual(200, res.status);
+        made[1] = true;
+        try testing.expect(try f.awaitOperation(a, res.body, 300));
+    }
+    {
+        const res = try f.raw(a, .POST, try a.print("{s}/jobs?jobId={s}", .{ base, job_id }), try a.print(
+            \\{{"labels":{{"zigps":"suite"}},"template":{{"taskCount":1,"template":{{"maxRetries":0,
+            \\"containers":[{{"image":"us-docker.pkg.dev/cloudrun/container/job","command":["/bin/sh","-c"],"args":["echo hi"],"workingDir":"/tmp",
+            \\"env":[{{"name":"PLAIN","value":"x"}},{{"name":"FROM_SECRET","valueSource":{{"secretKeyRef":{{"secret":"{s}","version":"1"}}}}}}],
+            \\"resources":{{"limits":{{"cpu":"1","memory":"512Mi"}}}},"volumeMounts":[{{"name":"scratch","mountPath":"/scratch"}}]}}],
+            \\"volumes":[{{"name":"scratch","emptyDir":{{"medium":"MEMORY"}}}}],
+            \\"vpcAccess":{{"networkInterfaces":[{{"network":"default","subnetwork":"default"}}],"egress":"ALL_TRAFFIC"}}}}}}}}
+        , .{secret}));
+        try testing.expectEqual(200, res.status);
+        made_job = true;
+        try testing.expect(try f.awaitOperation(a, res.body, 300));
+    }
+    fact("made {s}, {s} and {s}, beside secret {s}", .{ full_id, plain_id, job_id, secret });
+
+    // Production, through the client.
+    var full = try f.client.getService(location, full_id);
+    defer full.deinit();
+    var plain = try f.client.getService(location, plain_id);
+    defer plain.deinit();
+    var full_revs = try f.client.listRevisions(location, full_id, .{});
+    defer full_revs.deinit();
+    var plain_revs = try f.client.listRevisions(location, plain_id, .{});
+    defer plain_revs.deinit();
+    var job = try f.client.getJob(location, job_id);
+    defer job.deinit();
+    try testing.expect(full.value.template != null and plain.value.template != null);
+    try testing.expect(full_revs.value.revisions.len == 1 and plain_revs.value.revisions.len == 1);
+    fact("full: terminal {s} ({s}); plain: ready={}", .{ if (full.value.terminal_condition) |c| c.reason else "none", if (full.value.ready()) "ready" else "not ready", plain.value.ready() });
+
+    // The fake: the full service and revision seeded with what production
+    // answered; the plain ones with an image and an account alone, so its
+    // defaults answer for production's.
+    var clock: core.testing.FakeClock = .{};
+    var fake: run_mod.testing.FakeRun = .init(testing.allocator, clock.io(), .{ .project_id = f.project });
+    defer fake.deinit();
+    try fake.putLocation(location);
+    _ = try fake.putService(.{ .location = location, .id = full_id, .template = full.value.template, .ingress = full.value.ingress, .default_uri_disabled = full.value.default_uri_disabled, .scaling = full.value.scaling });
+    const pt = plain.value.template.?;
+    _ = try fake.putService(.{ .location = location, .id = plain_id, .template = .{ .containers = &.{.{ .image = pt.containers[0].image }}, .service_account = pt.service_account } });
+    const fr = full_revs.value.revisions[0];
+    const fs = revisionSettings(fr);
+    _ = try fake.putRevision(.{ .location = location, .service = full_id, .id = fr.id, .containers = fs.containers, .volumes = fs.volumes, .service_account = fs.service_account, .min_instances = fs.min_instances, .max_instances = fs.max_instances, .concurrency = fs.concurrency, .timeout_s = fs.timeout_s, .execution_environment = fs.execution_environment, .vpc_access = fs.vpc_access, .session_affinity = fs.session_affinity, .encryption_key = fs.encryption_key });
+    const pr = plain_revs.value.revisions[0];
+    _ = try fake.putRevision(.{ .location = location, .service = plain_id, .id = pr.id, .containers = &.{.{ .image = pr.containers[0].image }}, .service_account = pr.service_account });
+    _ = try fake.putJob(.{ .location = location, .id = job_id, .containers = job.value.containers, .service_account = job.value.service_account, .volumes = job.value.volumes, .vpc_access = job.value.vpc_access, .max_retries = job.value.max_retries, .task_timeout_s = job.value.task_timeout_s });
+    var fake_token: core.StaticToken = .{ .token = "t" };
+    var in_memory = try run_mod.Client.init(testing.allocator, clock.io(), .{ .project_id = f.project, .token_provider = fake_token.provider(), .transport = fake.transport() });
+    defer in_memory.deinit();
+
+    var differences: usize = 0;
+    var fake_full = try in_memory.getService(location, full_id);
+    defer fake_full.deinit();
+    var fake_plain = try in_memory.getService(location, plain_id);
+    defer fake_plain.deinit();
+    var fake_fr = try in_memory.getRevision(location, full_id, fr.id);
+    defer fake_fr.deinit();
+    var fake_pr = try in_memory.getRevision(location, plain_id, pr.id);
+    defer fake_pr.deinit();
+    var fake_job = try in_memory.getJob(location, job_id);
+    defer fake_job.deinit();
+    const job_line = struct {
+        fn line(al: Allocator, j: run_mod.Job) ![]const u8 {
+            return std.json.Stringify.valueAlloc(al, .{ .containers = j.containers, .volumes = j.volumes, .vpc_access = j.vpc_access, .execution_environment = j.execution_environment, .timeout = j.task_timeout_s }, .{});
+        }
+    }.line;
+    const service_line = struct {
+        fn line(al: Allocator, s: run_mod.Service) ![]const u8 {
+            return std.json.Stringify.valueAlloc(al, .{ .ingress = s.ingress, .scaling = s.scaling, .default_uri_disabled = s.default_uri_disabled, .uri = s.uri, .urls = s.urls.len }, .{});
+        }
+    }.line;
+    agree(&differences, "full service's template", try settingsLine(a, full.value.template.?), try settingsLine(a, fake_full.value.template.?));
+    agree(&differences, "full service", try service_line(a, full.value), try service_line(a, fake_full.value));
+    agree(&differences, "plain service's template, the fake's defaults", try settingsLine(a, plain.value.template.?), try settingsLine(a, fake_plain.value.template.?));
+    agree(&differences, "plain service's scaling and ingress", try std.json.Stringify.valueAlloc(a, .{ plain.value.scaling, plain.value.ingress }, .{}), try std.json.Stringify.valueAlloc(a, .{ fake_plain.value.scaling, fake_plain.value.ingress }, .{}));
+    agree(&differences, "full revision", try settingsLine(a, fs), try settingsLine(a, revisionSettings(fake_fr.value)));
+    agree(&differences, "plain revision, the fake's defaults and name", try settingsLine(a, revisionSettings(pr)), try settingsLine(a, revisionSettings(fake_pr.value)));
+    agree(&differences, "job's task template", try job_line(a, job.value), try job_line(a, fake_job.value));
+    try testing.expectEqual(0, differences);
+}
