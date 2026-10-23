@@ -1620,6 +1620,9 @@ pub const FakeMultipart = struct {
         errdefer self.gpa.free(bucket);
         const kms = if (keys.kms_key_name) |k| try self.gpa.dupe(u8, k) else null;
         errdefer if (kms) |k| self.gpa.free(k);
+        // The reply first: once the session is stored, nothing may fail
+        // and free what it holds (issue #321).
+        const reply_headers = try replyHeaders(arena, &.{.{ .name = "Location", .value = location }});
         try self.sessions.append(self.gpa, .{
             .id = id,
             .bucket = bucket,
@@ -1635,7 +1638,7 @@ pub const FakeMultipart = struct {
             .retention = retention,
         });
         self.next_session += 1;
-        return .{ .status = 200, .headers = try replyHeaders(arena, &.{.{ .name = "Location", .value = location }}) };
+        return .{ .status = 200, .headers = reply_headers };
     }
 
     fn sessionIndex(self: *const FakeMultipart, id: []const u8) ?usize {
@@ -4137,4 +4140,33 @@ test "folders and managed folders at their edges: a listing's prefix and pages, 
     try testing.expectEqual(200, (try ask(&fake, a, .GET, folders ++ "/d%2F?userProject=extractctl", .{})).status);
     try expectSays(try ask(&fake, a, .GET, managed ++ "/m1%2F?userProject=another", .{}), 403, "serviceusage.services.use");
     try testing.expectEqual(200, (try ask(&fake, a, .GET, managed ++ "/m1%2F?userProject=extractctl", .{})).status);
+}
+
+test "a resumable start that runs out of memory replying keeps no session, and frees nothing twice (issue #321)" {
+    // Each allocation from the request's arena refused in turn, the one
+    // that makes the reply's headers among them: a session is either
+    // opened whole, or not at all, and the fake's deinit frees only what
+    // it holds. The KMS key's name is one of the strings a session keeps.
+    const start = "/upload/storage/v1/b/b/o?uploadType=resumable&kmsKeyName=projects%2Fp%2Flocations%2Fl%2FkeyRings%2Fr%2FcryptoKeys%2Fk";
+    var refused: usize = 0;
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var fake: FakeMultipart = .init(testing.allocator, testing.io);
+        defer fake.deinit();
+        // Above the arena, so that every allocation the request makes is
+        // counted, not only the arena's growth.
+        var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena_state.deinit();
+        var failing: std.testing.FailingAllocator = .init(arena_state.allocator(), .{ .fail_index = fail_index });
+        const reply = ask(&fake, failing.allocator(), .POST, start, .{ .body = "{\"name\":\"s\"}" }) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqual(0, fake.openSessions());
+            refused += 1;
+            continue;
+        };
+        try testing.expectEqual(200, reply.status);
+        try testing.expectEqual(1, fake.openSessions());
+        break;
+    } else return error.TestNeverSucceeded;
+    try testing.expect(refused > 0);
 }
