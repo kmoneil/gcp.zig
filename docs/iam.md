@@ -148,6 +148,25 @@ wildcard.
 
 Every answer is sorted by name, not in the order asked.
 
+### In tests
+
+`resource_manager.testing.FakeResourceManager` and
+`run.testing.FakeRun` answer these reads as production did:
+`setProjectPolicy` and `setIamPolicy` put a policy in, and
+`holdPermissions` says what the caller holds, so a test can reach both
+sides of a permissions view, the actions it shows and the ones it hides.
+[`examples/permissions.zig`](../examples/permissions.zig) runs on both
+with `--fake`:
+
+```sh
+zig build example-permissions -- --fake
+zig build example-permissions -- --service us-central1/checkout --object gs://my-bucket/report.pdf
+```
+
+The fakes' guides say what each models:
+[Resource Manager](resource_manager/testing.md#what-it-models),
+[Cloud Run](run/testing.md#who-has-access).
+
 ## Errors and retries
 
 - **A concurrent change is `error.Aborted`** on every resource. Cloud

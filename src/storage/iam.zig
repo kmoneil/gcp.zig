@@ -865,3 +865,185 @@ test "object IAM: every allocation failure is OutOfMemory without leaks" {
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
 }
+
+test "object IAM on the fake: production's policy from the object's list, and its refusals" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.fake.put("a b.txt", "one");
+    const o = f.client.bucket("zigps-iam-fine").object("a b.txt");
+
+    // Production's answer for a new object, with only the bucket's and
+    // the generation's names told apart.
+    var policy = try o.iamPolicy(.{});
+    defer policy.deinit();
+    var want_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer want_arena.deinit();
+    const want = try core.iam.decode(want_arena.allocator(), object_policy);
+    try testing.expectEqual(want.version, policy.value.version);
+    try testing.expectEqualStrings(want.etag.?, policy.value.etag.?);
+    try testing.expectEqual(want.bindings.len, policy.value.bindings.len);
+    for (want.bindings, policy.value.bindings) |w, g| {
+        try testing.expectEqualStrings(w.role, g.role);
+        try testing.expectEqual(w.members.len, g.members.len);
+        for (w.members, g.members) |wm, gm| try testing.expectEqualStrings(wm, gm);
+    }
+    // The raw body too: kind, resourceId with #0, then version and etag.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = try f.fake.transport().send(.{ .method = .GET, .url = "https://storage.googleapis.com/storage/v1/b/zigps-iam-fine/o/a%20b.txt/iam", .bearer = "t" }, a);
+    try testing.expect(std.mem.startsWith(u8, raw.body, "{\"kind\":\"storage#policy\",\"resourceId\":\"projects/_/buckets/zigps-iam-fine/objects/a b.txt#0\",\"version\":1,\"etag\":\"CAE=\""));
+
+    // A generation named, live: its own number closes resourceId; one that
+    // is not live is 404, as one that never was.
+    const live = f.fake.object("a b.txt").?.generation;
+    const named = try f.fake.transport().send(.{ .method = .GET, .url = try a.print("https://storage.googleapis.com/storage/v1/b/zigps-iam-fine/o/a%20b.txt/iam?generation={d}", .{live}), .bearer = "t" }, a);
+    try testing.expect(std.mem.indexOf(u8, named.body, try a.print("objects/a b.txt#{d}\"", .{live})) != null);
+    try testing.expectError(error.NotFound, o.iamPolicy(.{ .generation = 1 }));
+    try testing.expectEqualStrings("No such object: zigps-iam-fine/a b.txt", f.diag.message());
+    try testing.expectError(error.NotFound, f.client.bucket("zigps-iam-fine").object("nope.txt").iamPolicy(.{}));
+    try testing.expectError(error.NotFound, f.client.bucket("zigps-nope").object("a b.txt").iamPolicy(.{}));
+    try testing.expectEqualStrings("The specified bucket does not exist.", f.diag.message());
+
+    // Uniform access: refused, in production's words.
+    try testing.expectError(error.InvalidArgument, f.client.bucket("zigps-iam").object("a b.txt").iamPolicy(.{}));
+    try testing.expectEqualStrings("Object policies are disabled for bucket 'zigps-iam' when uniform bucket-level access is enabled. Read more at https://cloud.google.com/storage/docs/uniform-bucket-level-access.", f.diag.message());
+}
+
+test "object IAM on the fake: permission tests answer what the caller holds, sorted, as production refused" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.fake.put("a.txt", "one");
+    const o = f.client.bucket("zigps-iam-fine").object("a.txt");
+
+    var all = try o.testIamPermissions(&.{ "storage.objects.update", "storage.objects.get" }, .{});
+    defer all.deinit();
+    try testing.expectEqualStrings("storage.objects.get", all.value[0]);
+    try testing.expectEqualStrings("storage.objects.update", all.value[1]);
+    // In a uniform bucket too, and on an object nobody wrote.
+    var uniform = try f.client.bucket("zigps-iam").object("ghost").testIamPermissions(&.{"storage.objects.get"}, .{});
+    defer uniform.deinit();
+    try testing.expectEqual(1, uniform.value.len);
+
+    try f.fake.holdObjectPermissions("zigps-iam-fine", "a.txt", &.{"storage.objects.get"});
+    var some = try o.testIamPermissions(&.{ "storage.objects.delete", "storage.objects.get" }, .{});
+    defer some.deinit();
+    try testing.expectEqual(1, some.value.len);
+    try f.fake.holdObjectPermissions("zigps-iam-fine", "a.txt", &.{});
+    var none = try o.testIamPermissions(&.{"storage.objects.get"}, .{});
+    defer none.deinit();
+    try testing.expectEqual(0, none.value.len);
+
+    try testing.expectError(error.InvalidArgument, o.testIamPermissions(&.{"storage.buckets.get"}, .{}));
+    try testing.expectEqualStrings("Invalid argument.", f.diag.message());
+    try testing.expectError(error.InvalidArgument, o.testIamPermissions(&.{"pubsub.topics.get"}, .{}));
+    try testing.expectEqualStrings("pubsub.topics.get is not a valid Google Cloud Storage permission.", f.diag.message());
+    var many: [85][]const u8 = undefined;
+    var buf: [85][24]u8 = undefined;
+    for (&many, &buf, 0..) |*m, *b, i| m.* = try std.fmt.bufPrint(b, "storage.objects.get{d}", .{i});
+    try testing.expectError(error.InvalidArgument, o.testIamPermissions(&many, .{}));
+    try testing.expectEqualStrings("Must specify <= 84 permissions.", f.diag.message());
+    try testing.expectError(error.NotFound, f.client.bucket("zigps-nope").object("a.txt").testIamPermissions(&.{"storage.objects.get"}, .{}));
+
+    // What the client would not send, refused as production refused it.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = "https://storage.googleapis.com/storage/v1/b/zigps-iam-fine/o/a.txt/iam/testPermissions";
+    const empty = try f.fake.transport().send(.{ .method = .GET, .url = base, .bearer = "t" }, a);
+    try testing.expectEqual(400, empty.status);
+    try testing.expect(std.mem.indexOf(u8, empty.body, "Required parameter: permissions") != null);
+    const dup = try f.fake.transport().send(.{ .method = .GET, .url = base ++ "?permissions=storage.objects.get&permissions=storage.objects.get", .bearer = "t" }, a);
+    try testing.expect(std.mem.indexOf(u8, dup.body, "Duplicate permissions must not be specified.") != null);
+}
+
+fn objectIamProperty(_: void, input: []const u8) anyerror!void {
+    const gpa = testing.allocator;
+    var g: test_util.ByteGen = .init(input);
+    var fake: test_util.FakeMultipart = .init(gpa, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var client = try Client.init(gpa, fake.io, .{
+        .project_id = "extractctl",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+        .retry = .{ .max_attempts = 1 },
+    });
+    defer client.deinit();
+    var made = try client.bucket("u").create(.{ .uniform_bucket_level_access = true });
+    made.deinit();
+    made = try client.bucket("f").create(.{});
+    made.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const permissions = [_][]const u8{ "storage.objects.get", "storage.objects.delete", "storage.objects.update", "storage.objects.getIamPolicy", "storage.objects.setIamPolicy" };
+    const object_names = [_][]const u8{ "a", "b/c", "d e", "f%g" };
+    var written: [object_names.len]bool = @splat(false);
+    var held: [2][object_names.len]?[]const []const u8 = @splat(@splat(null));
+    for (object_names, 0..) |name, i| if (g.boolean()) {
+        try fake.put(name, "x");
+        written[i] = true;
+    };
+    for (0..2) |b| for (object_names, 0..) |name, i| if (g.intRange(u8, 0, 2) == 0) {
+        var list: std.ArrayList([]const u8) = .empty;
+        for (permissions) |p| if (g.boolean()) try list.append(a, p);
+        try fake.holdObjectPermissions(if (b == 0) "u" else "f", name, list.items);
+        held[b][i] = list.items;
+    };
+
+    for (0..g.intRange(usize, 0, 10)) |_| {
+        const b = g.intRange(usize, 0, 1);
+        const i = g.intRange(usize, 0, object_names.len - 1);
+        const o = client.bucket(if (b == 0) "u" else "f").object(object_names[i]);
+        if (g.boolean()) {
+            if (b == 0) {
+                try testing.expectError(error.InvalidArgument, o.iamPolicy(.{}));
+                continue;
+            }
+            if (!written[i]) {
+                try testing.expectError(error.NotFound, o.iamPolicy(.{}));
+                continue;
+            }
+            var policy = try o.iamPolicy(.{});
+            defer policy.deinit();
+            // The default list, then its writer: production's four.
+            try testing.expectEqual(2, policy.value.bindings.len);
+            try testing.expect(policy.value.grants("roles/storage.legacyObjectReader", "projectViewer:extractctl"));
+            for ([_][]const u8{ "projectOwner:extractctl", "projectEditor:extractctl", "serviceAccount:zig-gcp@extractctl.iam.gserviceaccount.com" }) |m| {
+                try testing.expect(policy.value.grants("roles/storage.legacyObjectOwner", m));
+            }
+        } else {
+            var asked: std.ArrayList([]const u8) = .empty;
+            for (permissions) |p| if (g.boolean()) try asked.append(a, p);
+            if (asked.items.len == 0) try asked.append(a, permissions[0]);
+            var answer = try o.testIamPermissions(asked.items, .{});
+            defer answer.deinit();
+            var want: std.ArrayList([]const u8) = .empty;
+            for (asked.items) |p| {
+                const holds = if (held[b][i]) |list| for (list) |h| {
+                    if (std.mem.eql(u8, h, p)) break true;
+                } else false else true;
+                if (holds) try want.append(a, p);
+            }
+            std.mem.sort([]const u8, want.items, {}, struct {
+                fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+                    return std.mem.lessThan(u8, x, y);
+                }
+            }.lessThan);
+            try testing.expectEqual(want.items.len, answer.value.len);
+            for (want.items, answer.value) |x, y| try testing.expectEqualStrings(x, y);
+        }
+    }
+}
+
+test "heavy property object IAM against the fake: policies and permission tests agree with a plain model, read through the client" {
+    try test_util.fuzzBytes({}, objectIamProperty, .{
+        .corpus = &.{ "", "\x01\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x0a", "\xff\xff\xff\xff\x00\x01\x00\x01\x00\x01\x00\x01\x00\x01\x00\x01\x0a" },
+        .random_runs = 200,
+        .max_len = 300,
+    });
+}

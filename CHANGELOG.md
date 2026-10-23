@@ -36,6 +36,18 @@ including the ones that did not change.
     Google's discovery document names them. The test takes any scope.
   - Every `testIamPermissions` answer is sorted by name, as production
     sends it.
+  - In tests: `FakeResourceManager.setProjectPolicy` and
+    `holdPermissions`, and `FakeRun.setIamPolicy` and `holdPermissions`,
+    answer the reads as production did, a service or job nobody put
+    included (an empty policy, permissions held as if it existed). Cloud
+    Storage's internal fake derives an object's policy from its access
+    control list. Each fake is held to production's recorded answers,
+    has a fuzzed property against a plain model, and a gated suite
+    (`tests/iam_gcp_integration.zig`, `IAM_READS_TEST=1`) replays the
+    reads against production and the fakes: on 2026-10-23 every answer
+    agreed. `examples/permissions.zig` shows a project's, a service's and
+    an object's policy and what the caller may do, with `--fake` for no
+    network.
 - auth, bigquery, core, dataflow, datatransfer, error_reporting,
   firestore, kms, logging, monitoring, pubsub, scheduler and
   secret_manager: unchanged.

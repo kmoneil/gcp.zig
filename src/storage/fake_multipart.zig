@@ -84,6 +84,24 @@
 //! unless their metadata says `eventBasedHold: false`. `objects.patch`
 //! sets and releases holds, and takes nothing else.
 //!
+//! An object's IAM policy and permission test are held to what Cloud
+//! Storage measured on 2026-10-23 does. The policy is the object's list
+//! as legacy roles: `roles/storage.legacyObjectReader` for its readers,
+//! then `roles/storage.legacyObjectOwner` for its owners, each in the
+//! list's order, a project team as `projectViewer:` and its siblings by
+//! the project's id, a `user-` entity whose address is a service
+//! account's as `serviceAccount:`; version 1, its etag the object's
+//! metageneration (`CAE=` for 1), and `#0` closing `resourceId` for the
+//! live object, the generation when one is named. In a bucket with
+//! uniform access it is 400. A permission test answers what
+//! `holdObjectPermissions` said, else every permission, sorted, for an
+//! object that does not exist too; it refuses none, over 84, one named
+//! twice, one that is not Cloud Storage's, and a bucket's permission on an
+//! object ("Invalid argument."). Both need the bucket in `buckets`.
+//! Noncurrent generations are not kept here, so a generation that is not
+//! the live one is 404; `group-` and `domain-` entities become `group:`
+//! and `domain:` members, which was not measured.
+//!
 //! Object retention, in a bucket created with it, is held to the same
 //! day's measurements: an upload or a patch names both its mode and its
 //! time, in the future and with a zone, and not beside an event-based
@@ -132,6 +150,9 @@ pub const FakeMultipart = struct {
     /// Buckets and their settings, apart from the objects above, which
     /// belong to whatever bucket a request names.
     buckets: FakeBuckets,
+    /// By `bucket/object`: what `holdObjectPermissions` said the caller
+    /// holds there. In the bucket fake's arena.
+    held: std.StringHashMapUnmanaged([]const []const u8) = .empty,
     /// The project's HMAC keys.
     hmac: FakeHmacKeys,
     next_upload: u32 = 1,
@@ -208,7 +229,7 @@ pub const FakeMultipart = struct {
         session_stale_bytes: u64 = 0,
     };
 
-    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel, insert, bucket, restore, patch, notification, folder, managed, operation, layout, hmac };
+    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel, insert, bucket, restore, patch, notification, folder, managed, operation, layout, hmac, iam };
 
     pub const Fault = enum {
         none,
@@ -441,6 +462,89 @@ pub const FakeMultipart = struct {
         self.next_generation += 1;
     }
 
+    /// An object's IAM policy or permission test, as Cloud Storage answered
+    /// them on 2026-10-23.
+    fn objectIam(self: *FakeMultipart, t: ObjectIamTarget, arena: Allocator) Allocator.Error!Reply {
+        if (self.buckets.resource(t.bucket) == null) return bucket_missing;
+        if (t.test_permissions) return self.testObjectPermissions(t, arena);
+        if (self.buckets.isUniform(t.bucket)) return jsonRefusal(arena, 400, "invalid", try arena.print("Object policies are disabled for bucket '{s}' when uniform bucket-level access is enabled. Read more at https://cloud.google.com/storage/docs/uniform-bucket-level-access.", .{t.bucket}));
+        const index = self.liveIndex(t.name);
+        const o = if (index) |i| &self.objects.items[i] else null;
+        if (o == null or (t.generation != null and t.generation.? != o.?.generation)) {
+            return jsonRefusal(arena, 404, "notFound", try arena.print("No such object: {s}/{s}", .{ t.bucket, t.name }));
+        }
+        const live = o.?;
+        var readers: std.ArrayList([]const u8) = .empty;
+        var owners: std.ArrayList([]const u8) = .empty;
+        for (live.acl) |entry| {
+            const member = try iamMember(arena, entry.entity);
+            if (std.mem.eql(u8, entry.role, "OWNER")) try owners.append(arena, member) else try readers.append(arena, member);
+        }
+        // The etag is the metageneration as a protobuf varint, field 1.
+        var raw: [11]u8 = undefined;
+        raw[0] = 0x08;
+        var len: usize = 1;
+        var m = live.metageneration;
+        while (true) {
+            raw[len] = @as(u8, @truncate(m & 0x7f)) | (if (m >= 0x80) @as(u8, 0x80) else 0);
+            len += 1;
+            m >>= 7;
+            if (m == 0) break;
+        }
+        var etag_buf: [16]u8 = undefined;
+        const etag = std.base64.standard.Encoder.encode(&etag_buf, raw[0..len]);
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: std.json.Stringify = .{ .writer = &out.writer };
+        writeObjectPolicy(&jw, t.bucket, t.name, t.generation orelse 0, etag, readers.items, owners.items) catch return error.OutOfMemory;
+        return .{ .status = 200, .body = out.written() };
+    }
+
+    fn testObjectPermissions(self: *FakeMultipart, t: ObjectIamTarget, arena: Allocator) Allocator.Error!Reply {
+        const asked = t.permissions;
+        if (asked.len == 0) return jsonRefusal(arena, 400, "required", "Required parameter: permissions");
+        if (asked.len > 84) return jsonRefusal(arena, 400, "invalid", "Must specify <= 84 permissions.");
+        for (asked, 0..) |p, i| {
+            for (asked[0..i]) |q| if (std.mem.eql(u8, p, q)) return jsonRefusal(arena, 400, "invalid", "Duplicate permissions must not be specified.");
+        }
+        for (asked) |p| {
+            if (!std.mem.startsWith(u8, p, "storage.") or std.mem.indexOfScalar(u8, p, '*') != null) {
+                return jsonRefusal(arena, 400, "invalid", try arena.print("{s} is not a valid Google Cloud Storage permission.", .{p}));
+            }
+            if (!std.mem.startsWith(u8, p, "storage.objects.")) return jsonRefusal(arena, 400, "invalid", "Invalid argument.");
+        }
+        const said = self.held.get(try std.mem.concat(arena, u8, &.{ t.bucket, "/", t.name }));
+        var held: std.ArrayList([]const u8) = .empty;
+        for (asked) |p| {
+            const holds = if (said) |list| for (list) |h| {
+                if (std.mem.eql(u8, h, p)) break true;
+            } else false else true;
+            if (holds) try held.append(arena, p);
+        }
+        std.mem.sort([]const u8, held.items, {}, struct {
+            fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lessThan);
+        const body = if (held.items.len == 0)
+            "{\"kind\":\"storage#testIamPermissionsResponse\"}"
+        else
+            try std.json.Stringify.valueAlloc(arena, .{ .kind = "storage#testIamPermissionsResponse", .permissions = held.items }, .{});
+        return .{ .status = 200, .body = body };
+    }
+
+    /// Says exactly which permissions the caller holds on the object
+    /// `name` in `bucket`, replacing what was said before: what a
+    /// permission test answers there, whether or not the object exists.
+    /// Nothing said, every permission asked is held.
+    pub fn holdObjectPermissions(self: *FakeMultipart, bucket: []const u8, name: []const u8, permissions: []const []const u8) Allocator.Error!void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const a = self.buckets.listArena();
+        const copy = try a.alloc([]const u8, permissions.len);
+        for (permissions, copy) |p, *c| c.* = try a.dupe(u8, p);
+        try self.held.put(a, try std.mem.concat(a, u8, &.{ bucket, "/", name }), copy);
+    }
+
     const NewAcl = struct { owner: []const u8, acl: []const fake_acl.Entry };
 
     /// A new object's owner, the writer, and its list: the canned one its
@@ -594,6 +698,7 @@ pub const FakeMultipart = struct {
             },
             .layout => if (method == .GET) .layout else return error.HttpProtocolError,
             .hmac => .hmac,
+            .object_iam => if (method == .GET) .iam else return error.HttpProtocolError,
             .restore => if (method == .POST) .restore else return error.HttpProtocolError,
             .session => switch (method) {
                 .PUT => .session_put,
@@ -615,7 +720,7 @@ pub const FakeMultipart = struct {
             .xml => |x| if (x.query == .part) x.query.part.number else 0,
             .json => |j| if (j.media) mediaPart(headers) else 0,
             .session => if (kind == .session_put) sessionPart(headers) else 0,
-            .move, .resumable, .insert, .bucket, .restore, .folders, .managed, .operations, .layout, .hmac => 0,
+            .move, .resumable, .insert, .bucket, .restore, .folders, .managed, .operations, .layout, .hmac, .object_iam => 0,
         };
         if (try self.billingRefusal(target, url, headers, arena)) |refusal| return refusal;
         if (try keyRefusal(kind, target, url, headers, arena)) |refusal| return refusal;
@@ -703,6 +808,7 @@ pub const FakeMultipart = struct {
                 break :hmac Reply{ .status = r.status, .body = r.body };
             },
             .restore => |t| try self.restoreObject(t, arena),
+            .object_iam => |t| try self.objectIam(t, arena),
             .session => |id| if (kind == .session_put)
                 try self.sessionPut(id, headers, body, fault, arena)
             else
@@ -1336,7 +1442,7 @@ pub const FakeMultipart = struct {
                 if (fault == .gone) return self.drop(index, gone);
                 return self.listParts(index, target, arena);
             },
-            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel, .insert, .bucket, .restore, .patch, .notification, .folder, .managed, .operation, .layout, .hmac => unreachable,
+            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel, .insert, .bucket, .restore, .patch, .notification, .folder, .managed, .operation, .layout, .hmac, .iam => unreachable,
         }
     }
 
@@ -2761,6 +2867,49 @@ fn objectJsonFull(
 }
 
 /// A JSON API error body, as Cloud Storage writes one.
+/// An access control list's entity as an IAM member, as Cloud Storage's
+/// object policy names it: a project team by the project's id, and a
+/// service account's address as `serviceAccount:`.
+fn iamMember(arena: Allocator, entity: []const u8) Allocator.Error![]const u8 {
+    if (std.mem.eql(u8, entity, fake_acl.owners)) return "projectOwner:" ++ fake_acl.project_id;
+    if (std.mem.eql(u8, entity, fake_acl.editors)) return "projectEditor:" ++ fake_acl.project_id;
+    if (std.mem.eql(u8, entity, fake_acl.viewers)) return "projectViewer:" ++ fake_acl.project_id;
+    if (std.mem.startsWith(u8, entity, "user-")) {
+        const address = entity["user-".len..];
+        const kind = if (std.mem.endsWith(u8, address, ".gserviceaccount.com")) "serviceAccount:" else "user:";
+        return std.mem.concat(arena, u8, &.{ kind, address });
+    }
+    inline for (.{ .{ "group-", "group:" }, .{ "domain-", "domain:" } }) |pair| {
+        if (std.mem.startsWith(u8, entity, pair[0])) return std.mem.concat(arena, u8, &.{ pair[1], entity[pair[0].len..] });
+    }
+    return entity;
+}
+
+fn writeObjectPolicy(jw: *std.json.Stringify, bucket: []const u8, name: []const u8, generation: u64, etag: []const u8, readers: []const []const u8, owners: []const []const u8) std.json.Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("kind");
+    try jw.write("storage#policy");
+    try jw.objectField("resourceId");
+    try jw.print("\"projects/_/buckets/{s}/objects/{s}#{d}\"", .{ bucket, name, generation });
+    try jw.objectField("version");
+    try jw.write(1);
+    try jw.objectField("etag");
+    try jw.write(etag);
+    try jw.objectField("bindings");
+    try jw.beginArray();
+    for ([_]struct { []const u8, []const []const u8 }{ .{ "roles/storage.legacyObjectReader", readers }, .{ "roles/storage.legacyObjectOwner", owners } }) |b| {
+        if (b[1].len == 0) continue;
+        try jw.beginObject();
+        try jw.objectField("role");
+        try jw.write(b[0]);
+        try jw.objectField("members");
+        try jw.write(b[1]);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.endObject();
+}
+
 fn jsonRefusal(arena: Allocator, status: u16, reason: []const u8, message: []const u8) Allocator.Error!FakeMultipart.Reply {
     const body = try std.json.Stringify.valueAlloc(arena, .{ .@"error" = .{
         .code = status,
@@ -3051,6 +3200,17 @@ const Target = union(enum) {
     hmac: FakeHmacKeys.Target,
     /// A session URL's id.
     session: []const u8,
+    /// `.../o/{object}/iam` or `.../iam/testPermissions`.
+    object_iam: ObjectIamTarget,
+};
+
+const ObjectIamTarget = struct {
+    bucket: []const u8,
+    name: []const u8,
+    generation: ?u64,
+    /// `.../iam/testPermissions`, with the permissions asked.
+    test_permissions: bool,
+    permissions: []const []const u8,
 };
 
 /// `/storage/v1/b/{bucket}/folders`, or one folder: an insert, a get, a
@@ -3330,6 +3490,7 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
         var override = false;
         var full = false;
         var predefined_param: ?[]const u8 = null;
+        var permissions: std.ArrayList([]const u8) = .empty;
         var conditions: Conditions = .{};
         var params = std.mem.splitScalar(u8, query, '&');
         while (params.next()) |param| {
@@ -3348,7 +3509,19 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
                 full = true;
             } else if (std.mem.startsWith(u8, param, "predefinedAcl=")) {
                 predefined_param = try decode(arena, param["predefinedAcl=".len..]);
+            } else if (std.mem.startsWith(u8, param, "permissions=")) {
+                try permissions.append(arena, try decode(arena, param["permissions=".len..]));
             }
+        }
+        // A name is one strictly encoded segment, so a slash here is IAM's.
+        inline for (.{ .{ "/iam", false }, .{ "/iam/testPermissions", true } }) |suffix| {
+            if (std.mem.endsWith(u8, object_part, suffix[0])) return .{ .object_iam = .{
+                .bucket = bucket,
+                .name = try decode(arena, object_part[0 .. object_part.len - suffix[0].len]),
+                .generation = generation,
+                .test_permissions = suffix[1],
+                .permissions = permissions.items,
+            } };
         }
         // A name is one strictly encoded segment, so a slash here is the
         // list's.

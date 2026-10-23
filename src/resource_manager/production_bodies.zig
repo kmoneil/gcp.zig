@@ -937,3 +937,105 @@ fn sameShape(x: std.json.Value, y: std.json.Value) bool {
         .number_string => |s| return y == .number_string and std.mem.eql(u8, s, y.number_string),
     }
 }
+
+/// The resource a troubleshooter error id names: production's ids are a
+/// request's UUID, then the resource, base64 encoded; the fake's UUID is
+/// its own.
+fn errorIdResource(a: std.mem.Allocator, id: []const u8) ![]const u8 {
+    const raw = try a.alloc(u8, try std.base64.standard_no_pad.Decoder.calcSizeForSlice(id));
+    try std.base64.standard_no_pad.Decoder.decode(raw, id);
+    if (raw.len < 2 or raw[0] != 0x0a or raw.len < 2 + raw[1] + 2) return error.TestUnexpectedResult;
+    const rest = raw[2 + raw[1] ..];
+    if (rest[0] != 0x12 or rest.len != 2 + rest[1]) return error.TestUnexpectedResult;
+    return rest[2..];
+}
+
+/// `text` with every troubleshooter error id replaced by the resource it
+/// names.
+fn withoutErrorIds(a: std.mem.Allocator, text: []const u8) ![]const u8 {
+    const marker = "errorId=";
+    var out: std.ArrayList(u8) = .empty;
+    var rest = text;
+    while (std.mem.indexOf(u8, rest, marker)) |at| {
+        try out.appendSlice(a, rest[0 .. at + marker.len]);
+        const start = at + marker.len;
+        var end = start;
+        while (end < rest.len and (std.ascii.isAlphanumeric(rest[end]) or rest[end] == '+' or rest[end] == '/')) end += 1;
+        try out.appendSlice(a, try errorIdResource(a, rest[start..end]));
+        rest = rest[end..];
+    }
+    try out.appendSlice(a, rest);
+    return out.items;
+}
+
+/// A POST to the fake, answered as production answered it: the status,
+/// the message and every `ErrorInfo`, troubleshooter ids compared by the
+/// resource they name.
+fn expectFakeSaysPost(fake: *FakeResourceManager, path: []const u8, body: ?[]const u8, status: u16, production: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const url = try std.fmt.allocPrint(a, "https://cloudresourcemanager.googleapis.com{s}", .{path});
+    const reply = try fake.serve(.{ .method = .POST, .url = url, .bearer = "sa-token", .body = body }, a);
+    try testing.expectEqual(status, reply.status);
+    const ours = (try core.errors.decodeErrorBody(a, reply.body)).?;
+    const theirs = (try core.errors.decodeErrorBody(a, production)).?;
+    try testing.expectEqualStrings(theirs.status, ours.status);
+    try testing.expectEqualStrings(try withoutErrorIds(a, theirs.message), try withoutErrorIds(a, ours.message));
+    const our_infos = try core.errors.decodeErrorInfos(a, reply.body);
+    const their_infos = try core.errors.decodeErrorInfos(a, production);
+    try testing.expectEqual(their_infos.len, our_infos.len);
+    for (their_infos, our_infos) |t, o| {
+        try testing.expectEqualStrings(t.reason, o.reason);
+        try testing.expectEqualStrings(t.domain, o.domain);
+        try testing.expectEqual(t.metadata.len, o.metadata.len);
+        for (t.metadata, o.metadata) |tm, om| {
+            try testing.expectEqualStrings(tm.key, om.key);
+            if (std.mem.eql(u8, tm.key, "error_info_id")) {
+                try testing.expectEqualStrings(try errorIdResource(a, tm.value), try errorIdResource(a, om.value));
+            } else {
+                try testing.expectEqualStrings(try withoutErrorIds(a, tm.value), try withoutErrorIds(a, om.value));
+            }
+        }
+    }
+}
+
+test "production: the fake's IAM answers and refusals are production's" {
+    var clock: test_util.FakeClock = .{};
+    var fake = try probeFake(&clock);
+    defer fake.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The policy, set from production's own answer, is answered back in
+    // production's shape: its order, version 1, every binding.
+    const Wire = struct { bindings: []const struct { role: []const u8, members: []const []const u8 } };
+    const wire = try std.json.parseFromSliceLeaky(Wire, a, iam_policy_extractctl, .{ .ignore_unknown_fields = true });
+    const bindings = try a.alloc(core.iam.Binding, wire.bindings.len);
+    // Set in reverse, so the fake's own sort is what restores the order.
+    for (wire.bindings, 0..) |b, i| bindings[wire.bindings.len - 1 - i] = .{ .role = b.role, .members = b.members };
+    try fake.setProjectPolicy("extractctl", bindings);
+    const v3 = "{\"options\":{\"requestedPolicyVersion\":3}}";
+    const policy = try fake.serve(.{ .method = .POST, .url = "https://cloudresourcemanager.googleapis.com/v3/projects/extractctl:getIamPolicy?prettyPrint=false", .bearer = "sa-token", .body = v3 }, a);
+    try testing.expectEqual(iam_policy_extractctl_status, policy.status);
+    try expectSameShape(a, iam_policy_extractctl, policy.body);
+
+    // The test: the five the service account held, sorted; none at all for
+    // a project that does not exist.
+    try fake.holdPermissions("sa-token", "extractctl", &.{ "pubsub.topics.create", "resourcemanager.projects.get", "resourcemanager.projects.getIamPolicy", "run.services.create", "storage.buckets.create", "bigquery.datasets.get", "pubsub.topics.get" });
+    const held = try fake.serve(.{ .method = .POST, .url = "https://cloudresourcemanager.googleapis.com/v3/projects/extractctl:testIamPermissions?prettyPrint=false", .bearer = "sa-token", .body = "{\"permissions\":[\"resourcemanager.projects.get\",\"resourcemanager.projects.getIamPolicy\",\"resourcemanager.projects.setIamPolicy\",\"resourcemanager.projects.delete\",\"run.services.create\",\"storage.buckets.create\",\"pubsub.topics.create\"]}" }, a);
+    try expectSameShape(a, iam_test_held, held.body);
+    const other = try fake.serve(.{ .method = .POST, .url = "https://cloudresourcemanager.googleapis.com/v3/projects/extractctl:testIamPermissions?prettyPrint=false", .bearer = "sa-token", .body = "{\"permissions\":[\"pubsub.topics.get\",\"bigquery.datasets.get\"]}" }, a);
+    try expectSameShape(a, iam_test_other_service, other.body);
+    const missing = try fake.serve(.{ .method = .POST, .url = "https://cloudresourcemanager.googleapis.com/v3/projects/zigps-nope-02667a:testIamPermissions?prettyPrint=false", .bearer = "sa-token", .body = "{\"permissions\":[\"resourcemanager.projects.get\"]}" }, a);
+    try testing.expectEqualStrings(iam_test_missing, missing.body);
+
+    try expectFakeSaysPost(&fake, "/v3/projects/zigps-nope-02667a:getIamPolicy?prettyPrint=false", v3, iam_policy_missing_status, iam_policy_missing);
+    try expectFakeSaysPost(&fake, "/v3/projects/BAD_ID%21:getIamPolicy?prettyPrint=false", v3, iam_policy_malformed_status, iam_policy_malformed);
+    var many: std.ArrayList(u8) = .empty;
+    try many.appendSlice(a, "{\"permissions\":[");
+    for (0..101) |i| try many.print(a, "{s}\"resourcemanager.projects.get\"", .{if (i == 0) "" else ","});
+    try many.appendSlice(a, "]}");
+    try expectFakeSaysPost(&fake, "/v3/projects/extractctl:testIamPermissions?prettyPrint=false", many.items, iam_test_too_many_status, iam_test_too_many);
+}

@@ -32,6 +32,8 @@ pub const Entry = struct { entity: []const u8, role: []const u8 };
 pub const Kind = enum { bucket, default_object, object };
 
 pub const project_number = "82150720798";
+/// The same project by id, as IAM names its teams (`projectOwner:extractctl`).
+pub const project_id = "extractctl";
 pub const owners = "project-owners-" ++ project_number;
 pub const editors = "project-editors-" ++ project_number;
 pub const viewers = "project-viewers-" ++ project_number;

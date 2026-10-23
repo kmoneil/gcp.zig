@@ -56,11 +56,26 @@
 //!   and its terminal condition fails. `validateOnly` checks the etag and
 //!   the prefix and changes nothing. Its operation is done from its first
 //!   read on.
+//! - IAM reads, as measured on 2026-10-23: a service's or job's policy is
+//!   what `setIamPolicy` set, else none, `{"etag":"ACAB"}`, and a service
+//!   or job nobody put is answered the same, as production answered one
+//!   that did not exist. `testIamPermissions` answers what
+//!   `holdPermissions` said the caller holds there, else every permission
+//!   asked, again whether or not the resource exists; sorted, one named
+//!   twice answered twice. It refuses, as production did and in its words
+//!   after "Failed to test IAM permissions: ", none, a malformed or
+//!   wildcard permission, one that is not Cloud Run's, and more than 100.
+//!   A region nobody put, `-` included, is 403 "Permission denied on
+//!   'locations/<l>' (or it may not exist)". A policy with bindings is
+//!   written version, etag, bindings, as KMS's was measured: Cloud Run's
+//!   was not (the probe could not grant one).
 //! - Faults a test asks for: refusals, dropped connections, and a lost
 //!   answer, writes included.
 //!
 //! Not modelled, answered 501 with the reason: other writes (deploys,
-//! deletes, IAM), run overrides, traffic other than one revision at 100 %,
+//! deletes, setting IAM), which of Cloud Run's permissions belong to a
+//! service and which to a job (every `run.` one is taken on both), a
+//! version 1 read of a policy with a condition, run overrides, traffic other than one revision at 100 %,
 //! an update mask other than the two above, reading a `validateOnly`
 //! request's operation (production's answer was not measured), an etag
 //! the fake did not make under the etag mask, `-` for a location in a
@@ -103,6 +118,18 @@ pub const FakeRun = struct {
     version: u64 = 0,
     faults: [3]Fault = .{ .{}, .{}, .{} },
     calls: usize = 0,
+    /// By a service's or job's full name, as `setIamPolicy` set them. In
+    /// `store`.
+    policies: std.StringHashMapUnmanaged(Policy) = .empty,
+    /// By a service's or job's full name, as `holdPermissions` said. In
+    /// `store`.
+    held: std.StringHashMapUnmanaged([]const []const u8) = .empty,
+
+    const Policy = struct {
+        /// Sorted by role, each one's members sorted.
+        bindings: []const core.iam.Binding,
+        etag: []const u8,
+    };
 
     const Fault = struct { n: usize = 0, status: u16 = 0 };
     const refuse = 0;
@@ -311,6 +338,66 @@ pub const FakeRun = struct {
     // What a test puts in.
 
     pub const PutError = error{ OutOfMemory, InvalidEntry };
+
+    /// Sets the IAM policy of the service or job with full `name`, as
+    /// `putService` or `putJob` returned it: `getIamPolicy` answers these
+    /// bindings sorted by role, each one's members sorted, with an etag of
+    /// the fake's own. `error.InvalidEntry` for a name nobody put, a role
+    /// or member `core.iam` refuses, a binding with no members, or a
+    /// condition that is not a JSON object.
+    pub fn setIamPolicy(f: *FakeRun, name: []const u8, bindings: []const core.iam.Binding) PutError!void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        const a = f.store.allocator();
+        if (!f.services.contains(name) and !f.jobs.contains(name)) return error.InvalidEntry;
+        const out = try a.alloc(core.iam.Binding, bindings.len);
+        for (bindings, out) |b, *o| {
+            if (core.iam.roleProblem(b.role) != null or b.members.len == 0) return error.InvalidEntry;
+            const members = try a.alloc([]const u8, b.members.len);
+            for (b.members, members) |m, *om| {
+                if (core.iam.memberProblem(m, .{}) != null) return error.InvalidEntry;
+                om.* = try a.dupe(u8, m);
+            }
+            std.mem.sort([]const u8, members, {}, stringLessThan);
+            var condition: ?[]const u8 = null;
+            if (b.condition) |c| {
+                const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, c, .{}) catch return error.InvalidEntry;
+                if (parsed != .object) return error.InvalidEntry;
+                condition = try a.dupe(u8, c);
+            }
+            o.* = .{ .role = try a.dupe(u8, b.role), .members = members, .condition = condition };
+        }
+        std.mem.sort(core.iam.Binding, out, {}, struct {
+            fn lessThan(_: void, x: core.iam.Binding, y: core.iam.Binding) bool {
+                return std.mem.lessThan(u8, x.role, y.role);
+            }
+        }.lessThan);
+        f.version += 1;
+        const key = if (f.services.getEntry(name)) |e| e.key_ptr.* else f.jobs.getEntry(name).?.key_ptr.*;
+        try f.policies.put(a, key, .{ .bindings = out, .etag = try a.print("BwZ{d:0>9}", .{f.version}) });
+    }
+
+    /// Says exactly which permissions the caller holds on the service or
+    /// job with full `name`, replacing what was said before: what
+    /// `testIamPermissions` answers there. Nothing said, every permission
+    /// asked is held. A name nobody put may be given, since production
+    /// tests permissions on a service that does not exist as on one that
+    /// does; `error.InvalidEntry` for one that is not a service's or job's
+    /// name in the fake's project.
+    pub fn holdPermissions(f: *FakeRun, name: []const u8, permissions: []const []const u8) PutError!void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        const a = f.store.allocator();
+        const target = parseRoute(try a.print("/v2/{s}", .{name})) orelse return error.InvalidEntry;
+        if (!std.mem.eql(u8, target.project, f.options.project_id)) return error.InvalidEntry;
+        switch (target.kind) {
+            .service, .job => {},
+            else => return error.InvalidEntry,
+        }
+        const copy = try a.alloc([]const u8, permissions.len);
+        for (permissions, copy) |x, *c| c.* = try a.dupe(u8, x);
+        try f.held.put(a, try a.dupe(u8, name), copy);
+    }
 
     /// A location services can live in, such as "us-central1".
     pub fn putLocation(f: *FakeRun, id: []const u8) PutError!void {
@@ -711,6 +798,7 @@ pub const FakeRun = struct {
         if (!std.mem.eql(u8, target.project, f.options.project_id)) return notModelled(arena, "a project other than the fake's own");
         const allowed: tp.Method = switch (target.kind) {
             .run, .cancel => .POST,
+            .iam => |i| if (i.test_permissions) .POST else .GET,
             .service => if (req.method == .PATCH) .PATCH else .GET,
             else => .GET,
         };
@@ -754,6 +842,7 @@ pub const FakeRun = struct {
                 if (operation.subject == .validation) return notModelled(arena, "reading a validateOnly request's operation (production's answer was not measured)");
                 return f.operationReply(arena, operation, true, null);
             },
+            .iam => |i| return f.iam(arena, req, i, params),
             .locations => return f.listLocations(arena, params),
             .services => |location| {
                 if (!std.mem.eql(u8, location, "-") and !f.locations.contains(location)) return badRegion(arena);
@@ -784,6 +873,57 @@ pub const FakeRun = struct {
                 return .{ .status = 200, .body = out.written() };
             },
         }
+    }
+
+    /// `getIamPolicy` and `testIamPermissions` on a service or a job.
+    fn iam(f: *FakeRun, arena: Allocator, req: tp.Request, i: IamRoute, params: []const Param) Allocator.Error!Reply {
+        if (!f.locations.contains(i.location)) return noRegion(arena, i.location);
+        const name = try arena.print("projects/{s}/locations/{s}/{s}/{s}", .{ f.options.project_id, i.location, @tagName(i.collection), i.id });
+        if (i.test_permissions) {
+            if (params.len > 0) return notModelled(arena, "a testIamPermissions query");
+            return f.testPermissions(arena, name, req.body orelse "");
+        }
+        var version: i64 = 0;
+        for (params) |p| {
+            if (!std.mem.eql(u8, p.name, "options.requestedPolicyVersion")) return notModelled(arena, try arena.print("a getIamPolicy with {s}", .{p.name}));
+            version = std.fmt.parseInt(i64, p.value, 10) catch return notModelled(arena, "a policy version that is not a number");
+        }
+        if (version < 0 or version > 3) return notModelled(arena, "a policy version past 3");
+        const policy = f.policies.get(name) orelse return .{ .status = 200, .body = "{\"etag\":\"ACAB\"}" };
+        var conditional = false;
+        for (policy.bindings) |b| conditional = conditional or b.condition != null;
+        if (conditional and version < 3) return notModelled(arena, "a version 1 read of a policy with a condition");
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        writePolicy(&jw, if (conditional) 3 else 1, policy) catch return error.OutOfMemory;
+        return .{ .status = 200, .body = out.written() };
+    }
+
+    fn testPermissions(f: *FakeRun, arena: Allocator, name: []const u8, body: []const u8) Allocator.Error!Reply {
+        const prefix = "Failed to test IAM permissions: ";
+        const Wire = struct { permissions: ?[]const []const u8 = null };
+        const wire: Wire = if (body.len == 0) .{} else std.json.parseFromSliceLeaky(Wire, arena, body, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return notModelled(arena, "a testIamPermissions body other than its permissions"),
+        };
+        const asked = wire.permissions orelse &.{};
+        if (asked.len == 0) return fail(arena, 400, "INVALID_ARGUMENT", prefix ++ "At least one permission must be specified.");
+        for (asked) |p| {
+            if (!isPermission(p)) return fail(arena, 400, "INVALID_ARGUMENT", try arena.print(prefix ++ "The permission {s} is invalid.", .{p}));
+            if (!std.mem.startsWith(u8, p, "run.")) return fail(arena, 400, "INVALID_ARGUMENT", try arena.print(prefix ++ "Permission {s} is not valid for this resource.", .{p}));
+        }
+        if (asked.len > 100) return fail(arena, 400, "INVALID_ARGUMENT", try arena.print(prefix ++ "The number of permissions ({d}) is greater than the maximum allowed (100).", .{asked.len}));
+        var held: std.ArrayList([]const u8) = .empty;
+        const said = f.held.get(name);
+        for (asked) |p| {
+            const holds = if (said) |list| for (list) |h| {
+                if (std.mem.eql(u8, h, p)) break true;
+            } else false else true;
+            if (holds) try held.append(arena, p);
+        }
+        if (held.items.len == 0) return .{ .status = 200, .body = "{}" };
+        std.mem.sort([]const u8, held.items, {}, stringLessThan);
+        return .{ .status = 200, .body = try Stringify.valueAlloc(arena, .{ .permissions = held.items }, .{}) };
     }
 
     fn badRegion(arena: Allocator) Allocator.Error!Reply {
@@ -1717,8 +1857,26 @@ pub const FakeRun = struct {
             /// `executions/E:cancel`.
             cancel: ExecutionRoute,
             operation: struct { location: []const u8, id: []const u8 },
+            /// `services/S:getIamPolicy`, `jobs/J:testIamPermissions`.
+            iam: IamRoute,
         },
     };
+
+    const IamRoute = struct {
+        location: []const u8,
+        collection: enum { services, jobs },
+        id: []const u8,
+        test_permissions: bool,
+    };
+
+    /// `S:getIamPolicy` or `S:testIamPermissions` as an IAM route, else
+    /// null.
+    fn iamRoute(location: []const u8, collection: @FieldType(IamRoute, "collection"), part: []const u8) ?IamRoute {
+        inline for (.{ .{ ":getIamPolicy", false }, .{ ":testIamPermissions", true } }) |verb| {
+            if (std.mem.endsWith(u8, part, verb[0])) return .{ .location = location, .collection = collection, .id = part[0 .. part.len - verb[0].len], .test_permissions = verb[1] };
+        }
+        return null;
+    }
 
     const JobRoute = struct { location: []const u8, id: []const u8 };
     const ExecutionRoute = struct { location: []const u8, job: []const u8, id: []const u8 };
@@ -1748,6 +1906,7 @@ pub const FakeRun = struct {
         if (std.mem.eql(u8, collection, "jobs")) {
             const job_part = parts.next() orelse return .{ .project = project, .kind = .{ .jobs = location } };
             const sub = parts.next() orelse {
+                if (iamRoute(location, .jobs, job_part)) |i| return .{ .project = project, .kind = .{ .iam = i } };
                 if (std.mem.endsWith(u8, job_part, ":run")) return .{ .project = project, .kind = .{ .run = .{ .location = location, .id = job_part[0 .. job_part.len - ":run".len] } } };
                 return .{ .project = project, .kind = .{ .job = .{ .location = location, .id = job_part } } };
             };
@@ -1764,7 +1923,10 @@ pub const FakeRun = struct {
         }
         if (!std.mem.eql(u8, collection, "services")) return null;
         const service_id = parts.next() orelse return .{ .project = project, .kind = .{ .services = location } };
-        const revisions_word = parts.next() orelse return .{ .project = project, .kind = .{ .service = .{ .location = location, .id = service_id } } };
+        const revisions_word = parts.next() orelse {
+            if (iamRoute(location, .services, service_id)) |i| return .{ .project = project, .kind = .{ .iam = i } };
+            return .{ .project = project, .kind = .{ .service = .{ .location = location, .id = service_id } } };
+        };
         if (!std.mem.eql(u8, revisions_word, "revisions")) return null;
         const revision_id = parts.next() orelse return .{ .project = project, .kind = .{ .revisions = .{ .location = location, .service = service_id } } };
         if (parts.next() != null) return null;
@@ -1814,6 +1976,50 @@ pub const FakeRun = struct {
 
     fn pageRefusal(arena: Allocator) Allocator.Error!Reply {
         return fail(arena, 400, "INVALID_ARGUMENT", "Invalid page token or page size.");
+    }
+
+    fn stringLessThan(_: void, x: []const u8, y: []const u8) bool {
+        return std.mem.lessThan(u8, x, y);
+    }
+
+    /// `service.resource.verb`, as production takes a permission's shape.
+    fn isPermission(p: []const u8) bool {
+        var parts: usize = 0;
+        var it = std.mem.splitScalar(u8, p, '.');
+        while (it.next()) |part| {
+            if (part.len == 0) return false;
+            for (part) |c| if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+            parts += 1;
+        }
+        return parts == 3;
+    }
+
+    fn writePolicy(jw: *Stringify, version: u32, policy: Policy) Stringify.Error!void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(version);
+        try jw.objectField("etag");
+        try jw.write(policy.etag);
+        if (policy.bindings.len > 0) {
+            try jw.objectField("bindings");
+            try jw.beginArray();
+            for (policy.bindings) |b| {
+                try jw.beginObject();
+                try jw.objectField("role");
+                try jw.write(b.role);
+                try jw.objectField("members");
+                try jw.write(b.members);
+                if (b.condition) |c| {
+                    try jw.objectField("condition");
+                    try jw.beginWriteRaw();
+                    try jw.writer.writeAll(c);
+                    jw.endWriteRaw();
+                }
+                try jw.endObject();
+            }
+            try jw.endArray();
+        }
+        try jw.endObject();
     }
 
     fn fail(arena: Allocator, code: u16, status: []const u8, message: []const u8) Allocator.Error!Reply {
@@ -2805,5 +3011,254 @@ test "slow property writes: any sequence of runs, cancels, status moves and traf
             "\x20\x00\x01\x01\x00\x01\x02\x00\x03\x02\x00\x01\x04\x05\x00\x06\x00\x07",
             "",
         },
+    });
+}
+
+test "IAM: a service's and a job's policy as set, empty when none, and the same for what nobody put" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    try b.fake.putLocation("us-central1");
+    const svc = try b.fake.putService(.{ .location = "us-central1", .id = "checkout" });
+    const job = try b.fake.putJob(.{ .location = "us-central1", .id = "nightly" });
+
+    // None set: production's empty policy, for a service nobody put too.
+    for ([_][]const u8{ "checkout", "nobody-put-this" }) |id| {
+        var empty = try b.client.getServiceIamPolicy("us-central1", id);
+        defer empty.deinit();
+        try testing.expectEqual(0, empty.value.bindings.len);
+        try testing.expectEqualStrings("ACAB", empty.value.etag.?);
+    }
+
+    try b.fake.setIamPolicy(svc, &.{
+        .{ .role = "roles/run.invoker", .members = &.{ "user:b@example.com", "allUsers" } },
+        .{ .role = "roles/run.developer", .members = &.{"group:devs@example.com"} },
+    });
+    var public = try b.client.getServiceIamPolicy("us-central1", "checkout");
+    defer public.deinit();
+    try testing.expectEqual(1, public.value.version);
+    try testing.expectEqualStrings("roles/run.developer", public.value.bindings[0].role);
+    try testing.expectEqualStrings("allUsers", public.value.bindings[1].members[0]);
+    try testing.expect(public.value.grants("roles/run.invoker", "allUsers"));
+
+    try b.fake.setIamPolicy(job, &.{.{ .role = "roles/run.invoker", .members = &.{"serviceAccount:s@p.iam.gserviceaccount.com"}, .condition = "{\"title\":\"t\",\"expression\":\"true\"}" }});
+    var conditional = try b.client.getJobIamPolicy("us-central1", "nightly");
+    defer conditional.deinit();
+    try testing.expectEqual(3, conditional.value.version);
+    try testing.expect(conditional.value.hasConditions());
+    // A new policy, a new etag.
+    try testing.expect(!std.mem.eql(u8, public.value.etag.?, conditional.value.etag.?));
+
+    // A region nobody put is production's 403.
+    try testing.expectError(error.PermissionDenied, b.client.getServiceIamPolicy("europe-west1", "checkout"));
+    try testing.expectEqualStrings("Permission denied on 'locations/europe-west1' (or it may not exist)", b.diag.message());
+
+    try testing.expectError(error.InvalidEntry, b.fake.setIamPolicy("projects/my-project/locations/us-central1/services/nobody", &.{}));
+    try testing.expectError(error.InvalidEntry, b.fake.setIamPolicy(svc, &.{.{ .role = "run.invoker", .members = &.{"allUsers"} }}));
+    try testing.expectError(error.InvalidEntry, b.fake.setIamPolicy(svc, &.{.{ .role = "roles/run.invoker", .members = &.{} }}));
+    try testing.expectError(error.InvalidEntry, b.fake.setIamPolicy(svc, &.{.{ .role = "roles/run.invoker", .members = &.{"allUsers"}, .condition = "\"x\"" }}));
+}
+
+test "IAM: testIamPermissions answers what the caller holds, sorted, and refuses as production did" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    try b.fake.putLocation("us-central1");
+    const svc = try b.fake.putService(.{ .location = "us-central1", .id = "checkout" });
+
+    var all = try b.client.testServiceIamPermissions("us-central1", "checkout", &.{ "run.services.update", "run.routes.invoke" });
+    defer all.deinit();
+    try testing.expectEqualStrings("run.routes.invoke", all.value[0]);
+    try testing.expectEqualStrings("run.services.update", all.value[1]);
+
+    try b.fake.holdPermissions(svc, &.{"run.services.get"});
+    var some = try b.client.testServiceIamPermissions("us-central1", "checkout", &.{ "run.services.update", "run.services.get" });
+    defer some.deinit();
+    try testing.expectEqual(1, some.value.len);
+    try b.fake.holdPermissions(svc, &.{});
+    var none = try b.client.testServiceIamPermissions("us-central1", "checkout", &.{"run.services.get"});
+    defer none.deinit();
+    try testing.expectEqual(0, none.value.len);
+    // A job nobody put: held as if it were there.
+    try b.fake.holdPermissions("projects/my-project/locations/us-central1/jobs/ghost", &.{"run.jobs.run"});
+    var ghost = try b.client.testJobIamPermissions("us-central1", "ghost", &.{ "run.jobs.run", "run.jobs.get" });
+    defer ghost.deinit();
+    try testing.expectEqual(1, ghost.value.len);
+
+    try testing.expectError(error.InvalidArgument, b.client.testServiceIamPermissions("us-central1", "checkout", &.{ "run.services.get", "pubsub.topics.get" }));
+    try testing.expectEqualStrings("Failed to test IAM permissions: Permission pubsub.topics.get is not valid for this resource.", b.diag.message());
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const url = "https://run.googleapis.com/v2/projects/my-project/locations/us-central1/services/checkout:testIamPermissions";
+    var many: std.ArrayList(u8) = .empty;
+    try many.appendSlice(a, "{\"permissions\":[");
+    for (0..101) |i| try many.print(a, "{s}\"run.services.get\"", .{if (i == 0) "" else ","});
+    try many.appendSlice(a, "]}");
+    const Case = struct { body: ?[]const u8, status: u16, message: []const u8 };
+    for ([_]Case{
+        .{ .body = null, .status = 400, .message = "Failed to test IAM permissions: At least one permission must be specified." },
+        .{ .body = "{\"permissions\":[\"notapermission\"]}", .status = 400, .message = "Failed to test IAM permissions: The permission notapermission is invalid." },
+        .{ .body = "{\"permissions\":[\"run.services.*\"]}", .status = 400, .message = "Failed to test IAM permissions: The permission run.services.* is invalid." },
+        .{ .body = many.items, .status = 400, .message = "Failed to test IAM permissions: The number of permissions (101) is greater than the maximum allowed (100)." },
+        .{ .body = "{\"permissions\":[\"run.services.get\"],\"x\":1}", .status = 501, .message = "fake: a testIamPermissions body other than its permissions is not modelled yet" },
+    }) |c| {
+        const reply = try b.fake.serve(.{ .method = .POST, .url = url, .bearer = "t", .body = c.body }, a);
+        try testing.expectEqual(c.status, reply.status);
+        try testing.expectEqualStrings(c.message, (try core.errors.decodeErrorBody(a, reply.body)).?.message);
+    }
+    try b.fake.holdPermissions(svc, &.{"run.services.get"});
+    const dup = try b.fake.serve(.{ .method = .POST, .url = url, .bearer = "t", .body = "{\"permissions\":[\"run.services.get\",\"run.services.get\"]}" }, a);
+    try testing.expectEqualStrings("{\"permissions\":[\"run.services.get\",\"run.services.get\"]}", dup.body);
+    // What it does not model, it says so.
+    try b.fake.setIamPolicy(svc, &.{.{ .role = "roles/run.invoker", .members = &.{"allUsers"}, .condition = "{\"expression\":\"true\"}" }});
+    for ([_][]const u8{ "?options.requestedPolicyVersion=1", "?options.requestedPolicyVersion=4", "?fields=etag" }) |q| {
+        const reply = try b.raw(a, .GET, try a.print("https://run.googleapis.com/v2/projects/my-project/locations/us-central1/services/checkout:getIamPolicy{s}", .{q}));
+        try testing.expectEqual(501, reply.status);
+    }
+    const set = try b.raw(a, .POST, "https://run.googleapis.com/v2/projects/my-project/locations/us-central1/services/checkout:setIamPolicy");
+    try testing.expectEqual(501, set.status);
+    try testing.expectError(error.InvalidEntry, b.fake.holdPermissions("projects/other/locations/us-central1/services/x", &.{}));
+    try testing.expectError(error.InvalidEntry, b.fake.holdPermissions("projects/my-project/locations/us-central1/services/x/revisions/r", &.{}));
+}
+
+test "IAM: the fake's answers are production's" {
+    var b: Bench = undefined;
+    try b.init(.{ .project_id = "extractctl" });
+    defer b.deinit();
+    try b.fake.putLocation("us-central1");
+    _ = try b.fake.putService(.{ .location = "us-central1", .id = "zigps-02667a" });
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = "https://run.googleapis.com/v2/projects/extractctl/locations/";
+    const Case = struct { method: tp.Method, path: []const u8, body: ?[]const u8, status: u16, want: []const u8 };
+    for ([_]Case{
+        .{ .method = .GET, .path = "us-central1/services/zigps-02667a:getIamPolicy?options.requestedPolicyVersion=3", .body = null, .status = production.iam_service_policy_new_status, .want = production.iam_service_policy_new },
+        .{ .method = .GET, .path = "us-central1/jobs/zigps-02667a-job:getIamPolicy?options.requestedPolicyVersion=3", .body = null, .status = production.iam_job_policy_status, .want = production.iam_job_policy },
+        .{ .method = .GET, .path = "-/services/zigps-02667a:getIamPolicy?options.requestedPolicyVersion=3", .body = null, .status = production.iam_service_policy_dash_status, .want = production.iam_service_policy_dash },
+        .{ .method = .POST, .path = "us-central1/services/zigps-02667a:testIamPermissions", .body = "{\"permissions\":[\"pubsub.topics.get\",\"bigquery.datasets.get\"]}", .status = production.iam_service_test_other_service_status, .want = production.iam_service_test_other_service },
+        .{ .method = .POST, .path = "us-central1/services/zigps-nope-02667a:testIamPermissions", .body = "{\"permissions\":[\"run.services.get\"]}", .status = production.iam_service_test_missing_status, .want = production.iam_service_test_missing },
+    }) |c| {
+        const reply = try b.fake.serve(.{ .method = c.method, .url = try a.print("{s}{s}", .{ base, c.path }), .bearer = "t", .body = c.body }, a);
+        try testing.expectEqual(c.status, reply.status);
+        const want = try std.json.parseFromSliceLeaky(std.json.Value, a, c.want, .{});
+        const got = try std.json.parseFromSliceLeaky(std.json.Value, a, reply.body, .{});
+        try testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, want, .{}), try std.json.Stringify.valueAlloc(a, got, .{}));
+    }
+    // The held five of six, sorted, as the probe's account held them.
+    const name = "projects/extractctl/locations/us-central1/services/zigps-02667a";
+    try b.fake.holdPermissions(name, &.{ "run.routes.invoke", "run.services.delete", "run.services.get", "run.services.getIamPolicy", "run.services.update" });
+    const held = try b.fake.serve(.{ .method = .POST, .url = base ++ "us-central1/services/zigps-02667a:testIamPermissions", .bearer = "t", .body = "{\"permissions\":[\"run.services.get\",\"run.services.update\",\"run.services.delete\",\"run.services.getIamPolicy\",\"run.services.setIamPolicy\",\"run.routes.invoke\"]}" }, a);
+    const want = try std.json.parseFromSliceLeaky(std.json.Value, a, production.iam_service_test_held, .{});
+    try testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, want, .{}), held.body);
+}
+
+fn iamProperty(_: void, input: []const u8) !void {
+    const gpa = test_util.propertyAllocator();
+    var g: test_util.ByteGen = .init(input);
+    var clock: core.testing.FakeClock = .{};
+    var fake: FakeRun = .init(gpa, clock.io(), .{});
+    defer fake.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try fake.putLocation("us-central1");
+
+    const roles = [_][]const u8{ "roles/run.invoker", "roles/run.developer", "roles/run.viewer", "roles/run.admin" };
+    const members = [_][]const u8{ "allUsers", "allAuthenticatedUsers", "user:a@example.com", "group:ops@example.com", "serviceAccount:r@p.iam.gserviceaccount.com" };
+    const permissions = [_][]const u8{ "run.services.get", "run.services.update", "run.routes.invoke", "run.jobs.run", "run.jobs.get", "run.services.setIamPolicy" };
+
+    const Want = struct { job: bool, id: []const u8, put: bool, bindings: ?[]const core.iam.Binding, held: ?[]const []const u8 };
+    var wants: [8]Want = undefined;
+    const n = g.intRange(usize, 0, wants.len);
+    for (wants[0..n], 0..) |*w, i| {
+        w.job = g.boolean();
+        w.id = try a.print("r-{d}", .{i});
+        w.put = g.intRange(u8, 0, 3) != 0;
+        w.bindings = null;
+        w.held = null;
+        const name = try a.print("projects/my-project/locations/us-central1/{s}/{s}", .{ if (w.job) "jobs" else "services", w.id });
+        if (w.put) {
+            if (w.job) _ = try fake.putJob(.{ .location = "us-central1", .id = w.id }) else _ = try fake.putService(.{ .location = "us-central1", .id = w.id });
+            if (g.boolean()) {
+                var bindings: std.ArrayList(core.iam.Binding) = .empty;
+                for (roles) |role| {
+                    if (!g.boolean()) continue;
+                    var ms: std.ArrayList([]const u8) = .empty;
+                    for (members) |m| if (g.intRange(u8, 0, 2) == 0) try ms.append(a, m);
+                    if (ms.items.len == 0) try ms.append(a, members[0]);
+                    try bindings.append(a, .{ .role = role, .members = ms.items, .condition = if (g.intRange(u8, 0, 4) == 0) "{\"expression\":\"true\"}" else null });
+                }
+                try fake.setIamPolicy(name, bindings.items);
+                w.bindings = bindings.items;
+            }
+        }
+        if (g.intRange(u8, 0, 2) == 0) {
+            var held: std.ArrayList([]const u8) = .empty;
+            for (permissions) |p| if (g.boolean()) try held.append(a, p);
+            try fake.holdPermissions(name, held.items);
+            w.held = held.items;
+        }
+    }
+
+    var token = core.StaticToken{ .token = "t" };
+    var client = try Client.init(gpa, clock.io(), .{ .project_id = "my-project", .token_provider = token.provider(), .transport = fake.transport() });
+    defer client.deinit();
+
+    for (0..g.intRange(usize, 0, 12)) |_| {
+        if (n == 0) break;
+        const w = &wants[g.intRange(usize, 0, n - 1)];
+        if (g.boolean()) {
+            var policy = if (w.job) try client.getJobIamPolicy("us-central1", w.id) else try client.getServiceIamPolicy("us-central1", w.id);
+            defer policy.deinit();
+            const set = w.bindings orelse {
+                // None set, or nobody put it: production's empty policy.
+                try testing.expectEqual(0, policy.value.bindings.len);
+                try testing.expectEqualStrings("ACAB", policy.value.etag.?);
+                continue;
+            };
+            var conditional = false;
+            for (set) |b| conditional = conditional or b.condition != null;
+            try testing.expectEqual(@as(u32, if (conditional) 3 else 1), policy.value.version);
+            try testing.expectEqual(set.len, policy.value.bindings.len);
+            for (policy.value.bindings, 0..) |b, i| {
+                if (i > 0) try testing.expect(std.mem.order(u8, policy.value.bindings[i - 1].role, b.role) == .lt);
+                const s = for (set) |x| {
+                    if (std.mem.eql(u8, x.role, b.role)) break x;
+                } else return error.TestUnexpectedResult;
+                try testing.expectEqual(s.members.len, b.members.len);
+                for (s.members) |m| {
+                    for (b.members) |bm| {
+                        if (std.mem.eql(u8, bm, m)) break;
+                    } else return error.TestUnexpectedResult;
+                }
+            }
+        } else {
+            var asked: std.ArrayList([]const u8) = .empty;
+            for (permissions) |p| if (g.boolean()) try asked.append(a, p);
+            if (asked.items.len == 0) try asked.append(a, permissions[0]);
+            var answer = if (w.job) try client.testJobIamPermissions("us-central1", w.id, asked.items) else try client.testServiceIamPermissions("us-central1", w.id, asked.items);
+            defer answer.deinit();
+            var want: std.ArrayList([]const u8) = .empty;
+            for (asked.items) |p| {
+                const holds = if (w.held) |held| for (held) |h| {
+                    if (std.mem.eql(u8, h, p)) break true;
+                } else false else true;
+                if (holds) try want.append(a, p);
+            }
+            std.mem.sort([]const u8, want.items, {}, FakeRun.stringLessThan);
+            try testing.expectEqual(want.items.len, answer.value.len);
+            for (want.items, answer.value) |x, y| try testing.expectEqualStrings(x, y);
+        }
+    }
+}
+
+test "fuzz IAM: the fake's policies and permission tests agree with a plain model, read through the client" {
+    try test_util.fuzzBytes({}, iamProperty, .{
+        .corpus = &.{ "", "\x08\x00\xff\x01\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x0c", "\x03\x01\x01\x01\x00\x01\x01\x00\x02\x00\x01\x01\x00\x01\x00\x01" },
+        .random_runs = 200,
+        .max_len = 400,
     });
 }
