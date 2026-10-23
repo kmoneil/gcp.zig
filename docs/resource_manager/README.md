@@ -62,6 +62,8 @@ everything the credential can see.
 | `Client.allProjects(options)` | Every page of one search: each project once, pending deletion left out, sorted by project id |
 | `Client.searchProjects(options)`, `search.page(token)` | One search, a page a call, the same request every time |
 | `Client.getProject(id_or_number)` | One project, as it is now |
+| `Client.getProjectIamPolicy(id_or_number)` | The project's IAM policy, which everything under it inherits: [Who has access](projects.md#who-has-access) |
+| `Client.testProjectIamPermissions(id_or_number, permissions)` | Which of the permissions asked the caller holds on the project |
 | `Client.parentNames(options)` | The folders and organizations the caller can read, for `label` and `path` |
 | `Client.searchFolders`, `Client.searchOrganizations` | Either search, a page a call |
 | `Client.lastConsumerRefusal()` | The project a refusal charged, and the link that fixes it |

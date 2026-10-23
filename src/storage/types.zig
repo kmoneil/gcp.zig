@@ -524,6 +524,13 @@ pub const Downloaded = struct {
     result: DownloadResult,
 };
 
+/// Which generation an object's IAM read or permission test names.
+pub const ObjectIamOptions = struct {
+    /// A noncurrent generation, or the live one by number; null is the
+    /// live object.
+    generation: ?u64 = null,
+};
+
 pub const GetOptions = struct {
     /// Address one specific generation instead of the live one.
     generation: ?u64 = null,

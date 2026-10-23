@@ -238,10 +238,7 @@ pub fn parentNames(self: *Client, options: types.ParentOptions) Error!types.Owne
 /// read here though no search shows it.
 pub fn getProject(self: *Client, id_or_number: []const u8) Error!types.Owned(types.Project) {
     rpc.begin(self);
-    if (!validate.isProjectRef(id_or_number)) {
-        if (self.diagnostics) |d| d.print("invalid project: expected a project number, or an id of lowercase letters, digits, '-', '.' and ':'", .{});
-        return error.InvalidName;
-    }
+    try self.checkProjectRef(id_or_number);
     var result: types.Owned(types.Project) = try .init(self.gpa);
     errdefer result.deinit();
     var response: std.heap.ArenaAllocator = .init(self.gpa);
@@ -253,6 +250,62 @@ pub fn getProject(self: *Client, id_or_number: []const u8) Error!types.Owned(typ
     result.value = codec.decodeProject(result.arena.allocator(), scratch.allocator(), body) catch |err|
         return rpc.decodeFailed(self, err, "project");
     return result;
+}
+
+/// The project's IAM policy, from `projects.getIamPolicy`, asked for as
+/// version 3 so conditional bindings come back whole: what the project
+/// grants, which every resource under it inherits. Takes the id or the
+/// number. A policy with no condition is answered as version 1, whatever
+/// was asked, as measured on 2026-10-23. Production answers a project that
+/// does not exist, and one whose policy the caller may not read, with the
+/// same 403, `error.PermissionDenied`, "(or it may not exist)" in
+/// `Diagnostics`. Needs `resourcemanager.projects.getIamPolicy`; the
+/// client's read-only scope serves it.
+pub fn getProjectIamPolicy(self: *Client, id_or_number: []const u8) Error!types.Owned(core.iam.Policy) {
+    rpc.begin(self);
+    try self.checkProjectRef(id_or_number);
+    var result: types.Owned(core.iam.Policy) = try .init(self.gpa);
+    errdefer result.deinit();
+    var response: std.heap.ArenaAllocator = .init(self.gpa);
+    defer response.deinit();
+    const path = try std.fmt.allocPrint(response.allocator(), "/v3/projects/{s}:getIamPolicy?prettyPrint=false", .{id_or_number});
+    const body = try rpc.post(self, &response, path, "{\"options\":{\"requestedPolicyVersion\":3}}");
+    result.value = core.iam.decode(result.arena.allocator(), body) catch |err|
+        return rpc.decodeFailed(self, err, "IAM policy");
+    return result;
+}
+
+/// Of `permissions`, those the caller holds on the project, from
+/// `projects.testIamPermissions`, sorted by name as production answers
+/// them. Any service's permissions can be asked of a project; 1 to 100 of
+/// them, each once and none a wildcard, are checked before sending
+/// (`error.InvalidArgument`). Production refuses a permission it does not
+/// know with `error.InvalidArgument`, and answers a project that does not
+/// exist with none held rather than an error: a diagnostic, not a check.
+pub fn testProjectIamPermissions(self: *Client, id_or_number: []const u8, permissions: []const []const u8) Error!types.Owned([]const []const u8) {
+    rpc.begin(self);
+    try self.checkProjectRef(id_or_number);
+    if (core.iam.permissionsProblem(permissions)) |problem| {
+        if (self.diagnostics) |d| d.print("{s}", .{problem});
+        return error.InvalidArgument;
+    }
+    var result: types.Owned([]const []const u8) = try .init(self.gpa);
+    errdefer result.deinit();
+    var response: std.heap.ArenaAllocator = .init(self.gpa);
+    defer response.deinit();
+    const a = response.allocator();
+    const path = try std.fmt.allocPrint(a, "/v3/projects/{s}:testIamPermissions?prettyPrint=false", .{id_or_number});
+    const body = try rpc.post(self, &response, path, try core.iam.encodePermissions(a, permissions));
+    result.value = core.iam.decodePermissions(result.arena.allocator(), body) catch |err|
+        return rpc.decodeFailed(self, err, "testIamPermissions answer");
+    return result;
+}
+
+fn checkProjectRef(self: *Client, id_or_number: []const u8) Error!void {
+    if (!validate.isProjectRef(id_or_number)) {
+        if (self.diagnostics) |d| d.print("invalid project: expected a project number, or an id of lowercase letters, digits, '-', '.' and ':'", .{});
+        return error.InvalidName;
+    }
 }
 
 /// The last call's refusal for a disabled API or an unusable quota
@@ -537,6 +590,135 @@ test "getProject: every allocation failure is OutOfMemory without leaks" {
             defer client.deinit();
             var p = try client.getProject("bigquery-public-data");
             p.deinit();
+        }
+    };
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+}
+
+test "getProjectIamPolicy: the version 3 request, production's policy, and its refusals" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = bodies.iam_policy_extractctl } },
+        .{ .respond = .{ .status = 503, .body = "{\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\"}}" } },
+        .{ .respond = .{ .body = bodies.iam_policy_extractctl } },
+        .{ .respond = .{ .status = bodies.iam_policy_missing_status, .body = bodies.iam_policy_missing } },
+        .{ .respond = .{ .status = bodies.iam_policy_scope_status, .body = bodies.iam_policy_scope } },
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Fail to resolve resource 'projects/a..b'\",\"status\":\"INVALID_ARGUMENT\"}}" } },
+        .{ .respond = .{ .body = "[]" } },
+    }, .{ .retry = .{ .initial_backoff_ms = 1, .max_backoff_ms = 1 } });
+    defer h.deinit();
+
+    var policy = try h.client.getProjectIamPolicy("extractctl");
+    defer policy.deinit();
+    try h.expectRequest(0, .POST, "https://cloudresourcemanager.googleapis.com/v3/projects/extractctl:getIamPolicy?prettyPrint=false", "{\"options\":{\"requestedPolicyVersion\":3}}");
+    try testing.expectEqualStrings("https://www.googleapis.com/auth/cloud-platform.read-only", h.token.firstScope());
+    try testing.expectEqual(1, policy.value.version);
+    try testing.expectEqualStrings("BwZeRiqaZf0=", policy.value.etag.?);
+    try testing.expectEqual(31, policy.value.bindings.len);
+    try testing.expect(policy.value.grants("roles/owner", "user:person2@example.com"));
+    try testing.expect(policy.value.grants("roles/editor", "serviceAccount:ACCOUNT4@example-project.iam.gserviceaccount.com"));
+    try testing.expect(!policy.value.grants("roles/owner", "serviceAccount:account4@example-project.iam.gserviceaccount.com"));
+    try testing.expect(!policy.value.hasConditions());
+
+    // By number, and a 503 is tried again: the POST changes nothing.
+    var by_number = try h.client.getProjectIamPolicy("82150720798");
+    defer by_number.deinit();
+    try h.expectRequest(2, .POST, "https://cloudresourcemanager.googleapis.com/v3/projects/82150720798:getIamPolicy?prettyPrint=false", "{\"options\":{\"requestedPolicyVersion\":3}}");
+    try testing.expectEqual(31, by_number.value.bindings.len);
+
+    try testing.expectError(error.PermissionDenied, h.client.getProjectIamPolicy("zigps-nope-02667a"));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "(or it may not exist)") != null);
+    try testing.expectError(error.PermissionDenied, h.client.getProjectIamPolicy("extractctl"));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "insufficient authentication scopes") != null);
+    // A 400 is not tried again.
+    try testing.expectError(error.InvalidArgument, h.client.getProjectIamPolicy("a..b"));
+    try h.expectRequestCount(6);
+    try testing.expectError(error.InvalidResponse, h.client.getProjectIamPolicy("extractctl"));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "IAM policy response") != null);
+
+    try testing.expectError(error.InvalidName, h.client.getProjectIamPolicy("Bad_Id!"));
+    try testing.expectError(error.InvalidName, h.client.getProjectIamPolicy(""));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "invalid project") != null);
+    try h.expectRequestCount(7);
+}
+
+test "testProjectIamPermissions: the request, production's sorted answer, and the checks before sending" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = bodies.iam_test_held } },
+        .{ .respond = .{ .body = bodies.iam_test_other_service } },
+        .{ .respond = .{ .body = bodies.iam_test_missing } },
+        .{ .respond = .{ .status = bodies.iam_test_unknown_status, .body = bodies.iam_test_unknown } },
+        .{ .respond = .{ .status = 503, .body = "{\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\"}}" } },
+        .{ .respond = .{ .body = bodies.iam_test_missing } },
+        .{ .respond = .{ .body = "{\"permissions\":\"x\"}" } },
+    }, .{ .retry = .{ .initial_backoff_ms = 1, .max_backoff_ms = 1 } });
+    defer h.deinit();
+
+    const asked = [_][]const u8{
+        "resourcemanager.projects.get",          "resourcemanager.projects.getIamPolicy",
+        "resourcemanager.projects.setIamPolicy", "resourcemanager.projects.delete",
+        "run.services.create",                   "storage.buckets.create",
+        "pubsub.topics.create",
+    };
+    var held = try h.client.testProjectIamPermissions("extractctl", &asked);
+    defer held.deinit();
+    try h.expectRequest(0, .POST, "https://cloudresourcemanager.googleapis.com/v3/projects/extractctl:testIamPermissions?prettyPrint=false", "{\"permissions\":[\"resourcemanager.projects.get\",\"resourcemanager.projects.getIamPolicy\",\"resourcemanager.projects.setIamPolicy\",\"resourcemanager.projects.delete\",\"run.services.create\",\"storage.buckets.create\",\"pubsub.topics.create\"]}");
+    // Sorted by name, as production answers, not in the order asked.
+    const want = [_][]const u8{ "pubsub.topics.create", "resourcemanager.projects.get", "resourcemanager.projects.getIamPolicy", "run.services.create", "storage.buckets.create" };
+    try testing.expectEqual(want.len, held.value.len);
+    for (want, held.value) |w, g| try testing.expectEqualStrings(w, g);
+
+    var other = try h.client.testProjectIamPermissions("extractctl", &.{ "pubsub.topics.get", "bigquery.datasets.get" });
+    defer other.deinit();
+    try testing.expectEqualStrings("bigquery.datasets.get", other.value[0]);
+    try testing.expectEqualStrings("pubsub.topics.get", other.value[1]);
+
+    // A project that does not exist holds nothing, and is not an error.
+    var missing = try h.client.testProjectIamPermissions("zigps-nope-02667a", &.{"resourcemanager.projects.get"});
+    defer missing.deinit();
+    try testing.expectEqual(0, missing.value.len);
+
+    try testing.expectError(error.InvalidArgument, h.client.testProjectIamPermissions("extractctl", &.{"zigps.probe.get"}));
+    try testing.expectEqualStrings("Permission zigps.probe.get is not valid for this resource.", h.diag.message());
+
+    var retried = try h.client.testProjectIamPermissions("extractctl", &.{"resourcemanager.projects.get"});
+    retried.deinit();
+    try h.expectRequestCount(6);
+    try testing.expectError(error.InvalidResponse, h.client.testProjectIamPermissions("extractctl", &.{"resourcemanager.projects.get"}));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "testIamPermissions answer") != null);
+    try h.expectRequestCount(7);
+
+    // Refused before sending: production's limit of 100, none twice, no
+    // wildcard, at least one, and a project name it could read.
+    var many: [101][]const u8 = undefined;
+    var names_buf: [101][24]u8 = undefined;
+    for (&many, &names_buf, 0..) |*m, *buf, i| m.* = try std.fmt.bufPrint(buf, "storage.buckets.get{d}", .{i});
+    try testing.expectError(error.InvalidArgument, h.client.testProjectIamPermissions("extractctl", &many));
+    try testing.expectEqualStrings("at most 100 permissions in one test", h.diag.message());
+    try testing.expectError(error.InvalidArgument, h.client.testProjectIamPermissions("extractctl", &.{}));
+    try testing.expectError(error.InvalidArgument, h.client.testProjectIamPermissions("extractctl", &.{ "a.b.c", "a.b.c" }));
+    try testing.expectError(error.InvalidArgument, h.client.testProjectIamPermissions("extractctl", &.{"resourcemanager.projects.*"}));
+    try testing.expectError(error.InvalidName, h.client.testProjectIamPermissions("Bad_Id!", &.{"resourcemanager.projects.get"}));
+    try h.expectRequestCount(7);
+}
+
+test "getProjectIamPolicy and testProjectIamPermissions: every allocation failure is OutOfMemory without leaks" {
+    const Run = struct {
+        fn run(gpa: Allocator) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+                .{ .respond = .{ .body = bodies.iam_policy_extractctl } },
+                .{ .respond = .{ .body = bodies.iam_test_held } },
+            });
+            defer fake.deinit();
+            var clock: test_util.FakeClock = .{};
+            var token: test_util.FakeTokenProvider = .{};
+            var client = try Client.init(gpa, clock.io(), .{ .token_provider = token.provider(), .transport = fake.transport() });
+            defer client.deinit();
+            var p = try client.getProjectIamPolicy("extractctl");
+            p.deinit();
+            var t = try client.testProjectIamPermissions("extractctl", &.{ "resourcemanager.projects.get", "run.services.create" });
+            t.deinit();
         }
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});

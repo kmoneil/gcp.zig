@@ -78,6 +78,7 @@ pub const DownloadOptions = @import("types.zig").DownloadOptions;
 pub const DownloadResult = @import("types.zig").DownloadResult;
 pub const Downloaded = @import("types.zig").Downloaded;
 pub const GetOptions = @import("types.zig").GetOptions;
+pub const ObjectIamOptions = @import("types.zig").ObjectIamOptions;
 pub const ListOptions = @import("types.zig").ListOptions;
 pub const Metadata = @import("types.zig").Metadata;
 pub const FolderInfo = @import("types.zig").FolderInfo;

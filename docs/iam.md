@@ -111,6 +111,20 @@ Guides: [buckets](storage/buckets.md#iam),
 [topics and subscriptions](pubsub/topics-and-subscriptions.md#iam),
 [secrets](secret-manager/README.md#iam).
 
+## Policies that are read, not written
+
+A project, a Cloud Run service or job, and an object have their policy
+and permission test here, and no writes: a console shows who has
+access, and changes it in Google's console.
+
+| | Project | Cloud Run service or job | Object |
+| --- | --- | --- | --- |
+| Policy | `resource_manager.Client.getProjectIamPolicy` | `run.Client.getServiceIamPolicy`, `getJobIamPolicy` | `Object.iamPolicy(options)` |
+| Test | `testProjectIamPermissions` | `testServiceIamPermissions`, `testJobIamPermissions` | `Object.testIamPermissions(permissions, options)` |
+| What it holds | What everything under the project inherits | The resource's own bindings, nothing inherited | The object's access control list as legacy roles; refused with uniform bucket-level access |
+| OAuth scope | `cloud-platform.read-only` or `cloud-platform` | `run.readonly`, `run` or `cloud-platform` | Policy: `Scope.full_control` or `.cloud_platform`; test: any |
+| Guides | [projects](resource_manager/projects.md#who-has-access) | [Cloud Run](run/README.md#who-has-access) | [buckets](storage/buckets.md#an-objects-policy) |
+
 ## Testing permissions
 
 `testIamPermissions` answers which of the permissions asked the caller
@@ -124,6 +138,15 @@ wildcard.
 | At most | 84 | 100 | 100 |
 | Which | Cloud Storage's own, not `storage.buckets.list` or `create` | Pub/Sub's own | Secret Manager's own |
 | On a resource that does not exist | `error.NotFound` | `error.NotFound`, though Google's documentation says an empty answer | An empty answer: none held |
+
+| | Projects | Cloud Run services and jobs | Objects |
+| --- | --- | --- | --- |
+| At most | 100 | 100 | 84 |
+| Which | Any service's | Cloud Run's own | Cloud Storage's object permissions |
+| A permission named twice (refused here before sending) | Answered twice | Answered twice | 400 |
+| On a resource that does not exist | An empty answer: none held | Answered as if it existed | Answered as if it existed; a missing bucket is `error.NotFound` |
+
+Every answer is sorted by name, not in the order asked.
 
 ## Errors and retries
 

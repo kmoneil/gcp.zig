@@ -90,6 +90,7 @@ it differs from Cloud Storage.
 | `storage.decodeEvent(gpa, message, options)` | One of those messages, as a `pubsub.Subscriber` receives it, read into an `ObjectEvent` | [Notifications](notifications.md) |
 | `client.serviceAgent()` | The account a Cloud KMS key, or a notification's topic, must be granted to | [Encryption keys](encryption.md#cloud-kms-keys) |
 | `bucket.iamPolicy()`, `.setIamPolicy(policy)`, `.addIamBinding(role, member)`, `.removeIamBinding(role, member)`, `.testIamPermissions(permissions)` | Who may do what with the bucket and its objects | [IAM](buckets.md#iam) |
+| `object.iamPolicy(options)`, `.testIamPermissions(permissions, options)` | Who may do what with one object, where its bucket has no uniform access | [An object's policy](buckets.md#an-objects-policy) |
 
 The default OAuth scope is `devstorage.read_write`; `Options.scope`
 picks `.read_only`, `.full_control` (which a bucket's IAM policy needs)

@@ -323,6 +323,29 @@ fn writeNotifications(w: *Writer, bucket: []const u8, id: ?[]const u8) Writer.Er
     }
 }
 
+/// `/storage/v1/b/{bucket}/o/{object}/iam`, at `generation` when one is
+/// named. No policy version is asked: an object's policy has no
+/// conditions, and production ignores the parameter (measured 2026-10-23).
+pub fn objectIamPath(arena: Allocator, bucket: []const u8, object: []const u8, generation: ?u64) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    write(&out.writer, .{ .bucket = bucket, .object = object, .suffix = "/iam", .generation = generation }) catch
+        return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+/// `/storage/v1/b/{bucket}/o/{object}/iam/testPermissions`, one
+/// `permissions` parameter for each name, then `generation` when one is
+/// named.
+pub fn objectTestPermissionsPath(arena: Allocator, bucket: []const u8, object: []const u8, generation: ?u64, permissions: []const []const u8) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    write(w, .{ .bucket = bucket, .object = object, .suffix = "/iam/testPermissions" }) catch return error.OutOfMemory;
+    var params: query.Params = .init(w);
+    for (permissions) |permission| params.add("permissions", permission) catch return error.OutOfMemory;
+    if (generation) |g| params.addInt("generation", g) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
 /// `/storage/v1/b/{bucket}/iam`, asking for policy version 3 when `read`:
 /// the only version that shows conditions as they are, and a bucket answers
 /// an unconditioned policy as version 1 whatever was asked.
@@ -1088,5 +1111,18 @@ test "rewrite paths name both objects and carry the loop's state" {
     try expectPath(
         "/storage/v1/b/s/o/a/rewriteTo/b/d/o/b?destinationPredefinedAcl=bucketOwnerRead&rewriteToken=t",
         try rewritePath(gpa, "s", "a", "d", "b", .{ .destination_predefined_acl = .bucket_owner_read, .rewrite_token = "t" }),
+    );
+}
+
+test "objectIamPath and objectTestPermissionsPath: the name escaped whole, the generation last" {
+    try expectPath("/storage/v1/b/b/o/a%20b%2Fc%3F.txt/iam", try objectIamPath(testing.allocator, "b", "a b/c?.txt", null));
+    try expectPath("/storage/v1/b/b/o/o/iam?generation=1792754022606886", try objectIamPath(testing.allocator, "b", "o", 1792754022606886));
+    try expectPath(
+        "/storage/v1/b/b/o/a%20b/iam/testPermissions?permissions=storage.objects.get&permissions=storage.objects.delete",
+        try objectTestPermissionsPath(testing.allocator, "b", "a b", null, &.{ "storage.objects.get", "storage.objects.delete" }),
+    );
+    try expectPath(
+        "/storage/v1/b/b/o/o/iam/testPermissions?permissions=storage.objects.get&generation=7",
+        try objectTestPermissionsPath(testing.allocator, "b", "o", 7, &.{"storage.objects.get"}),
     );
 }

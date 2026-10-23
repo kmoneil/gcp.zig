@@ -389,3 +389,38 @@ fake-gcs-server has no IAM: every call there is `error.NotFound`.
 [IAM on every resource](../iam.md) compares the four resources that take
 these calls.
 
+
+### An object's policy
+
+Two reads show who has access to one object: `Object.iamPolicy(options)`
+and `Object.testIamPermissions(permissions, options)`, each at the live
+object or the generation `options.generation` names.
+
+```zig
+const object = gcs.bucket("my-bucket").object("reports/q3.pdf");
+var policy = try object.iamPolicy(.{});
+defer policy.deinit();
+var held = try object.testIamPermissions(&.{ "storage.objects.get", "storage.objects.delete" }, .{});
+defer held.deinit();
+```
+
+Measured on 2026-10-23:
+
+- In a bucket without uniform access, an object's policy is its access
+  control list as legacy roles: `roles/storage.legacyObjectReader` to
+  `projectViewer:` the project, `roles/storage.legacyObjectOwner` to
+  `projectOwner:`, `projectEditor:` and whoever wrote it. It is always
+  version 1, with no conditions.
+- **In a bucket with uniform access it is refused**, "Object policies are
+  disabled for bucket 'B' when uniform bucket-level access is enabled.",
+  `error.InvalidArgument`: the bucket's policy is the one that applies.
+- **Reading it takes `Scope.full_control` or `.cloud_platform`**, as a
+  bucket's does. Production refused `devstorage.read_only`,
+  `devstorage.read_write` and `cloud-platform.read-only`, "Provided
+  scope(s) are not authorized", although Google's discovery document
+  names them. Testing permissions takes any scope.
+- An object or generation that does not exist is `error.NotFound` for
+  the policy. The test answers it as if it existed; only a missing
+  bucket is `error.NotFound` there. The test takes at most 84 of Cloud
+  Storage's object permissions, each once: a bucket's permission is 400
+  "Invalid argument.".

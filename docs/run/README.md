@@ -48,6 +48,8 @@ pub fn main(init: std.process.Init) !void {
 | `Client.listExecutions(location, job, options)` | One page of a job's executions, newest first; the job may be `-`, every job in the region |
 | `Client.getExecution(location, job, id)`, `getExecutionNamed(name)` | One execution |
 | `Client.getOperation(name)` | A long-running operation, by the full name a write's answer gives |
+| `Client.getServiceIamPolicy(location, id)`, `getJobIamPolicy(location, id)` | A service's or a job's own IAM policy: [Who has access](#who-has-access) |
+| `Client.testServiceIamPermissions(location, id, permissions)`, `testJobIamPermissions(...)` | Which of the permissions asked the caller holds there |
 
 A `Service` carries its `uri` and `urls`, the latest ready and created
 revision ids, `traffic` (what was asked) and `traffic_statuses` (what
@@ -206,6 +208,44 @@ executing jobs says. Its page on rollbacks asks for Developer and
 Service Account User on the service identity "to manage Cloud Run
 services and revisions", without saying whether a change to traffic
 alone checks the second.
+
+## Who has access
+
+`Client.getServiceIamPolicy(location, id)` and `getJobIamPolicy` read a
+service's or a job's own IAM policy, as `core.iam.Policy` (exported here
+as `iam`). `roles/run.invoker` held by `allUsers` makes a service public.
+The policy holds only what was granted on the service itself: what the
+project grants, which applies to the service too, is
+`resource_manager.Client.getProjectIamPolicy`'s.
+
+```zig
+var policy = try client.getServiceIamPolicy("us-central1", "checkout");
+defer policy.deinit();
+const public = policy.value.grants("roles/run.invoker", "allUsers");
+
+var held = try client.testServiceIamPermissions("us-central1", "checkout", &.{ "run.services.update", "run.services.delete" });
+defer held.deinit();
+```
+
+`testServiceIamPermissions` and `testJobIamPermissions` answer which of
+the permissions asked the caller holds, sorted by name as production
+sends them. One to 100, each once and none a wildcard, are checked
+before sending; Cloud Run refuses any permission but its own, 400
+"Failed to test IAM permissions: Permission pubsub.topics.get is not
+valid for this resource.", `error.InvalidArgument`.
+
+Measured on 2026-10-23:
+
+- A new service's and a new job's policy has no bindings:
+  `{"etag":"ACAB"}`.
+- **A service or job that does not exist is answered as if it did**: the
+  same empty policy, and its permissions tested as for any other. Read
+  the service first where that matters.
+- Location `-` is a 403 that reads like a missing permission
+  ("Permission denied on 'locations/-' (or it may not exist)"), so the
+  client refuses it before sending, `error.InvalidName`.
+- Both calls take every scope a client asks (`run.readonly` included).
+  `cloud-platform.read-only` is refused.
 
 ## The scope
 

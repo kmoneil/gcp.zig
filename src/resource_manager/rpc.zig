@@ -52,9 +52,9 @@ pub fn begin(client: *Client) void {
 /// `ResourceExhausted`. The searches share 4 calls a second and 240 a
 /// minute per charged project with every other user of it, and core's
 /// default would spend four more within 1.5 s. Google's own clients never
-/// retry a search, and retry a get only on UNAVAILABLE; every call here is
-/// a GET with no side effect, so the 500s and dropped connections core
-/// retries are safe to try again.
+/// retry a search, and retry a get only on UNAVAILABLE; every call here
+/// reads and changes nothing, the IAM reads' POSTs included, so the 500s
+/// and dropped connections core retries are safe to try again.
 pub fn retryable(err: anyerror, http_status: u16) bool {
     _ = http_status;
     return err != error.ResourceExhausted and core.isRetryable(err);
@@ -65,13 +65,31 @@ pub fn retryable(err: anyerror, http_status: u16) bool {
 /// token, the only thing production refuses with nothing but "Request
 /// contains an invalid argument.".
 pub fn get(client: *Client, response: *std.heap.ArenaAllocator, path: []const u8, with_token: bool) Error![]const u8 {
+    return send(client, response, .GET, path, null, with_token);
+}
+
+/// Sends a POST of `body` to `path`, as `get` sends a GET: for the IAM
+/// reads, which are POSTs that change nothing.
+pub fn post(client: *Client, response: *std.heap.ArenaAllocator, path: []const u8, body: []const u8) Error![]const u8 {
+    return send(client, response, .POST, path, body, false);
+}
+
+fn send(
+    client: *Client,
+    response: *std.heap.ArenaAllocator,
+    method: core.transport.Method,
+    path: []const u8,
+    body: ?[]const u8,
+    with_token: bool,
+) Error![]const u8 {
     var local: core.Diagnostics = .{};
     var e = engine(client);
     if (e.diagnostics == null) e.diagnostics = &local;
     var error_body: ?[]const u8 = null;
     return e.execute(response, .{
-        .method = .GET,
+        .method = method,
         .path = path,
+        .body = body,
         .retryable = retryable,
         .quota_project = switch (client.quota_project) {
             .project => |p| p,

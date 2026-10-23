@@ -7,6 +7,8 @@
 //! one project, strongly consistent where search is not.
 //! `Client.parentNames` gives display text for the folders and
 //! organizations a caller can read, for showing where a project sits.
+//! `Client.getProjectIamPolicy` and `testProjectIamPermissions` say who
+//! has access to a project, and what the caller may do there.
 //!
 //! No quota project is sent unless asked for, as gcloud does for every
 //! project command: a quota project with the API off breaks a search that
@@ -27,6 +29,9 @@ pub const StaticToken = core.StaticToken;
 pub const auth_scope = @import("rpc.zig").scope;
 
 pub const RetryPolicy = core.RetryPolicy;
+/// IAM policies as a project reads them: `Policy`, `Binding`, and
+/// `Policy.grants`.
+pub const iam = core.iam;
 pub const Diagnostics = core.Diagnostics;
 pub const Error = @import("errors.zig").Error;
 pub const ApiError = core.ApiError;
