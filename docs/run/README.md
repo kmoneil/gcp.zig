@@ -339,4 +339,7 @@ production did: [Testing](testing.md). `examples/run_revisions.zig
 --fake` draws the recent-revisions widget offline, and
 `examples/run_actions.zig` runs a job, cancels an execution or rolls a
 service back, showing the exact request and sending it only with
-`--yes` (`--fake` for no network).
+`--yes` (`--fake` for no network). `examples/run_service.zig` draws one
+service's page: its URL and ingress, its scaling, and each container's
+image, CPU and memory, environment variable names and secrets, volumes
+and VPC access (`--fake` for no network).

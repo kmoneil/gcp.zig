@@ -24,6 +24,12 @@ including the ones that did not change.
   on 2026-10-23: production leaves out every false and zero, keeps CPU,
   memory and secrets exactly as deployed, and answers no `uri` or `urls`
   for a service whose default URL is disabled.
+  `FakeRun.putService`, `putRevision` and `putJob` take the settings
+  and fill production's defaults where a test gives none, measured; a
+  slow fuzz property holds the round trip, and a gated test
+  (`RUN_SETTINGS_TEST=1`) replays a real deploy's settings on the fake:
+  all seven answers agreed on 2026-10-23. `examples/run_service.zig`
+  shows one service's page, with `--fake`.
 - auth, bigquery, core, dataflow, datatransfer, error_reporting,
   firestore, kms, logging, monitoring, pubsub, resource_manager,
   scheduler, secret_manager and storage: unchanged.
