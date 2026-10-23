@@ -634,6 +634,12 @@ jobs:
         # against the fake for up to 24 steps a run: about 0.65 ms a run on
         # the Mac (200K in 130 s; 1M since, clean), so 1400K, about an hour
         # at four times the Mac, to be priced by its first nights.
+        # heavy-pubsub took 103, 102, 98 and 113 minutes at 9M on the
+        # nightlies of 10-20 to 10-23 (runs 39393583152, 39569725428,
+        # 39748528927 and 39924930962) and drops to 7M, about 88 minutes
+        # at the slowest of them. firestore took 87 at 3200K on 10-20 and
+        # 10-21, then 137 on both 10-22 and 10-23, and drops to 2M, about
+        # 86 minutes at the slower rate.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 630K }
           - { job: auth, module: auth, filter: fuzz, iterations: 850K }
@@ -641,7 +647,7 @@ jobs:
           - { job: pubsub, module: pubsub, filter: fuzz, iterations: 950K }
           - { job: slow-pubsub, module: pubsub, filter: slow property Publisher, iterations: 1900K }
           - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 44K }
-          - { job: heavy-pubsub, module: pubsub, filter: heavy property, iterations: 9M }
+          - { job: heavy-pubsub, module: pubsub, filter: heavy property, iterations: 7M }
           - { job: fake-pubsub, module: pubsub, filter: fake property, iterations: 650K }
           - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 5100K }
           - { job: heavy-secret_manager, module: secret_manager, filter: heavy property, iterations: 110K }
@@ -650,7 +656,7 @@ jobs:
           - { job: heavy-storage, module: storage, filter: heavy property, iterations: 20K }
           - { job: fault-storage, module: storage, filter: fault property parallel|fault property uploadFile resume, iterations: 55K }
           - { job: fault-gzip, module: storage, filter: fault property gzip|fault property compressed, iterations: 150 }
-          - { job: firestore, module: firestore, filter: fuzz, iterations: 3200K }
+          - { job: firestore, module: firestore, filter: fuzz, iterations: 2M }
           - { job: heavy-firestore, module: firestore, filter: heavy property, iterations: 1300K }
           - { job: logging, module: logging, filter: fuzz, iterations: 2M }
           - { job: slow-logging, module: logging, filter: slow property, iterations: 90K }
