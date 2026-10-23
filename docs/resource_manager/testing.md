@@ -68,6 +68,29 @@ test "the switcher finds a project by a few letters, from a fake" {
 - **Faults** on searches: `refuseNext`, `refuseNextWithDelay` for a
   refusal that asks the client to wait, in any of the three forms,
   `dropNext`, `emptyNext`, `shortenNext`.
+- **Who has access, and what a caller may do** (measured on
+  2026-10-23). `setProjectPolicy(project_id, bindings)` sets a project's
+  IAM policy; `getProjectIamPolicy` answers it sorted by role with each
+  binding's members sorted, as production's was, version 1 unless a
+  binding has a condition, with an etag that moves with each set.
+  `holdPermissions(token, project_id, permissions)` says exactly what a
+  caller holds on a project: what `testProjectIamPermissions` answers,
+  sorted, and whether it may read the policy
+  (`resourcemanager.projects.getIamPolicy`). A caller nothing was said
+  of holds every permission on a project it sees and none elsewhere. A
+  policy the caller may not read, or of a project nobody added, is
+  production's 403 "(or it may not exist)"; a test there holds nothing,
+  as production's did. A permission list is held to production's rules:
+  at least one, each `service.resource.verb`, at most 100.
+
+```zig
+try fake.setProjectPolicy("shop-prod", &.{
+    .{ .role = "roles/owner", .members = &.{"user:alice@example.com"} },
+    .{ .role = "roles/run.invoker", .members = &.{"allUsers"} },
+});
+// The caller may read the project and its policy, and do nothing else.
+try fake.holdPermissions("person-token", "shop-prod", &.{ "resourcemanager.projects.get", "resourcemanager.projects.getIamPolicy" });
+```
 
 ## What it does not model
 
@@ -83,9 +106,14 @@ Each is answered 501 with the reason, never guessed at:
 - folder and organization queries other than the empty one;
 - a token from another kind of search, or past `token_lifetime_ns`
   (production's still worked after 65 s).
+- which permissions exist: every well-formed one is taken, where
+  production refuses one it does not know ("Permission x.y.z is not
+  valid for this resource.");
+- a version 1 read of a policy with a condition, and a version past 3.
 
 Its 403 for a project the caller cannot see leaves out production's
-Troubleshooter link; its 429 uses the documented limit's names, since
+Troubleshooter link (its 403 for a policy carries one, its request id
+the fake's own); its 429 uses the documented limit's names, since
 production's for v3 search were not seen.
 
 ## Held to production
@@ -99,4 +127,7 @@ fixes to the fake: production refuses a malformed project id such as
 is a position in one order, where the fake had kept each search's own. The
 refusals the probe recorded are kept verbatim in
 `src/resource_manager/production_bodies.zig`, and the fake's are held to
-them word for word.
+them word for word. The IAM reads' suite, `tests/iam_gcp_integration.zig`, sets the
+fake's policy and held permissions from production's answers and replays
+five calls; on 2026-10-23 every one agreed, extractctl's 31-binding
+policy byte for byte.

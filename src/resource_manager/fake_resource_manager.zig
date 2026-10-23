@@ -40,13 +40,28 @@
 //! - Eventual consistency: a change shows in `projects.get` at once and in
 //!   search after `search_lag_ns`.
 //! - The query language, by `fake_query.zig`'s reading of it.
+//! - IAM reads, as measured on 2026-10-23 (milestone 0 of the IAM reads
+//!   spec): a project's policy as a test sets it (`setProjectPolicy`),
+//!   answered sorted by role with each binding's members sorted, as
+//!   version 1 when no binding has a condition; what each caller holds
+//!   (`holdPermissions`), else every permission on a project it sees and
+//!   none elsewhere. A policy the caller may not read, or of a project
+//!   that does not exist, is production's 403 "(or it may not exist)",
+//!   with a troubleshooter link of the fake's own; a permission test there
+//!   holds nothing (`{}`). A test's permissions are checked as production
+//!   checked them: at least one, each `service.resource.verb`, at most
+//!   100; one named twice is answered twice; the answer is sorted.
 //! - Faults on searches: refusals with any status, dropped connections,
 //!   empty pages that go on, and short pages.
 //!
 //! Not modelled, each answered 501 with the reason: a token past its
 //! lifetime (production's still worked after 65 s), or from another kind
 //! of search, what `fake_query.zig` does not read, the quota of
-//! `projects.get`, and every other call.
+//! `projects.get`, a version 1 read of a policy with a condition, a
+//! policy version past 3, and every other call. Which permissions exist is
+//! not modelled either: every well-formed one is taken, where production
+//! refuses one it does not know ("Permission x.y.z is not valid for this
+//! resource.").
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -78,6 +93,7 @@ pub const FakeResourceManager = struct {
     faults: [4]Fault = @splat(.{}),
     search_calls: usize = 0,
     get_calls: usize = 0,
+    iam_calls: usize = 0,
     /// Makes every token issued its own, as an empty page's is a new one.
     tokens_issued: u64 = 0,
 
@@ -154,6 +170,10 @@ pub const FakeResourceManager = struct {
         /// What search shows from `pending_at` on.
         pending: ?Version = null,
         pending_at: i96 = 0,
+        /// As `setProjectPolicy` set them, sorted as production answers.
+        bindings: []const core.iam.Binding = &.{},
+        /// Moves the etag with each policy set.
+        policy_serial: u32 = 0,
     };
 
     const Principal = struct {
@@ -163,6 +183,9 @@ pub const FakeResourceManager = struct {
         grants: std.StringHashMapUnmanaged(void) = .empty,
         /// Project ids the caller may name as its quota project.
         quota_use: std.StringHashMapUnmanaged(void) = .empty,
+        /// By project id: every permission the caller holds there, as
+        /// `holdPermissions` said.
+        held: std.StringHashMapUnmanaged([]const []const u8) = .empty,
     };
 
     /// What a search lists.
@@ -354,6 +377,57 @@ pub const FakeResourceManager = struct {
         s.api_enabled = enabled;
     }
 
+    /// Sets the project's IAM policy as production holds it, replacing
+    /// what was there: `getIamPolicy` answers these bindings sorted by
+    /// role, each one's members sorted, and a new etag. `error.InvalidEntry`
+    /// for a project the fake does not have, a role or member
+    /// `core.iam` refuses, a binding with no members, or a condition that
+    /// is not a JSON object.
+    pub fn setProjectPolicy(f: *FakeResourceManager, project_id: []const u8, bindings: []const core.iam.Binding) WriteError!void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        const a = f.store.allocator();
+        const s = f.byId(project_id) orelse return error.InvalidEntry;
+        const out = try a.alloc(core.iam.Binding, bindings.len);
+        for (bindings, out) |b, *o| {
+            if (core.iam.roleProblem(b.role) != null or b.members.len == 0) return error.InvalidEntry;
+            const members = try a.alloc([]const u8, b.members.len);
+            for (b.members, members) |m, *om| {
+                if (core.iam.memberProblem(m, .{}) != null) return error.InvalidEntry;
+                om.* = try a.dupe(u8, m);
+            }
+            std.mem.sort([]const u8, members, {}, lessThan);
+            var condition: ?[]const u8 = null;
+            if (b.condition) |c| {
+                const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, c, .{}) catch return error.InvalidEntry;
+                if (parsed != .object) return error.InvalidEntry;
+                condition = try a.dupe(u8, c);
+            }
+            o.* = .{ .role = try a.dupe(u8, b.role), .members = members, .condition = condition };
+        }
+        std.mem.sort(core.iam.Binding, out, {}, bindingLessThan);
+        s.bindings = out;
+        s.policy_serial +%= 1;
+    }
+
+    /// Says exactly which permissions the caller with `token` holds on the
+    /// project, replacing what was said before: what `testIamPermissions`
+    /// answers there, and whether it may read the policy
+    /// (`resourcemanager.projects.getIamPolicy`). A caller nothing was
+    /// said of holds every permission on a project it sees and none
+    /// elsewhere. `error.InvalidEntry` for a caller or project the fake
+    /// does not have.
+    pub fn holdPermissions(f: *FakeResourceManager, token: []const u8, project_id: []const u8, permissions: []const []const u8) WriteError!void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        const a = f.store.allocator();
+        const p = f.principals.get(token) orelse return error.InvalidEntry;
+        const s = f.byId(project_id) orelse return error.InvalidEntry;
+        const copy = try a.alloc([]const u8, permissions.len);
+        for (permissions, copy) |x, *c| c.* = try a.dupe(u8, x);
+        try p.held.put(a, s.project_id, copy);
+    }
+
     /// A change to a project, seen by get now and by search after the lag.
     pub const Change = union(enum) {
         display_name: ?[]const u8,
@@ -537,6 +611,16 @@ pub const FakeResourceManager = struct {
         if (req.method == .GET and std.mem.startsWith(u8, route, "/v3/projects/")) {
             f.get_calls += 1;
             return f.get(arena, req, route["/v3/projects/".len..], query);
+        }
+        if (req.method == .POST and std.mem.startsWith(u8, route, "/v3/projects/")) {
+            const rest = route["/v3/projects/".len..];
+            // An id may hold a colon of its own ("example.com:p").
+            const colon = std.mem.lastIndexOfScalar(u8, rest, ':') orelse return notModelled(arena, "this call");
+            const verb = rest[colon + 1 ..];
+            if (std.mem.eql(u8, verb, "getIamPolicy") or std.mem.eql(u8, verb, "testIamPermissions")) {
+                f.iam_calls += 1;
+                return f.iam(arena, req, rest[0..colon], query, std.mem.eql(u8, verb, "getIamPolicy"));
+            }
         }
         return notModelled(arena, "this call");
     }
@@ -792,6 +876,70 @@ pub const FakeResourceManager = struct {
             .{ "resource", try std.fmt.allocPrint(arena, "projects/{s}", .{ref}) },
             .{ "permission", "resourcemanager.projects.get" },
         });
+    }
+
+    const get_policy_method = "google.cloud.resourcemanager.v3.Projects.GetIamPolicy";
+    const test_permissions_method = "google.cloud.resourcemanager.v3.Projects.TestIamPermissions";
+
+    /// Whether `principal` holds `permission` on the project: as
+    /// `holdPermissions` said, else on every project it sees.
+    fn holds(f: *const FakeResourceManager, principal: *const Principal, s: *const Stored, permission: []const u8) bool {
+        if (principal.held.get(s.project_id)) |held| {
+            for (held) |h| if (std.mem.eql(u8, h, permission)) return true;
+            return false;
+        }
+        return f.sees(principal, s, s.current.parent);
+    }
+
+    /// `projects.getIamPolicy` and `projects.testIamPermissions`.
+    fn iam(f: *FakeResourceManager, arena: Allocator, req: tp.Request, raw_ref: []const u8, query: []const u8, policy: bool) Allocator.Error!Reply {
+        const ref = try decode(arena, raw_ref) orelse return notModelled(arena, "a path this fake cannot read");
+        const params = try parseParams(arena, query) orelse return notModelled(arena, "a query string this fake cannot read");
+        for (params) |p| if (!isOneOf(p.name, &.{"prettyPrint"})) return notModelled(arena, try std.fmt.allocPrint(arena, "the parameter {s}", .{p.name}));
+        const principal = switch (try f.caller(arena, req, if (policy) get_policy_method else test_permissions_method)) {
+            .principal => |p| p,
+            .refused => |r| return r,
+        };
+        switch (try f.charged(arena, req, principal)) {
+            .key => {},
+            .refused => |r| return r,
+        }
+        if (ref.len == 0 or std.mem.indexOfScalar(u8, ref, '/') != null) return notModelled(arena, "this call");
+        if (!resolvable(ref)) return fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Fail to resolve resource 'projects/{s}'", .{ref}));
+        const found: ?*Stored = if (f.byRef(ref)) |s| (if (s.current.purged) null else s) else null;
+        if (policy) return f.readPolicy(arena, req, principal, ref, found);
+        return f.testPermissions(arena, req, principal, found);
+    }
+
+    fn readPolicy(f: *FakeResourceManager, arena: Allocator, req: tp.Request, principal: *const Principal, ref: []const u8, found: ?*Stored) Allocator.Error!Reply {
+        const version = try policyVersionAsked(arena, req.body orelse "") orelse
+            return notModelled(arena, "a getIamPolicy body other than its options");
+        if (version > 3) return notModelled(arena, "a policy version past 3");
+        const s = found orelse return policyDenied(arena, ref);
+        if (!f.holds(principal, s, "resourcemanager.projects.getIamPolicy")) return policyDenied(arena, ref);
+        var conditional = false;
+        for (s.bindings) |b| conditional = conditional or b.condition != null;
+        if (conditional and version < 3) return notModelled(arena, "a version 1 read of a policy with a condition");
+        var etag: [8]u8 = undefined;
+        std.mem.writeInt(u64, &etag, std.hash.Wyhash.hash(s.policy_serial, std.mem.asBytes(&s.number)), .big);
+        etag[0] = 0x07; // production's began BwZ, as its etags do
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        writePolicy(&jw, if (conditional) 3 else 1, &etag, s.bindings) catch return error.OutOfMemory;
+        return ok(try out.toOwnedSlice());
+    }
+
+    fn testPermissions(f: *FakeResourceManager, arena: Allocator, req: tp.Request, principal: *const Principal, found: ?*Stored) Allocator.Error!Reply {
+        const asked = try permissionsAsked(arena, req.body orelse "") orelse
+            return notModelled(arena, "a testIamPermissions body other than its permissions");
+        if (asked.len == 0) return fail(arena, 400, "INVALID_ARGUMENT", "At least one permission must be specified.");
+        for (asked) |p| if (!isPermission(p)) return fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "The permission {s} is invalid.", .{p}));
+        if (asked.len > 100) return fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "The number of permissions ({d}) is greater than the maximum allowed (100).", .{asked.len}));
+        var held: std.ArrayList([]const u8) = .empty;
+        if (found) |s| for (asked) |p| if (f.holds(principal, s, p)) try held.append(arena, p);
+        if (held.items.len == 0) return ok("{}");
+        std.mem.sort([]const u8, held.items, {}, lessThan);
+        return ok(try Stringify.valueAlloc(arena, .{ .permissions = held.items }, .{}));
     }
 };
 
@@ -1185,6 +1333,110 @@ fn refusal(arena: Allocator, status: u16) Allocator.Error!FakeResourceManager.Re
 fn asking(arena: Allocator, reply: FakeResourceManager.Reply, delay: ?core.retry_after.Asked) Allocator.Error!FakeResourceManager.Reply {
     const d = delay orelse return reply;
     return .{ .status = reply.status, .headers = try d.headers(arena), .body = try d.intoBody(arena, reply.body) };
+}
+
+fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+/// Production's order: by role. Two bindings of one role, one with a
+/// condition, keep the order they were set in.
+fn bindingLessThan(_: void, a: core.iam.Binding, b: core.iam.Binding) bool {
+    return std.mem.lessThan(u8, a.role, b.role);
+}
+
+/// `service.resource.verb`, as production takes a permission's shape;
+/// anything else, a wildcard included, is "The permission x is invalid.".
+fn isPermission(p: []const u8) bool {
+    var parts: usize = 0;
+    var it = std.mem.splitScalar(u8, p, '.');
+    while (it.next()) |part| {
+        if (part.len == 0) return false;
+        for (part) |c| if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+        parts += 1;
+    }
+    return parts == 3;
+}
+
+/// The version a `getIamPolicy` body asks for: 0 when it names none, which
+/// production took as it took 1 and 2; null for a body this fake cannot
+/// read.
+fn policyVersionAsked(arena: Allocator, body: []const u8) Allocator.Error!?u32 {
+    if (body.len == 0) return 0;
+    const Wire = struct { options: ?struct { requestedPolicyVersion: ?u32 = null } = null };
+    const wire = std.json.parseFromSliceLeaky(Wire, arena, body, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const options = wire.options orelse return 0;
+    return options.requestedPolicyVersion orelse 0;
+}
+
+/// A `testIamPermissions` body's permissions, in the order sent; null for
+/// a body this fake cannot read.
+fn permissionsAsked(arena: Allocator, body: []const u8) Allocator.Error!?[]const []const u8 {
+    if (body.len == 0) return &.{};
+    const Wire = struct { permissions: ?[]const []const u8 = null };
+    const wire = std.json.parseFromSliceLeaky(Wire, arena, body, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    return wire.permissions orelse &.{};
+}
+
+/// A policy as production answered it: version, etag, then the bindings,
+/// none at all when there are none.
+fn writePolicy(jw: *Stringify, version: u32, etag: *const [8]u8, bindings: []const core.iam.Binding) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("version");
+    try jw.write(version);
+    try jw.objectField("etag");
+    var buf: [12]u8 = undefined;
+    try jw.write(std.base64.standard.Encoder.encode(&buf, etag));
+    if (bindings.len > 0) {
+        try jw.objectField("bindings");
+        try jw.beginArray();
+        for (bindings) |b| {
+            try jw.beginObject();
+            try jw.objectField("role");
+            try jw.write(b.role);
+            try jw.objectField("members");
+            try jw.write(b.members);
+            if (b.condition) |c| {
+                try jw.objectField("condition");
+                try jw.beginWriteRaw();
+                try jw.writer.writeAll(c);
+                jw.endWriteRaw();
+            }
+            try jw.endObject();
+        }
+        try jw.endArray();
+    }
+    try jw.endObject();
+}
+
+/// Production's 403 for a policy the caller may not read, or of a project
+/// that does not exist: its troubleshooter link names a request id, here
+/// the fake's own, in production's encoding (a UUID, then the resource).
+fn policyDenied(arena: Allocator, ref: []const u8) Allocator.Error!FakeResourceManager.Reply {
+    const resource = try std.fmt.allocPrint(arena, "projects/{s}", .{ref});
+    const uuid = "00000000-0000-7000-8000-000000000000";
+    var raw: std.ArrayList(u8) = .empty;
+    try raw.appendSlice(arena, &.{ 0x0a, uuid.len });
+    try raw.appendSlice(arena, uuid);
+    try raw.append(arena, 0x12);
+    if (resource.len > 127) return notModelled(arena, "a project reference this long");
+    try raw.append(arena, @intCast(resource.len));
+    try raw.appendSlice(arena, resource);
+    const id = try arena.alloc(u8, std.base64.standard_no_pad.Encoder.calcSize(raw.items.len));
+    _ = std.base64.standard_no_pad.Encoder.encode(id, raw.items);
+    const link = try std.fmt.allocPrint(arena, "https://console.cloud.google.com/iam-admin/troubleshooter/summary;errorId={s}", .{id});
+    return failInfo(arena, 403, "PERMISSION_DENIED", try std.fmt.allocPrint(arena, "Permission 'resourcemanager.projects.getIamPolicy' denied on resource '//cloudresourcemanager.googleapis.com/{s}' (or it may not exist). Remediate access with this Troubleshooter URL or share it with your administrator - {s} .", .{ resource, link }), "IAM_PERMISSION_DENIED", "cloudresourcemanager.googleapis.com", &.{
+        .{ "troubleshooter_url", link },
+        .{ "error_info_id", id },
+        .{ "permission", "resourcemanager.projects.getIamPolicy" },
+        .{ "resource", resource },
+    });
 }
 
 /// What this fake has no answer for: said, never guessed at.
@@ -1928,4 +2180,284 @@ fn parentNamesProperty(_: void, input: []const u8) !void {
 
 test "fuzz parent names: every path climbs the tree as far as the caller can read, as a plain model does" {
     try test_util.fuzzBytes({}, parentNamesProperty, .{ .corpus = &.{ "", "\x03\x00\x00\x00\x00\x00\x00\x00\x00\x01\x01\x01\x0c" } });
+}
+
+test "IAM: a project's policy as set, sorted as production answers it, to a caller that may read it" {
+    var r: Rig = undefined;
+    try r.init(.{}, .none);
+    defer r.deinit();
+    const f = &r.fake;
+    try f.addFolder(.{ .name = "folders/10", .parent = "organizations/1" });
+    try f.addProject(.{ .number = 1, .project_id = "home-project" });
+    try f.addProject(.{ .number = 2, .project_id = "mine" });
+    try f.addProject(.{ .number = 3, .project_id = "under", .parent = "folders/10" });
+    try f.addProject(.{ .number = 4, .project_id = "elsewhere" });
+    try f.addProject(.{ .number = 5, .project_id = "public-data", .public = true });
+    try f.addPrincipal("person-token", "home-project");
+    try f.grant("person-token", "mine");
+    try f.grant("person-token", "folders/10");
+    try f.setProjectPolicy("mine", &.{
+        .{ .role = "roles/viewer", .members = &.{ "user:zed@example.com", "group:ops@example.com" } },
+        .{ .role = "roles/editor", .members = &.{"serviceAccount:robot@mine.iam.gserviceaccount.com"} },
+    });
+
+    var policy = try r.client.getProjectIamPolicy("mine");
+    defer policy.deinit();
+    try testing.expectEqual(1, policy.value.version);
+    try testing.expectEqual(2, policy.value.bindings.len);
+    try testing.expectEqualStrings("roles/editor", policy.value.bindings[0].role);
+    try testing.expectEqualStrings("group:ops@example.com", policy.value.bindings[1].members[0]);
+    try testing.expect(policy.value.grants("roles/viewer", "user:ZED@example.com"));
+    // By number, the same policy; a new one moves the etag.
+    var by_number = try r.client.getProjectIamPolicy("2");
+    defer by_number.deinit();
+    try testing.expectEqualStrings(policy.value.etag.?, by_number.value.etag.?);
+    try testing.expect(std.mem.startsWith(u8, policy.value.etag.?, "B"));
+    try f.setProjectPolicy("mine", &.{.{ .role = "roles/owner", .members = &.{"user:a@example.com"}, .condition = "{\"title\":\"until 2027\",\"expression\":\"request.time < timestamp('2027-01-01T00:00:00Z')\"}" }});
+    var conditional = try r.client.getProjectIamPolicy("mine");
+    defer conditional.deinit();
+    try testing.expectEqual(3, conditional.value.version);
+    try testing.expect(conditional.value.hasConditions());
+    try testing.expect(!std.mem.eql(u8, policy.value.etag.?, conditional.value.etag.?));
+
+    // A project seen through a folder, with no policy set: no bindings.
+    var under = try r.client.getProjectIamPolicy("under");
+    defer under.deinit();
+    try testing.expectEqual(0, under.value.bindings.len);
+
+    // Not seen, public, or not there: production's 403, the same words.
+    for ([_][]const u8{ "elsewhere", "public-data", "no-such-project", "99" }) |ref| {
+        try testing.expectError(error.PermissionDenied, r.client.getProjectIamPolicy(ref));
+        try testing.expect(std.mem.indexOf(u8, r.diag.message(), "denied on resource '//cloudresourcemanager.googleapis.com/projects/") != null);
+        try testing.expect(std.mem.indexOf(u8, r.diag.message(), "(or it may not exist)") != null);
+    }
+
+    // What a caller holds, said, decides the policy read too.
+    try f.holdPermissions("person-token", "mine", &.{"resourcemanager.projects.get"});
+    try testing.expectError(error.PermissionDenied, r.client.getProjectIamPolicy("mine"));
+    try f.holdPermissions("person-token", "elsewhere", &.{"resourcemanager.projects.getIamPolicy"});
+    var granted = try r.client.getProjectIamPolicy("elsewhere");
+    granted.deinit();
+    try testing.expectEqual(10, f.iam_calls);
+}
+
+test "IAM: testIamPermissions answers what the caller holds, sorted, and holds nothing where it sees nothing" {
+    var r: Rig = undefined;
+    try r.init(.{}, .none);
+    defer r.deinit();
+    const f = &r.fake;
+    try f.addProject(.{ .number = 1, .project_id = "home-project" });
+    try f.addProject(.{ .number = 2, .project_id = "mine" });
+    try f.addProject(.{ .number = 3, .project_id = "elsewhere" });
+    try f.addPrincipal("person-token", "home-project");
+    try f.grant("person-token", "mine");
+
+    // Seen and nothing said: every one held, any service's.
+    var all = try r.client.testProjectIamPermissions("mine", &.{ "storage.buckets.create", "pubsub.topics.create", "resourcemanager.projects.delete" });
+    defer all.deinit();
+    try testing.expectEqual(3, all.value.len);
+    try testing.expectEqualStrings("pubsub.topics.create", all.value[0]);
+    try testing.expectEqualStrings("storage.buckets.create", all.value[2]);
+
+    try f.holdPermissions("person-token", "mine", &.{ "run.services.create", "resourcemanager.projects.get" });
+    var some = try r.client.testProjectIamPermissions("mine", &.{ "run.services.create", "resourcemanager.projects.delete", "resourcemanager.projects.get" });
+    defer some.deinit();
+    try testing.expectEqual(2, some.value.len);
+    try testing.expectEqualStrings("resourcemanager.projects.get", some.value[0]);
+    try testing.expectEqualStrings("run.services.create", some.value[1]);
+
+    // Not seen, or not there: none held, and not an error.
+    for ([_][]const u8{ "elsewhere", "no-such-project" }) |ref| {
+        var none = try r.client.testProjectIamPermissions(ref, &.{"resourcemanager.projects.get"});
+        defer none.deinit();
+        try testing.expectEqual(0, none.value.len);
+    }
+}
+
+test "IAM: production's refusals of a request the client would not send" {
+    var r: Rig = undefined;
+    try r.init(.{}, .none);
+    defer r.deinit();
+    const f = &r.fake;
+    try f.addProject(.{ .number = 2, .project_id = "mine" });
+    try f.addPrincipal("person-token", "mine");
+    try f.grant("person-token", "mine");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = "https://cloudresourcemanager.googleapis.com/v3/projects/";
+    const Case = struct { path: []const u8, body: ?[]const u8, status: u16, message: []const u8 };
+    var many: std.ArrayList(u8) = .empty;
+    try many.appendSlice(a, "{\"permissions\":[");
+    for (0..101) |i| try many.print(a, "{s}\"a.b.c\"", .{if (i == 0) "" else ","});
+    try many.appendSlice(a, "]}");
+    for ([_]Case{
+        .{ .path = "mine:testIamPermissions", .body = "{\"permissions\":[]}", .status = 400, .message = "At least one permission must be specified." },
+        .{ .path = "mine:testIamPermissions", .body = null, .status = 400, .message = "At least one permission must be specified." },
+        .{ .path = "mine:testIamPermissions", .body = "{\"permissions\":[\"notapermission\"]}", .status = 400, .message = "The permission notapermission is invalid." },
+        .{ .path = "mine:testIamPermissions", .body = "{\"permissions\":[\"resourcemanager.projects.*\"]}", .status = 400, .message = "The permission resourcemanager.projects.* is invalid." },
+        .{ .path = "mine:testIamPermissions", .body = many.items, .status = 400, .message = "The number of permissions (101) is greater than the maximum allowed (100)." },
+        .{ .path = "Bad_Id%21:getIamPolicy", .body = "{}", .status = 400, .message = "Fail to resolve resource 'projects/Bad_Id!'" },
+    }) |c| {
+        const reply = try f.serve(.{ .method = .POST, .url = try std.fmt.allocPrint(a, "{s}{s}", .{ base, c.path }), .bearer = "person-token", .body = c.body }, a);
+        try testing.expectEqual(c.status, reply.status);
+        const e = (try core.errors.decodeErrorBody(a, reply.body)).?;
+        try testing.expectEqualStrings(c.message, e.message);
+    }
+    // A permission named twice is answered twice, as production did.
+    const dup = try f.serve(.{ .method = .POST, .url = base ++ "mine:testIamPermissions", .bearer = "person-token", .body = "{\"permissions\":[\"a.b.c\",\"a.b.c\"]}" }, a);
+    try testing.expectEqualStrings("{\"permissions\":[\"a.b.c\",\"a.b.c\"]}", dup.body);
+    // No body, or version 2, is answered as production answered them.
+    for ([_]?[]const u8{ null, "{}", "{\"options\":{\"requestedPolicyVersion\":2}}" }) |body| {
+        const reply = try f.serve(.{ .method = .POST, .url = base ++ "mine:getIamPolicy", .bearer = "person-token", .body = body }, a);
+        try testing.expectEqual(200, reply.status);
+    }
+    // What it cannot answer, it says so.
+    try f.setProjectPolicy("mine", &.{.{ .role = "roles/owner", .members = &.{"user:a@example.com"}, .condition = "{\"expression\":\"true\"}" }});
+    for ([_]Case{
+        .{ .path = "mine:getIamPolicy", .body = "{\"options\":{\"requestedPolicyVersion\":1}}", .status = 501, .message = "fake: a version 1 read of a policy with a condition is not modelled yet" },
+        .{ .path = "mine:getIamPolicy", .body = "{\"options\":{\"requestedPolicyVersion\":4}}", .status = 501, .message = "fake: a policy version past 3 is not modelled yet" },
+        .{ .path = "mine:getIamPolicy", .body = "[]", .status = 501, .message = "fake: a getIamPolicy body other than its options is not modelled yet" },
+        .{ .path = "mine:testIamPermissions", .body = "{\"permissions\":[\"a.b.c\"],\"x\":1}", .status = 501, .message = "fake: a testIamPermissions body other than its permissions is not modelled yet" },
+        .{ .path = "mine:setIamPolicy", .body = "{}", .status = 501, .message = "fake: this call is not modelled yet" },
+    }) |c| {
+        const reply = try f.serve(.{ .method = .POST, .url = try std.fmt.allocPrint(a, "{s}{s}", .{ base, c.path }), .bearer = "person-token", .body = c.body }, a);
+        try testing.expectEqual(c.status, reply.status);
+        try testing.expectEqualStrings(c.message, (try core.errors.decodeErrorBody(a, reply.body)).?.message);
+    }
+}
+
+test "IAM: setup it refuses" {
+    var r: Rig = undefined;
+    try r.init(.{}, .none);
+    defer r.deinit();
+    const f = &r.fake;
+    try f.addProject(.{ .number = 2, .project_id = "mine" });
+    try f.addPrincipal("person-token", "mine");
+    try testing.expectError(error.InvalidEntry, f.setProjectPolicy("nope", &.{}));
+    try testing.expectError(error.InvalidEntry, f.setProjectPolicy("mine", &.{.{ .role = "viewer", .members = &.{"user:a@example.com"} }}));
+    try testing.expectError(error.InvalidEntry, f.setProjectPolicy("mine", &.{.{ .role = "roles/viewer", .members = &.{} }}));
+    try testing.expectError(error.InvalidEntry, f.setProjectPolicy("mine", &.{.{ .role = "roles/viewer", .members = &.{"alice"} }}));
+    try testing.expectError(error.InvalidEntry, f.setProjectPolicy("mine", &.{.{ .role = "roles/viewer", .members = &.{"user:a@example.com"}, .condition = "[1]" }}));
+    try testing.expectError(error.InvalidEntry, f.holdPermissions("nobody", "mine", &.{}));
+    try testing.expectError(error.InvalidEntry, f.holdPermissions("person-token", "nope", &.{}));
+}
+
+fn iamProperty(_: void, input: []const u8) !void {
+    const gpa = test_util.propertyAllocator();
+    var g: test_util.ByteGen = .init(input);
+    var clock: test_util.FakeClock = .{ .now_ns = 1_792_141_200 * std.time.ns_per_s };
+    var fake: FakeResourceManager = .init(gpa, clock.io(), .{});
+    defer fake.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try fake.addFolder(.{ .name = "folders/10", .parent = "organizations/1" });
+    try fake.addPrincipal("person-token", "home");
+    try fake.grant("person-token", "folders/10");
+
+    const roles = [_][]const u8{ "roles/owner", "roles/editor", "roles/viewer", "roles/run.invoker", "roles/storage.admin" };
+    const members = [_][]const u8{ "user:a@example.com", "user:b@example.com", "group:ops@example.com", "serviceAccount:r@p.iam.gserviceaccount.com", "domain:example.com", "allUsers" };
+    const permissions = [_][]const u8{ "resourcemanager.projects.get", "resourcemanager.projects.getIamPolicy", "resourcemanager.projects.delete", "run.services.create", "storage.buckets.create", "pubsub.topics.get" };
+
+    const Want = struct { id: []const u8, number: u64, visible: bool, held: ?[]const []const u8, bindings: []const core.iam.Binding };
+    var wants: [8]Want = undefined;
+    const n = g.intRange(usize, 0, wants.len);
+    for (wants[0..n], 0..) |*w, i| {
+        w.id = try std.fmt.allocPrint(a, "proj-{d:0>4}", .{i});
+        w.number = 100 + i;
+        const under = g.boolean();
+        try fake.addProject(.{ .number = w.number, .project_id = w.id, .parent = if (under) "folders/10" else null, .public = g.intRange(u8, 0, 5) == 0 });
+        w.visible = under;
+        if (!under and g.boolean()) {
+            try fake.grant("person-token", w.id);
+            w.visible = true;
+        }
+        // Distinct roles, each with distinct members; now and then a
+        // condition.
+        var bindings: std.ArrayList(core.iam.Binding) = .empty;
+        for (roles) |role| {
+            if (!g.boolean()) continue;
+            var ms: std.ArrayList([]const u8) = .empty;
+            for (members) |m| if (g.intRange(u8, 0, 2) == 0) try ms.append(a, m);
+            if (ms.items.len == 0) try ms.append(a, members[0]);
+            const condition: ?[]const u8 = if (g.intRange(u8, 0, 4) == 0) "{\"title\":\"t\",\"expression\":\"request.time < timestamp('2030-01-01T00:00:00Z')\"}" else null;
+            try bindings.append(a, .{ .role = role, .members = ms.items, .condition = condition });
+        }
+        w.bindings = bindings.items;
+        if (w.bindings.len > 0 or g.boolean()) try fake.setProjectPolicy(w.id, w.bindings);
+        w.held = null;
+        if (g.intRange(u8, 0, 2) == 0) {
+            var held: std.ArrayList([]const u8) = .empty;
+            for (permissions) |p| if (g.boolean()) try held.append(a, p);
+            try fake.holdPermissions("person-token", w.id, held.items);
+            w.held = held.items;
+        }
+    }
+
+    var token = core.StaticToken{ .token = "person-token" };
+    var client = try Client.init(gpa, clock.io(), .{ .token_provider = token.provider(), .transport = fake.transport() });
+    defer client.deinit();
+
+    for (0..g.intRange(usize, 0, 12)) |_| {
+        // A project of the model, by id or number, or one nobody has.
+        const which = g.intRange(usize, 0, n);
+        const w: ?*const Want = if (which < n) &wants[which] else null;
+        const ref = if (w) |x| (if (g.boolean()) x.id else try std.fmt.allocPrint(a, "{d}", .{x.number})) else "no-such-project";
+        const holds = struct {
+            fn holds(x: *const Want, p: []const u8) bool {
+                const held = x.held orelse return x.visible;
+                for (held) |h| if (std.mem.eql(u8, h, p)) return true;
+                return false;
+            }
+        }.holds;
+        if (g.boolean()) {
+            const readable = if (w) |x| holds(x, "resourcemanager.projects.getIamPolicy") else false;
+            if (!readable) {
+                try testing.expectError(error.PermissionDenied, client.getProjectIamPolicy(ref));
+                continue;
+            }
+            var policy = try client.getProjectIamPolicy(ref);
+            defer policy.deinit();
+            const x = w.?;
+            var conditional = false;
+            for (x.bindings) |b| conditional = conditional or b.condition != null;
+            try testing.expectEqual(@as(u32, if (conditional) 3 else 1), policy.value.version);
+            try testing.expectEqual(x.bindings.len, policy.value.bindings.len);
+            // Sorted by role, each binding as set, its members sorted.
+            for (policy.value.bindings, 0..) |b, i| {
+                if (i > 0) try testing.expect(std.mem.order(u8, policy.value.bindings[i - 1].role, b.role) == .lt);
+                const set = for (x.bindings) |s| {
+                    if (std.mem.eql(u8, s.role, b.role)) break s;
+                } else return error.TestUnexpectedResult;
+                try testing.expectEqual(set.members.len, b.members.len);
+                for (b.members, 0..) |m, j| {
+                    if (j > 0) try testing.expect(std.mem.order(u8, b.members[j - 1], m) == .lt);
+                    for (set.members) |sm| {
+                        if (std.mem.eql(u8, sm, m)) break;
+                    } else return error.TestUnexpectedResult;
+                }
+                try testing.expectEqual(set.condition != null, b.condition != null);
+            }
+        } else {
+            var asked: std.ArrayList([]const u8) = .empty;
+            for (permissions) |p| if (g.boolean()) try asked.append(a, p);
+            if (asked.items.len == 0) try asked.append(a, permissions[0]);
+            var answer = try client.testProjectIamPermissions(ref, asked.items);
+            defer answer.deinit();
+            var want: std.ArrayList([]const u8) = .empty;
+            if (w) |x| for (asked.items) |p| if (holds(x, p)) try want.append(a, p);
+            std.mem.sort([]const u8, want.items, {}, lessThan);
+            try testing.expectEqual(want.items.len, answer.value.len);
+            for (want.items, answer.value) |x, y| try testing.expectEqualStrings(x, y);
+        }
+    }
+}
+
+test "fuzz IAM: the fake's policies and permission tests agree with a plain model, read through the client" {
+    try test_util.fuzzBytes({}, iamProperty, .{
+        .corpus = &.{ "", "\x08\x01\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x0c", "\x03\x00\x01\x00\x01\x01\x00\x01\x00\x00\x02\x01\x00\x01\x01\x00\x01\x00\x01" },
+        .random_runs = 200,
+        .max_len = 400,
+    });
 }

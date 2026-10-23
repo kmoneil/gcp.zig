@@ -628,6 +628,30 @@ pub fn build(b: *std.Build) void {
     });
     gcp_step.dependOn(&streamed(b, datatransfer_gcp_tests).step);
     test_step.dependOn(&datatransfer_gcp_tests.step);
+    // The IAM reads against a real project: IAM_READS_TEST=1 beside the
+    // usual two variables, a cloud-platform token. The suite reads the
+    // project's policy, deploys a zigps- service and job raw and makes two
+    // zigps- buckets, reads every policy and permission test, holds the
+    // Resource Manager and Cloud Run fakes to production's answers, and
+    // deletes everything it made.
+    const iam_gcp_tests = b.addTest(.{
+        .name = "iam-gcp-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/iam_gcp_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "resource_manager", .module = resource_manager },
+                .{ .name = "run", .module = cloud_run },
+                .{ .name = "storage", .module = storage },
+                .{ .name = "core", .module = core },
+            },
+        }),
+        .filters = test_filters,
+        .test_runner = test_runner,
+    });
+    gcp_step.dependOn(&streamed(b, iam_gcp_tests).step);
+    test_step.dependOn(&iam_gcp_tests.step);
     // Error Reporting against a real project with the API on:
     // GCP_TEST_PROJECT and GCP_TEST_TOKEN, a token that may report errors
     // and read and update groups. Each run reports a few errors of its own.
@@ -707,14 +731,14 @@ pub fn build(b: *std.Build) void {
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "monitoring_policies", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "run_actions", "dataflow_jobs", "dataflow_stop", "bigquery_query", "datatransfer_runs" }) |name| {
+    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "monitoring_policies", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "run_actions", "dataflow_jobs", "dataflow_stop", "bigquery_query", "datatransfer_runs", "permissions" }) |name| {
         // whoami, secret, gcs_cp, gcs_sign, gcs_notify, quickstart, iam,
         // secret_rotation, firestore, logs_read, logs_tail, projects_list,
         // error_dashboard, monitoring, monitoring_alerts,
         // monitoring_policies, pubsub_metrics,
         // kms, scheduler_jobs, scheduler_run, run_revisions, run_actions,
-        // dataflow_jobs, dataflow_stop, bigquery_query and
-        // datatransfer_runs pick their own credentials.
+        // dataflow_jobs, dataflow_stop, bigquery_query, datatransfer_runs
+        // and permissions pick their own credentials.
         const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "secret"))
@@ -749,6 +773,8 @@ pub fn build(b: *std.Build) void {
             &.{ .{ .name = "bigquery", .module = bigquery }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "datatransfer_runs"))
             &.{ .{ .name = "datatransfer", .module = datatransfer }, .{ .name = "auth", .module = auth } }
+        else if (std.mem.eql(u8, name, "permissions"))
+            &.{ .{ .name = "resource_manager", .module = resource_manager }, .{ .name = "run", .module = cloud_run }, .{ .name = "storage", .module = storage }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "gcs_notify") or std.mem.eql(u8, name, "quickstart"))
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else

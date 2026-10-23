@@ -175,8 +175,35 @@ Each as production answered when measured on 2026-10-21:
 could not hold: a location or job nobody put, an id taken, malformed or
 `-`, a status of `.unspecified` or `.unknown`.
 
+### Who has access
+
+Each as production answered when measured on 2026-10-23:
+
+- `setIamPolicy(name, bindings)` sets the policy of a service or job a
+  test put, by the full name `putService` or `putJob` returned;
+  `getServiceIamPolicy` and `getJobIamPolicy` answer it sorted by role,
+  each binding's members sorted. With none set the answer is
+  production's empty policy, `{"etag":"ACAB"}`, and **so it is for a
+  service or job nobody put**, as production answered one that did not
+  exist.
+- `holdPermissions(name, permissions)` says exactly what the caller holds
+  on a service or job, put or not, since production tests permissions on
+  one that does not exist as on one that does. Nothing said, every
+  permission asked is held. The answer is sorted; a permission named
+  twice is answered twice. Refused in production's words after "Failed
+  to test IAM permissions: ": none, a malformed or wildcard permission,
+  one that is not Cloud Run's, more than 100.
+- A region nobody put, `-` included, is 403 "Permission denied on
+  'locations/<l>' (or it may not exist)".
+
+A policy with bindings is written version, etag, bindings, as KMS's was
+measured: Cloud Run's was not, since the probe's account could not set
+one. Which of Cloud Run's permissions belong to a service and which to a
+job is not modelled: every `run.` one is taken on both.
+
 Not modelled, answered 501 with the reason: other writes (deploys,
-deletes, IAM), run overrides, traffic other than one revision at 100 %,
+deletes, setting IAM), a version 1 read of a policy with a condition,
+run overrides, traffic other than one revision at 100 %,
 an update mask other than the two above, reading a `validateOnly`
 request's operation, an etag the fake did not make under the etag mask,
 `-` for a location in a jobs path other than the jobs list, and another
@@ -188,4 +215,8 @@ nobody has, seeds the fake with everything production lists, and holds
 the fake to production's answer for every read. Its writes suite
 (`RUN_WRITES_TEST=1`) runs, cancels and routes traffic on real `zigps-`
 jobs and a service, then replays the same script on a fake seeded from
-production's reads and holds every outcome and refusal equal.
+production's reads and holds every outcome and refusal equal. The IAM
+reads' suite (`tests/iam_gcp_integration.zig`, `IAM_READS_TEST=1`) reads
+a real service's and job's policies and permissions, and those of ones
+nobody has, then replays the eight calls on a fake seeded from
+production's answers: on 2026-10-23 all eight agreed.
