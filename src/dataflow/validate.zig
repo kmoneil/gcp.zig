@@ -68,6 +68,6 @@ test "locations, job ids, names, tokens and agents" {
     try testing.expect(isPageToken("CicyMDI2LTEwLTIw="));
     try testing.expect(!isPageToken("a b"));
     try testing.expect(!isPageToken(""));
-    try testing.expect(isUserAgent("zig-gcp-dataflow/0.57"));
+    try testing.expect(isUserAgent("zig-gcp-dataflow/0.58"));
     try testing.expect(!isUserAgent("a\nb"));
 }

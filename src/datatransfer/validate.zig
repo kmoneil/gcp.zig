@@ -75,6 +75,6 @@ test "locations, ids, data sources and tokens: what goes into a request" {
     try testing.expect(!isDataSourceId(""));
     try testing.expect(isPageToken("CgwI"));
     try testing.expect(!isPageToken("a b"));
-    try testing.expect(isUserAgent("zig-gcp-datatransfer/0.57"));
+    try testing.expect(isUserAgent("zig-gcp-datatransfer/0.58"));
     try testing.expect(!isUserAgent("a\n"));
 }
