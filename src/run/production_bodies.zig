@@ -2833,3 +2833,131 @@ pub const operation_cancel_raced =
     \\ }
     \\}
 ;
+
+// The IAM reads, measured on 2026-10-23 in milestone 0 of the IAM reads
+// spec (`_tmp/iam-reads-m0/`), as the same account: verbatim but for a
+// final line break (that probe kept the raw answers).
+
+/// `GET .../services/S:getIamPolicy?options.requestedPolicyVersion=3` of a new service, under `run.readonly`, 2026-10-23 (`_tmp/iam-reads-m0/`): no bindings. A service that does not exist answered the same. HTTP 200.
+pub const iam_service_policy_new_status = 200;
+pub const iam_service_policy_new =
+    \\{
+    \\  "etag": "ACAB"
+    \\}
+;
+
+/// `getIamPolicy` at location `-`. HTTP 403.
+pub const iam_service_policy_dash_status = 403;
+pub const iam_service_policy_dash =
+    \\{
+    \\  "error": {
+    \\    "code": 403,
+    \\    "message": "Permission denied on 'locations/-' (or it may not exist)",
+    \\    "status": "PERMISSION_DENIED"
+    \\  }
+    \\}
+;
+
+/// `getIamPolicy` under `cloud-platform.read-only`, a scope Cloud Run does not take. HTTP 403.
+pub const iam_service_policy_scope_status = 403;
+pub const iam_service_policy_scope =
+    \\{
+    \\  "error": {
+    \\    "code": 403,
+    \\    "message": "Request had insufficient authentication scopes.",
+    \\    "status": "PERMISSION_DENIED",
+    \\    "details": [
+    \\      {
+    \\        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+    \\        "reason": "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+    \\        "domain": "googleapis.com",
+    \\        "metadata": {
+    \\          "method": "google.cloud.run.v2.Services.GetIamPolicy",
+    \\          "service": "run.googleapis.com"
+    \\        }
+    \\      }
+    \\    ]
+    \\  }
+    \\}
+;
+
+/// `testIamPermissions` of six on the service: the five held, sorted by name. HTTP 200.
+pub const iam_service_test_held_status = 200;
+pub const iam_service_test_held =
+    \\{
+    \\  "permissions": [
+    \\    "run.routes.invoke",
+    \\    "run.services.delete",
+    \\    "run.services.get",
+    \\    "run.services.getIamPolicy",
+    \\    "run.services.update"
+    \\  ]
+    \\}
+;
+
+/// `testIamPermissions` of `pubsub.topics.get` and `bigquery.datasets.get` on a service. HTTP 400.
+pub const iam_service_test_other_service_status = 400;
+pub const iam_service_test_other_service =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "Failed to test IAM permissions: Permission pubsub.topics.get is not valid for this resource.",
+    \\    "status": "INVALID_ARGUMENT"
+    \\  }
+    \\}
+;
+
+/// `testIamPermissions` on a service that does not exist: answered as if it did. HTTP 200.
+pub const iam_service_test_missing_status = 200;
+pub const iam_service_test_missing =
+    \\{
+    \\  "permissions": [
+    \\    "run.services.get"
+    \\  ]
+    \\}
+;
+
+/// `testIamPermissions` of 101 on a service. HTTP 400.
+pub const iam_service_test_too_many_status = 400;
+pub const iam_service_test_too_many =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "Failed to test IAM permissions: The number of permissions (101) is greater than the maximum allowed (100).",
+    \\    "status": "INVALID_ARGUMENT"
+    \\  }
+    \\}
+;
+
+/// `setIamPolicy` as an account without `run.services.setIamPolicy`, for the record: the policy stayed empty. HTTP 403.
+pub const iam_service_set_refused_status = 403;
+pub const iam_service_set_refused =
+    \\{
+    \\  "error": {
+    \\    "code": 403,
+    \\    "message": "Permission 'run.services.setIamPolicy' denied on resource 'projects/extractctl/locations/us-central1/services/zigps-02667a' (or resource may not exist).",
+    \\    "status": "PERMISSION_DENIED"
+    \\  }
+    \\}
+;
+
+/// `getIamPolicy` of a new job, under `run.readonly`. HTTP 200.
+pub const iam_job_policy_status = 200;
+pub const iam_job_policy =
+    \\{
+    \\  "etag": "ACAB"
+    \\}
+;
+
+/// `testIamPermissions` of five on the job: the four held, sorted by name. HTTP 200.
+pub const iam_job_test_held_status = 200;
+pub const iam_job_test_held =
+    \\{
+    \\  "permissions": [
+    \\    "run.executions.cancel",
+    \\    "run.jobs.get",
+    \\    "run.jobs.run",
+    \\    "run.jobs.runWithOverrides"
+    \\  ]
+    \\}
+;

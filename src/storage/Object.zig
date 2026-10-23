@@ -19,6 +19,7 @@ const encryption = @import("encryption.zig");
 const errors = @import("errors.zig");
 const gzip_download = @import("gzip_download.zig");
 const gzip_upload = @import("gzip_upload.zig");
+const iam = @import("iam.zig");
 const idempotency = @import("idempotency.zig");
 const logging = @import("logging.zig");
 const metadata = @import("metadata.zig");
@@ -133,6 +134,38 @@ fn getBilled(self: Object, options: types.GetOptions) Error!types.Owned(types.Ob
     result.value = codec.decodeObject(result.arena.allocator(), response) catch |err|
         return rpc.decodeFailed(self.client, err, "object");
     return result;
+}
+
+/// The object's IAM policy: in a bucket without uniform access, its access
+/// control list as Cloud Storage's legacy roles,
+/// `roles/storage.legacyObjectReader` and `.legacyObjectOwner`, always
+/// version 1 with no conditions. In a bucket with uniform access Cloud
+/// Storage refuses it, `error.InvalidArgument` with its words in
+/// `Diagnostics`: the bucket's policy is the one that applies there. Needs
+/// `storage.objects.getIamPolicy`, and a token for `Scope.full_control` or
+/// `.cloud_platform`: production refused the read-only and read-write
+/// scopes on 2026-10-23, though Google's discovery document names them. An
+/// object or generation that does not exist is `error.NotFound`.
+pub fn iamPolicy(self: Object, options: types.ObjectIamOptions) Error!types.Owned(core.iam.Policy) {
+    var client: Client = undefined;
+    const billed = try self.forCall(&client);
+    try rpc.checkBucketName(billed.client, billed.bucket);
+    try rpc.checkObjectName(billed.client, billed.name);
+    return iam.readObject(billed.client, billed.bucket, billed.name, options.generation);
+}
+
+/// Of `permissions`, those the caller holds on the object, sorted by name
+/// as Cloud Storage answers them: 1 to 100 of them, each once and none a
+/// wildcard, are checked before sending (`error.InvalidArgument`), and
+/// Cloud Storage takes at most 84 and only its own object permissions. An
+/// object that does not exist is answered as if it did: a diagnostic, not
+/// a check. Takes any Storage scope.
+pub fn testIamPermissions(self: Object, permissions: []const []const u8, options: types.ObjectIamOptions) Error!types.Owned([]const []const u8) {
+    var client: Client = undefined;
+    const billed = try self.forCall(&client);
+    try rpc.checkBucketName(billed.client, billed.bucket);
+    try rpc.checkObjectName(billed.client, billed.name);
+    return iam.testObjectPermissions(billed.client, billed.bucket, billed.name, options.generation, permissions);
 }
 
 /// A V4 signed URL: whoever holds it can make the one request it describes

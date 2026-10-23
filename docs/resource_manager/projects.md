@@ -130,6 +130,41 @@ page each, on the same quota as the project search. Then:
   folders the caller can read to the organization: "Prod", "Payments",
   "example.com". An organization's display name is its primary domain.
 
+## Who has access
+
+`Client.getProjectIamPolicy(id_or_number)` reads the project's IAM
+policy, as `core.iam.Policy` (exported here as `iam`): what the project
+grants, which every resource under it inherits. A Cloud Run service's
+policy, read with `run.Client.getServiceIamPolicy`, holds only its own
+bindings, so a permissions view shows the project's beside it as
+inherited.
+
+```zig
+var policy = try client.getProjectIamPolicy("my-project");
+defer policy.deinit();
+for (policy.value.bindings) |b| std.debug.print("{s}: {d} members\n", .{ b.role, b.members.len });
+const owner = policy.value.grants("roles/owner", "user:alice@example.com");
+```
+
+It asks for version 3, so a conditional binding comes back whole; a
+policy with no condition is answered as version 1. A project that does
+not exist and one whose policy the caller may not read are the same
+403, `error.PermissionDenied`, "(or it may not exist)". It needs
+`resourcemanager.projects.getIamPolicy` (Viewer has it), and the
+client's read-only scope serves it.
+
+`Client.testProjectIamPermissions(id_or_number, permissions)` answers
+which of `permissions` the caller holds on the project, sorted by name as
+production sends them. Any service's permissions can be asked of a
+project (`storage.buckets.create`, `run.services.create`): what the
+caller holds there it holds on everything under the project. One to
+100, each once and none a wildcard, are checked before sending; an
+unknown permission is production's 400, `error.InvalidArgument`
+("Permission x.y.z is not valid for this resource."). A project that
+does not exist holds nothing, which is not an error. Google calls the
+test a diagnostic that "may fail open", not a check: see
+[IAM](../iam.md#testing-permissions).
+
 ## Errors
 
 | Error | When |

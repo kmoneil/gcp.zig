@@ -449,6 +449,90 @@ pub fn getOperation(self: *Client, name: []const u8) Error!types.Owned(types.Ope
     return result;
 }
 
+/// The service's own IAM policy, asked for as version 3: not what it
+/// inherits from its project, which `resource_manager`'s
+/// `Client.getProjectIamPolicy` reads. `roles/run.invoker` held by
+/// `allUsers` makes a service public. A new service's policy has no
+/// bindings (`{"etag":"ACAB"}`), and production answers a service that
+/// does not exist with that same empty policy rather than an error, as
+/// measured on 2026-10-23: read the service first where that matters.
+/// Takes `run.services.getIamPolicy`, under any of the client's scopes.
+/// Location `-` is refused before sending, which production answers with a
+/// 403 that reads like a missing permission.
+pub fn getServiceIamPolicy(self: *Client, location: []const u8, id: []const u8) Error!types.Owned(core.iam.Policy) {
+    return self.iamPolicy(.service, location, id);
+}
+
+/// Of `permissions`, those the caller holds on the service, sorted by name
+/// as production answers them. 1 to 100 of them, each once and none a
+/// wildcard, are checked before sending (`error.InvalidArgument`); Cloud
+/// Run refuses any but its own permissions with `error.InvalidArgument`.
+/// A service that does not exist is answered as if it did: a diagnostic,
+/// not a check.
+pub fn testServiceIamPermissions(self: *Client, location: []const u8, id: []const u8, permissions: []const []const u8) Error!types.Owned([]const []const u8) {
+    return self.testIamPermissions(.service, location, id, permissions);
+}
+
+/// The job's own IAM policy, as `getServiceIamPolicy` reads a service's,
+/// and answered the same way for a job that does not exist. Takes
+/// `run.jobs.getIamPolicy`.
+pub fn getJobIamPolicy(self: *Client, location: []const u8, id: []const u8) Error!types.Owned(core.iam.Policy) {
+    return self.iamPolicy(.job, location, id);
+}
+
+/// Of `permissions`, those the caller holds on the job, as
+/// `testServiceIamPermissions` answers for a service.
+pub fn testJobIamPermissions(self: *Client, location: []const u8, id: []const u8, permissions: []const []const u8) Error!types.Owned([]const []const u8) {
+    return self.testIamPermissions(.job, location, id, permissions);
+}
+
+const IamTarget = enum { service, job };
+
+fn iamPath(self: *Client, a: Allocator, target: IamTarget, location: []const u8, id: []const u8, method: []const u8) Error![]const u8 {
+    if (!validate.isLocation(location) or std.mem.eql(u8, location, "-")) {
+        if (self.diagnostics) |d| d.print("invalid location: expected one region id such as us-central1; production answers - with a 403 for an IAM call", .{});
+        return error.InvalidName;
+    }
+    try self.checkId(id, @tagName(target));
+    const resource = switch (target) {
+        .service => try names.service(a, self.project, location, id),
+        .job => try names.job(a, self.project, location, id),
+    };
+    return std.mem.concat(a, u8, &.{ resource, method });
+}
+
+fn iamPolicy(self: *Client, target: IamTarget, location: []const u8, id: []const u8) Error!types.Owned(core.iam.Policy) {
+    rpc.begin(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const path = try self.iamPath(scratch.allocator(), target, location, id, ":getIamPolicy?options.requestedPolicyVersion=3");
+    var result: types.Owned(core.iam.Policy) = try .init(self.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(self, result.arena, .{ .method = .GET, .path = path });
+    result.value = core.iam.decode(result.arena.allocator(), body) catch |err|
+        return rpc.decodeFailed(self, err, "IAM policy");
+    return result;
+}
+
+/// A POST that changes nothing, so retried as a read is.
+fn testIamPermissions(self: *Client, target: IamTarget, location: []const u8, id: []const u8, permissions: []const []const u8) Error!types.Owned([]const []const u8) {
+    rpc.begin(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const path = try self.iamPath(a, target, location, id, ":testIamPermissions");
+    if (core.iam.permissionsProblem(permissions)) |problem| {
+        if (self.diagnostics) |d| d.print("{s}", .{problem});
+        return error.InvalidArgument;
+    }
+    var result: types.Owned([]const []const u8) = try .init(self.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(self, result.arena, .{ .method = .POST, .path = path, .body = try core.iam.encodePermissions(a, permissions) });
+    result.value = core.iam.decodePermissions(result.arena.allocator(), body) catch |err|
+        return rpc.decodeFailed(self, err, "testIamPermissions answer");
+    return result;
+}
+
 /// Starts a new execution of the job, as it is configured (no overrides).
 /// Answers its operation at once, not done: the operation's subject is the
 /// new execution, by its full name, to read with `getExecutionNamed`. The
@@ -1307,4 +1391,137 @@ test "every allocation failure in a write is OutOfMemory without leaks" {
         }
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.calls, .{});
+}
+
+test "golden: a service's and a job's IAM policy and permissions, production's answers" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = production.iam_service_policy_new } },
+        .{ .respond = .{ .body = production.iam_service_test_held } },
+        .{ .respond = .{ .body = production.iam_job_policy } },
+        .{ .respond = .{ .body = production.iam_job_test_held } },
+        .{ .respond = .{ .body = "{\"version\":3,\"etag\":\"BwX=\",\"bindings\":[{\"role\":\"roles/run.invoker\",\"members\":[\"allUsers\"]},{\"role\":\"roles/run.developer\",\"members\":[\"user:a@example.com\"],\"condition\":{\"title\":\"t\",\"expression\":\"request.time < timestamp('2027-01-01T00:00:00Z')\"}}]}" } },
+    });
+    defer h.deinit();
+
+    var empty = try h.client.getServiceIamPolicy("us-central1", "zigps-02667a");
+    defer empty.deinit();
+    try h.expectRequest(0, .GET, "https://run.googleapis.com/v2/projects/my-project/locations/us-central1/services/zigps-02667a:getIamPolicy?options.requestedPolicyVersion=3");
+    try testing.expectEqualStrings("https://www.googleapis.com/auth/run.readonly", h.token.firstScope());
+    try testing.expectEqual(0, empty.value.bindings.len);
+    try testing.expectEqualStrings("ACAB", empty.value.etag.?);
+
+    const asked = [_][]const u8{ "run.services.get", "run.services.update", "run.services.delete", "run.services.getIamPolicy", "run.services.setIamPolicy", "run.routes.invoke" };
+    var held = try h.client.testServiceIamPermissions("us-central1", "zigps-02667a", &asked);
+    defer held.deinit();
+    try h.expectSent(1, .POST, "https://run.googleapis.com/v2/projects/my-project/locations/us-central1/services/zigps-02667a:testIamPermissions", "{\"permissions\":[\"run.services.get\",\"run.services.update\",\"run.services.delete\",\"run.services.getIamPolicy\",\"run.services.setIamPolicy\",\"run.routes.invoke\"]}");
+    // Sorted by name, as production answers; setIamPolicy not held.
+    const want = [_][]const u8{ "run.routes.invoke", "run.services.delete", "run.services.get", "run.services.getIamPolicy", "run.services.update" };
+    try testing.expectEqual(want.len, held.value.len);
+    for (want, held.value) |w, g| try testing.expectEqualStrings(w, g);
+
+    var job = try h.client.getJobIamPolicy("us-central1", "zigps-02667a-job");
+    defer job.deinit();
+    try h.expectRequest(2, .GET, "https://run.googleapis.com/v2/projects/my-project/locations/us-central1/jobs/zigps-02667a-job:getIamPolicy?options.requestedPolicyVersion=3");
+    try testing.expectEqual(0, job.value.bindings.len);
+
+    var job_held = try h.client.testJobIamPermissions("us-central1", "zigps-02667a-job", &.{ "run.jobs.get", "run.jobs.run", "run.jobs.runWithOverrides", "run.executions.cancel", "run.jobs.setIamPolicy" });
+    defer job_held.deinit();
+    try h.expectSent(3, .POST, "https://run.googleapis.com/v2/projects/my-project/locations/us-central1/jobs/zigps-02667a-job:testIamPermissions", "{\"permissions\":[\"run.jobs.get\",\"run.jobs.run\",\"run.jobs.runWithOverrides\",\"run.executions.cancel\",\"run.jobs.setIamPolicy\"]}");
+    try testing.expectEqual(4, job_held.value.len);
+    try testing.expectEqualStrings("run.executions.cancel", job_held.value[0]);
+
+    // A public service, with a conditional binding beside it: production's
+    // shape for both comes from core.iam's measurements elsewhere.
+    var public = try h.client.getServiceIamPolicy("us-central1", "s");
+    defer public.deinit();
+    try testing.expect(public.value.grants("roles/run.invoker", "allUsers"));
+    try testing.expect(public.value.hasConditions());
+    try testing.expectEqualStrings("t", (try std.json.parseFromSliceLeaky(struct { title: []const u8 }, public.arena.allocator(), public.value.bindings[1].condition.?, .{ .ignore_unknown_fields = true })).title);
+}
+
+test "IAM reads: production's refusals, the open answers for what does not exist, and retries" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = production.iam_service_policy_scope_status, .body = production.iam_service_policy_scope } },
+        .{ .respond = .{ .status = production.iam_service_test_other_service_status, .body = production.iam_service_test_other_service } },
+        .{ .respond = .{ .body = production.iam_service_policy_new } },
+        .{ .respond = .{ .body = production.iam_service_test_missing } },
+        .{ .respond = .{ .status = 503, .body = "{\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\"}}" } },
+        .{ .respond = .{ .body = production.iam_service_test_missing } },
+        .{ .respond = .{ .status = 503, .body = "{\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\"}}" } },
+        .{ .respond = .{ .body = production.iam_job_policy } },
+        .{ .respond = .{ .body = "{\"bindings\":{}}" } },
+    });
+    defer h.deinit();
+
+    try testing.expectError(error.PermissionDenied, h.client.getServiceIamPolicy("us-central1", "s"));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "insufficient authentication scopes") != null);
+    try testing.expectError(error.InvalidArgument, h.client.testServiceIamPermissions("us-central1", "s", &.{ "pubsub.topics.get", "bigquery.datasets.get" }));
+    try testing.expectEqualStrings("Failed to test IAM permissions: Permission pubsub.topics.get is not valid for this resource.", h.diag.message());
+
+    // Production cannot tell a missing service from one with no policy, and
+    // tests permissions on it as if it existed.
+    var missing = try h.client.getServiceIamPolicy("us-central1", "zigps-nope-02667a");
+    defer missing.deinit();
+    try testing.expectEqual(0, missing.value.bindings.len);
+    var missing_held = try h.client.testServiceIamPermissions("us-central1", "zigps-nope-02667a", &.{"run.services.get"});
+    defer missing_held.deinit();
+    try testing.expectEqualStrings("run.services.get", missing_held.value[0]);
+
+    // A 503 is tried again on both, the POST included: it changes nothing.
+    var retried = try h.client.testServiceIamPermissions("us-central1", "s", &.{"run.services.get"});
+    retried.deinit();
+    var retried_job = try h.client.getJobIamPolicy("us-central1", "j");
+    retried_job.deinit();
+    try h.expectRequestCount(8);
+
+    try testing.expectError(error.InvalidResponse, h.client.getJobIamPolicy("us-central1", "j"));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "IAM policy response") != null);
+    try h.expectRequestCount(9);
+
+    // Refused before sending: location -, which production answers with a
+    // 403; a bad region or id; and the permission list's rules.
+    try testing.expectError(error.InvalidName, h.client.getServiceIamPolicy("-", "s"));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "one region id") != null);
+    try testing.expectError(error.InvalidName, h.client.testJobIamPermissions("-", "j", &.{"run.jobs.get"}));
+    try testing.expectError(error.InvalidName, h.client.getJobIamPolicy("US Central", "j"));
+    try testing.expectError(error.InvalidName, h.client.getServiceIamPolicy("us-central1", "-"));
+    try testing.expectError(error.InvalidName, h.client.getServiceIamPolicy("us-central1", "a/b"));
+    try testing.expectError(error.InvalidArgument, h.client.testServiceIamPermissions("us-central1", "s", &.{}));
+    try testing.expectError(error.InvalidArgument, h.client.testServiceIamPermissions("us-central1", "s", &.{ "run.services.get", "run.services.get" }));
+    try testing.expectError(error.InvalidArgument, h.client.testJobIamPermissions("us-central1", "j", &.{"run.jobs.*"}));
+    var many: [101][]const u8 = undefined;
+    var names_buf: [101][24]u8 = undefined;
+    for (&many, &names_buf, 0..) |*m, *buf, i| m.* = try std.fmt.bufPrint(buf, "run.services.get{d}", .{i});
+    try testing.expectError(error.InvalidArgument, h.client.testServiceIamPermissions("us-central1", "s", &many));
+    try testing.expectEqualStrings("at most 100 permissions in one test", h.diag.message());
+    try h.expectRequestCount(9);
+}
+
+test "every allocation failure in an IAM read is OutOfMemory without leaks" {
+    const Run = struct {
+        fn run(gpa: Allocator) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+                .{ .respond = .{ .body = production.iam_service_policy_new } },
+                .{ .respond = .{ .body = production.iam_service_test_held } },
+                .{ .respond = .{ .body = production.iam_job_policy } },
+                .{ .respond = .{ .body = production.iam_job_test_held } },
+            });
+            defer fake.deinit();
+            var clock: test_util.FakeClock = .{};
+            var tokens: test_util.FakeTokenProvider = .{};
+            var client = try Client.init(gpa, clock.io(), .{ .project_id = "my-project", .token_provider = tokens.provider(), .transport = fake.transport() });
+            defer client.deinit();
+            var a = try client.getServiceIamPolicy("us-central1", "s");
+            a.deinit();
+            var b = try client.testServiceIamPermissions("us-central1", "s", &.{ "run.services.get", "run.routes.invoke" });
+            b.deinit();
+            var c = try client.getJobIamPolicy("us-central1", "j");
+            c.deinit();
+            var d = try client.testJobIamPermissions("us-central1", "j", &.{"run.jobs.get"});
+            d.deinit();
+        }
+    };
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
 }

@@ -1,7 +1,8 @@
 //! IAM on buckets: `GET b/{bucket}/iam`, `PUT b/{bucket}/iam`, which takes
 //! the policy bare, and `GET b/{bucket}/iam/testPermissions`, through
-//! `core.iam`. A billed handle's calls name its project, as every call
-//! does.
+//! `core.iam`; and the reads of an object's, `GET b/{bucket}/o/{object}/iam`
+//! and `.../iam/testPermissions`. A billed handle's calls name its project,
+//! as every call does.
 //!
 //! Measured in production on 2026-10-01:
 //!
@@ -23,6 +24,23 @@
 //!   Cloud Storage's own, and not `storage.buckets.list` or
 //!   `storage.buckets.create`, which belong to projects.
 //! - fake-gcs-server has no IAM routes: every call is `error.NotFound`.
+//!
+//! And on 2026-10-23, of objects:
+//!
+//! - An object's policy is read only under `cloud-platform` or
+//!   `devstorage.full_control`: the read-only and read-write scopes, and
+//!   `cloud-platform.read-only`, are 403 "Provided scope(s) are not
+//!   authorized", though the discovery document names them.
+//!   `testPermissions` answers under any Storage scope.
+//! - In a bucket without uniform access it is the object's access control
+//!   list as legacy roles, `roles/storage.legacyObjectReader` and
+//!   `roles/storage.legacyObjectOwner`, version 1, etag `CAE=`. In one with
+//!   uniform access it is refused, 400 "Object policies are disabled for
+//!   bucket 'B' when uniform bucket-level access is enabled. ...".
+//! - `testPermissions` on an object that does not exist, or a generation
+//!   that never was, answers as if it did; a bucket that does not exist is
+//!   404. It refuses a bucket's permission on an object, 400 "Invalid
+//!   argument.".
 
 const std = @import("std");
 const core = @import("core");
@@ -166,6 +184,36 @@ pub fn testPermissions(r: Resource, permissions: []const []const u8) Error!types
     const body = try rpc.execute(c, result.arena, .{ .method = .GET, .path = path });
     result.value = core.iam.decodePermissions(result.arena.allocator(), body) catch |err|
         return rpc.decodeFailed(c, err, "testIamPermissions answer");
+    return result;
+}
+
+/// An object's IAM policy: its access control list as Cloud Storage's
+/// legacy roles, at a generation when one is named.
+pub fn readObject(client: *Client, bucket: []const u8, object: []const u8, generation: ?u64) Error!types.Owned(Policy) {
+    var scratch: std.heap.ArenaAllocator = .init(client.gpa);
+    defer scratch.deinit();
+    const path = try names.objectIamPath(scratch.allocator(), bucket, object, generation);
+    var result: types.Owned(Policy) = try .init(client.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(client, result.arena, .{ .method = .GET, .path = path });
+    return decoded(client, &result, body);
+}
+
+/// `testIamPermissions` on an object, after the check every service
+/// shares.
+pub fn testObjectPermissions(client: *Client, bucket: []const u8, object: []const u8, generation: ?u64, permissions: []const []const u8) Error!types.Owned([]const []const u8) {
+    if (core.iam.permissionsProblem(permissions)) |problem| {
+        if (client.diagnostics) |d| d.print("{s}", .{problem});
+        return error.InvalidArgument;
+    }
+    var scratch: std.heap.ArenaAllocator = .init(client.gpa);
+    defer scratch.deinit();
+    const path = try names.objectTestPermissionsPath(scratch.allocator(), bucket, object, generation, permissions);
+    var result: types.Owned([]const []const u8) = try .init(client.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(client, result.arena, .{ .method = .GET, .path = path });
+    result.value = core.iam.decodePermissions(result.arena.allocator(), body) catch |err|
+        return rpc.decodeFailed(client, err, "testIamPermissions answer");
     return result;
 }
 
@@ -544,4 +592,276 @@ fn iamModelProperty(_: void, bytes: []const u8) !void {
 
 test "heavy property iam on buckets: grants and revokes land as asked, a stale write is Aborted, and the legacy owners stay" {
     try test_util.fuzzBytes({}, iamModelProperty, .{ .corpus = &.{ "", test_util.repeat("\x01", 64), test_util.repeat("\x00\x01\x02\x03\x04", 20) } });
+}
+
+// Production's answers on 2026-10-23, milestone 0 of the IAM reads spec
+// (`_tmp/iam-reads-m0/`): verbatim but for a final line break.
+
+/// `GET b/B/o/a%20b.txt/iam` under `cloud-platform`, a bucket without uniform access, 2026-10-23: the object's access control list as legacy roles; `#0`, the live object. HTTP 200.
+const object_policy_status = 200;
+const object_policy =
+    \\{
+    \\  "kind": "storage#policy",
+    \\  "resourceId": "projects/_/buckets/zigps-02667a-fine/objects/a b.txt#0",
+    \\  "version": 1,
+    \\  "etag": "CAE=",
+    \\  "bindings": [
+    \\    {
+    \\      "role": "roles/storage.legacyObjectReader",
+    \\      "members": [
+    \\        "projectViewer:extractctl"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/storage.legacyObjectOwner",
+    \\      "members": [
+    \\        "projectOwner:extractctl",
+    \\        "projectEditor:extractctl",
+    \\        "serviceAccount:zig-gcp@extractctl.iam.gserviceaccount.com"
+    \\      ]
+    \\    }
+    \\  ]
+    \\}
+;
+
+/// The same at the noncurrent generation: `#G` in `resourceId`. HTTP 200.
+const object_policy_old_status = 200;
+const object_policy_old =
+    \\{
+    \\  "kind": "storage#policy",
+    \\  "resourceId": "projects/_/buckets/zigps-5d3f17-fine/objects/a b.txt#1792754022606886",
+    \\  "version": 1,
+    \\  "etag": "CAE=",
+    \\  "bindings": [
+    \\    {
+    \\      "role": "roles/storage.legacyObjectReader",
+    \\      "members": [
+    \\        "projectViewer:extractctl"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/storage.legacyObjectOwner",
+    \\      "members": [
+    \\        "projectOwner:extractctl",
+    \\        "projectEditor:extractctl",
+    \\        "serviceAccount:zig-gcp@extractctl.iam.gserviceaccount.com"
+    \\      ]
+    \\    }
+    \\  ]
+    \\}
+;
+
+/// An object's policy in a bucket with uniform access. HTTP 400.
+const object_policy_uniform_status = 400;
+const object_policy_uniform =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "Object policies are disabled for bucket 'zigps-02667a-uniform' when uniform bucket-level access is enabled. Read more at https://cloud.google.com/storage/docs/uniform-bucket-level-access.",
+    \\    "errors": [
+    \\      {
+    \\        "message": "Object policies are disabled for bucket 'zigps-02667a-uniform' when uniform bucket-level access is enabled. Read more at https://cloud.google.com/storage/docs/uniform-bucket-level-access.",
+    \\        "domain": "global",
+    \\        "reason": "invalid"
+    \\      }
+    \\    ]
+    \\  }
+    \\}
+;
+
+/// An object's policy under `devstorage.read_only`, which the discovery document names. HTTP 403.
+const object_policy_scope_status = 403;
+const object_policy_scope =
+    \\{
+    \\  "error": {
+    \\    "code": 403,
+    \\    "message": "Provided scope(s) are not authorized",
+    \\    "errors": [
+    \\      {
+    \\        "message": "Provided scope(s) are not authorized",
+    \\        "domain": "global",
+    \\        "reason": "forbidden"
+    \\      }
+    \\    ]
+    \\  }
+    \\}
+;
+
+/// An object that does not exist. HTTP 404.
+const object_policy_missing_status = 404;
+const object_policy_missing =
+    \\{
+    \\  "error": {
+    \\    "code": 404,
+    \\    "message": "No such object: zigps-5d3f17-fine/nope.txt",
+    \\    "errors": [
+    \\      {
+    \\        "message": "No such object: zigps-5d3f17-fine/nope.txt",
+    \\        "domain": "global",
+    \\        "reason": "notFound"
+    \\      }
+    \\    ]
+    \\  }
+    \\}
+;
+
+/// `testPermissions` of five on the object, under `devstorage.read_only`: all held, sorted. HTTP 200.
+const object_test_held_status = 200;
+const object_test_held =
+    \\{
+    \\  "kind": "storage#testIamPermissionsResponse",
+    \\  "permissions": [
+    \\    "storage.objects.delete",
+    \\    "storage.objects.get",
+    \\    "storage.objects.getIamPolicy",
+    \\    "storage.objects.setIamPolicy",
+    \\    "storage.objects.update"
+    \\  ]
+    \\}
+;
+
+/// `testPermissions` on an object that does not exist: answered as if it did. HTTP 200.
+const object_test_missing_status = 200;
+const object_test_missing =
+    \\{
+    \\  "kind": "storage#testIamPermissionsResponse",
+    \\  "permissions": [
+    \\    "storage.objects.get"
+    \\  ]
+    \\}
+;
+
+/// `testPermissions` of 85. HTTP 400.
+const object_test_too_many_status = 400;
+const object_test_too_many =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "Must specify \u003c= 84 permissions.",
+    \\    "errors": [
+    \\      {
+    \\        "message": "Must specify \u003c= 84 permissions.",
+    \\        "domain": "global",
+    \\        "reason": "invalid"
+    \\      }
+    \\    ]
+    \\  }
+    \\}
+;
+
+test "object IAM: production's policy at the live and a named generation, its refusals, and the paths" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = object_policy } },
+        .{ .respond = .{ .body = object_policy_old } },
+        .{ .respond = .{ .status = object_policy_uniform_status, .body = object_policy_uniform } },
+        .{ .respond = .{ .status = object_policy_scope_status, .body = object_policy_scope } },
+        .{ .respond = .{ .status = object_policy_missing_status, .body = object_policy_missing } },
+        .{ .respond = .{ .body = object_policy } },
+        .{ .respond = .{ .body = "{\"bindings\":7}" } },
+    }, .{});
+    defer h.deinit();
+    const o = h.client.bucket("zigps-02667a-fine").object("a b.txt");
+
+    var live = try o.iamPolicy(.{});
+    defer live.deinit();
+    try h.expectRequest(0, .GET, "https://storage.googleapis.com/storage/v1/b/zigps-02667a-fine/o/a%20b.txt/iam", null);
+    try testing.expectEqual(1, live.value.version);
+    try testing.expectEqualStrings("CAE=", live.value.etag.?);
+    try testing.expectEqual(2, live.value.bindings.len);
+    try testing.expect(live.value.grants("roles/storage.legacyObjectReader", "projectViewer:extractctl"));
+    try testing.expect(live.value.grants("roles/storage.legacyObjectOwner", "serviceAccount:zig-gcp@extractctl.iam.gserviceaccount.com"));
+    try testing.expect(!live.value.grants("roles/storage.legacyObjectOwner", "projectViewer:extractctl"));
+
+    var old = try o.iamPolicy(.{ .generation = 1792754022606886 });
+    defer old.deinit();
+    try h.expectRequest(1, .GET, "https://storage.googleapis.com/storage/v1/b/zigps-02667a-fine/o/a%20b.txt/iam?generation=1792754022606886", null);
+    try testing.expectEqual(2, old.value.bindings.len);
+
+    try testing.expectError(error.InvalidArgument, h.client.bucket("zigps-02667a-uniform").object("a.txt").iamPolicy(.{}));
+    try testing.expect(std.mem.startsWith(u8, h.diag.message(), "Object policies are disabled for bucket 'zigps-02667a-uniform'"));
+    try testing.expectError(error.PermissionDenied, o.iamPolicy(.{}));
+    try testing.expectEqualStrings("Provided scope(s) are not authorized", h.diag.message());
+    try testing.expectError(error.NotFound, h.client.bucket("zigps-02667a-fine").object("nope.txt").iamPolicy(.{}));
+
+    var billed = try o.withBillingProject("payer").iamPolicy(.{ .generation = 5 });
+    defer billed.deinit();
+    try h.expectRequest(5, .GET, "https://storage.googleapis.com/storage/v1/b/zigps-02667a-fine/o/a%20b.txt/iam?generation=5&userProject=payer", null);
+    try testing.expectEqualStrings("payer", (try h.fake.request(5)).header("x-goog-user-project").?);
+
+    try testing.expectError(error.InvalidResponse, o.iamPolicy(.{}));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "IAM policy response") != null);
+
+    // Names Cloud Storage could not take are refused before sending.
+    try testing.expectError(error.InvalidBucketName, h.client.bucket("a b").object("a").iamPolicy(.{}));
+    try testing.expectError(error.InvalidBucketName, h.client.bucket("a/b").object("a").testIamPermissions(&.{"storage.objects.get"}, .{}));
+    try testing.expectError(error.InvalidObjectName, h.client.bucket("b").object("").iamPolicy(.{}));
+    try testing.expectError(error.InvalidObjectName, h.client.bucket("b").object("").testIamPermissions(&.{"storage.objects.get"}, .{}));
+    try h.expectRequestCount(7);
+}
+
+test "object IAM: testPermissions' path, production's sorted answer, and the checks before sending" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = object_test_held } },
+        .{ .respond = .{ .body = object_test_missing } },
+        .{ .respond = .{ .status = object_test_too_many_status, .body = object_test_too_many } },
+        .{ .respond = .{ .status = 503, .body = "{\"error\":{\"code\":503,\"message\":\"Backend Error\"}}" } },
+        .{ .respond = .{ .body = object_test_missing } },
+    }, .{});
+    defer h.deinit();
+    const o = h.client.bucket("zigps-02667a-fine").object("a b.txt");
+
+    const asked = [_][]const u8{ "storage.objects.get", "storage.objects.delete", "storage.objects.update", "storage.objects.getIamPolicy", "storage.objects.setIamPolicy" };
+    var held = try o.testIamPermissions(&asked, .{});
+    defer held.deinit();
+    try h.expectRequest(0, .GET, "https://storage.googleapis.com/storage/v1/b/zigps-02667a-fine/o/a%20b.txt/iam/testPermissions?permissions=storage.objects.get&permissions=storage.objects.delete&permissions=storage.objects.update&permissions=storage.objects.getIamPolicy&permissions=storage.objects.setIamPolicy", null);
+    const want = [_][]const u8{ "storage.objects.delete", "storage.objects.get", "storage.objects.getIamPolicy", "storage.objects.setIamPolicy", "storage.objects.update" };
+    try testing.expectEqual(want.len, held.value.len);
+    for (want, held.value) |w, g| try testing.expectEqualStrings(w, g);
+
+    // An object that does not exist is answered as if it did.
+    var missing = try h.client.bucket("zigps-02667a-fine").object("nope.txt").testIamPermissions(&.{"storage.objects.get"}, .{ .generation = 7 });
+    defer missing.deinit();
+    try h.expectRequest(1, .GET, "https://storage.googleapis.com/storage/v1/b/zigps-02667a-fine/o/nope.txt/iam/testPermissions?permissions=storage.objects.get&generation=7", null);
+    try testing.expectEqualStrings("storage.objects.get", missing.value[0]);
+
+    // Cloud Storage's own limit is 84, below core's 100.
+    var many: [85][]const u8 = undefined;
+    var names_buf: [85][24]u8 = undefined;
+    for (&many, &names_buf, 0..) |*m, *buf, i| m.* = try std.fmt.bufPrint(buf, "storage.objects.get{d}", .{i});
+    try testing.expectError(error.InvalidArgument, o.testIamPermissions(&many, .{}));
+    try testing.expectEqualStrings("Must specify <= 84 permissions.", h.diag.message());
+
+    // A GET, so a 503 is tried again.
+    var retried = try o.testIamPermissions(&.{"storage.objects.get"}, .{});
+    retried.deinit();
+    try h.expectRequestCount(5);
+
+    try testing.expectError(error.InvalidArgument, o.testIamPermissions(&.{}, .{}));
+    try testing.expectError(error.InvalidArgument, o.testIamPermissions(&.{ "storage.objects.get", "storage.objects.get" }, .{}));
+    try testing.expectError(error.InvalidArgument, o.testIamPermissions(&.{"storage.objects.*"}, .{}));
+    try h.expectRequestCount(5);
+}
+
+test "object IAM: every allocation failure is OutOfMemory without leaks" {
+    const Run = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+                .{ .respond = .{ .body = object_policy } },
+                .{ .respond = .{ .body = object_test_held } },
+            });
+            defer fake.deinit();
+            var clock: test_util.FakeClock = .{};
+            var token: test_util.FakeTokenProvider = .{};
+            var client = try Client.init(gpa, clock.io(), .{ .project_id = "p", .token_provider = token.provider(), .transport = fake.transport() });
+            defer client.deinit();
+            const o = client.bucket("b").object("a b.txt");
+            var p = try o.iamPolicy(.{ .generation = 3 });
+            p.deinit();
+            var t = try o.testIamPermissions(&.{ "storage.objects.get", "storage.objects.delete" }, .{});
+            t.deinit();
+        }
+    };
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
 }

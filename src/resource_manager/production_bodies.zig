@@ -479,6 +479,334 @@ pub const folders_get_missing =
     \\}
 ;
 
+// The IAM reads, measured on 2026-10-23 in milestone 0 of the IAM reads
+// spec (`_tmp/iam-reads-m0/`), as the same account: verbatim but for a
+// final line break, and the project policy's members, each replaced by an
+// example.com address of its kind.
+
+/// `POST /v3/projects/extractctl:getIamPolicy` asking version 3, under `cloud-platform.read-only`, 2026-10-23: no condition, so version 1; every member replaced by an example.com address of its kind, the layout kept (asked without `prettyPrint=false`). HTTP 200.
+pub const iam_policy_extractctl_status = 200;
+pub const iam_policy_extractctl =
+    \\{
+    \\  "version": 1,
+    \\  "etag": "BwZeRiqaZf0=",
+    \\  "bindings": [
+    \\    {
+    \\      "role": "roles/artifactregistry.admin",
+    \\      "members": [
+    \\        "user:person1@example.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/artifactregistry.serviceAgent",
+    \\      "members": [
+    \\        "serviceAccount:account1@example-project.iam.gserviceaccount.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/bigquery.admin",
+    \\      "members": [
+    \\        "user:person1@example.com",
+    \\        "user:person2@example.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/bigquery.jobUser",
+    \\      "members": [
+    \\        "serviceAccount:account2@example-project.iam.gserviceaccount.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/bigquerydatatransfer.serviceAgent",
+    \\      "members": [
+    \\        "serviceAccount:account3@example-project.iam.gserviceaccount.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/browser",
+    \\      "members": [
+    \\        "serviceAccount:account4@example-project.iam.gserviceaccount.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/cloudbuild.admin",
+    \\      "members": [
+    \\        "user:person1@example.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/cloudbuild.builds.builder",
+    \\      "members": [
+    \\        "serviceAccount:account5@example-project.iam.gserviceaccount.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/cloudbuild.serviceAgent",
+    \\      "members": [
+    \\        "serviceAccount:account6@example-project.iam.gserviceaccount.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/cloudkms.admin",
+    \\      "members": [
+    \\        "user:person1@example.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/cloudscheduler.serviceAgent",
+    \\      "members": [
+    \\        "serviceAccount:account7@example-project.iam.gserviceaccount.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/compute.serviceAgent",
+    \\      "members": [
+    \\        "serviceAccount:account8@example-project.iam.gserviceaccount.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/containerregistry.ServiceAgent",
+    \\      "members": [
+    \\        "serviceAccount:account9@example-project.iam.gserviceaccount.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/dataflow.serviceAgent",
+    \\      "members": [
+    \\        "serviceAccount:account10@example-project.iam.gserviceaccount.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/datastore.owner",
+    \\      "members": [
+    \\        "serviceAccount:account4@example-project.iam.gserviceaccount.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/editor",
+    \\      "members": [
+    \\        "serviceAccount:account11@example-project.iam.gserviceaccount.com",
+    \\        "serviceAccount:account12@example-project.iam.gserviceaccount.com",
+    \\        "serviceAccount:account4@example-project.iam.gserviceaccount.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/firebase.admin",
+    \\      "members": [
+    \\        "user:person2@example.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/firebaserules.system",
+    \\      "members": [
+    \\        "serviceAccount:account13@example-project.iam.gserviceaccount.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/firestore.serviceAgent",
+    \\      "members": [
+    \\        "serviceAccount:account14@example-project.iam.gserviceaccount.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/iam.serviceAccountUser",
+    \\      "members": [
+    \\        "user:person1@example.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/monitoring.viewer",
+    \\      "members": [
+    \\        "serviceAccount:account11@example-project.iam.gserviceaccount.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/owner",
+    \\      "members": [
+    \\        "user:person1@example.com",
+    \\        "user:person2@example.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/pubsub.admin",
+    \\      "members": [
+    \\        "serviceAccount:account4@example-project.iam.gserviceaccount.com",
+    \\        "user:person1@example.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/pubsub.serviceAgent",
+    \\      "members": [
+    \\        "serviceAccount:account15@example-project.iam.gserviceaccount.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/resourcemanager.tagUser",
+    \\      "members": [
+    \\        "user:person1@example.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/run.admin",
+    \\      "members": [
+    \\        "serviceAccount:account11@example-project.iam.gserviceaccount.com",
+    \\        "user:person1@example.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/run.invoker",
+    \\      "members": [
+    \\        "serviceAccount:account11@example-project.iam.gserviceaccount.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/run.serviceAgent",
+    \\      "members": [
+    \\        "serviceAccount:account16@example-project.iam.gserviceaccount.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/secretmanager.admin",
+    \\      "members": [
+    \\        "serviceAccount:account4@example-project.iam.gserviceaccount.com",
+    \\        "user:person1@example.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/serviceusage.serviceUsageConsumer",
+    \\      "members": [
+    \\        "user:person1@example.com",
+    \\        "user:person2@example.com"
+    \\      ]
+    \\    },
+    \\    {
+    \\      "role": "roles/storage.admin",
+    \\      "members": [
+    \\        "serviceAccount:account11@example-project.iam.gserviceaccount.com",
+    \\        "serviceAccount:account4@example-project.iam.gserviceaccount.com",
+    \\        "user:person1@example.com",
+    \\        "user:person2@example.com"
+    \\      ]
+    \\    }
+    \\  ]
+    \\}
+;
+
+/// `getIamPolicy` of a project that does not exist. HTTP 403.
+pub const iam_policy_missing_status = 403;
+pub const iam_policy_missing =
+    \\{
+    \\  "error": {
+    \\    "code": 403,
+    \\    "message": "Permission 'resourcemanager.projects.getIamPolicy' denied on resource '//cloudresourcemanager.googleapis.com/projects/zigps-nope-02667a' (or it may not exist). Remediate access with this Troubleshooter URL or share it with your administrator - https://console.cloud.google.com/iam-admin/troubleshooter/summary;errorId=CiQwMWExNjg3Ni0xZWQ0LTdmODUtYTYyMC02NzIyNzQ2NjA4MDcSGnByb2plY3RzL3ppZ3BzLW5vcGUtMDI2Njdh .",
+    \\    "status": "PERMISSION_DENIED",
+    \\    "details": [
+    \\      {
+    \\        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+    \\        "reason": "IAM_PERMISSION_DENIED",
+    \\        "domain": "cloudresourcemanager.googleapis.com",
+    \\        "metadata": {
+    \\          "troubleshooter_url": "https://console.cloud.google.com/iam-admin/troubleshooter/summary;errorId=CiQwMWExNjg3Ni0xZWQ0LTdmODUtYTYyMC02NzIyNzQ2NjA4MDcSGnByb2plY3RzL3ppZ3BzLW5vcGUtMDI2Njdh",
+    \\          "error_info_id": "CiQwMWExNjg3Ni0xZWQ0LTdmODUtYTYyMC02NzIyNzQ2NjA4MDcSGnByb2plY3RzL3ppZ3BzLW5vcGUtMDI2Njdh",
+    \\          "permission": "resourcemanager.projects.getIamPolicy",
+    \\          "resource": "projects/zigps-nope-02667a"
+    \\        }
+    \\      }
+    \\    ]
+    \\  }
+    \\}
+;
+
+/// `getIamPolicy` of `projects/BAD_ID!`. HTTP 400.
+pub const iam_policy_malformed_status = 400;
+pub const iam_policy_malformed =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "Fail to resolve resource 'projects/BAD_ID!'",
+    \\    "status": "INVALID_ARGUMENT"
+    \\  }
+    \\}
+;
+
+/// `getIamPolicy` under `run.readonly`, a scope Resource Manager does not take. HTTP 403.
+pub const iam_policy_scope_status = 403;
+pub const iam_policy_scope =
+    \\{
+    \\  "error": {
+    \\    "code": 403,
+    \\    "message": "Request had insufficient authentication scopes.",
+    \\    "status": "PERMISSION_DENIED",
+    \\    "details": [
+    \\      {
+    \\        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+    \\        "reason": "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+    \\        "domain": "googleapis.com",
+    \\        "metadata": {
+    \\          "method": "google.cloud.resourcemanager.v3.Projects.GetIamPolicy",
+    \\          "service": "cloudresourcemanager.googleapis.com"
+    \\        }
+    \\      }
+    \\    ]
+    \\  }
+    \\}
+;
+
+/// `testIamPermissions` of seven: the five held, sorted by name, not in the order asked. HTTP 200.
+pub const iam_test_held_status = 200;
+pub const iam_test_held =
+    \\{
+    \\  "permissions": [
+    \\    "pubsub.topics.create",
+    \\    "resourcemanager.projects.get",
+    \\    "resourcemanager.projects.getIamPolicy",
+    \\    "run.services.create",
+    \\    "storage.buckets.create"
+    \\  ]
+    \\}
+;
+
+/// `testIamPermissions` of `pubsub.topics.get` and `bigquery.datasets.get`: another service's permissions answered at a project. HTTP 200.
+pub const iam_test_other_service_status = 200;
+pub const iam_test_other_service =
+    \\{
+    \\  "permissions": [
+    \\    "bigquery.datasets.get",
+    \\    "pubsub.topics.get"
+    \\  ]
+    \\}
+;
+
+/// `testIamPermissions` of `zigps.probe.get`. HTTP 400.
+pub const iam_test_unknown_status = 400;
+pub const iam_test_unknown =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "Permission zigps.probe.get is not valid for this resource.",
+    \\    "status": "INVALID_ARGUMENT"
+    \\  }
+    \\}
+;
+
+/// `testIamPermissions` of 101. HTTP 400.
+pub const iam_test_too_many_status = 400;
+pub const iam_test_too_many =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "The number of permissions (101) is greater than the maximum allowed (100).",
+    \\    "status": "INVALID_ARGUMENT"
+    \\  }
+    \\}
+;
+
+/// `testIamPermissions` on a project that does not exist: none held, not an error. HTTP 200.
+pub const iam_test_missing_status = 200;
+pub const iam_test_missing =
+    \\{}
+;
+
 const std = @import("std");
 const core = @import("core");
 const testing = std.testing;

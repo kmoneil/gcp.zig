@@ -4,6 +4,42 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.57.0 (unreleased)
+
+- resource_manager, run and storage: IAM reads, for issue #308, so a
+  console can show who has access to a project, a Cloud Run service or
+  job, and an object, what the project grants that the rest inherit, and
+  what the caller may do. Each answers `core.iam.Policy`, which
+  `resource_manager` and `run` now export as `iam`, as the other modules
+  do. Measured in production on 2026-10-23 (milestone 0 of the IAM reads
+  spec):
+  - resource_manager: `Client.getProjectIamPolicy` (by id or number,
+    asked for as version 3; a policy with no condition comes back as
+    version 1) and `Client.testProjectIamPermissions`, which takes any
+    service's permissions. Both take the client's read-only scope. A
+    project that does not exist is `error.PermissionDenied` for the
+    policy, and holds nothing (not an error) for the test.
+  - run: `Client.getServiceIamPolicy`, `testServiceIamPermissions`,
+    `getJobIamPolicy` and `testJobIamPermissions`, under `run.readonly`.
+    A new service's or job's policy has no bindings, and production
+    answers one that does not exist with that same empty policy and
+    tests permissions on it as if it existed: read the service first
+    where that matters. Location `-`, which production answers with a
+    403, is refused before sending.
+  - storage: `Object.iamPolicy(options)` and
+    `Object.testIamPermissions(permissions, options)`, with
+    `ObjectIamOptions.generation`. An object's policy is its access
+    control list as legacy roles; in a bucket with uniform access Cloud
+    Storage refuses it (`error.InvalidArgument`). Reading it takes
+    `Scope.full_control` or `.cloud_platform`, as a bucket's does:
+    production refused the read-only and read-write scopes, though
+    Google's discovery document names them. The test takes any scope.
+  - Every `testIamPermissions` answer is sorted by name, as production
+    sends it.
+- auth, bigquery, core, dataflow, datatransfer, error_reporting,
+  firestore, kms, logging, monitoring, pubsub, scheduler and
+  secret_manager: unchanged.
+
 ## 0.56.0 (2026-10-21)
 
 - datatransfer: new module, **experimental**, for issue #271: the read

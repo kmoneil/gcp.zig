@@ -4,7 +4,9 @@
 //! runs, with their executions; and three writes a console confirms
 //! before sending, each with a twin that builds its exact request: run a
 //! job, cancel an execution, send all of a service's traffic to one
-//! revision. Nothing here deploys, creates or deletes anything.
+//! revision. `Client.getServiceIamPolicy` and its siblings read a
+//! service's or a job's IAM policy and test the caller's permissions.
+//! Nothing here deploys, creates or deletes anything.
 //!
 //! **Experimental**: new in 0.48.0, and free to change between minor
 //! versions until it has been used in anger. Jobs, executions,
@@ -34,6 +36,9 @@ pub const Scope = @import("rpc.zig").Scope;
 pub const auth_scope = @import("rpc.zig").scope;
 
 pub const RetryPolicy = core.RetryPolicy;
+/// IAM policies as services and jobs read them: `Policy`, `Binding`, and
+/// `Policy.grants`.
+pub const iam = core.iam;
 pub const Diagnostics = core.Diagnostics;
 pub const Error = @import("errors.zig").Error;
 pub const ApiError = core.ApiError;
