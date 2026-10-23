@@ -160,6 +160,9 @@ fn jobOf(out: Allocator, v: Value) DecodeError!types.Job {
             job.max_retries = try integer(i32, task, "maxRetries");
             job.containers = try containerList(out, task);
             job.service_account = try string(out, task, "serviceAccount") orelse "";
+            job.volumes = try volumeList(out, task);
+            job.vpc_access = try vpcAccessOf(out, task);
+            job.execution_environment = if (try field(task, "executionEnvironment", .string)) |e| types.ExecutionEnvironment.fromWire(e) else .unspecified;
         }
     }
     return job;
@@ -238,12 +241,42 @@ fn serviceOf(out: Allocator, v: Value) DecodeError!types.Service {
         .reconciling = try boolean(obj, "reconciling") orelse false,
         .labels = try labelMap(out, obj, "labels"),
         .etag = try string(out, obj, "etag") orelse "",
+        .template = if (try field(obj, "template", .object)) |t| try templateOf(out, t) else null,
+        .ingress = if (try field(obj, "ingress", .string)) |i| types.Ingress.fromWire(i) else .unspecified,
+        .invoker_iam_disabled = try boolean(obj, "invokerIamDisabled") orelse false,
+        .default_uri_disabled = try boolean(obj, "defaultUriDisabled") orelse false,
+        .scaling = if (try field(obj, "scaling", .object)) |sc| .{
+            .min_instances = try integer(i32, sc, "minInstanceCount"),
+            .max_instances = try integer(i32, sc, "maxInstanceCount"),
+            .mode = if (try field(sc, "scalingMode", .string)) |m| types.ScalingMode.fromWire(m) else .unspecified,
+            .manual_instances = try integer(i32, sc, "manualInstanceCount"),
+        } else null,
+    };
+}
+
+/// The settings a revision runs with, as a service's template and a
+/// revision both carry them, by the same keys.
+fn templateOf(out: Allocator, obj: std.json.ObjectMap) DecodeError!types.RevisionTemplate {
+    const scaling = try field(obj, "scaling", .object);
+    return .{
+        .containers = try containerList(out, obj),
+        .volumes = try volumeList(out, obj),
+        .service_account = try string(out, obj, "serviceAccount") orelse "",
+        .min_instances = if (scaling) |sc| try integer(i32, sc, "minInstanceCount") else null,
+        .max_instances = if (scaling) |sc| try integer(i32, sc, "maxInstanceCount") else null,
+        .concurrency = try integer(i32, obj, "maxInstanceRequestConcurrency"),
+        .timeout_s = try duration(obj, "timeout"),
+        .execution_environment = if (try field(obj, "executionEnvironment", .string)) |e| types.ExecutionEnvironment.fromWire(e) else .unspecified,
+        .vpc_access = try vpcAccessOf(out, obj),
+        .session_affinity = try boolean(obj, "sessionAffinity") orelse false,
+        .encryption_key = try string(out, obj, "encryptionKey") orelse "",
     };
 }
 
 fn revisionOf(out: Allocator, v: Value) DecodeError!types.Revision {
     const obj = try object(v);
     const name = try string(out, obj, "name") orelse return error.InvalidResponse;
+    const settings = try templateOf(out, obj);
     return .{
         .name = name,
         .id = trailing(name),
@@ -252,11 +285,20 @@ fn revisionOf(out: Allocator, v: Value) DecodeError!types.Revision {
         .create_time = try time(obj, "createTime"),
         .update_time = try time(obj, "updateTime"),
         .generation = try integer(i64, obj, "generation"),
-        .containers = try containerList(out, obj),
+        .containers = settings.containers,
         .conditions = try conditionList(out, obj),
         .log_uri = try string(out, obj, "logUri") orelse "",
-        .service_account = try string(out, obj, "serviceAccount") orelse "",
+        .service_account = settings.service_account,
         .labels = try labelMap(out, obj, "labels"),
+        .volumes = settings.volumes,
+        .min_instances = settings.min_instances,
+        .max_instances = settings.max_instances,
+        .concurrency = settings.concurrency,
+        .timeout_s = settings.timeout_s,
+        .execution_environment = settings.execution_environment,
+        .vpc_access = settings.vpc_access,
+        .session_affinity = settings.session_affinity,
+        .encryption_key = settings.encryption_key,
     };
 }
 
@@ -268,9 +310,152 @@ fn containerList(out: Allocator, obj: std.json.ObjectMap) DecodeError![]const ty
         c.* = .{
             .name = try string(out, o, "name") orelse "",
             .image = try string(out, o, "image") orelse "",
+            .command = try stringList(out, o, "command"),
+            .args = try stringList(out, o, "args"),
+            .working_dir = try string(out, o, "workingDir") orelse "",
+            .env = try envList(out, o),
+            .resources = if (try field(o, "resources", .object)) |r| try resourcesOf(out, r) else null,
+            .ports = try portList(out, o),
+            .volume_mounts = try mountList(out, o),
+            .depends_on = try stringList(out, o, "dependsOn"),
         };
     }
     return containers;
+}
+
+/// Each variable's value, or its secret: an entry with neither is an
+/// empty value, as one deployed with `""` reads.
+fn envList(out: Allocator, obj: std.json.ObjectMap) DecodeError![]const types.EnvVar {
+    const list = try field(obj, "env", .array) orelse return &.{};
+    const env = try out.alloc(types.EnvVar, list.items.len);
+    for (list.items, env) |item, *e| {
+        const o = try object(item);
+        const name = try string(out, o, "name") orelse return error.InvalidResponse;
+        if (try field(o, "valueSource", .object)) |source| {
+            const ref = try field(source, "secretKeyRef", .object) orelse return error.InvalidResponse;
+            e.* = .{ .name = name, .source = .{ .secret = .{
+                .secret = try string(out, ref, "secret") orelse return error.InvalidResponse,
+                .version = try string(out, ref, "version") orelse "",
+            } } };
+        } else {
+            e.* = .{ .name = name, .source = .{ .value = try string(out, o, "value") orelse "" } };
+        }
+    }
+    return env;
+}
+
+fn resourcesOf(out: Allocator, obj: std.json.ObjectMap) DecodeError!types.Resources {
+    var r: types.Resources = .{
+        .cpu_idle = try boolean(obj, "cpuIdle") orelse false,
+        .startup_cpu_boost = try boolean(obj, "startupCpuBoost") orelse false,
+    };
+    if (try field(obj, "limits", .object)) |limits| {
+        r.cpu = try string(out, limits, "cpu") orelse "";
+        r.memory = try string(out, limits, "memory") orelse "";
+        r.gpu = try string(out, limits, "nvidia.com/gpu") orelse "";
+    }
+    return r;
+}
+
+fn portList(out: Allocator, obj: std.json.ObjectMap) DecodeError![]const types.Port {
+    const list = try field(obj, "ports", .array) orelse return &.{};
+    const ports = try out.alloc(types.Port, list.items.len);
+    for (list.items, ports) |item, *p| {
+        const o = try object(item);
+        p.* = .{
+            .name = try string(out, o, "name") orelse "",
+            .container_port = try integer(u16, o, "containerPort") orelse 0,
+        };
+    }
+    return ports;
+}
+
+fn mountList(out: Allocator, obj: std.json.ObjectMap) DecodeError![]const types.VolumeMount {
+    const list = try field(obj, "volumeMounts", .array) orelse return &.{};
+    const mounts = try out.alloc(types.VolumeMount, list.items.len);
+    for (list.items, mounts) |item, *m| {
+        const o = try object(item);
+        m.* = .{
+            .name = try string(out, o, "name") orelse return error.InvalidResponse,
+            .mount_path = try string(out, o, "mountPath") orelse "",
+            .sub_path = try string(out, o, "subPath") orelse "",
+        };
+    }
+    return mounts;
+}
+
+fn volumeList(out: Allocator, obj: std.json.ObjectMap) DecodeError![]const types.Volume {
+    const list = try field(obj, "volumes", .array) orelse return &.{};
+    const volumes = try out.alloc(types.Volume, list.items.len);
+    for (list.items, volumes) |item, *vol| {
+        const o = try object(item);
+        vol.* = .{ .name = try string(out, o, "name") orelse return error.InvalidResponse, .source = try volumeSource(out, o) };
+    }
+    return volumes;
+}
+
+/// Whichever source the volume names; one this library does not read
+/// is kept by its key.
+fn volumeSource(out: Allocator, o: std.json.ObjectMap) DecodeError!types.Volume.Source {
+    if (try field(o, "secret", .object)) |sv| {
+        var items: []types.SecretItem = &.{};
+        if (try field(sv, "items", .array)) |list| {
+            items = try out.alloc(types.SecretItem, list.items.len);
+            for (list.items, items) |it, *dst| {
+                const io = try object(it);
+                dst.* = .{
+                    .path = try string(out, io, "path") orelse return error.InvalidResponse,
+                    .version = try string(out, io, "version") orelse "",
+                    .mode = try integer(u32, io, "mode"),
+                };
+            }
+        }
+        return .{ .secret = .{
+            .secret = try string(out, sv, "secret") orelse return error.InvalidResponse,
+            .default_mode = try integer(u32, sv, "defaultMode"),
+            .items = items,
+        } };
+    }
+    if (try field(o, "emptyDir", .object)) |ed| return .{ .empty_dir = .{
+        .medium = try string(out, ed, "medium") orelse "",
+        .size_limit = try string(out, ed, "sizeLimit") orelse "",
+    } };
+    if (try field(o, "cloudSqlInstance", .object)) |sql| return .{ .cloud_sql = .{ .instances = try stringList(out, sql, "instances") } };
+    if (try field(o, "gcs", .object)) |g| return .{ .gcs = .{
+        .bucket = try string(out, g, "bucket") orelse "",
+        .read_only = try boolean(g, "readOnly") orelse false,
+        .mount_options = try stringList(out, g, "mountOptions"),
+    } };
+    if (try field(o, "nfs", .object)) |n| return .{ .nfs = .{
+        .server = try string(out, n, "server") orelse "",
+        .path = try string(out, n, "path") orelse "",
+        .read_only = try boolean(n, "readOnly") orelse false,
+    } };
+    for (o.keys()) |key| {
+        if (!std.mem.eql(u8, key, "name")) return .{ .other = try out.dupe(u8, key) };
+    }
+    return .{ .other = "" };
+}
+
+fn vpcAccessOf(out: Allocator, obj: std.json.ObjectMap) DecodeError!?types.VpcAccess {
+    const vpc = try field(obj, "vpcAccess", .object) orelse return null;
+    var interfaces: []types.NetworkInterface = &.{};
+    if (try field(vpc, "networkInterfaces", .array)) |list| {
+        interfaces = try out.alloc(types.NetworkInterface, list.items.len);
+        for (list.items, interfaces) |item, *ni| {
+            const o = try object(item);
+            ni.* = .{
+                .network = try string(out, o, "network") orelse "",
+                .subnetwork = try string(out, o, "subnetwork") orelse "",
+                .tags = try stringList(out, o, "tags"),
+            };
+        }
+    }
+    return .{
+        .connector = try string(out, vpc, "connector") orelse "",
+        .egress = if (try field(vpc, "egress", .string)) |e| types.Egress.fromWire(e) else .unspecified,
+        .network_interfaces = interfaces,
+    };
 }
 
 fn conditionList(out: Allocator, obj: std.json.ObjectMap) DecodeError![]const types.Condition {
@@ -820,4 +1005,213 @@ test "fuzz decoders: any body decodes or is InvalidResponse, never a crash or a 
         production.operation_traffic_done,
         "{\"services\":[{\"name\":\"projects/p/locations/l/services/s\",\"trafficStatuses\":[{\"type\":\"TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION\",\"revision\":\"r\",\"percent\":50,\"tag\":\"blue\",\"uri\":\"https://blue---s.run.app\"}]}],\"unreachable\":[\"us-east7\"]}",
     } });
+}
+
+test "settings: a service deployed with every setting, and its revision, as production answered" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const service = try decodeService(a, a, production.settings_service_full);
+    try testing.expectEqual(.internal_load_balancer, service.ingress);
+    try testing.expect(service.default_uri_disabled);
+    try testing.expect(!service.invoker_iam_disabled);
+    // A disabled default URL leaves no uri and no urls.
+    try testing.expectEqualStrings("", service.uri);
+    try testing.expectEqual(0, service.urls.len);
+    try testing.expectEqual(.automatic, service.scaling.?.mode);
+    try testing.expectEqual(5, service.scaling.?.max_instances.?);
+    try testing.expectEqual(null, service.scaling.?.min_instances);
+
+    const t = service.template.?;
+    try testing.expectEqual(null, t.min_instances);
+    try testing.expectEqual(3, t.max_instances.?);
+    try testing.expectEqual(40, t.concurrency.?);
+    try testing.expectEqual(120, t.timeout_s.?);
+    try testing.expectEqual(.gen2, t.execution_environment);
+    try testing.expect(t.session_affinity);
+    try testing.expectEqual(.private_ranges_only, t.vpc_access.?.egress);
+    try testing.expectEqualStrings("default", t.vpc_access.?.network_interfaces[0].network);
+    try testing.expectEqualStrings("zigps", t.vpc_access.?.network_interfaces[0].tags[0]);
+    try testing.expectEqualStrings("82150720798-compute@developer.gserviceaccount.com", t.service_account);
+
+    // The template's container is unnamed; its env as deployed.
+    const c = t.containers[0];
+    try testing.expectEqualStrings("", c.name);
+    try testing.expectEqual(4, c.env.len);
+    try testing.expectEqualStrings("hello", c.env[0].source.value);
+    try testing.expectEqualStrings("EMPTY", c.env[1].name);
+    try testing.expectEqualStrings("", c.env[1].source.value);
+    try testing.expectEqualStrings("zigps-3c3b48", c.env[2].source.secret.secret);
+    try testing.expectEqualStrings("latest", c.env[2].source.secret.version);
+    try testing.expectEqualStrings("projects/extractctl/secrets/zigps-3c3b48", c.env[3].source.secret.secret);
+    try testing.expectEqualStrings("1", c.env[3].source.secret.version);
+    // cpuIdle false was left out, as production leaves out every false.
+    const r = c.resources.?;
+    try testing.expectEqualStrings("2", r.cpu);
+    try testing.expectEqualStrings("1Gi", r.memory);
+    try testing.expect(!r.cpu_idle);
+    try testing.expect(r.startup_cpu_boost);
+    try testing.expectEqual(2000, r.cpuMillis().?);
+    try testing.expectEqual(1 << 30, r.memoryBytes().?);
+    try testing.expectEqual(8080, c.ports[0].container_port);
+    try testing.expectEqualStrings("http1", c.ports[0].name);
+    try testing.expectEqualStrings("/secrets", c.volume_mounts[0].mount_path);
+
+    try testing.expectEqual(2, t.volumes.len);
+    const sec = t.volumes[0].source.secret;
+    try testing.expectEqualStrings("zigps-3c3b48", sec.secret);
+    try testing.expectEqual(292, sec.default_mode.?);
+    try testing.expectEqualStrings("value", sec.items[0].path);
+    try testing.expectEqualStrings("latest", sec.items[0].version);
+    try testing.expectEqualStrings("MEMORY", t.volumes[1].source.empty_dir.medium);
+    try testing.expectEqualStrings("64Mi", t.volumes[1].source.empty_dir.size_limit);
+
+    // The revision: the same settings by the same names, its container
+    // named and its image pinned.
+    const rev = try decodeRevision(a, a, production.settings_revision_full);
+    try testing.expectEqualStrings("hello-1", rev.containers[0].name);
+    try testing.expect(std.mem.indexOf(u8, rev.containers[0].image, "@sha256:") != null);
+    try testing.expectEqual(t.max_instances, rev.max_instances);
+    try testing.expectEqual(t.concurrency, rev.concurrency);
+    try testing.expectEqual(t.timeout_s, rev.timeout_s);
+    try testing.expectEqual(t.execution_environment, rev.execution_environment);
+    try testing.expectEqual(t.session_affinity, rev.session_affinity);
+    try testing.expectEqualStrings(t.vpc_access.?.network_interfaces[0].subnetwork, rev.vpc_access.?.network_interfaces[0].subnetwork);
+    try testing.expectEqual(t.volumes.len, rev.volumes.len);
+    try testing.expectEqual(t.containers[0].env.len, rev.containers[0].env.len);
+    try testing.expectEqualStrings(t.service_account, rev.service_account);
+}
+
+test "settings: a plain deploy's defaults, CPU and memory as sent, a secret it could not read, and a job" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const plain = try decodeService(a, a, production.settings_service_plain);
+    try testing.expectEqual(.all, plain.ingress);
+    try testing.expectEqual(20, plain.scaling.?.max_instances.?);
+    try testing.expectEqual(.unspecified, plain.scaling.?.mode);
+    try testing.expect(plain.uri.len > 0);
+    const t = plain.template.?;
+    try testing.expectEqual(300, t.timeout_s.?);
+    try testing.expectEqual(80, t.concurrency.?);
+    try testing.expectEqual(null, t.max_instances);
+    try testing.expectEqual(null, t.vpc_access);
+    try testing.expectEqual(.unspecified, t.execution_environment);
+    const r = t.containers[0].resources.?;
+    try testing.expectEqualStrings("1000m", r.cpu);
+    try testing.expectEqualStrings("512Mi", r.memory);
+    try testing.expect(r.cpu_idle);
+    try testing.expectEqual(1000, r.cpuMillis().?);
+    try testing.expectEqual(512 << 20, r.memoryBytes().?);
+    try testing.expectEqual(0, t.containers[0].env.len);
+
+    const rev = try decodeRevision(a, a, production.settings_revision_plain);
+    try testing.expectEqual(null, rev.max_instances);
+    try testing.expectEqual(null, rev.vpc_access);
+    try testing.expectEqual(0, rev.volumes.len);
+    try testing.expect(!rev.session_affinity);
+    try testing.expectEqual(80, rev.concurrency.?);
+
+    const forms = try decodeService(a, a, production.settings_service_cpu_forms);
+    const fr = forms.template.?.containers[0].resources.?;
+    try testing.expectEqualStrings("1", fr.cpu);
+    try testing.expectEqualStrings("1G", fr.memory);
+    try testing.expectEqual(1000, fr.cpuMillis().?);
+    try testing.expectEqual(1_000_000_000, fr.memoryBytes().?);
+
+    const failed = try decodeService(a, a, production.settings_service_no_secret_access);
+    try testing.expect(!failed.ready());
+    try testing.expectEqualStrings("SECRETS_ACCESS_CHECK_FAILED", failed.terminal_condition.?.reason);
+    try testing.expectEqualStrings("zigps-3c3b48", failed.template.?.containers[0].env[0].source.secret.secret);
+
+    const job = try decodeJob(a, a, production.settings_job);
+    const jc = job.containers[0];
+    try testing.expectEqualStrings("/bin/sh", jc.command[0]);
+    try testing.expectEqualStrings("-c", jc.command[1]);
+    try testing.expectEqualStrings("echo hi", jc.args[0]);
+    try testing.expectEqualStrings("/tmp", jc.working_dir);
+    try testing.expectEqualStrings("1", jc.env[1].source.secret.version);
+    try testing.expectEqualStrings("512Mi", jc.resources.?.memory);
+    try testing.expectEqual(.gen2, job.execution_environment);
+    try testing.expectEqual(.all_traffic, job.vpc_access.?.egress);
+    try testing.expectEqual(0, job.vpc_access.?.network_interfaces[0].tags.len);
+    try testing.expectEqualStrings("scratch", job.volumes[0].name);
+    try testing.expectEqualStrings("MEMORY", job.volumes[0].source.empty_dir.medium);
+    try testing.expectEqual(600, job.task_timeout_s.?);
+}
+
+test "settings: every volume kind, an unknown one by its key, and what is refused" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rev = try decodeRevision(a, a,
+        \\{"name":"projects/p/locations/l/services/s/revisions/r","volumes":[
+        \\{"name":"db","cloudSqlInstance":{"instances":["p:us-central1:db"]}},
+        \\{"name":"bucket","gcs":{"bucket":"b","readOnly":true,"mountOptions":["implicit-dirs"]}},
+        \\{"name":"share","nfs":{"server":"10.0.0.2","path":"/export","readOnly":true}},
+        \\{"name":"later","somethingNew":{}},{"name":"bare"}],
+        \\"vpcAccess":{"connector":"projects/p/locations/l/connectors/c","egress":"SOMETHING_NEW"},
+        \\"executionEnvironment":"EXECUTION_ENVIRONMENT_GEN9","encryptionKey":"projects/p/locations/l/keyRings/r/cryptoKeys/k",
+        \\"containers":[{"env":[{"name":"N"}],"resources":{"limits":{"nvidia.com/gpu":"1"}},"dependsOn":["sidecar"]}]}
+    );
+    try testing.expectEqualStrings("p:us-central1:db", rev.volumes[0].source.cloud_sql.instances[0]);
+    try testing.expect(rev.volumes[1].source.gcs.read_only);
+    try testing.expectEqualStrings("implicit-dirs", rev.volumes[1].source.gcs.mount_options[0]);
+    try testing.expectEqualStrings("/export", rev.volumes[2].source.nfs.path);
+    try testing.expectEqualStrings("somethingNew", rev.volumes[3].source.other);
+    try testing.expectEqualStrings("", rev.volumes[4].source.other);
+    try testing.expectEqual(.unknown, rev.vpc_access.?.egress);
+    try testing.expectEqualStrings("projects/p/locations/l/connectors/c", rev.vpc_access.?.connector);
+    try testing.expectEqual(.unknown, rev.execution_environment);
+    try testing.expectEqualStrings("projects/p/locations/l/keyRings/r/cryptoKeys/k", rev.encryption_key);
+    try testing.expectEqualStrings("", rev.containers[0].env[0].source.value);
+    try testing.expectEqualStrings("1", rev.containers[0].resources.?.gpu);
+    try testing.expectEqual(null, rev.containers[0].resources.?.cpuMillis());
+    try testing.expectEqualStrings("sidecar", rev.containers[0].depends_on[0]);
+
+    const refused = [_][]const u8{
+        // An env var with no name, a source with no secret, a secret
+        // with no name.
+        \\{"name":"n","containers":[{"env":[{"value":"x"}]}]}
+        ,
+        \\{"name":"n","containers":[{"env":[{"name":"x","valueSource":{}}]}]}
+        ,
+        \\{"name":"n","containers":[{"env":[{"name":"x","valueSource":{"secretKeyRef":{"version":"1"}}}]}]}
+        ,
+        \\{"name":"n","containers":[{"ports":[{"containerPort":70000}]}]}
+        ,
+        \\{"name":"n","containers":[{"volumeMounts":[{"mountPath":"/x"}]}]}
+        ,
+        \\{"name":"n","volumes":[{"secret":{"secret":"s"}}]}
+        ,
+        \\{"name":"n","volumes":[{"name":"v","secret":{"items":[]}}]}
+        ,
+        \\{"name":"n","volumes":[{"name":"v","secret":{"secret":"s","items":[{"version":"1"}]}}]}
+        ,
+        \\{"name":"n","timeout":"forever"}
+        ,
+        \\{"name":"n","scaling":{"maxInstanceCount":"many"}}
+        ,
+        \\{"name":"n","vpcAccess":[]}
+        ,
+        \\{"name":"n","containers":[{"resources":{"limits":{"cpu":2}}}]}
+        ,
+    };
+    for (refused) |body| try testing.expectError(error.InvalidResponse, decodeRevision(a, a, body));
+    try testing.expectError(error.InvalidResponse, decodeService(a, a, "{\"name\":\"n\",\"template\":{\"containers\":[{\"env\":[{}]}]}}"));
+    try testing.expectError(error.InvalidResponse, decodeService(a, a, "{\"name\":\"n\",\"scaling\":{\"scalingMode\":1}}"));
+}
+
+test "settings: every allocation failure in the new decoders is OutOfMemory without leaks" {
+    const Run = struct {
+        fn run(gpa: Allocator) !void {
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            const a = arena.allocator();
+            _ = try decodeService(a, a, production.settings_service_full);
+            _ = try decodeRevision(a, a, production.settings_revision_full);
+            _ = try decodeJob(a, a, production.settings_job);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
 }

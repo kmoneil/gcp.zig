@@ -2961,3 +2961,786 @@ pub const iam_job_test_held =
     \\  ]
     \\}
 ;
+
+// The settings, measured on 2026-10-23 in milestone 0 of the Cloud Run
+// settings spec (`_tmp/run-settings-m0/`): verbatim but for a final
+// line break (that probe kept the raw answers).
+
+/// A service deployed with every setting in scope, 2026-10-23 (`_tmp/run-settings-m0/`, run 3c3b48): ingress internal and load balancer, default URL disabled (so no uri or urls), service scaling, and a template with env, secrets, resources, a secret volume and an empty dir, scaling, concurrency, timeout, gen2, direct VPC egress and session affinity. HTTP 200.
+pub const settings_service_full_status = 200;
+pub const settings_service_full =
+    \\{
+    \\  "name": "projects/extractctl/locations/us-central1/services/zigps-3c3b48-full",
+    \\  "uid": "c4f7110e-c31d-49fd-92cf-fefce5f2a4b2",
+    \\  "generation": "1",
+    \\  "labels": {
+    \\    "zigps": "probe"
+    \\  },
+    \\  "createTime": "2026-10-23T14:27:09.189673Z",
+    \\  "updateTime": "2026-10-23T14:27:09.189673Z",
+    \\  "creator": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\  "lastModifier": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\  "ingress": "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER",
+    \\  "launchStage": "GA",
+    \\  "template": {
+    \\    "scaling": {
+    \\      "maxInstanceCount": 3
+    \\    },
+    \\    "vpcAccess": {
+    \\      "egress": "PRIVATE_RANGES_ONLY",
+    \\      "networkInterfaces": [
+    \\        {
+    \\          "network": "default",
+    \\          "subnetwork": "default",
+    \\          "tags": [
+    \\            "zigps"
+    \\          ]
+    \\        }
+    \\      ]
+    \\    },
+    \\    "timeout": "120s",
+    \\    "serviceAccount": "82150720798-compute@developer.gserviceaccount.com",
+    \\    "containers": [
+    \\      {
+    \\        "image": "us-docker.pkg.dev/cloudrun/container/hello",
+    \\        "env": [
+    \\          {
+    \\            "name": "PLAIN",
+    \\            "value": "hello"
+    \\          },
+    \\          {
+    \\            "name": "EMPTY",
+    \\            "value": ""
+    \\          },
+    \\          {
+    \\            "name": "FROM_SECRET",
+    \\            "valueSource": {
+    \\              "secretKeyRef": {
+    \\                "secret": "zigps-3c3b48",
+    \\                "version": "latest"
+    \\              }
+    \\            }
+    \\          },
+    \\          {
+    \\            "name": "FROM_SECRET_FULL",
+    \\            "valueSource": {
+    \\              "secretKeyRef": {
+    \\                "secret": "projects/extractctl/secrets/zigps-3c3b48",
+    \\                "version": "1"
+    \\              }
+    \\            }
+    \\          }
+    \\        ],
+    \\        "resources": {
+    \\          "limits": {
+    \\            "cpu": "2",
+    \\            "memory": "1Gi"
+    \\          },
+    \\          "startupCpuBoost": true
+    \\        },
+    \\        "ports": [
+    \\          {
+    \\            "name": "http1",
+    \\            "containerPort": 8080
+    \\          }
+    \\        ],
+    \\        "volumeMounts": [
+    \\          {
+    \\            "name": "sec",
+    \\            "mountPath": "/secrets"
+    \\          },
+    \\          {
+    \\            "name": "scratch",
+    \\            "mountPath": "/scratch"
+    \\          }
+    \\        ],
+    \\        "startupProbe": {
+    \\          "timeoutSeconds": 240,
+    \\          "periodSeconds": 240,
+    \\          "failureThreshold": 1,
+    \\          "tcpSocket": {
+    \\            "port": 8080
+    \\          }
+    \\        }
+    \\      }
+    \\    ],
+    \\    "volumes": [
+    \\      {
+    \\        "name": "sec",
+    \\        "secret": {
+    \\          "secret": "zigps-3c3b48",
+    \\          "items": [
+    \\            {
+    \\              "path": "value",
+    \\              "version": "latest"
+    \\            }
+    \\          ],
+    \\          "defaultMode": 292
+    \\        }
+    \\      },
+    \\      {
+    \\        "name": "scratch",
+    \\        "emptyDir": {
+    \\          "medium": "MEMORY",
+    \\          "sizeLimit": "64Mi"
+    \\        }
+    \\      }
+    \\    ],
+    \\    "executionEnvironment": "EXECUTION_ENVIRONMENT_GEN2",
+    \\    "maxInstanceRequestConcurrency": 40,
+    \\    "sessionAffinity": true
+    \\  },
+    \\  "traffic": [
+    \\    {
+    \\      "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST",
+    \\      "percent": 100
+    \\    }
+    \\  ],
+    \\  "scaling": {
+    \\    "scalingMode": "AUTOMATIC",
+    \\    "maxInstanceCount": 5
+    \\  },
+    \\  "defaultUriDisabled": true,
+    \\  "sshEnabled": false,
+    \\  "observedGeneration": "1",
+    \\  "terminalCondition": {
+    \\    "type": "Ready",
+    \\    "state": "CONDITION_SUCCEEDED",
+    \\    "lastTransitionTime": "2026-10-23T14:27:16.793193Z"
+    \\  },
+    \\  "conditions": [
+    \\    {
+    \\      "type": "RoutesReady",
+    \\      "state": "CONDITION_SUCCEEDED",
+    \\      "lastTransitionTime": "2026-10-23T14:27:16.764483Z"
+    \\    },
+    \\    {
+    \\      "type": "ConfigurationsReady",
+    \\      "state": "CONDITION_SUCCEEDED",
+    \\      "lastTransitionTime": "2026-10-23T14:27:09.992877Z"
+    \\    }
+    \\  ],
+    \\  "latestReadyRevision": "projects/extractctl/locations/us-central1/services/zigps-3c3b48-full/revisions/zigps-3c3b48-full-00001-cld",
+    \\  "latestCreatedRevision": "projects/extractctl/locations/us-central1/services/zigps-3c3b48-full/revisions/zigps-3c3b48-full-00001-cld",
+    \\  "trafficStatuses": [
+    \\    {
+    \\      "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST",
+    \\      "revision": "zigps-3c3b48-full-00001-cld",
+    \\      "percent": 100
+    \\    }
+    \\  ],
+    \\  "etag": "\"CL3d7dYGEKjcuFo/cHJvamVjdHMvZXh0cmFjdGN0bC9sb2NhdGlvbnMvdXMtY2VudHJhbDEvc2VydmljZXMvemlncHMtM2MzYjQ4LWZ1bGw\""
+    \\}
+;
+
+/// That service's revision: the same settings, its container named and its image pinned. HTTP 200.
+pub const settings_revision_full_status = 200;
+pub const settings_revision_full =
+    \\{
+    \\  "name": "projects/extractctl/locations/us-central1/services/zigps-3c3b48-full/revisions/zigps-3c3b48-full-00001-cld",
+    \\  "uid": "c00da09d-5629-4290-ba05-94443d6c78f9",
+    \\  "generation": "1",
+    \\  "createTime": "2026-10-23T14:27:09.294820Z",
+    \\  "updateTime": "2026-10-23T14:27:09.294820Z",
+    \\  "launchStage": "GA",
+    \\  "service": "zigps-3c3b48-full",
+    \\  "scaling": {
+    \\    "maxInstanceCount": 3
+    \\  },
+    \\  "vpcAccess": {
+    \\    "egress": "PRIVATE_RANGES_ONLY",
+    \\    "networkInterfaces": [
+    \\      {
+    \\        "network": "default",
+    \\        "subnetwork": "default",
+    \\        "tags": [
+    \\          "zigps"
+    \\        ]
+    \\      }
+    \\    ]
+    \\  },
+    \\  "timeout": "120s",
+    \\  "serviceAccount": "82150720798-compute@developer.gserviceaccount.com",
+    \\  "containers": [
+    \\    {
+    \\      "name": "hello-1",
+    \\      "image": "us-docker.pkg.dev/cloudrun/container/hello@sha256:efd04605322d5d1ce6b1fd3dfc63a9c1fb2b99c97194ec316c0df0fd8f5dcf01",
+    \\      "env": [
+    \\        {
+    \\          "name": "PLAIN",
+    \\          "value": "hello"
+    \\        },
+    \\        {
+    \\          "name": "EMPTY",
+    \\          "value": ""
+    \\        },
+    \\        {
+    \\          "name": "FROM_SECRET",
+    \\          "valueSource": {
+    \\            "secretKeyRef": {
+    \\              "secret": "zigps-3c3b48",
+    \\              "version": "latest"
+    \\            }
+    \\          }
+    \\        },
+    \\        {
+    \\          "name": "FROM_SECRET_FULL",
+    \\          "valueSource": {
+    \\            "secretKeyRef": {
+    \\              "secret": "projects/extractctl/secrets/zigps-3c3b48",
+    \\              "version": "1"
+    \\            }
+    \\          }
+    \\        }
+    \\      ],
+    \\      "resources": {
+    \\        "limits": {
+    \\          "cpu": "2",
+    \\          "memory": "1Gi"
+    \\        },
+    \\        "startupCpuBoost": true
+    \\      },
+    \\      "ports": [
+    \\        {
+    \\          "name": "http1",
+    \\          "containerPort": 8080
+    \\        }
+    \\      ],
+    \\      "volumeMounts": [
+    \\        {
+    \\          "name": "sec",
+    \\          "mountPath": "/secrets"
+    \\        },
+    \\        {
+    \\          "name": "scratch",
+    \\          "mountPath": "/scratch"
+    \\        }
+    \\      ],
+    \\      "startupProbe": {
+    \\        "timeoutSeconds": 240,
+    \\        "periodSeconds": 240,
+    \\        "failureThreshold": 1,
+    \\        "tcpSocket": {
+    \\          "port": 8080
+    \\        }
+    \\      }
+    \\    }
+    \\  ],
+    \\  "volumes": [
+    \\    {
+    \\      "name": "sec",
+    \\      "secret": {
+    \\        "secret": "zigps-3c3b48",
+    \\        "items": [
+    \\          {
+    \\            "path": "value",
+    \\            "version": "latest"
+    \\          }
+    \\        ],
+    \\        "defaultMode": 292
+    \\      }
+    \\    },
+    \\    {
+    \\      "name": "scratch",
+    \\      "emptyDir": {
+    \\        "medium": "MEMORY",
+    \\        "sizeLimit": "64Mi"
+    \\      }
+    \\    }
+    \\  ],
+    \\  "executionEnvironment": "EXECUTION_ENVIRONMENT_GEN2",
+    \\  "conditions": [
+    \\    {
+    \\      "type": "Ready",
+    \\      "state": "CONDITION_SUCCEEDED",
+    \\      "message": "Deploying revision succeeded in 6.14s.",
+    \\      "lastTransitionTime": "2026-10-23T14:27:15.431014Z"
+    \\    },
+    \\    {
+    \\      "type": "Active",
+    \\      "state": "CONDITION_SUCCEEDED",
+    \\      "lastTransitionTime": "2026-10-23T14:27:15.592624Z",
+    \\      "severity": "INFO"
+    \\    },
+    \\    {
+    \\      "type": "ResourcesAvailable",
+    \\      "state": "CONDITION_SUCCEEDED",
+    \\      "message": "Provisioning imported containers completed in 1.75s. Checking container health. This will wait for up to 4m for the configured startup probe, including an initial delay of 0s.",
+    \\      "lastTransitionTime": "2026-10-23T14:27:11.644799Z"
+    \\    },
+    \\    {
+    \\      "type": "ContainerReady",
+    \\      "state": "CONDITION_SUCCEEDED",
+    \\      "message": "Container image import completed.",
+    \\      "lastTransitionTime": "2026-10-23T14:27:09.897751Z"
+    \\    },
+    \\    {
+    \\      "type": "ContainerHealthy",
+    \\      "state": "CONDITION_SUCCEEDED",
+    \\      "message": "Containers became healthy.",
+    \\      "lastTransitionTime": "2026-10-23T14:27:15.366776Z"
+    \\    }
+    \\  ],
+    \\  "observedGeneration": "1",
+    \\  "logUri": "https://console.cloud.google.com/logs/viewer?project=extractctl&resource=cloud_run_revision/service_name/zigps-3c3b48-full/revision_name/zigps-3c3b48-full-00001-cld&advancedFilter=resource.type%3D%22cloud_run_revision%22%0Aresource.labels.service_name%3D%22zigps-3c3b48-full%22%0Aresource.labels.revision_name%3D%22zigps-3c3b48-full-00001-cld%22",
+    \\  "maxInstanceRequestConcurrency": 40,
+    \\  "sessionAffinity": true,
+    \\  "creator": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\  "etag": "\"CL3d7dYGEKCxyowB/cHJvamVjdHMvZXh0cmFjdGN0bC9sb2NhdGlvbnMvdXMtY2VudHJhbDEvc2VydmljZXMvemlncHMtM2MzYjQ4LWZ1bGwvcmV2aXNpb25zL3ppZ3BzLTNjM2I0OC1mdWxsLTAwMDAxLWNsZA\""
+    \\}
+;
+
+/// A service deployed with an image alone: production's defaults filled in (512Mi, 1000m, cpuIdle, port 8080, a startup probe, 300 s, 80) and a service scaling of 20. HTTP 200.
+pub const settings_service_plain_status = 200;
+pub const settings_service_plain =
+    \\{
+    \\  "name": "projects/extractctl/locations/us-central1/services/zigps-3c3b48-plain",
+    \\  "uid": "ea63946f-9279-4af2-a124-f1e39060c83f",
+    \\  "generation": "1",
+    \\  "labels": {
+    \\    "zigps": "probe"
+    \\  },
+    \\  "createTime": "2026-10-23T14:27:20.071863Z",
+    \\  "updateTime": "2026-10-23T14:27:20.071863Z",
+    \\  "creator": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\  "lastModifier": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\  "ingress": "INGRESS_TRAFFIC_ALL",
+    \\  "launchStage": "GA",
+    \\  "template": {
+    \\    "timeout": "300s",
+    \\    "serviceAccount": "82150720798-compute@developer.gserviceaccount.com",
+    \\    "containers": [
+    \\      {
+    \\        "image": "us-docker.pkg.dev/cloudrun/container/hello",
+    \\        "resources": {
+    \\          "limits": {
+    \\            "memory": "512Mi",
+    \\            "cpu": "1000m"
+    \\          },
+    \\          "cpuIdle": true
+    \\        },
+    \\        "ports": [
+    \\          {
+    \\            "name": "http1",
+    \\            "containerPort": 8080
+    \\          }
+    \\        ],
+    \\        "startupProbe": {
+    \\          "timeoutSeconds": 240,
+    \\          "periodSeconds": 240,
+    \\          "failureThreshold": 1,
+    \\          "tcpSocket": {
+    \\            "port": 8080
+    \\          }
+    \\        }
+    \\      }
+    \\    ],
+    \\    "maxInstanceRequestConcurrency": 80
+    \\  },
+    \\  "traffic": [
+    \\    {
+    \\      "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST",
+    \\      "percent": 100
+    \\    }
+    \\  ],
+    \\  "scaling": {
+    \\    "maxInstanceCount": 20
+    \\  },
+    \\  "urls": [
+    \\    "https://zigps-3c3b48-plain-82150720798.us-central1.run.app",
+    \\    "https://zigps-3c3b48-plain-el44yx5gia-uc.a.run.app"
+    \\  ],
+    \\  "sshEnabled": false,
+    \\  "observedGeneration": "1",
+    \\  "terminalCondition": {
+    \\    "type": "Ready",
+    \\    "state": "CONDITION_SUCCEEDED",
+    \\    "lastTransitionTime": "2026-10-23T14:27:24.230184Z"
+    \\  },
+    \\  "conditions": [
+    \\    {
+    \\      "type": "RoutesReady",
+    \\      "state": "CONDITION_SUCCEEDED",
+    \\      "lastTransitionTime": "2026-10-23T14:27:24.177410Z"
+    \\    },
+    \\    {
+    \\      "type": "ConfigurationsReady",
+    \\      "state": "CONDITION_SUCCEEDED",
+    \\      "lastTransitionTime": "2026-10-23T14:27:20.898613Z"
+    \\    }
+    \\  ],
+    \\  "latestReadyRevision": "projects/extractctl/locations/us-central1/services/zigps-3c3b48-plain/revisions/zigps-3c3b48-plain-00001-j6p",
+    \\  "latestCreatedRevision": "projects/extractctl/locations/us-central1/services/zigps-3c3b48-plain/revisions/zigps-3c3b48-plain-00001-j6p",
+    \\  "trafficStatuses": [
+    \\    {
+    \\      "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST",
+    \\      "revision": "zigps-3c3b48-plain-00001-j6p",
+    \\      "percent": 100
+    \\    }
+    \\  ],
+    \\  "uri": "https://zigps-3c3b48-plain-el44yx5gia-uc.a.run.app",
+    \\  "etag": "\"CMjd7dYGENiVoiI/cHJvamVjdHMvZXh0cmFjdGN0bC9sb2NhdGlvbnMvdXMtY2VudHJhbDEvc2VydmljZXMvemlncHMtM2MzYjQ4LXBsYWlu\""
+    \\}
+;
+
+/// That service's first revision: no scaling, execution environment, VPC access, volumes or session affinity. HTTP 200.
+pub const settings_revision_plain_status = 200;
+pub const settings_revision_plain =
+    \\{
+    \\  "name": "projects/extractctl/locations/us-central1/services/zigps-3c3b48-plain/revisions/zigps-3c3b48-plain-00001-j6p",
+    \\  "uid": "cb73b069-76bd-490b-91dd-76f82cf11703",
+    \\  "generation": "1",
+    \\  "createTime": "2026-10-23T14:27:20.182816Z",
+    \\  "updateTime": "2026-10-23T14:27:20.182816Z",
+    \\  "launchStage": "GA",
+    \\  "service": "zigps-3c3b48-plain",
+    \\  "timeout": "300s",
+    \\  "serviceAccount": "82150720798-compute@developer.gserviceaccount.com",
+    \\  "containers": [
+    \\    {
+    \\      "name": "hello-1",
+    \\      "image": "us-docker.pkg.dev/cloudrun/container/hello@sha256:efd04605322d5d1ce6b1fd3dfc63a9c1fb2b99c97194ec316c0df0fd8f5dcf01",
+    \\      "resources": {
+    \\        "limits": {
+    \\          "memory": "512Mi",
+    \\          "cpu": "1000m"
+    \\        },
+    \\        "cpuIdle": true
+    \\      },
+    \\      "ports": [
+    \\        {
+    \\          "name": "http1",
+    \\          "containerPort": 8080
+    \\        }
+    \\      ],
+    \\      "startupProbe": {
+    \\        "timeoutSeconds": 240,
+    \\        "periodSeconds": 240,
+    \\        "failureThreshold": 1,
+    \\        "tcpSocket": {
+    \\          "port": 8080
+    \\        }
+    \\      }
+    \\    }
+    \\  ],
+    \\  "conditions": [
+    \\    {
+    \\      "type": "Ready",
+    \\      "state": "CONDITION_SUCCEEDED",
+    \\      "message": "Deploying revision succeeded in 2.66s.",
+    \\      "lastTransitionTime": "2026-10-23T14:27:22.846876Z"
+    \\    },
+    \\    {
+    \\      "type": "Active",
+    \\      "state": "CONDITION_SUCCEEDED",
+    \\      "lastTransitionTime": "2026-10-23T14:27:22.975600Z",
+    \\      "severity": "INFO"
+    \\    },
+    \\    {
+    \\      "type": "ResourcesAvailable",
+    \\      "state": "CONDITION_SUCCEEDED",
+    \\      "message": "Provisioning imported containers completed in 1.47s. Checking container health. This will wait for up to 4m for the configured startup probe, including an initial delay of 0s.",
+    \\      "lastTransitionTime": "2026-10-23T14:27:22.265815Z"
+    \\    },
+    \\    {
+    \\      "type": "ContainerReady",
+    \\      "state": "CONDITION_SUCCEEDED",
+    \\      "message": "Container image import completed.",
+    \\      "lastTransitionTime": "2026-10-23T14:27:20.794192Z"
+    \\    },
+    \\    {
+    \\      "type": "ContainerHealthy",
+    \\      "state": "CONDITION_SUCCEEDED",
+    \\      "message": "Containers became healthy.",
+    \\      "lastTransitionTime": "2026-10-23T14:27:22.771028Z"
+    \\    }
+    \\  ],
+    \\  "observedGeneration": "1",
+    \\  "logUri": "https://console.cloud.google.com/logs/viewer?project=extractctl&resource=cloud_run_revision/service_name/zigps-3c3b48-plain/revision_name/zigps-3c3b48-plain-00001-j6p&advancedFilter=resource.type%3D%22cloud_run_revision%22%0Aresource.labels.service_name%3D%22zigps-3c3b48-plain%22%0Aresource.labels.revision_name%3D%22zigps-3c3b48-plain-00001-j6p%22",
+    \\  "maxInstanceRequestConcurrency": 80,
+    \\  "creator": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\  "etag": "\"CMjd7dYGEICallc/cHJvamVjdHMvZXh0cmFjdGN0bC9sb2NhdGlvbnMvdXMtY2VudHJhbDEvc2VydmljZXMvemlncHMtM2MzYjQ4LXBsYWluL3JldmlzaW9ucy96aWdwcy0zYzNiNDgtcGxhaW4tMDAwMDEtajZw\""
+    \\}
+;
+
+/// The plain service after a deploy of CPU "1" and memory "1G": kept as sent. HTTP 200.
+pub const settings_service_cpu_forms_status = 200;
+pub const settings_service_cpu_forms =
+    \\{
+    \\  "name": "projects/extractctl/locations/us-central1/services/zigps-3c3b48-plain",
+    \\  "uid": "ea63946f-9279-4af2-a124-f1e39060c83f",
+    \\  "generation": "3",
+    \\  "createTime": "2026-10-23T14:27:20.071863Z",
+    \\  "updateTime": "2026-10-23T14:27:34.961029Z",
+    \\  "creator": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\  "lastModifier": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\  "ingress": "INGRESS_TRAFFIC_ALL",
+    \\  "launchStage": "GA",
+    \\  "template": {
+    \\    "timeout": "300s",
+    \\    "serviceAccount": "82150720798-compute@developer.gserviceaccount.com",
+    \\    "containers": [
+    \\      {
+    \\        "image": "us-docker.pkg.dev/cloudrun/container/hello",
+    \\        "resources": {
+    \\          "limits": {
+    \\            "cpu": "1",
+    \\            "memory": "1G"
+    \\          },
+    \\          "cpuIdle": true
+    \\        },
+    \\        "ports": [
+    \\          {
+    \\            "name": "http1",
+    \\            "containerPort": 8080
+    \\          }
+    \\        ],
+    \\        "startupProbe": {
+    \\          "timeoutSeconds": 240,
+    \\          "periodSeconds": 240,
+    \\          "failureThreshold": 1,
+    \\          "tcpSocket": {
+    \\            "port": 8080
+    \\          }
+    \\        }
+    \\      }
+    \\    ],
+    \\    "maxInstanceRequestConcurrency": 80
+    \\  },
+    \\  "traffic": [
+    \\    {
+    \\      "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST",
+    \\      "percent": 100
+    \\    }
+    \\  ],
+    \\  "scaling": {
+    \\    "maxInstanceCount": 20
+    \\  },
+    \\  "urls": [
+    \\    "https://zigps-3c3b48-plain-82150720798.us-central1.run.app",
+    \\    "https://zigps-3c3b48-plain-el44yx5gia-uc.a.run.app"
+    \\  ],
+    \\  "sshEnabled": false,
+    \\  "observedGeneration": "3",
+    \\  "terminalCondition": {
+    \\    "type": "Ready",
+    \\    "state": "CONDITION_SUCCEEDED",
+    \\    "lastTransitionTime": "2026-10-23T14:27:39.299222Z"
+    \\  },
+    \\  "conditions": [
+    \\    {
+    \\      "type": "RoutesReady",
+    \\      "state": "CONDITION_SUCCEEDED",
+    \\      "lastTransitionTime": "2026-10-23T14:27:39.240447Z"
+    \\    },
+    \\    {
+    \\      "type": "ConfigurationsReady",
+    \\      "state": "CONDITION_SUCCEEDED",
+    \\      "lastTransitionTime": "2026-10-23T14:27:35.740959Z"
+    \\    }
+    \\  ],
+    \\  "latestReadyRevision": "projects/extractctl/locations/us-central1/services/zigps-3c3b48-plain/revisions/zigps-3c3b48-plain-00003-cx5",
+    \\  "latestCreatedRevision": "projects/extractctl/locations/us-central1/services/zigps-3c3b48-plain/revisions/zigps-3c3b48-plain-00003-cx5",
+    \\  "trafficStatuses": [
+    \\    {
+    \\      "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST",
+    \\      "revision": "zigps-3c3b48-plain-00003-cx5",
+    \\      "percent": 100
+    \\    }
+    \\  ],
+    \\  "uri": "https://zigps-3c3b48-plain-el44yx5gia-uc.a.run.app",
+    \\  "etag": "\"CNbd7dYGEIjHoMoD/cHJvamVjdHMvZXh0cmFjdGN0bC9sb2NhdGlvbnMvdXMtY2VudHJhbDEvc2VydmljZXMvemlncHMtM2MzYjQ4LXBsYWlu\""
+    \\}
+;
+
+/// A service whose secret env var the runtime account could not read: failed, SECRETS_ACCESS_CHECK_FAILED, its env as sent. HTTP 200.
+pub const settings_service_no_secret_access_status = 200;
+pub const settings_service_no_secret_access =
+    \\{
+    \\  "name": "projects/extractctl/locations/us-central1/services/zigps-3c3b48-nogrant",
+    \\  "uid": "e558ff3d-2a34-4745-b64c-a65fa9d23b4a",
+    \\  "generation": "1",
+    \\  "labels": {
+    \\    "zigps": "probe"
+    \\  },
+    \\  "createTime": "2026-10-23T14:26:43.743950Z",
+    \\  "updateTime": "2026-10-23T14:26:43.743950Z",
+    \\  "creator": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\  "lastModifier": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\  "ingress": "INGRESS_TRAFFIC_ALL",
+    \\  "launchStage": "GA",
+    \\  "template": {
+    \\    "timeout": "300s",
+    \\    "serviceAccount": "82150720798-compute@developer.gserviceaccount.com",
+    \\    "containers": [
+    \\      {
+    \\        "image": "us-docker.pkg.dev/cloudrun/container/hello",
+    \\        "env": [
+    \\          {
+    \\            "name": "FROM_SECRET",
+    \\            "valueSource": {
+    \\              "secretKeyRef": {
+    \\                "secret": "zigps-3c3b48",
+    \\                "version": "latest"
+    \\              }
+    \\            }
+    \\          }
+    \\        ],
+    \\        "resources": {
+    \\          "limits": {
+    \\            "memory": "512Mi",
+    \\            "cpu": "1000m"
+    \\          },
+    \\          "cpuIdle": true
+    \\        },
+    \\        "ports": [
+    \\          {
+    \\            "name": "http1",
+    \\            "containerPort": 8080
+    \\          }
+    \\        ],
+    \\        "startupProbe": {
+    \\          "timeoutSeconds": 240,
+    \\          "periodSeconds": 240,
+    \\          "failureThreshold": 1,
+    \\          "tcpSocket": {
+    \\            "port": 8080
+    \\          }
+    \\        }
+    \\      }
+    \\    ],
+    \\    "maxInstanceRequestConcurrency": 80
+    \\  },
+    \\  "traffic": [
+    \\    {
+    \\      "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST",
+    \\      "percent": 100
+    \\    }
+    \\  ],
+    \\  "scaling": {
+    \\    "maxInstanceCount": 20
+    \\  },
+    \\  "urls": [
+    \\    "https://zigps-3c3b48-nogrant-82150720798.us-central1.run.app"
+    \\  ],
+    \\  "sshEnabled": false,
+    \\  "observedGeneration": "1",
+    \\  "terminalCondition": {
+    \\    "type": "Ready",
+    \\    "state": "CONDITION_FAILED",
+    \\    "message": "spec.template.spec.containers[0].env[0].value_from.secret_key_ref.name: Permission denied on secret: projects/82150720798/secrets/zigps-3c3b48/versions/latest for Revision service account 82150720798-compute@developer.gserviceaccount.com. The service account used must be granted the 'Secret Manager Secret Accessor' role (roles/secretmanager.secretAccessor) at the secret, project or higher level.",
+    \\    "lastTransitionTime": "2026-10-23T14:26:45.033871Z",
+    \\    "reason": "SECRETS_ACCESS_CHECK_FAILED"
+    \\  },
+    \\  "conditions": [
+    \\    {
+    \\      "type": "RoutesReady",
+    \\      "state": "CONDITION_FAILED",
+    \\      "message": "spec.template.spec.containers[0].env[0].value_from.secret_key_ref.name: Permission denied on secret: projects/82150720798/secrets/zigps-3c3b48/versions/latest for Revision service account 82150720798-compute@developer.gserviceaccount.com. The service account used must be granted the 'Secret Manager Secret Accessor' role (roles/secretmanager.secretAccessor) at the secret, project or higher level.",
+    \\      "lastTransitionTime": "2026-10-23T14:26:45.033871Z",
+    \\      "reason": "SECRETS_ACCESS_CHECK_FAILED"
+    \\    },
+    \\    {
+    \\      "type": "ConfigurationsReady",
+    \\      "state": "CONDITION_FAILED",
+    \\      "message": "spec.template.spec.containers[0].env[0].value_from.secret_key_ref.name: Permission denied on secret: projects/82150720798/secrets/zigps-3c3b48/versions/latest for Revision service account 82150720798-compute@developer.gserviceaccount.com. The service account used must be granted the 'Secret Manager Secret Accessor' role (roles/secretmanager.secretAccessor) at the secret, project or higher level.",
+    \\      "lastTransitionTime": "2026-10-23T14:26:44.953736Z",
+    \\      "reason": "SECRETS_ACCESS_CHECK_FAILED"
+    \\    }
+    \\  ],
+    \\  "latestCreatedRevision": "projects/extractctl/locations/us-central1/services/zigps-3c3b48-nogrant/revisions/zigps-3c3b48-nogrant-00001-99d",
+    \\  "etag": "\"CKPd7dYGELCN3-IC/cHJvamVjdHMvZXh0cmFjdGN0bC9sb2NhdGlvbnMvdXMtY2VudHJhbDEvc2VydmljZXMvemlncHMtM2MzYjQ4LW5vZ3JhbnQ\""
+    \\}
+;
+
+/// A job whose task template sets command, args, working directory, env, resources, a volume, gen2 and direct VPC egress. HTTP 200.
+pub const settings_job_status = 200;
+pub const settings_job =
+    \\{
+    \\  "name": "projects/extractctl/locations/us-central1/jobs/zigps-3c3b48-job",
+    \\  "uid": "88ce2de0-8066-492a-b6b5-971ae3c94603",
+    \\  "generation": "1",
+    \\  "labels": {
+    \\    "zigps": "probe"
+    \\  },
+    \\  "createTime": "2026-10-23T14:27:57.028013Z",
+    \\  "updateTime": "2026-10-23T14:27:57.028013Z",
+    \\  "creator": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\  "lastModifier": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\  "launchStage": "GA",
+    \\  "template": {
+    \\    "taskCount": 1,
+    \\    "template": {
+    \\      "containers": [
+    \\        {
+    \\          "image": "us-docker.pkg.dev/cloudrun/container/job",
+    \\          "command": [
+    \\            "/bin/sh",
+    \\            "-c"
+    \\          ],
+    \\          "args": [
+    \\            "echo hi"
+    \\          ],
+    \\          "env": [
+    \\            {
+    \\              "name": "PLAIN",
+    \\              "value": "x"
+    \\            },
+    \\            {
+    \\              "name": "FROM_SECRET",
+    \\              "valueSource": {
+    \\                "secretKeyRef": {
+    \\                  "secret": "zigps-3c3b48",
+    \\                  "version": "1"
+    \\                }
+    \\              }
+    \\            }
+    \\          ],
+    \\          "resources": {
+    \\            "limits": {
+    \\              "cpu": "1",
+    \\              "memory": "512Mi"
+    \\            }
+    \\          },
+    \\          "volumeMounts": [
+    \\            {
+    \\              "name": "scratch",
+    \\              "mountPath": "/scratch"
+    \\            }
+    \\          ],
+    \\          "workingDir": "/tmp"
+    \\        }
+    \\      ],
+    \\      "volumes": [
+    \\        {
+    \\          "name": "scratch",
+    \\          "emptyDir": {
+    \\            "medium": "MEMORY"
+    \\          }
+    \\        }
+    \\      ],
+    \\      "maxRetries": 0,
+    \\      "timeout": "600s",
+    \\      "serviceAccount": "82150720798-compute@developer.gserviceaccount.com",
+    \\      "executionEnvironment": "EXECUTION_ENVIRONMENT_GEN2",
+    \\      "vpcAccess": {
+    \\        "egress": "ALL_TRAFFIC",
+    \\        "networkInterfaces": [
+    \\          {
+    \\            "network": "default",
+    \\            "subnetwork": "default"
+    \\          }
+    \\        ]
+    \\      }
+    \\    }
+    \\  },
+    \\  "observedGeneration": "1",
+    \\  "terminalCondition": {
+    \\    "type": "Ready",
+    \\    "state": "CONDITION_SUCCEEDED",
+    \\    "lastTransitionTime": "2026-10-23T14:27:57.336774Z"
+    \\  },
+    \\  "latestCreatedExecution": {},
+    \\  "etag": "\"CO3d7dYGEMjjrQ0/cHJvamVjdHMvZXh0cmFjdGN0bC9sb2NhdGlvbnMvdXMtY2VudHJhbDEvam9icy96aWdwcy0zYzNiNDgtam9i\""
+    \\}
+;

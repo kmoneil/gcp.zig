@@ -4,6 +4,30 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.58.0 (unreleased)
+
+- run: what a deploy set, for issue #309, so a console's service and
+  revision pages show it. A `Container` now carries its `command`,
+  `args`, `working_dir`, `env` (each an `EnvVar` with a `.value` as
+  deployed or a `.secret` `SecretRef`), `resources` (`Resources`, with
+  `cpuMillis` and `memoryBytes`), `ports`, `volume_mounts` and
+  `depends_on`; jobs' containers too. A `Revision` carries its
+  `volumes` (`Volume`: secret, empty dir, Cloud SQL, Cloud Storage, NFS),
+  `min_instances`, `max_instances`, `concurrency`, `timeout_s`,
+  `execution_environment`, `vpc_access`, `session_affinity` and
+  `encryption_key`. A `Service` carries its `template`
+  (`RevisionTemplate`, the same settings by the same names), `ingress`,
+  `invoker_iam_disabled`, `default_uri_disabled` and `scaling`
+  (`ServiceScaling`). A `Job` carries its task template's `volumes`,
+  `vpc_access` and `execution_environment`. Every new field has a
+  default, so nothing that builds today changes. Measured in production
+  on 2026-10-23: production leaves out every false and zero, keeps CPU,
+  memory and secrets exactly as deployed, and answers no `uri` or `urls`
+  for a service whose default URL is disabled.
+- auth, bigquery, core, dataflow, datatransfer, error_reporting,
+  firestore, kms, logging, monitoring, pubsub, resource_manager,
+  scheduler, secret_manager and storage: unchanged.
+
 ## 0.57.0 (2026-10-23)
 
 - resource_manager, run and storage: IAM reads, for issue #308, so a
