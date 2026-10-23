@@ -67,6 +67,66 @@ words: the broken revision's `Ready` condition said "Image
 `CONDITION_FAILED`, reason `REVISION_FAILED`, while
 `latest_ready_revision` stayed on the last good revision.
 
+## What a deploy set
+
+A `Revision` carries the settings it runs with, and `Service.template`
+the ones the next deploy will make a revision from, as a
+`RevisionTemplate` with the same field names:
+
+| Field | What it is |
+| --- | --- |
+| `containers` | Each container's `image`, `command`, `args`, `working_dir`, `env`, `resources`, `ports`, `volume_mounts`, `depends_on` |
+| `volumes` | Each volume by name: `.secret`, `.empty_dir`, `.cloud_sql`, `.gcs`, `.nfs`, or `.other` with the key of a kind not read here |
+| `min_instances`, `max_instances` | The revision's scaling |
+| `concurrency`, `timeout_s` | Requests an instance takes at once, and how long one may take |
+| `execution_environment` | `.gen1` or `.gen2` |
+| `vpc_access` | A connector, or direct egress's network, subnetwork and tags, and which traffic goes through it |
+| `service_account`, `session_affinity`, `encryption_key` | The identity it runs as, sticky sessions, a customer-managed key |
+
+A `Service` adds `ingress`, `invoker_iam_disabled`,
+`default_uri_disabled` and its own `scaling` (minimum, maximum, mode,
+manual count). A `Job` adds its task template's `volumes`, `vpc_access`
+and `execution_environment` beside the containers it already had.
+
+```zig
+var service = try client.getService("us-central1", "checkout");
+defer service.deinit();
+const template = service.value.template.?;
+for (template.containers) |c| {
+    const r = c.resources orelse continue;
+    std.debug.print("{s}: {d} millicores, {?d} bytes\n", .{ c.image, r.cpuMillis() orelse 0, r.memoryBytes() });
+    for (c.env) |e| switch (e.source) {
+        .value => std.debug.print("  {s}\n", .{e.name}), // the value is often a credential
+        .secret => |ref| std.debug.print("  {s} from secret {s} ({s})\n", .{ e.name, ref.secret, ref.version }),
+    };
+}
+```
+
+An environment variable's `.value` is kept as deployed, and is often a
+credential: show names where a person may see them.
+
+Measured on 2026-10-23, with services and a job deployed for it:
+
+- **Production leaves out every false and zero it holds.** `cpuIdle:
+  false` and a minimum of 0 come back absent, so here they read as
+  `false` and `null` (a null minimum is 0). It fills defaults only where
+  a deploy gave none: 512Mi of memory, 1000m of CPU with `cpuIdle`, port
+  8080 as `http1`, a 300 s timeout, a concurrency of 80, and a service
+  scaling with a maximum of 20.
+- **CPU and memory are kept as deployed**: `"1"` and `"1000m"`, `"1G"`
+  and `"1024Mi"` each come back as written. `Resources.cpuMillis` and
+  `.memoryBytes` read every form production took.
+- **A secret is kept as deployed**, a bare id or a full name, with its
+  version (`latest` or a number). A secret the runtime account may not
+  read still makes a revision, and the service fails with reason
+  `SECRETS_ACCESS_CHECK_FAILED`.
+- **A disabled default URL leaves no `uri` and no `urls`** on the
+  service.
+- A template's container has no name unless the deploy gave one; a
+  revision's does (`hello-1`), with its image pinned to a digest.
+- `invoker_iam_disabled` could not be measured set: production takes it
+  only from a caller who may set the service's IAM policy.
+
 ## Jobs and executions
 
 **Experimental** on their own, new in 0.54.0.

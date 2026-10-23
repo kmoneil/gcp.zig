@@ -107,11 +107,311 @@ pub const TrafficTarget = struct {
     uri: []const u8 = "",
 };
 
-/// One container of a revision: what a deploy marker names.
+/// One container of a revision, of a service's template or of a job's
+/// task: what a deploy set it to run with. Production leaves out every
+/// false and zero it holds, so an absent setting reads as its default
+/// here (measured 2026-10-23).
 pub const Container = struct {
+    /// A revision's are named (`hello-1`, production's own when the deploy
+    /// gave none); a template's may be "".
     name: []const u8 = "",
-    /// Production answers it pinned to its digest, not the tag deployed.
+    /// A revision's is pinned to its digest, not the tag deployed.
     image: []const u8 = "",
+    /// The entrypoint, in place of the image's; empty for the image's.
+    command: []const []const u8 = &.{},
+    args: []const []const u8 = &.{},
+    working_dir: []const u8 = "",
+    env: []const EnvVar = &.{},
+    /// Null when the answer carried none.
+    resources: ?Resources = null,
+    ports: []const Port = &.{},
+    volume_mounts: []const VolumeMount = &.{},
+    /// Names of the containers that must start before this one.
+    depends_on: []const []const u8 = &.{},
+};
+
+/// An environment variable: a value as deployed, or a Secret Manager
+/// secret Cloud Run reads at start.
+pub const EnvVar = struct {
+    name: []const u8,
+    source: Source = .{ .value = "" },
+
+    pub const Source = union(enum) {
+        /// As deployed. Often a credential: show names, not values, where
+        /// a person may see them.
+        value: []const u8,
+        secret: SecretRef,
+    };
+};
+
+/// A Secret Manager secret, as deployed: an id in the service's project
+/// or a full `projects/P/secrets/S` (by id or number), both kept as sent.
+pub const SecretRef = struct {
+    secret: []const u8,
+    /// `latest`, a version number, or an alias; "" when the answer named
+    /// none.
+    version: []const u8 = "",
+};
+
+/// A container's limits, as production answers them: kept as deployed,
+/// so `"1000m"` and `"1"` are both one CPU and `"1Gi"` and `"1024Mi"` the
+/// same memory (measured 2026-10-23). `cpuMillis` and `memoryBytes` read
+/// them as numbers.
+pub const Resources = struct {
+    cpu: []const u8 = "",
+    memory: []const u8 = "",
+    /// `nvidia.com/gpu`, when the answer names one.
+    gpu: []const u8 = "",
+    /// CPU only while a request is handled; false is CPU always.
+    cpu_idle: bool = false,
+    startup_cpu_boost: bool = false,
+
+    /// The CPU limit in thousandths of a CPU: `"1000m"` and `"1"` are
+    /// 1000, `"0.5"` 500. Null when there is none or it is in a form not
+    /// read here.
+    pub fn cpuMillis(self: Resources) ?u64 {
+        const text = self.cpu;
+        if (text.len == 0) return null;
+        if (text[text.len - 1] == 'm') return std.fmt.parseInt(u64, text[0 .. text.len - 1], 10) catch null;
+        return decimalTimes(text, 1000);
+    }
+
+    /// The memory limit in bytes: binary suffixes (`Ki`, `Mi`, `Gi`,
+    /// `Ti`) count in 1024s, decimal ones (`k`, `M`, `G`, `T`) in 1000s,
+    /// none is bytes. Null when there is none, it overflows, or it is in a
+    /// form not read here (an exponent, a fraction of a byte).
+    pub fn memoryBytes(self: Resources) ?u64 {
+        const text = self.memory;
+        if (text.len == 0) return null;
+        const units = [_]struct { []const u8, u64 }{
+            .{ "Ki", 1 << 10 }, .{ "Mi", 1 << 20 },  .{ "Gi", 1 << 30 },      .{ "Ti", 1 << 40 },
+            .{ "k", 1_000 },    .{ "M", 1_000_000 }, .{ "G", 1_000_000_000 }, .{ "T", 1_000_000_000_000 },
+        };
+        for (units) |unit| {
+            if (std.mem.endsWith(u8, text, unit[0])) return decimalTimes(text[0 .. text.len - unit[0].len], unit[1]);
+        }
+        return decimalTimes(text, 1);
+    }
+};
+
+/// `text`, a plain decimal such as "2" or "1.5", times `scale`, when the
+/// result is a whole number that fits; else null.
+fn decimalTimes(text: []const u8, scale: u64) ?u64 {
+    const dot = std.mem.indexOfScalar(u8, text, '.');
+    const whole_text = text[0 .. dot orelse text.len];
+    const frac_text = if (dot) |d| text[d + 1 ..] else "";
+    if (whole_text.len == 0 and frac_text.len == 0) return null;
+    if (frac_text.len > 18) return null;
+    for (whole_text) |c| if (!std.ascii.isDigit(c)) return null;
+    for (frac_text) |c| if (!std.ascii.isDigit(c)) return null;
+    const whole: u64 = if (whole_text.len == 0) 0 else std.fmt.parseInt(u64, whole_text, 10) catch return null;
+    const frac: u128 = if (frac_text.len == 0) 0 else std.fmt.parseInt(u128, frac_text, 10) catch return null;
+    const denominator = std.math.powi(u128, 10, frac_text.len) catch return null;
+    const scaled = frac * scale;
+    if (scaled % denominator != 0) return null;
+    const total = @as(u128, whole) * scale + scaled / denominator;
+    return std.math.cast(u64, total);
+}
+
+pub const Port = struct {
+    /// `http1` or `h2c`: the protocol the container speaks.
+    name: []const u8 = "",
+    container_port: u16 = 0,
+};
+
+pub const VolumeMount = struct {
+    /// The `Volume` it mounts.
+    name: []const u8,
+    mount_path: []const u8 = "",
+    sub_path: []const u8 = "",
+};
+
+/// A volume a revision or task makes available to its containers.
+pub const Volume = struct {
+    name: []const u8,
+    source: Source = .{ .other = "" },
+
+    pub const Source = union(enum) {
+        secret: SecretVolume,
+        empty_dir: EmptyDir,
+        cloud_sql: CloudSql,
+        gcs: GcsVolume,
+        nfs: NfsVolume,
+        /// A kind this library does not read, by its key ("" for none).
+        other: []const u8,
+    };
+};
+
+/// A secret mounted as files: one named for the secret, or `items`.
+pub const SecretVolume = struct {
+    secret: []const u8,
+    /// The files' mode bits, as an integer (292 is 0444).
+    default_mode: ?u32 = null,
+    items: []const SecretItem = &.{},
+};
+
+pub const SecretItem = struct {
+    /// The file's path under the mount.
+    path: []const u8,
+    version: []const u8 = "",
+    mode: ?u32 = null,
+};
+
+pub const EmptyDir = struct {
+    /// `MEMORY`, or "" for the default.
+    medium: []const u8 = "",
+    /// Such as "64Mi", as deployed.
+    size_limit: []const u8 = "",
+};
+
+pub const CloudSql = struct {
+    /// `project:region:instance` connection names.
+    instances: []const []const u8 = &.{},
+};
+
+pub const GcsVolume = struct {
+    bucket: []const u8 = "",
+    read_only: bool = false,
+    mount_options: []const []const u8 = &.{},
+};
+
+pub const NfsVolume = struct {
+    server: []const u8 = "",
+    path: []const u8 = "",
+    read_only: bool = false,
+};
+
+/// Which traffic a revision sends through its VPC access.
+pub const Egress = enum {
+    unspecified,
+    all_traffic,
+    private_ranges_only,
+    /// A value this library does not know, read back from the server.
+    unknown,
+
+    pub fn fromWire(name: []const u8) Egress {
+        inline for (.{
+            .{ "ALL_TRAFFIC", .all_traffic },
+            .{ "PRIVATE_RANGES_ONLY", .private_ranges_only },
+            .{ "VPC_EGRESS_UNSPECIFIED", .unspecified },
+        }) |entry| {
+            if (std.mem.eql(u8, name, entry[0])) return entry[1];
+        }
+        return .unknown;
+    }
+};
+
+/// A revision's or task's way into a VPC: a Serverless VPC Access
+/// connector, or direct egress through `network_interfaces`.
+pub const VpcAccess = struct {
+    /// `projects/P/locations/L/connectors/C`; "" for direct egress.
+    connector: []const u8 = "",
+    egress: Egress = .unspecified,
+    /// Production takes one.
+    network_interfaces: []const NetworkInterface = &.{},
+};
+
+pub const NetworkInterface = struct {
+    network: []const u8 = "",
+    subnetwork: []const u8 = "",
+    tags: []const []const u8 = &.{},
+};
+
+pub const ExecutionEnvironment = enum {
+    unspecified,
+    gen1,
+    gen2,
+    /// A value this library does not know, read back from the server.
+    unknown,
+
+    pub fn fromWire(name: []const u8) ExecutionEnvironment {
+        inline for (.{
+            .{ "EXECUTION_ENVIRONMENT_GEN1", .gen1 },
+            .{ "EXECUTION_ENVIRONMENT_GEN2", .gen2 },
+            .{ "EXECUTION_ENVIRONMENT_UNSPECIFIED", .unspecified },
+        }) |entry| {
+            if (std.mem.eql(u8, name, entry[0])) return entry[1];
+        }
+        return .unknown;
+    }
+};
+
+/// Where a service takes requests from.
+pub const Ingress = enum {
+    unspecified,
+    /// Anywhere, the internet included.
+    all,
+    internal_only,
+    /// Internal traffic and Cloud Load Balancing.
+    internal_load_balancer,
+    /// No traffic at all.
+    none,
+    /// A value this library does not know, read back from the server.
+    unknown,
+
+    pub fn fromWire(name: []const u8) Ingress {
+        inline for (.{
+            .{ "INGRESS_TRAFFIC_ALL", .all },
+            .{ "INGRESS_TRAFFIC_INTERNAL_ONLY", .internal_only },
+            .{ "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER", .internal_load_balancer },
+            .{ "INGRESS_TRAFFIC_NONE", .none },
+            .{ "INGRESS_TRAFFIC_UNSPECIFIED", .unspecified },
+        }) |entry| {
+            if (std.mem.eql(u8, name, entry[0])) return entry[1];
+        }
+        return .unknown;
+    }
+};
+
+pub const ScalingMode = enum {
+    unspecified,
+    automatic,
+    manual,
+    /// A value this library does not know, read back from the server.
+    unknown,
+
+    pub fn fromWire(name: []const u8) ScalingMode {
+        inline for (.{
+            .{ "AUTOMATIC", .automatic },
+            .{ "MANUAL", .manual },
+            .{ "SCALING_MODE_UNSPECIFIED", .unspecified },
+        }) |entry| {
+            if (std.mem.eql(u8, name, entry[0])) return entry[1];
+        }
+        return .unknown;
+    }
+};
+
+/// A service's own scaling, divided among its revisions by their traffic.
+/// Production answers a service that set none with a maximum of 20; an
+/// absent minimum is 0 (measured 2026-10-23).
+pub const ServiceScaling = struct {
+    min_instances: ?i32 = null,
+    max_instances: ?i32 = null,
+    mode: ScalingMode = .unspecified,
+    /// Under `.manual`.
+    manual_instances: ?i32 = null,
+};
+
+/// What a service's template holds for its next revision: the settings a
+/// `Revision` carries, by the same names.
+pub const RevisionTemplate = struct {
+    containers: []const Container = &.{},
+    volumes: []const Volume = &.{},
+    service_account: []const u8 = "",
+    /// Null when the answer named none: an absent minimum is 0.
+    min_instances: ?i32 = null,
+    /// Null when the answer named none: production's default applies.
+    max_instances: ?i32 = null,
+    /// Requests one instance takes at once; production fills 80.
+    concurrency: ?i32 = null,
+    /// How long a request may take; production fills 300 s.
+    timeout_s: ?f64 = null,
+    execution_environment: ExecutionEnvironment = .unspecified,
+    vpc_access: ?VpcAccess = null,
+    session_affinity: bool = false,
+    /// A Cloud KMS key's name, for customer-managed encryption.
+    encryption_key: []const u8 = "",
 };
 
 pub const Service = struct {
@@ -130,6 +430,17 @@ pub const Service = struct {
     latest_created_revision: []const u8 = "",
     traffic: []const TrafficTarget = &.{},
     traffic_statuses: []const TrafficTarget = &.{},
+    /// What the next revision will be made from. Its container has no
+    /// name unless the deploy gave one.
+    template: ?RevisionTemplate = null,
+    ingress: Ingress = .unspecified,
+    /// Callers need no `run.routes.invoke`: production refused to set it
+    /// without `run.services.setIamPolicy`, so only its documented shape
+    /// is read here.
+    invoker_iam_disabled: bool = false,
+    /// The service answers no `uri` and no `urls` while it is set.
+    default_uri_disabled: bool = false,
+    scaling: ?ServiceScaling = null,
     /// The service's own summary condition, `Ready` when healthy.
     terminal_condition: ?Condition = null,
     conditions: []const Condition = &.{},
@@ -174,6 +485,20 @@ pub const Revision = struct {
     log_uri: []const u8 = "",
     service_account: []const u8 = "",
     labels: []const Label = &.{},
+    // The settings it runs with, as `RevisionTemplate` names them.
+    volumes: []const Volume = &.{},
+    /// Null when the answer named none: an absent minimum is 0.
+    min_instances: ?i32 = null,
+    /// Null when the answer named none: production's default applies.
+    max_instances: ?i32 = null,
+    /// Requests one instance takes at once.
+    concurrency: ?i32 = null,
+    /// How long a request may take.
+    timeout_s: ?f64 = null,
+    execution_environment: ExecutionEnvironment = .unspecified,
+    vpc_access: ?VpcAccess = null,
+    session_affinity: bool = false,
+    encryption_key: []const u8 = "",
 
     /// The `Ready` condition, or null when the answer carried none.
     pub fn readyCondition(self: Revision) ?Condition {
@@ -268,6 +593,10 @@ pub const Job = struct {
     max_retries: ?i32 = null,
     containers: []const Container = &.{},
     service_account: []const u8 = "",
+    /// The task template's volumes, VPC access and execution environment.
+    volumes: []const Volume = &.{},
+    vpc_access: ?VpcAccess = null,
+    execution_environment: ExecutionEnvironment = .unspecified,
     create_time: ?std.Io.Timestamp = null,
     update_time: ?std.Io.Timestamp = null,
     creator: []const u8 = "",
@@ -555,4 +884,25 @@ test "Job.ready reads the job's own terminal condition" {
     try testing.expect(job.ready());
     job.terminal_condition = .{ .type = "Ready", .state = .failed };
     try testing.expect(!job.ready());
+}
+
+test "Resources.cpuMillis: millicores and cores, as production keeps them" {
+    const cases = [_]struct { []const u8, ?u64 }{
+        .{ "1000m", 1000 },                                 .{ "500m", 500 },               .{ "1", 1000 },      .{ "2", 2000 }, .{ "4", 4000 },
+        .{ "0.5", 500 },                                    .{ "1.25", 1250 },              .{ "0.0005", null }, .{ "", null },  .{ "m", null },
+        .{ "1e3", null },                                   .{ "-1", null },                .{ "1.", 1000 },     .{ ".5", 500 }, .{ ".", null },
+        .{ "18446744073709551615m", 18446744073709551615 }, .{ "18446744073709552", null },
+    };
+    for (cases) |c| try std.testing.expectEqual(c[1], (Resources{ .cpu = c[0] }).cpuMillis());
+}
+
+test "Resources.memoryBytes: binary and decimal suffixes, plain bytes, nothing else" {
+    const cases = [_]struct { []const u8, ?u64 }{
+        .{ "512Mi", 512 << 20 },  .{ "1024Mi", 1 << 30 },  .{ "1Gi", 1 << 30 },        .{ "2Gi", 2 << 30 },
+        .{ "1G", 1_000_000_000 }, .{ "256Mi", 256 << 20 }, .{ "1.5Gi", 3 << 29 },      .{ "64Ki", 64 << 10 },
+        .{ "1k", 1000 },          .{ "1M", 1_000_000 },    .{ "1Ti", 1 << 40 },        .{ "1T", 1_000_000_000_000 },
+        .{ "1048576", 1 << 20 },  .{ "0.5", null },        .{ "1e9", null },           .{ "", null },
+        .{ "512m", null },        .{ "Mi", null },         .{ "17179869184Gi", null }, .{ "1.1Ki", null },
+    };
+    for (cases) |c| try std.testing.expectEqual(c[1], (Resources{ .memory = c[0] }).memoryBytes());
 }
