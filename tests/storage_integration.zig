@@ -919,6 +919,39 @@ test "copyTo with changes: the new fields, and everything else carried" {
     classed.deinit();
 }
 
+test "moveTo: an emulator, which has no move, reads, judges the conditions, copies and deletes" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    const data = "moving\n";
+    try f.upload("mv/src.txt", data);
+    try f.upload("mv/taken.txt", "x");
+    const src = f.bucket().object("mv/src.txt");
+    var read = try src.get(.{});
+    defer read.deinit();
+
+    // fake-gcs-server keeps no condition on a copy, so the library judges
+    // them, as Cloud Storage would.
+    try testing.expectError(error.FailedPrecondition, src.moveTo("mv/taken.txt", .{ .preconditions = .does_not_exist }));
+    try testing.expectError(error.FailedPrecondition, src.moveTo("mv/dst ü+%.txt", .{ .if_source_generation_match = read.value.generation + 1 }));
+    try testing.expectError(error.NotModified, src.moveTo("mv/dst ü+%.txt", .{ .if_source_generation_not_match = read.value.generation }));
+    try testing.expect(try src.exists());
+    var kept = try f.bucket().object("mv/taken.txt").downloadAlloc(16, .{});
+    defer kept.deinit();
+    try testing.expectEqualStrings("x", kept.value.data);
+
+    var moved = try src.moveTo("mv/dst ü+%.txt", .{ .if_source_generation_match = read.value.generation, .preconditions = .does_not_exist });
+    defer moved.deinit();
+    try testing.expectEqualStrings("mv/dst ü+%.txt", moved.value.name);
+    try testing.expectEqual(data.len, moved.value.size);
+    try testing.expect(!(try src.exists()));
+    var round = try f.bucket().object("mv/dst ü+%.txt").downloadAlloc(1024, .{});
+    defer round.deinit();
+    try testing.expectEqualStrings(data, round.value.data);
+}
+
 test "does_not_exist uploads succeed once, then fail their precondition" {
     var f: Fixture = undefined;
     if (!try f.init()) return error.SkipZigTest;

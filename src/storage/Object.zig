@@ -23,6 +23,7 @@ const iam = @import("iam.zig");
 const idempotency = @import("idempotency.zig");
 const logging = @import("logging.zig");
 const metadata = @import("metadata.zig");
+const move_impl = @import("move.zig");
 const multipart = @import("multipart.zig");
 const names = @import("names.zig");
 const parallel = @import("parallel.zig");
@@ -68,11 +69,11 @@ pub fn withBillingProject(self: Object, project: []const u8) Object {
 /// each range and resume of it, an upload, a copy's source and
 /// destination, a compose, a metadata read or update (which otherwise
 /// leave out the checksums), and a signed URL, which signs the key's
-/// headers in for its holder to send. `exists`, `delete`, `restore` and
-/// listings carry nothing: they need no key, and a key sent for an object
-/// stored without one is refused. The handle borrows `key`, and must not
-/// outlive it. Nothing logs it, and the headers built from it are wiped
-/// when each call returns.
+/// headers in for its holder to send. `exists`, `delete`, `restore`,
+/// `moveTo` and listings carry nothing: they need no key, and a key sent
+/// for an object stored without one is refused. The handle borrows `key`,
+/// and must not outlive it. Nothing logs it, and the headers built from
+/// it are wiped when each call returns.
 pub fn withEncryptionKey(self: Object, key: *const types.EncryptionKey) Object {
     var copy = self;
     copy.encryption_key = key;
@@ -607,6 +608,41 @@ fn copyToBilled(self: Object, dest: Object, unchecked: types.CopyOptions) Error!
     options.kms_key_name = try encryption.kmsKeyName(self.client, unchecked.kms_key_name);
     try encryption.checkOneKey(self.client, dest.encryption_key, options.kms_key_name);
     return copy_impl.copy(self.client, self.bucket, self.name, dest.bucket, dest.name, options, dest.encryption_key);
+}
+
+/// Renames the object to `destination` in the same bucket, in one atomic
+/// step: no copy, no delete, no early deletion fee, and nothing of the
+/// source left behind, not even a noncurrent version. The object moved is
+/// a new generation at metageneration 1 that keeps the source's content
+/// fields, custom time, metadata, checksums, owner and access control
+/// list. A live object at `destination` is replaced unless
+/// `options.preconditions` say otherwise; in a versioned bucket it becomes
+/// noncurrent. A hierarchical bucket makes the folders `destination`
+/// needs. Answers the object as it now is.
+///
+/// Pin the move with `options.if_source_generation_match`: it then never
+/// moves an object written since the generation was read, and is repeated
+/// after a lost answer like any write made safe by a condition. A repeat
+/// that finds the source gone reads the destination and answers it, the
+/// earlier attempt having moved it. An unpinned move is repeated only
+/// within the idempotency token's window. A retained or held source or
+/// destination is `error.ObjectRetained`.
+///
+/// An emulator has no move: there it reads both ends, judges the
+/// conditions as Cloud Storage would, copies the source and deletes it,
+/// which is not atomic, and logs a warning saying so.
+pub fn moveTo(self: Object, destination: []const u8, options: types.MoveOptions) Error!types.Owned(types.ObjectInfo) {
+    var client: Client = undefined;
+    return (try self.forCall(&client)).moveToBilled(destination, options);
+}
+
+fn moveToBilled(self: Object, destination: []const u8, options: types.MoveOptions) Error!types.Owned(types.ObjectInfo) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.bucket);
+    try rpc.checkObjectName(self.client, self.name);
+    try rpc.checkObjectName(self.client, destination);
+    try move_impl.check(self.client.diagnostics, self.name, destination, options);
+    return move_impl.move(self.client, self.bucket, self.name, destination, options);
 }
 
 /// Uploads the file through the resumable protocol, reading it at offsets

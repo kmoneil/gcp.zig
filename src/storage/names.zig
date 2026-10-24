@@ -623,18 +623,17 @@ fn writeRewrite(
 }
 
 /// `/storage/v1/b/{bucket}/o/{source}/moveTo/o/{destination}`: an atomic
-/// rename within one bucket, pinned to the source's generation, under the
-/// conditions on the destination.
+/// rename within one bucket, under the conditions on the source, then
+/// those on the destination.
 pub fn movePath(
     arena: Allocator,
     bucket: []const u8,
     source: []const u8,
     destination: []const u8,
-    source_generation: u64,
-    preconditions: types.Preconditions,
+    options: types.MoveOptions,
 ) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);
-    writeMove(&out.writer, bucket, source, destination, source_generation, preconditions) catch
+    writeMove(&out.writer, bucket, source, destination, options) catch
         return error.OutOfMemory;
     return out.toOwnedSlice();
 }
@@ -644,8 +643,7 @@ fn writeMove(
     bucket: []const u8,
     source: []const u8,
     destination: []const u8,
-    source_generation: u64,
-    preconditions: types.Preconditions,
+    options: types.MoveOptions,
 ) Writer.Error!void {
     try w.writeAll("/storage/v1/b/");
     try query.writeStrictSegment(w, bucket);
@@ -654,8 +652,11 @@ fn writeMove(
     try w.writeAll("/moveTo/o/");
     try query.writeStrictSegment(w, destination);
     var params: query.Params = .init(w);
-    try params.addInt("ifSourceGenerationMatch", source_generation);
-    try writePreconditions(&params, preconditions);
+    if (options.if_source_generation_match) |g| try params.addInt("ifSourceGenerationMatch", g);
+    if (options.if_source_generation_not_match) |g| try params.addInt("ifSourceGenerationNotMatch", g);
+    if (options.if_source_metageneration_match) |m| try params.addInt("ifSourceMetagenerationMatch", m);
+    if (options.if_source_metageneration_not_match) |m| try params.addInt("ifSourceMetagenerationNotMatch", m);
+    try writePreconditions(&params, options.preconditions);
 }
 
 /// What an upload's path says beside the bucket: the conditions, the
@@ -1063,22 +1064,36 @@ test "XML API paths keep the name's slashes and encode the rest" {
     try expectPath("/b///?partNumber=10000&uploadId=u", try xmlPath(gpa, "b", "//", .{ .part = .{ .number = 10000, .upload_id = "u" } }));
 }
 
-test "move paths name both objects, pin the source, and carry the destination's conditions" {
+test "move paths name both objects and carry the source's conditions, then the destination's" {
     const gpa = testing.allocator;
     try expectPath(
         "/storage/v1/b/my-bucket/o/zig-gcp-tmp%2F0a1b/moveTo/o/backups%2Fdb.tar?ifSourceGenerationMatch=17",
-        try movePath(gpa, "my-bucket", "zig-gcp-tmp/0a1b", "backups/db.tar", 17, .{}),
+        try movePath(gpa, "my-bucket", "zig-gcp-tmp/0a1b", "backups/db.tar", .{ .if_source_generation_match = 17 }),
     );
     try expectPath(
         "/storage/v1/b/b/o/t/moveTo/o/a%20b?ifSourceGenerationMatch=1&ifGenerationMatch=0",
-        try movePath(gpa, "b", "t", "a b", 1, .does_not_exist),
+        try movePath(gpa, "b", "t", "a b", .{ .if_source_generation_match = 1, .preconditions = .does_not_exist }),
     );
     try expectPath(
         "/storage/v1/b/b/o/t/moveTo/o/d?ifSourceGenerationMatch=2&ifGenerationNotMatch=3&ifMetagenerationMatch=4&ifMetagenerationNotMatch=5",
-        try movePath(gpa, "b", "t", "d", 2, .{
+        try movePath(gpa, "b", "t", "d", .{ .if_source_generation_match = 2, .preconditions = .{
             .if_generation_not_match = 3,
             .if_metageneration_match = 4,
             .if_metageneration_not_match = 5,
+        } }),
+    );
+    // Unpinned, and every source condition, each name strictly encoded.
+    try expectPath(
+        "/storage/v1/b/b/o/a%2Fb%3F%23/moveTo/o/%C3%BC%2B%25",
+        try movePath(gpa, "b", "a/b?#", "ü+%", .{}),
+    );
+    try expectPath(
+        "/storage/v1/b/b/o/s/moveTo/o/d?ifSourceGenerationNotMatch=6&ifSourceMetagenerationMatch=7&ifSourceMetagenerationNotMatch=8&ifGenerationMatch=9",
+        try movePath(gpa, "b", "s", "d", .{
+            .if_source_generation_not_match = 6,
+            .if_source_metageneration_match = 7,
+            .if_source_metageneration_not_match = 8,
+            .preconditions = .{ .if_generation_match = 9 },
         }),
     );
 }

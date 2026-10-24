@@ -731,8 +731,8 @@ pub fn build(b: *std.Build) void {
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "monitoring_policies", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "run_actions", "dataflow_jobs", "dataflow_stop", "bigquery_query", "datatransfer_runs", "permissions", "run_service" }) |name| {
-        // whoami, secret, gcs_cp, gcs_sign, gcs_notify, quickstart, iam,
+    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "gcs_mv", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "monitoring_policies", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "run_actions", "dataflow_jobs", "dataflow_stop", "bigquery_query", "datatransfer_runs", "permissions", "run_service" }) |name| {
+        // whoami, secret, gcs_cp, gcs_sign, gcs_notify, gcs_mv, quickstart, iam,
         // secret_rotation, firestore, logs_read, logs_tail, projects_list,
         // error_dashboard, monitoring, monitoring_alerts,
         // monitoring_policies, pubsub_metrics,
@@ -743,7 +743,7 @@ pub fn build(b: *std.Build) void {
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "secret"))
             &.{ .{ .name = "secret_manager", .module = secret_manager }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "gcs_cp") or std.mem.eql(u8, name, "gcs_sign") or std.mem.eql(u8, name, "gcs_folders"))
+        else if (std.mem.eql(u8, name, "gcs_cp") or std.mem.eql(u8, name, "gcs_sign") or std.mem.eql(u8, name, "gcs_folders") or std.mem.eql(u8, name, "gcs_mv"))
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "iam"))
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "secret_manager", .module = secret_manager }, .{ .name = "auth", .module = auth } }

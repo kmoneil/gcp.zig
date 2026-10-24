@@ -3799,6 +3799,8 @@ test "52. soft delete: objects restored one and many at a time, and the bucket i
 
     // One object: deleted, found among the soft-deleted, read, restored.
     const original = try f.put("s/a", "a0");
+    var timed = try b.object("s/a").updateMetadata(.{ .custom_time = "2026-10-01T00:00:00Z" });
+    timed.deinit();
     try b.object("s/a").delete(.{});
     var listed = try b.listObjects(.{ .soft_deleted = true, .match_glob = "s/**" });
     defer listed.deinit();
@@ -3811,6 +3813,7 @@ test "52. soft delete: objects restored one and many at a time, and the bucket i
     defer restored.deinit();
     try testing.expect(restored.value.generation != original);
     try testing.expectEqualStrings("zig", restored.value.metadataValue("origin").?);
+    try testing.expectEqualStrings("2026-10-01T00:00:00Z", restored.value.custom_time.?);
     var bytes = try b.object("s/a").downloadAlloc(16, .{});
     defer bytes.deinit();
     try testing.expectEqualStrings("a0", bytes.value.data);
@@ -5201,4 +5204,108 @@ test "69. HMAC signing: a fresh key's GET and PUT URLs and POST policy work with
     const refused = try useUnsigned(a, .GET, tampered, &.{}, null);
     try testing.expectEqual(403, refused.status);
     try testing.expect(std.mem.indexOf(u8, refused.body, "SignatureDoesNotMatch") != null);
+}
+
+// Moves: the bucket settings and move spec's section 6, case 7. What a move
+// keeps and refuses, as the fake answers it in src/storage/move.zig.
+
+test "70. move: renamed in one step, keeping what production keeps, and each condition refused as measured" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    const src = try f.object("mv/src");
+    const other = try f.object("mv/other");
+    const dest = try f.object("mv/dst ü+%");
+    var up = src.upload("moving\n", .{
+        .content_type = "text/plain",
+        .cache_control = "no-cache",
+        .custom_time = "2026-10-01T00:00:00Z",
+        .metadata = &.{.{ .key = "k", .value = "v" }},
+    }) catch |err| return f.report(err);
+    defer up.deinit();
+    var there = other.upload("x", .{}) catch |err| return f.report(err);
+    defer there.deinit();
+    const g = up.value.generation;
+
+    try testing.expectError(error.FailedPrecondition, src.moveTo(dest.name, .{ .if_source_generation_match = g + 1 }));
+    try testing.expectEqualStrings("At least one of the pre-conditions you specified did not hold.", f.diag.message());
+    try testing.expectError(error.FailedPrecondition, src.moveTo(other.name, .{ .preconditions = .does_not_exist }));
+    // A NotMatch against no destination fails too.
+    try testing.expectError(error.FailedPrecondition, src.moveTo(dest.name, .{ .preconditions = .{ .if_generation_not_match = 0 } }));
+    // A NotMatch that hits, on either end, is 304.
+    try testing.expectError(error.NotModified, src.moveTo(dest.name, .{ .if_source_generation_not_match = g }));
+    try testing.expectError(error.NotModified, src.moveTo(dest.name, .{ .if_source_metageneration_not_match = 1 }));
+    try testing.expectError(error.NotModified, src.moveTo(other.name, .{ .preconditions = .{ .if_generation_not_match = there.value.generation } }));
+    const missing = try f.object("mv/nosuch");
+    try testing.expectError(error.NotFound, missing.moveTo(dest.name, .{}));
+    var words_buf: [256]u8 = undefined;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&words_buf, "No such object: {s}/{s}", .{ f.bucket_name, missing.name }), f.diag.message());
+
+    var moved = src.moveTo(dest.name, .{ .if_source_generation_match = g, .preconditions = .does_not_exist }) catch |err| return f.report(err);
+    defer moved.deinit();
+    try testing.expectEqualStrings(dest.name, moved.value.name);
+    try testing.expect(moved.value.generation != g);
+    try testing.expectEqual(1, moved.value.metageneration);
+    try testing.expectEqualStrings("text/plain", moved.value.content_type);
+    try testing.expectEqualStrings("no-cache", moved.value.cache_control.?);
+    try testing.expectEqualStrings("2026-10-01T00:00:00Z", moved.value.custom_time.?);
+    try testing.expectEqualStrings("v", moved.value.metadataValue("k").?);
+    try testing.expectEqual(up.value.crc32c, moved.value.crc32c);
+    try testing.expectEqual(up.value.md5, moved.value.md5);
+    var link_buf: [64]u8 = undefined;
+    try testing.expect(std.mem.endsWith(u8, moved.value.media_link.?, try std.fmt.bufPrint(&link_buf, "%2Fmv%2Fdst%20%C3%BC%2B%25?generation={d}&alt=media", .{moved.value.generation})));
+    try testing.expect(!(try src.exists()));
+    try f.expectContent(dest, "moving\n");
+
+    // Onto a live object with no condition: replaced.
+    var again = dest.moveTo(other.name, .{ .if_source_generation_match = moved.value.generation }) catch |err| return f.report(err);
+    defer again.deinit();
+    try testing.expect(!(try dest.exists()));
+    try f.expectContent(other, "moving\n");
+}
+
+test "71. move: a pinned move whose answer was lost is repeated, meets 404, and is settled by reading the destination" {
+    var plan = [_]FaultTransport.Fault{
+        .{ .method = .POST, .url_contains = "/moveTo/", .action = .lose_response },
+    };
+    var f: Fixture = undefined;
+    if (!try f.init(.{ .plan = &plan, .record = true, .idempotency_tokens = false })) return error.SkipZigTest;
+    defer f.deinit();
+    const src = try f.object("mv/lost");
+    const dest = try f.object("mv/found");
+    var up = src.upload("lost\n", .{}) catch |err| return f.report(err);
+    defer up.deinit();
+
+    var moved = src.moveTo(dest.name, .{ .if_source_generation_match = up.value.generation }) catch |err| return f.report(err);
+    defer moved.deinit();
+    try testing.expect(plan[0].fired);
+    const repeat = try f.after(try f.faulted(0));
+    std.debug.print("a pinned move repeated after one that landed: HTTP {?d}\n", .{repeat.status});
+    try testing.expect(std.mem.indexOf(u8, repeat.url, "/moveTo/") != null);
+    try testing.expectEqual(404, repeat.status.?);
+    try testing.expectEqualStrings(dest.name, moved.value.name);
+    try testing.expect(!(try src.exists()));
+    try f.expectContent(dest, "lost\n");
+}
+
+test "72. move: an unpinned move whose answer was lost, under a token, is repeated and answered with the first result" {
+    var plan = [_]FaultTransport.Fault{
+        .{ .method = .POST, .url_contains = "/moveTo/", .action = .lose_response },
+    };
+    var f: Fixture = undefined;
+    if (!try f.init(.{ .plan = &plan, .record = true })) return error.SkipZigTest;
+    defer f.deinit();
+    const src = try f.object("mv/once");
+    const dest = try f.object("mv/twice");
+    var up = src.upload("once\n", .{}) catch |err| return f.report(err);
+    defer up.deinit();
+
+    var moved = src.moveTo(dest.name, .{}) catch |err| return f.report(err);
+    defer moved.deinit();
+    try testing.expect(plan[0].fired);
+    const repeat = try f.after(try f.faulted(0));
+    try testing.expectEqual(200, repeat.status.?);
+    const first = f.faults.exchanges.items[try f.faulted(0)];
+    try testing.expectEqualStrings(first.header("X-Goog-Gcs-Idempotency-Token").?, repeat.header("X-Goog-Gcs-Idempotency-Token").?);
+    try f.expectContent(dest, "once\n");
 }
