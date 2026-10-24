@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.59.0 (unreleased)
+## 0.59.0 (2026-10-24)
 
 - storage: a bucket's other settings and two object fields, for issue
   #311, so a console's bucket and object pages show everything. A
