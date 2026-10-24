@@ -92,6 +92,18 @@ pub const ObjectInfo = struct {
     acl: ?[]const AclEntry = null,
     /// Who owns it, as `acl` is read: the account that wrote it.
     owner: ?AclEntity = null,
+    /// RFC 3339, in UTC, set by whoever wrote the object: what lifecycle
+    /// rules' `days_since_custom_time` and `custom_time_before` read.
+    /// Cloud Storage lets it move later and never earlier, and never
+    /// removes it once set. Null when never set.
+    custom_time: ?[]const u8 = null,
+    /// The JSON API URL that downloads this generation, as Cloud Storage
+    /// names it. It takes the same credentials as a read, unless the
+    /// object is public.
+    media_link: ?[]const u8 = null,
+    /// RFC 3339: when the storage class last changed, which an Autoclass
+    /// bucket does as objects go unread. The creation time until then.
+    time_storage_class_updated: ?[]const u8 = null,
 
     /// The value of the custom metadata entry named `key`, or null.
     pub fn metadataValue(self: ObjectInfo, key: []const u8) ?[]const u8 {
@@ -275,6 +287,11 @@ pub const MetadataUpdate = struct {
     content_disposition: ?[]const u8 = null,
     content_encoding: ?[]const u8 = null,
     content_language: ?[]const u8 = null,
+    /// RFC 3339: the object's new custom time. Cloud Storage takes one
+    /// later than, or the same as, the time it holds, and refuses an
+    /// earlier one with `error.InvalidArgument`; once set, a custom time is
+    /// never removed. Null leaves it.
+    custom_time: ?[]const u8 = null,
     edit: MetadataEdit = .keep,
     /// Place (true) or release (false) a temporary hold. Null leaves it.
     temporary_hold: ?bool = null,
@@ -308,6 +325,10 @@ pub const UploadOptions = struct {
     /// downloads behave; see the download options.
     content_encoding: ?[]const u8 = null,
     content_language: ?[]const u8 = null,
+    /// RFC 3339, such as `2026-10-01T00:00:00Z`: what lifecycle rules'
+    /// `days_since_custom_time` and `custom_time_before` read. Cloud
+    /// Storage keeps it in UTC.
+    custom_time: ?[]const u8 = null,
     /// Custom metadata. Keys must not be empty.
     metadata: []const Metadata = &.{},
     /// The known checksum of the whole object. Checked against the data
@@ -961,6 +982,85 @@ pub const RetentionPolicy = struct {
     locked: bool = false,
 };
 
+/// Autoclass: Cloud Storage moves each object to a colder class as it goes
+/// unread, and back to Standard when read. Objects are written Standard
+/// whatever class an upload names.
+pub const Autoclass = struct {
+    enabled: bool,
+    /// RFC 3339: when `enabled` last changed.
+    toggle_time: ?[]const u8 = null,
+    /// `NEARLINE`, the default, or `ARCHIVE`: the coldest class objects
+    /// reach. Null while Autoclass is off.
+    terminal_storage_class: ?[]const u8 = null,
+    /// RFC 3339: when the terminal class last changed.
+    terminal_storage_class_update_time: ?[]const u8 = null,
+};
+
+/// One cross-origin resource sharing rule.
+pub const CorsRule = struct {
+    /// Origins allowed, such as `https://example.com`; `*` is any.
+    origins: []const []const u8 = &.{},
+    /// HTTP methods allowed; `*` is any.
+    methods: []const []const u8 = &.{},
+    /// Response headers a browser may show the page.
+    response_headers: []const []const u8 = &.{},
+    /// How long a browser may keep a preflight's answer. Null when the
+    /// rule names none.
+    max_age_s: ?u32 = null,
+};
+
+/// How the bucket serves a site: what a path ending in `/` reads, and what
+/// a missing object answers.
+pub const Website = struct {
+    /// Appended to a path that names no object, such as `index.html`.
+    main_page_suffix: ?[]const u8 = null,
+    /// The object served, with status 404, for one that is missing.
+    not_found_page: ?[]const u8 = null,
+};
+
+/// Where a bucket's usage and storage logs go.
+pub const AccessLogging = struct {
+    /// Cloud Storage takes a bucket that does not exist, as measured.
+    log_bucket: []const u8,
+    /// What log object names start with. Cloud Storage fills in the logged
+    /// bucket's own name when none was given.
+    log_object_prefix: ?[]const u8 = null,
+};
+
+/// Which networks may reach the bucket and its objects.
+pub const IpFilter = struct {
+    /// Requests from anywhere else are refused. When false, the rules are
+    /// kept without being applied.
+    enforced: bool,
+    /// Public IPv4 and IPv6 ranges let in, such as `203.0.113.0/24`.
+    /// Empty: none, or a listing, which leaves them out.
+    public_ranges: []const []const u8 = &.{},
+    /// VPC networks let in, each with its ranges. A listing leaves them
+    /// out too.
+    vpc_sources: []const VpcSource = &.{},
+    /// VPC networks of other organizations may be named.
+    allow_cross_org_vpcs: bool = false,
+    /// Every Google Cloud service agent gets in whatever the rules say.
+    allow_all_service_agent_access: bool = false,
+
+    pub const VpcSource = struct {
+        /// `projects/P/global/networks/N`.
+        network: []const u8,
+        ranges: []const []const u8 = &.{},
+    };
+};
+
+/// A bucket's recovery point objective: how its two regions replicate.
+pub const Rpo = enum {
+    /// Default replication; what every multi-region and dual-region bucket
+    /// has unless turbo replication is on.
+    default,
+    /// Turbo replication, only on a dual-region.
+    async_turbo,
+    /// A value this library does not know yet.
+    unknown,
+};
+
 /// A bucket, as `create`, `get`, `update` and `listBuckets` return it.
 pub const BucketInfo = struct {
     name: []const u8,
@@ -1000,6 +1100,26 @@ pub const BucketInfo = struct {
     hard_delete_time: ?[]const u8 = null,
     /// Folders are real resources in this bucket.
     hierarchical_namespace: bool = false,
+    /// Null: Autoclass was never turned on. Once turned off it stays,
+    /// with `enabled` false and no terminal class.
+    autoclass: ?Autoclass = null,
+    /// The cross-origin rules, in the order the bucket keeps them.
+    cors: []const CorsRule = &.{},
+    website: ?Website = null,
+    /// Where usage and storage logs go. Null: nowhere.
+    logging: ?AccessLogging = null,
+    /// Null: no filter, or one the caller may not read, which takes
+    /// `storage.buckets.getIpFilter`: Cloud Storage leaves it out of the
+    /// answer rather than refusing the read, as measured 2026-10-24.
+    /// `listBuckets` gives a filter without its ranges; `Bucket.get` gives
+    /// them.
+    ip_filter: ?IpFilter = null,
+    /// Null for a regional bucket, which has none.
+    rpo: ?Rpo = null,
+    /// A configurable dual-region's two regions, such as `US-EAST1` and
+    /// `US-WEST1`. Empty for any other bucket, a predefined dual-region
+    /// such as `NAM4` included: its `location` names it.
+    data_locations: []const []const u8 = &.{},
 
     pub const SoftDelete = struct {
         retention_s: u32,

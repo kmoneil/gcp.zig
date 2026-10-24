@@ -90,6 +90,14 @@ A patch moves the metageneration and not the generation, so
 condition says nothing about it. `generation` patches one named
 generation, which needs a versioned bucket to reach a noncurrent one.
 
+`custom_time`, on an upload or a patch, is the time lifecycle rules'
+`days_since_custom_time` and `custom_time_before` count from: when a
+document was signed, say, rather than when it was uploaded. It is RFC
+3339 with a zone, checked before sending, and comes back in UTC as
+`ObjectInfo.custom_time`. Cloud Storage only lets it move later: an
+earlier one is `error.InvalidArgument` with its words in `Diagnostics`,
+and once set it is never removed. A copy carries it.
+
 Measured against a real bucket on 2026-09-23: a key the patch does not
 name survives it, `.clear` really does remove the lot, a stale
 `if_metageneration_match` is 412 and leaves the object alone, and the

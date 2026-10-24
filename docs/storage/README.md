@@ -97,7 +97,8 @@ picks `.read_only`, `.full_control` (which a bucket's IAM policy needs)
 or `.cloud_platform` instead. Not in this version:
 the JSON API's PUT, which replaces a whole resource (`updateMetadata`
 and `Bucket.update` patch, which merges), parallel composite uploads,
-and gRPC.
+and gRPC. Autoclass, CORS, a website, access logging, an IP filter and
+turbo replication are read, [not set](buckets.md#settings-read-and-not-set).
 
 The examples put it to work:
 [`examples/gcs_cp.zig`](../../examples/gcs_cp.zig) copies files up and
