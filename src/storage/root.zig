@@ -79,6 +79,7 @@ pub const acl = struct {
     pub const sameEntity = @import("acl.zig").sameEntity;
 };
 pub const CopyOptions = @import("types.zig").CopyOptions;
+pub const MoveOptions = @import("types.zig").MoveOptions;
 pub const DeleteOptions = @import("types.zig").DeleteOptions;
 pub const DownloadOptions = @import("types.zig").DownloadOptions;
 pub const DownloadResult = @import("types.zig").DownloadResult;
@@ -190,6 +191,7 @@ test {
     _ = @import("multipart.zig");
     _ = @import("logging.zig");
     _ = @import("metadata.zig");
+    _ = @import("move.zig");
     _ = @import("names.zig");
     _ = @import("parallel.zig");
     _ = @import("parallel_download.zig");

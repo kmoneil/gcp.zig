@@ -24,6 +24,20 @@ including the ones that did not change.
   the filter left out; a regional bucket has no `rpo`; logging without a
   prefix gets the bucket's own name; and a custom time can never move
   earlier or be removed.
+- storage: `Object.moveTo(name, MoveOptions)` renames an object within
+  its bucket in one atomic step, for issue #311: no copy, no delete, and
+  in production nothing of the source left behind. The moved object keeps
+  its metadata, custom time and access control list under a new
+  generation. `MoveOptions` holds the source's four conditions and the
+  destination's `preconditions`; a `Match` beside a `NotMatch` on one
+  field, and a move onto its own name, are `error.InvalidArgument` before
+  sending, and a `NotMatch` that hits is `error.NotModified`. A move
+  pinned with `if_source_generation_match` is repeated after a lost
+  answer, and a repeat that finds the source gone answers the
+  destination. Against an emulator, which has no move, it reads both
+  ends, judges the conditions itself, copies and deletes, with a
+  warning. The parallel upload's move into place
+  shares its request. New example: `gcs_mv`.
 - auth, bigquery, core, dataflow, datatransfer, error_reporting,
   firestore, kms, logging, monitoring, pubsub, resource_manager, run,
   scheduler and secret_manager: unchanged.

@@ -73,6 +73,7 @@ it differs from Cloud Storage.
 | `client.abandonTransfer(checkpoint)` | Drops what a checkpoint's unfinished transfer left on the server | [Transfers](transfers.md#transfers-that-outlive-the-process) |
 | `.download(writer, options)`, `.downloadAlloc(max_bytes, options)` | Into any writer, or into memory up to a cap | [Checksums](checksums-and-compression.md#checksums) |
 | `.copyTo(dest, options)` | A server-side copy, across buckets too | [Copies](writing-objects.md#copies-that-change-what-they-carry) |
+| `.moveTo(name, options)` | Renames the object within its bucket, in one atomic step | [Moves](writing-objects.md#moves) |
 | `.updateMetadata(options)` | Changes what an object says about itself, leaving its bytes alone | [Metadata](writing-objects.md#metadata-after-the-upload) |
 | `.restore(options)` | Brings back a soft-deleted generation as the live one | [Soft delete](buckets.md#versions-and-soft-delete) |
 | `bucket.bulkRestore(options)`, `.operation(id)`, `.cancelOperation(id)`, `.listOperations(page)` | Restores many soft-deleted objects at once, and follows the operation doing it | [Soft delete](buckets.md#versions-and-soft-delete) |

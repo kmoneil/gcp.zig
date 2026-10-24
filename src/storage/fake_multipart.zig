@@ -333,9 +333,11 @@ pub const FakeMultipart = struct {
         kms_key_name: ?[]u8 = null,
         /// The canned access control list its start named.
         predefined_acl: ?types.PredefinedAcl = null,
-        /// The holds and retention its start's metadata asked for.
+        /// The holds, retention and custom time its start's metadata asked
+        /// for.
         holds: Holds = .{},
         retention: ?Retention = null,
+        custom_time: ?std.Io.Timestamp = null,
     };
 
     /// An object's own retention.
@@ -375,6 +377,8 @@ pub const FakeMultipart = struct {
         holds: Holds = .{},
         /// Its own retention: until when, on the fake's clock.
         retention: ?Retention = null,
+        /// Its custom time, which only ever moves later.
+        custom_time: ?std.Io.Timestamp = null,
         /// Moved by every patch.
         metageneration: u64 = 1,
         /// When its retention period started, on the fake's clock: its
@@ -887,9 +891,12 @@ pub const FakeMultipart = struct {
         }
     }
 
-    /// `objects.patch`, of holds alone: every other field fails the test
-    /// that sent it. Releasing an event-based hold starts the retention
-    /// period over.
+    /// `objects.patch`, of holds, retention, lists and the custom time:
+    /// every other field fails the test that sent it. Releasing an
+    /// event-based hold starts the retention period over. A custom time
+    /// moves later or stays, and null leaves it, each moving the
+    /// metageneration all the same; an earlier one is refused, in
+    /// production's words of 2026-10-24.
     fn patchObject(self: *FakeMultipart, target: JsonTarget, index: ?usize, body: []const u8, arena: Allocator) Allocator.Error!Reply {
         self.counts.patches += 1;
         const i = index orelse return .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"No such object\",\"errors\":[{\"reason\":\"notFound\"}]}}" };
@@ -898,12 +905,13 @@ pub const FakeMultipart = struct {
             .hold => {},
             .match_failed, .not_match_failed => return condition_failed,
         }
-        const bad = "{\"error\":{\"code\":400,\"message\":\"this fake patches holds, retention and lists alone: ";
+        const bad = "{\"error\":{\"code\":400,\"message\":\"this fake patches holds, retention, custom times and lists alone: ";
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch return .{ .status = 400, .body = bad ++ "a body that is not JSON\"}}" };
         if (parsed != .object) return .{ .status = 400, .body = bad ++ "a body that is not an object\"}}" };
         var holds = o.holds;
         var retention = o.retention;
         var list = o.acl;
+        var custom_time = o.custom_time;
         // The list, before anything changes, as measured: uniform access
         // refuses any, a canned list beside a list that is not empty is
         // 409, and an empty list alone is ignored.
@@ -937,6 +945,21 @@ pub const FakeMultipart = struct {
                 }
                 continue;
             }
+            if (std.mem.eql(u8, entry.key_ptr.*, "customTime")) {
+                // Null is taken and changes nothing, as measured.
+                if (value == .null) continue;
+                const text = if (value == .string) value.string else return try jsonRefusal(arena, 400, "invalid", custom_time_words);
+                const next = core.timestamp.parse(text) catch return try jsonRefusal(arena, 400, "invalid", custom_time_words);
+                if (custom_time) |current| if (next.nanoseconds < current.nanoseconds) {
+                    const words = try arena.print("Custom time cannot be decreased. Previously: {s}. Attempting to set: {s}.", .{
+                        try offsetTime(arena, current),
+                        try offsetTime(arena, next),
+                    });
+                    return try jsonRefusal(arena, 400, "invalid", words);
+                };
+                custom_time = next;
+                continue;
+            }
             if (value != .bool) return .{ .status = 400, .body = bad ++ "a field that is not a boolean\"}}" };
             if (std.mem.eql(u8, entry.key_ptr.*, "temporaryHold")) {
                 holds.temporary = value.bool;
@@ -949,6 +972,7 @@ pub const FakeMultipart = struct {
         o.holds = holds;
         o.retention = retention;
         o.acl = list;
+        o.custom_time = custom_time;
         o.metageneration += 1;
         return .{ .status = 200, .body = try objectJsonFull(self, arena, o, o.name, o.generation, target.bucket, false, false, target.full) };
     }
@@ -1247,31 +1271,44 @@ pub const FakeMultipart = struct {
         return .{ .status = 200, .body = reply_body };
     }
 
-    /// `objects.move`: the source, pinned to its generation, renamed to the
-    /// destination under the destination's conditions, with a new
-    /// generation, atomically. The source goes; an object it replaces goes.
+    /// `objects.move`, as production answered it on 2026-10-24: a `Match`
+    /// beside a `NotMatch` on one field, on either end, is 409, and one
+    /// name for both ends 400, before anything is looked up; a missing
+    /// source is 404 naming it; a `Match` that fails, on either end, is the
+    /// storage-wide 412, and a `NotMatch` that hits is 304 with no body. A
+    /// held source or destination is refused as a delete would be. The
+    /// object moved is a new generation at metageneration 1 that keeps
+    /// everything else, in a hierarchical bucket under the folders made
+    /// for it; an object it replaces goes.
     fn moveObject(self: *FakeMultipart, target: MoveTarget, fault: Fault, arena: Allocator) Allocator.Error!Reply {
         self.counts.moves += 1;
-        const not_found: Reply = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"No such object\",\"errors\":[{\"reason\":\"notFound\"}]}}" };
-        const destination_holds = if (self.liveIndex(target.destination)) |d|
-            target.conditions.check(&self.objects.items[d]) == .hold
-        else
-            target.conditions.checkAbsent();
-        if (self.move_checks_destination_first and !destination_holds) return condition_failed;
-        const s = self.liveIndex(target.source) orelse return not_found;
-        if (target.if_source_generation_match) |g| if (self.objects.items[s].generation != g) return condition_failed;
-        if (!destination_holds) return condition_failed;
-        if (std.mem.eql(u8, target.source, target.destination)) return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"same name\"}}" };
+        if (target.source_conditions.conflicting() or target.conditions.conflicting()) {
+            return try jsonRefusal(arena, 409, "conflict", "Found conflicting object preconditions. Mutually exclusive fields cannot be set simultaneously.");
+        }
+        if (std.mem.eql(u8, target.source, target.destination)) {
+            return try jsonRefusal(arena, 400, "invalid", "Source and destination object names must be different.");
+        }
+        const destination: Conditions.Outcome = if (self.liveIndex(target.destination)) |d|
+            target.conditions.check(&self.objects.items[d])
+        else if (target.conditions.checkAbsent()) .hold else .match_failed;
+        if (self.move_checks_destination_first) if (refusedBy(destination)) |reply| return reply;
+        const s = self.liveIndex(target.source) orelse
+            return try jsonRefusal(arena, 404, "notFound", try arena.print("No such object: {s}/{s}", .{ target.bucket, target.source }));
+        if (refusedBy(target.source_conditions.check(&self.objects.items[s]))) |reply| return reply;
+        if (refusedBy(destination)) |reply| return reply;
         // A move takes its source away and replaces its destination.
         if (try self.keptRefusal(.json, target.bucket, &self.objects.items[s], arena)) |refusal| return refusal;
         if (try self.keptLive(.json, target.bucket, target.destination, arena)) |refusal| return refusal;
 
-        // The reply and the new name first: once the objects change,
-        // nothing may fail.
+        // The reply, the new name and the folders first: once the objects
+        // change, nothing may fail.
         const generation = self.next_generation;
-        // So does a move.
-        const reply_body = try objectJson(self, arena, &self.objects.items[s], target.destination, generation, target.bucket, fault == .corrupt, false);
+        var answered = self.objects.items[s];
+        answered.metageneration = 1;
+        const reply_body = try objectJsonFull(self, arena, &answered, target.destination, generation, target.bucket, fault == .corrupt, false, target.full);
         const name = try self.gpa.dupe(u8, target.destination);
+        errdefer self.gpa.free(name);
+        try self.ensureParents(target.bucket, target.destination);
         self.next_generation += 1;
         if (self.liveIndex(target.destination)) |d| {
             var replaced = self.objects.orderedRemove(d);
@@ -1598,6 +1635,10 @@ pub const FakeMultipart = struct {
             .refused => |reply| return reply,
             .ok => |r| r,
         };
+        const custom_time = switch (try uploadCustomTime(meta, arena)) {
+            .refused => |reply| return reply,
+            .ok => |t| t,
+        };
 
         const declared: ?u64 = if (headerValue(headers, "X-Upload-Content-Length")) |text|
             std.fmt.parseInt(u64, text, 10) catch null
@@ -1636,6 +1677,7 @@ pub const FakeMultipart = struct {
             .predefined_acl = target.predefined_acl,
             .holds = .{ .temporary = meta.temporaryHold, .event_based = meta.eventBasedHold },
             .retention = retention,
+            .custom_time = custom_time,
         });
         self.next_session += 1;
         return .{ .status = 200, .headers = reply_headers };
@@ -1726,6 +1768,7 @@ pub const FakeMultipart = struct {
         const made = try self.newAcl(s.bucket, s.predefined_acl);
         const o = try self.store(s.bucket, s.name, s.bytes.items, s.content_type, s.gzip, s.key_sha256, s.kms_key_name, s.holds);
         o.retention = s.retention;
+        o.custom_time = s.custom_time;
         o.predefined_acl = s.predefined_acl;
         o.owner = made.owner;
         o.acl = made.acl;
@@ -1823,9 +1866,14 @@ pub const FakeMultipart = struct {
             .ok => |r| r,
         };
         if (try self.cannedRefusal(target.bucket, target.predefined_acl, false, arena)) |refusal| return refusal;
+        const custom_time = switch (try uploadCustomTime(meta, arena)) {
+            .refused => |reply| return reply,
+            .ok => |t| t,
+        };
         const made = try self.newAcl(target.bucket, target.predefined_acl);
         const o = try self.store(target.bucket, meta.name, parts.data, meta.contentType orelse "application/octet-stream", meta.gzip(), keys.key_sha256, keys.kms_key_name, holds);
         o.retention = retention;
+        o.custom_time = custom_time;
         o.predefined_acl = target.predefined_acl;
         o.owner = made.owner;
         o.acl = made.acl;
@@ -2799,6 +2847,52 @@ const condition_failed: FakeMultipart.Reply = .{
     .body = "{\"error\":{\"code\":412,\"message\":\"At least one of the pre-conditions you specified did not hold.\",\"errors\":[{\"reason\":\"conditionNotMet\"}]}}",
 };
 
+/// A `NotMatch` that hits: 304, with no body at all.
+const not_modified: FakeMultipart.Reply = .{ .status = 304 };
+
+/// What a condition's outcome answers, or null when it holds.
+fn refusedBy(outcome: Conditions.Outcome) ?FakeMultipart.Reply {
+    return switch (outcome) {
+        .hold => null,
+        .match_failed => condition_failed,
+        .not_match_failed => not_modified,
+    };
+}
+
+/// Production's 400 for a custom time that is no time, an empty one
+/// included.
+const custom_time_words = "Parse Error: Invalid value for type.googleapis.com/google.protobuf.Timestamp field: 'Field 'customTime', Illegal timestamp format; timestamps must end with 'Z' or have a valid timezone offset.'.";
+
+const CustomTimeOutcome = union(enum) { ok: ?std.Io.Timestamp, refused: FakeMultipart.Reply };
+
+/// An upload's custom time, if its metadata names one.
+fn uploadCustomTime(meta: Meta, arena: Allocator) Allocator.Error!CustomTimeOutcome {
+    const text = meta.customTime orelse return .{ .ok = null };
+    const time = core.timestamp.parse(text) catch return .{ .refused = try jsonRefusal(arena, 400, "invalid", custom_time_words) };
+    return .{ .ok = time };
+}
+
+/// A time as production's refusal of an earlier custom time writes it,
+/// with an offset where an answer has `Z`. Measured for whole seconds.
+fn offsetTime(arena: Allocator, time: std.Io.Timestamp) Allocator.Error![]const u8 {
+    var buf: [core.timestamp.max_len]u8 = undefined;
+    const text = core.timestamp.format(&buf, time);
+    return std.mem.concat(arena, u8, &.{ text[0 .. text.len - 1], "+00:00" });
+}
+
+/// An object's `mediaLink`, as production writes it: the download host,
+/// both names strictly encoded, and the generation.
+fn mediaLink(arena: Allocator, bucket: []const u8, name: []const u8, generation: u64) Allocator.Error![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    w.writeAll("https://storage.googleapis.com/download/storage/v1/b/") catch return error.OutOfMemory;
+    core.query.writeStrictSegment(w, bucket) catch return error.OutOfMemory;
+    w.writeAll("/o/") catch return error.OutOfMemory;
+    core.query.writeStrictSegment(w, name) catch return error.OutOfMemory;
+    w.print("?generation={d}&alt=media", .{generation}) catch return error.OutOfMemory;
+    return out.written();
+}
+
 /// An object's resource as the JSON API answers it, under `name` and at
 /// `generation`, which a move changes, with the checksum flipped when
 /// `wrong_crc`. Every object here is at metageneration 1. An object under
@@ -2840,8 +2934,10 @@ fn objectJsonFull(
     const crc = core.crc32c.toBase64(core.crc32c.hash(o.bytes) ^ @intFromBool(wrong_crc));
     const hashes = o.key_sha256 == null or keyed_request;
     var sha_text: [44]u8 = undefined;
+    var custom_text: [core.timestamp.max_len]u8 = undefined;
     const expiration: ?[]const u8 = if (self.retainedUntil(bucket, o)) |until| try rfc3339(arena, until) else null;
     jw.write(.{
+        .mediaLink = try mediaLink(arena, bucket, name, generation),
         .name = name,
         .bucket = bucket,
         .size = try arena.print("{d}", .{o.bytes.len}),
@@ -2851,6 +2947,7 @@ fn objectJsonFull(
         .contentEncoding = @as(?[]const u8, if (o.served != null) "gzip" else null),
         .crc32c = @as(?[]const u8, if (hashes) &crc else null),
         .storageClass = "STANDARD",
+        .customTime = if (o.custom_time) |t| @as(?[]const u8, core.timestamp.format(&custom_text, t)) else null,
         .kmsKeyName = @as(?[]const u8, if (o.kms_key_name) |k| try arena.print("{s}/cryptoKeyVersions/1", .{k}) else null),
         .customerEncryption = if (o.key_sha256) |digest| @as(?struct { encryptionAlgorithm: []const u8, keySha256: []const u8 }, .{
             .encryptionAlgorithm = "AES256",
@@ -2972,13 +3069,30 @@ const Conditions = struct {
         return c.if_generation_not_match == null and c.if_metageneration_match == null and c.if_metageneration_not_match == null;
     }
 
+    /// A `Match` beside a `NotMatch` on one field, which production
+    /// refuses as conflicting.
+    fn conflicting(c: Conditions) bool {
+        return (c.if_generation_match != null and c.if_generation_not_match != null) or
+            (c.if_metageneration_match != null and c.if_metageneration_not_match != null);
+    }
+
     /// Reads one query parameter, if it is a condition.
     fn take(c: *Conditions, param: []const u8) core.transport.Error!bool {
+        return c.takeNamed(param, "if");
+    }
+
+    /// Reads one query parameter, if it is a move's condition on its
+    /// source.
+    fn takeSource(c: *Conditions, param: []const u8) core.transport.Error!bool {
+        return c.takeNamed(param, "ifSource");
+    }
+
+    fn takeNamed(c: *Conditions, param: []const u8, comptime prefix: []const u8) core.transport.Error!bool {
         const fields = [_]struct { []const u8, *?u64 }{
-            .{ "ifGenerationMatch=", &c.if_generation_match },
-            .{ "ifGenerationNotMatch=", &c.if_generation_not_match },
-            .{ "ifMetagenerationMatch=", &c.if_metageneration_match },
-            .{ "ifMetagenerationNotMatch=", &c.if_metageneration_not_match },
+            .{ prefix ++ "GenerationMatch=", &c.if_generation_match },
+            .{ prefix ++ "GenerationNotMatch=", &c.if_generation_not_match },
+            .{ prefix ++ "MetagenerationMatch=", &c.if_metageneration_match },
+            .{ prefix ++ "MetagenerationNotMatch=", &c.if_metageneration_not_match },
         };
         for (fields) |field| if (std.mem.startsWith(u8, param, field[0])) {
             field[1].* = std.fmt.parseInt(u64, param[field[0].len..], 10) catch return error.HttpProtocolError;
@@ -2997,6 +3111,7 @@ const Meta = struct {
     temporaryHold: ?bool = null,
     eventBasedHold: ?bool = null,
     retention: ?std.json.Value = null,
+    customTime: ?[]const u8 = null,
 
     fn gzip(m: Meta) bool {
         return std.ascii.eqlIgnoreCase(m.contentEncoding orelse "", "gzip");
@@ -3063,6 +3178,7 @@ fn copyStored(gpa: Allocator, o: *const FakeMultipart.Stored, generation: u64) A
         .acl = o.acl,
         .holds = o.holds,
         .retention = o.retention,
+        .custom_time = o.custom_time,
         .metageneration = o.metageneration,
         .retained_from_ns = o.retained_from_ns,
     };
@@ -3140,9 +3256,12 @@ const MoveTarget = struct {
     bucket: []const u8,
     source: []const u8,
     destination: []const u8,
-    if_source_generation_match: ?u64,
+    /// On the source, from the `ifSource` parameters.
+    source_conditions: Conditions,
     /// On the destination.
     conditions: Conditions,
+    /// `projection=full`: the answer names the list and the owner.
+    full: bool,
 };
 
 const XmlTarget = struct {
@@ -3487,7 +3606,7 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
         const bucket = try decode(arena, after[0..slash]);
         const object_part = after[slash + 3 ..];
         var generation: ?u64 = null;
-        var source_generation: ?u64 = null;
+        var source_conditions: Conditions = .{};
         var media = false;
         var soft_deleted = false;
         var override = false;
@@ -3498,10 +3617,9 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
         var params = std.mem.splitScalar(u8, query, '&');
         while (params.next()) |param| {
             if (try conditions.take(param)) continue;
+            if (try source_conditions.takeSource(param)) continue;
             if (std.mem.startsWith(u8, param, "generation=")) {
                 generation = std.fmt.parseInt(u64, param["generation=".len..], 10) catch return error.HttpProtocolError;
-            } else if (std.mem.startsWith(u8, param, "ifSourceGenerationMatch=")) {
-                source_generation = std.fmt.parseInt(u64, param["ifSourceGenerationMatch=".len..], 10) catch return error.HttpProtocolError;
             } else if (std.mem.eql(u8, param, "alt=media")) {
                 media = true;
             } else if (std.mem.eql(u8, param, "softDeleted=true")) {
@@ -3549,8 +3667,9 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
             .bucket = bucket,
             .source = try decode(arena, object_part[0..at]),
             .destination = try decode(arena, object_part[at + "/moveTo/o/".len ..]),
-            .if_source_generation_match = source_generation,
+            .source_conditions = source_conditions,
             .conditions = conditions,
+            .full = full,
         } };
         return .{ .json = .{
             .bucket = bucket,
@@ -4062,7 +4181,7 @@ test "metadata that says gzip over bytes that are not: stored as sent, and serve
     try testing.expectEqualStrings("gzip", headerValue(as_sent.headers, "Content-Encoding").?);
 }
 
-test "a restore keeps the custom metadata its object was uploaded with" {
+test "a restore keeps the custom metadata its object was uploaded with, and its custom time" {
     var fake: FakeMultipart = .init(testing.allocator, testing.io);
     defer fake.deinit();
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -4079,10 +4198,11 @@ test "a restore keeps the custom metadata its object was uploaded with" {
     const finish = try xml.encodeComplete(a, &.{.{ .number = 1, .etag = headerValue(part.headers, "ETag").? }});
     try testing.expectEqual(200, (try ask(&fake, a, .POST, upload, .{ .body = finish })).status);
     const first = fake.object("m").?.generation;
+    try expectSays(try ask(&fake, a, .PATCH, "/storage/v1/b/b/o/m", .{ .body = "{\"customTime\":\"2026-10-01T00:00:00Z\"}" }), 200, "\"customTime\":\"2026-10-01T00:00:00Z\"");
 
     try testing.expectEqual(204, (try ask(&fake, a, .DELETE, "/storage/v1/b/b/o/m", .{})).status);
     try testing.expectEqual(null, fake.object("m"));
-    try testing.expectEqual(200, (try ask(&fake, a, .POST, try a.print("/storage/v1/b/b/o/m/restore?generation={d}", .{first}), .{})).status);
+    try expectSays(try ask(&fake, a, .POST, try a.print("/storage/v1/b/b/o/m/restore?generation={d}", .{first}), .{}), 200, "\"customTime\":\"2026-10-01T00:00:00Z\"");
     const restored = fake.object("m").?;
     try testing.expect(restored.generation != first);
     try testing.expectEqualStrings("data", restored.bytes);
@@ -4169,4 +4289,54 @@ test "a resumable start that runs out of memory replying keeps no session, and f
         break;
     } else return error.TestNeverSucceeded;
     try testing.expect(refused > 0);
+}
+
+test "moves and custom times this library never sends, answered in production's words" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try makeBucket(&fake, a, "{\"name\":\"b\"}");
+    const insert = "/upload/storage/v1/b/b/o?uploadType=multipart";
+    const stored = try related(a, "{\"name\":\"s\",\"customTime\":\"2026-10-01T00:00:00Z\"}", "x");
+    try expectSays(try ask(&fake, a, .POST, insert, .{ .content_type = related_type, .body = stored }), 200, "\"customTime\":\"2026-10-01T00:00:00Z\"");
+
+    // A Match beside a NotMatch on one field, on either end, before anything.
+    const conflicting = "Found conflicting object preconditions. Mutually exclusive fields cannot be set simultaneously.";
+    for ([_][]const u8{
+        "ifSourceGenerationMatch=1&ifSourceGenerationNotMatch=2",
+        "ifSourceMetagenerationMatch=1&ifSourceMetagenerationNotMatch=2",
+        "ifGenerationMatch=0&ifGenerationNotMatch=3",
+        "ifMetagenerationMatch=1&ifMetagenerationNotMatch=2",
+    }) |conditions| {
+        try expectSays(try ask(&fake, a, .POST, try a.print("/storage/v1/b/b/o/nosuch/moveTo/o/d?{s}", .{conditions}), .{}), 409, conflicting);
+    }
+    try expectSays(try ask(&fake, a, .POST, "/storage/v1/b/b/o/nosuch/moveTo/o/nosuch", .{}), 400, "Source and destination object names must be different.");
+    // A NotMatch that hits answers 304 and nothing else.
+    const hit = try ask(&fake, a, .POST, try a.print("/storage/v1/b/b/o/s/moveTo/o/d?ifSourceGenerationNotMatch={d}", .{fake.object("s").?.generation}), .{});
+    try testing.expectEqual(304, hit.status);
+    try testing.expectEqualStrings("", hit.body);
+    // The full projection names the list and the owner.
+    try expectSays(try ask(&fake, a, .POST, "/storage/v1/b/b/o/s/moveTo/o/d?projection=full", .{}), 200, "\"owner\":{\"entity\":");
+
+    // A null custom time is taken, the time kept and the metageneration
+    // moved; an empty one is no time.
+    const patch = "/storage/v1/b/b/o/d";
+    try expectSays(try ask(&fake, a, .PATCH, patch, .{ .body = "{\"customTime\":null}" }), 200, "\"metageneration\":\"2\"");
+    try expectSays(try ask(&fake, a, .GET, patch, .{}), 200, "\"customTime\":\"2026-10-01T00:00:00Z\"");
+    const malformed = "Illegal timestamp format; timestamps must end with 'Z' or have a valid timezone offset.";
+    try expectSays(try ask(&fake, a, .PATCH, patch, .{ .body = "{\"customTime\":\"\"}" }), 400, malformed);
+    const bad_insert = try related(a, "{\"name\":\"t\",\"customTime\":\"not a time\"}", "x");
+    try expectSays(try ask(&fake, a, .POST, insert, .{ .content_type = related_type, .body = bad_insert }), 400, malformed);
+    try testing.expectEqual(null, fake.object("t"));
+
+    // A hierarchical bucket makes the folders a move's new name needs.
+    try makeBucket(&fake, a, "{\"name\":\"h\",\"hierarchicalNamespace\":{\"enabled\":true},\"iamConfiguration\":{\"uniformBucketLevelAccess\":{\"enabled\":true}}}");
+    const flat_name = try related(a, "{\"name\":\"top\"}", "x");
+    try testing.expectEqual(200, (try ask(&fake, a, .POST, "/upload/storage/v1/b/h/o?uploadType=multipart", .{ .content_type = related_type, .body = flat_name })).status);
+    try testing.expectEqual(null, fake.buckets.folderState("h", "a/"));
+    try expectSays(try ask(&fake, a, .POST, "/storage/v1/b/h/o/top/moveTo/o/a%2Fb%2Ftop", .{}), 200, "\"name\":\"a/b/top\"");
+    try testing.expect(fake.buckets.folderState("h", "a/") != null);
+    try testing.expect(fake.buckets.folderState("h", "a/b/") != null);
 }

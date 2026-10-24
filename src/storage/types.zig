@@ -619,6 +619,24 @@ pub const CopyOptions = struct {
     predefined_acl: ?PredefinedAcl = null,
 };
 
+/// What `Object.moveTo` checks before it moves. A `Match` that fails, on
+/// either end, is `error.FailedPrecondition`; a `NotMatch` that hits is
+/// `error.NotModified`, Cloud Storage's 304. A `Match` beside a
+/// `NotMatch` on one field is refused before sending, as Cloud Storage
+/// refuses it.
+pub const MoveOptions = struct {
+    /// Move only while the source's live generation is this. That pins
+    /// the move to one object, so it never moves one written since, and
+    /// makes it safe to repeat after an answer that was lost.
+    if_source_generation_match: ?u64 = null,
+    if_source_generation_not_match: ?u64 = null,
+    if_source_metageneration_match: ?u64 = null,
+    if_source_metageneration_not_match: ?u64 = null,
+    /// Conditions on the destination. `.does_not_exist` refuses to
+    /// replace an object already there.
+    preconditions: Preconditions = .{},
+};
+
 /// What an update does to a setting that can be taken away: `.keep`,
 /// `.set`, or `.clear`. Core's, shared with the other modules.
 pub const Change = core.Change;

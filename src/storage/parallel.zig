@@ -816,7 +816,10 @@ fn move(
 ) Error!types.Owned(types.ObjectInfo) {
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
     defer scratch.deinit();
-    const path = names.movePath(scratch.allocator(), bucket, temp, object, generation, preconditions) catch |err|
+    const path = names.movePath(scratch.allocator(), bucket, temp, object, .{
+        .if_source_generation_match = generation,
+        .preconditions = preconditions,
+    }) catch |err|
         return dropTemp(client, persist, bucket, temp, generation, err);
     var result: types.Owned(types.ObjectInfo) = types.Owned(types.ObjectInfo).init(client.gpa) catch |err|
         return dropTemp(client, persist, bucket, temp, generation, err);

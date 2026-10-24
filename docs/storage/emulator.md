@@ -31,7 +31,10 @@ trusted on. The differences it found:
   move for an update of an object named
   `{source}/moveTo/o/{destination}`, and answers 404. So
   `uploadParallel` sends an ordinary upload to an emulator, with any
-  conditions, and ignores a checkpoint, with a warning. The library's
+  conditions, and ignores a checkpoint, with a warning; and `moveTo`
+  reads the source, copies it and deletes it, which is not atomic, with
+  a warning too. The emulator keeps no condition on a copy, so `moveTo`
+  judges its conditions itself, as Cloud Storage would. The library's
   own tests run the multipart upload and the move against an in-memory
   fake and a loopback server that speak them.
 - It does serve ranges pinned to a generation, and decompresses a

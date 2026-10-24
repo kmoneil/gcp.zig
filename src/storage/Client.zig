@@ -72,6 +72,8 @@ encryption_key: ?*const types.EncryptionKey = null,
 /// take the multipart path instead of the ordinary upload `uploadParallel`
 /// falls back to there, so a test can send a few KiB in dozens of parts to
 /// a fake that speaks the XML API, and read them back in dozens of ranges.
+/// It also has `moveTo` send Cloud Storage's move there, not read, copy
+/// and delete, for a fake that answers one.
 multipart_test: MultipartTest = .{},
 
 pub const MultipartTest = struct {

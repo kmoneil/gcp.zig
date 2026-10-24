@@ -172,3 +172,68 @@ in between fails the copy with a 412 rather than mixing two versions. A
 copy with no `storage_class` takes the destination bucket's default:
 measured, a NEARLINE object copied, changed or not, into a STANDARD
 bucket came out STANDARD. ACLs, holds and retention are never copied.
+
+## Moves
+
+`moveTo` renames an object within its bucket in one atomic step. Nothing
+is copied and nothing deleted, so there is no early deletion fee, and no
+moment when both names, or neither, exist. It works in flat buckets and
+hierarchical ones alike.
+
+```zig
+var read = try bucket.object("reports/draft.pdf").get(.{});
+defer read.deinit();
+var moved = try bucket.object("reports/draft.pdf").moveTo("reports/final.pdf", .{
+    // Move only the object read: never one written since.
+    .if_source_generation_match = read.value.generation,
+    // Replace nothing already at the name.
+    .preconditions = .does_not_exist,
+});
+defer moved.deinit();
+```
+
+Measured against real buckets on 2026-10-24:
+
+- The object moved is a new generation at metageneration 1, with new
+  times. It keeps the source's content type and other content fields,
+  its custom time, custom metadata, checksums, owner and access control
+  list.
+- The source leaves nothing behind, not even a noncurrent version in a
+  versioned bucket. An object the move replaces becomes noncurrent there.
+- A hierarchical bucket makes the folders the new name needs.
+- A `Match` condition that fails, on the source or the destination, is
+  `error.FailedPrecondition`, in one message for both. A `NotMatch` that
+  hits is `error.NotModified`, Cloud Storage's 304. A `Match` beside a
+  `NotMatch` on one field, and a move onto its own name, are refused
+  before sending with `error.InvalidArgument`, as Cloud Storage refuses
+  them.
+- A held or retained source or destination is `error.ObjectRetained`.
+
+**Retries.** Pin the move with `if_source_generation_match`, as above.
+A pinned move can never move a second object, so it is repeated after a
+lost answer like any write a condition makes safe. A repeat under the
+same idempotency token gets the first attempt's answer, but Cloud
+Storage forgets the token in time. A repeat that then meets 404 or 412
+may have met the move its own earlier attempt made. So the library reads
+the source's name:
+
+- still at the generation pinned: the move never happened, and the
+  failure stands;
+- empty: it happened, and the destination is read and answered;
+- holding another generation: nothing tells, so the failure stands, and
+  its message says the move may have happened.
+
+An unpinned move is repeated only within the token's minute, or as
+`Options.retry_unconditional_writes` allows, and a repeat's 404 or 412
+says the same.
+
+An object under a customer-supplied key moves without the key, and the
+answer then names no checksum. An emulator has no move: there `moveTo`
+reads both ends and judges the conditions itself, as Cloud Storage
+would, since fake-gcs-server keeps none on a copy. Then it copies the
+source at the generation read and deletes it, and logs a warning that
+this is not atomic. The copy does not carry the source's access control
+list.
+
+[`examples/gcs_mv.zig`](../../examples/gcs_mv.zig) is a small `mv`:
+`zig build example-gcs_mv -- gs://my-bucket/reports/draft.pdf reports/final.pdf --no-clobber`.
