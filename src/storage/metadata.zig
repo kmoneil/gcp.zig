@@ -102,11 +102,22 @@ pub fn check(
         options.content_encoding,
         options.content_language,
     });
+    if (options.custom_time) |time| if (!isCustomTime(time)) {
+        if (diag) |d| d.print("custom_time: an RFC 3339 time, such as 2026-10-01T00:00:00Z, not \"{s}\"", .{time});
+        return error.InvalidMetadataUpdate;
+    };
     try checkEdit(diag, options.edit);
     switch (options.retention) {
         .set => |r| if (!retention.checkObjectRetention(diag, r, options.event_based_hold)) return error.InvalidMetadataUpdate,
         .keep, .clear => {},
     }
+}
+
+/// Whether Cloud Storage would take `text` as a custom time: RFC 3339 with
+/// a zone, as it refuses anything else, empty included.
+pub fn isCustomTime(text: []const u8) bool {
+    _ = core.timestamp.parse(text) catch return false;
+    return true;
 }
 
 /// The five fixed fields, in the order `content_type`, `cache_control`,
@@ -173,6 +184,10 @@ fn write(jw: *Stringify, options: types.MetadataUpdate) Stringify.Error!void {
         const value = field.value orelse continue;
         try jw.objectField(field.name);
         try jw.write(value);
+    }
+    if (options.custom_time) |time| {
+        try jw.objectField("customTime");
+        try jw.write(time);
     }
     switch (options.edit) {
         .keep => {},
@@ -295,6 +310,11 @@ const goldens = [_]Golden{
         .body = "{\"metadata\":null}",
     },
     .{
+        .label = "a custom time goes after the fixed fields, as sent",
+        .options = .{ .content_type = "text/plain", .custom_time = "2026-10-01T12:34:56.789+02:00" },
+        .body = "{\"contentType\":\"text/plain\",\"customTime\":\"2026-10-01T12:34:56.789+02:00\"}",
+    },
+    .{
         .label = "fields and custom entries together",
         .options = .{
             .content_type = "application/json",
@@ -312,6 +332,31 @@ test "golden: the patch body, written from the rules by hand" {
         try testing.expectEqualStrings(golden.body, try encode(arena_state.allocator(), golden.options));
     }
 }
+
+test "check: a custom time is RFC 3339 with a zone, as Cloud Storage takes it" {
+    for ([_][]const u8{ "2026-10-01T00:00:00Z", "2026-10-01T12:34:56.789+02:00", "2030-01-01T00:00:00.000000001Z" }) |time| {
+        errdefer std.debug.print("time: {s}\n", .{time});
+        try check(null, .{ .custom_time = time });
+    }
+    var diag: core.Diagnostics = .{};
+    // Production's 400 for each: "Illegal timestamp format".
+    for ([_][]const u8{ "", "not a time", "2026-10-01T00:00:00", "2026-10-01", "2026-13-01T00:00:00Z" }) |time| {
+        errdefer std.debug.print("time: {s}\n", .{time});
+        try testing.expectError(error.InvalidMetadataUpdate, check(&diag, .{ .custom_time = time }));
+        try testing.expect(std.mem.indexOf(u8, diag.message(), "custom_time") != null);
+    }
+}
+
+test "updateMetadata: an earlier custom time is production's 400, kept as InvalidArgument" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{.{ .respond = .{ .status = bodies.refusal_custom_time_earlier_status, .body = bodies.refusal_custom_time_earlier } }}, .{});
+    defer h.deinit();
+    try testing.expectError(error.InvalidArgument, h.client.bucket("b").object("a").updateMetadata(.{ .custom_time = "2025-01-01T00:00:00Z" }));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "Custom time cannot be decreased") != null);
+    try h.expectRequest(0, .PATCH, "https://storage.googleapis.com/storage/v1/b/b/o/a", "{\"customTime\":\"2025-01-01T00:00:00Z\"}");
+}
+
+const bodies = @import("production_bodies.zig");
 
 test "updateMetadata: the request, and the object it answers with" {
     var h: test_util.Harness = undefined;

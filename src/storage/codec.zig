@@ -62,6 +62,10 @@ fn writeUploadMetadata(
         try jw.objectField("contentLanguage");
         try jw.write(value);
     }
+    if (options.custom_time) |value| {
+        try jw.objectField("customTime");
+        try jw.write(value);
+    }
     if (options.metadata.len > 0) {
         try jw.objectField("metadata");
         try jw.beginObject();
@@ -430,6 +434,9 @@ const WireObject = struct {
     /// Only under `projection=full`, and only to a caller who may read it.
     acl: ?[]const acl.WireEntry = null,
     owner: ?acl.WireOwner = null,
+    customTime: ?[]const u8 = null,
+    mediaLink: ?[]const u8 = null,
+    timeStorageClassUpdated: ?[]const u8 = null,
 };
 
 const WireObjectPage = struct {
@@ -549,6 +556,40 @@ const WireBucket = struct {
     defaultEventBasedHold: ?bool = null,
     objectRetention: ?struct { mode: ?[]const u8 = null } = null,
     hierarchicalNamespace: ?struct { enabled: ?bool = null } = null,
+    autoclass: ?WireAutoclass = null,
+    cors: ?[]const WireCorsRule = null,
+    website: ?struct { mainPageSuffix: ?[]const u8 = null, notFoundPage: ?[]const u8 = null } = null,
+    logging: ?struct { logBucket: ?[]const u8 = null, logObjectPrefix: ?[]const u8 = null } = null,
+    ipFilter: ?WireIpFilter = null,
+    rpo: ?[]const u8 = null,
+    customPlacementConfig: ?struct { dataLocations: ?[]const ?[]const u8 = null } = null,
+};
+
+const WireAutoclass = struct {
+    enabled: ?bool = null,
+    toggleTime: ?[]const u8 = null,
+    terminalStorageClass: ?[]const u8 = null,
+    terminalStorageClassUpdateTime: ?[]const u8 = null,
+};
+
+/// `maxAgeSeconds` is a JSON number from Cloud Storage; a string is taken
+/// too, as for every other integer here.
+const WireCorsRule = struct {
+    origin: ?[]const ?[]const u8 = null,
+    method: ?[]const ?[]const u8 = null,
+    responseHeader: ?[]const ?[]const u8 = null,
+    maxAgeSeconds: ?std.json.Value = null,
+};
+
+const WireIpFilter = struct {
+    mode: ?[]const u8 = null,
+    publicNetworkSource: ?struct { allowedIpCidrRanges: ?[]const ?[]const u8 = null } = null,
+    vpcNetworkSources: ?[]const struct {
+        network: ?[]const u8 = null,
+        allowedIpCidrRanges: ?[]const ?[]const u8 = null,
+    } = null,
+    allowCrossOrgVpcs: ?bool = null,
+    allowAllServiceAgentAccess: ?bool = null,
 };
 
 const WireRetentionPolicy = struct {
@@ -618,6 +659,9 @@ fn objectFromWire(arena: Allocator, wire: WireObject) DecodeError!types.ObjectIn
         } else null,
         .acl = try acl.entriesFromWire(arena, wire.acl),
         .owner = acl.ownerFromWire(wire.owner),
+        .custom_time = nonEmpty(wire.customTime),
+        .media_link = nonEmpty(wire.mediaLink),
+        .time_storage_class_updated = nonEmpty(wire.timeStorageClassUpdated),
     };
 }
 
@@ -653,7 +697,77 @@ fn bucketFromWire(arena: Allocator, wire: WireBucket) DecodeError!types.BucketIn
         .default_event_based_hold = wire.defaultEventBasedHold orelse false,
         .object_retention = if (wire.objectRetention) |o| std.mem.eql(u8, o.mode orelse "", "Enabled") else false,
         .hierarchical_namespace = if (wire.hierarchicalNamespace) |h| h.enabled orelse false else false,
+        .autoclass = if (wire.autoclass) |a| .{
+            .enabled = a.enabled orelse false,
+            .toggle_time = nonEmpty(a.toggleTime),
+            .terminal_storage_class = nonEmpty(a.terminalStorageClass),
+            .terminal_storage_class_update_time = nonEmpty(a.terminalStorageClassUpdateTime),
+        } else null,
+        .cors = try corsFromWire(arena, wire.cors orelse &.{}),
+        // A website or logging that names nothing is none: Cloud Storage
+        // drops a removed one rather than sending it empty.
+        .website = if (wire.website) |w| website: {
+            const site: types.Website = .{
+                .main_page_suffix = nonEmpty(w.mainPageSuffix),
+                .not_found_page = nonEmpty(w.notFoundPage),
+            };
+            break :website if (site.main_page_suffix == null and site.not_found_page == null) null else site;
+        } else null,
+        .logging = if (wire.logging) |l| if (nonEmpty(l.logBucket)) |bucket| .{
+            .log_bucket = bucket,
+            .log_object_prefix = nonEmpty(l.logObjectPrefix),
+        } else null else null,
+        .ip_filter = if (wire.ipFilter) |f| try ipFilterFromWire(arena, f) else null,
+        .rpo = if (nonEmpty(wire.rpo)) |text| rpoOf(text) else null,
+        .data_locations = try stringsFromWire(arena, if (wire.customPlacementConfig) |c| c.dataLocations else null),
     };
+}
+
+fn corsFromWire(arena: Allocator, rules: []const WireCorsRule) DecodeError![]const types.CorsRule {
+    const out = try arena.alloc(types.CorsRule, rules.len);
+    for (rules, out) |rule, *r| r.* = .{
+        .origins = try stringsFromWire(arena, rule.origin),
+        .methods = try stringsFromWire(arena, rule.method),
+        .response_headers = try stringsFromWire(arena, rule.responseHeader),
+        .max_age_s = if (rule.maxAgeSeconds == null)
+            null
+        else
+            std.math.cast(u32, try u64FromValue(rule.maxAgeSeconds)) orelse return error.InvalidResponse,
+    };
+    return out;
+}
+
+/// A filter's mode is `Enabled` or `Disabled`; anything else is taken as
+/// not enforced, since a filter that cannot be read as applied is no
+/// promise that it is.
+fn ipFilterFromWire(arena: Allocator, wire: WireIpFilter) DecodeError!types.IpFilter {
+    const sources = wire.vpcNetworkSources orelse &.{};
+    const vpc = try arena.alloc(types.IpFilter.VpcSource, sources.len);
+    for (sources, vpc) |source, *v| v.* = .{
+        .network = source.network orelse return error.InvalidResponse,
+        .ranges = try stringsFromWire(arena, source.allowedIpCidrRanges),
+    };
+    return .{
+        .enforced = std.mem.eql(u8, wire.mode orelse "", "Enabled"),
+        .public_ranges = try stringsFromWire(arena, if (wire.publicNetworkSource) |p| p.allowedIpCidrRanges else null),
+        .vpc_sources = vpc,
+        .allow_cross_org_vpcs = wire.allowCrossOrgVpcs orelse false,
+        .allow_all_service_agent_access = wire.allowAllServiceAgentAccess orelse false,
+    };
+}
+
+pub fn rpoOf(text: []const u8) types.Rpo {
+    if (std.mem.eql(u8, text, "DEFAULT")) return .default;
+    if (std.mem.eql(u8, text, "ASYNC_TURBO")) return .async_turbo;
+    return .unknown;
+}
+
+/// A list of strings, its nulls dropped: a null in one says nothing.
+fn stringsFromWire(arena: Allocator, wire: ?[]const ?[]const u8) Allocator.Error![]const []const u8 {
+    const items = wire orelse return &.{};
+    var out: std.ArrayList([]const u8) = try .initCapacity(arena, items.len);
+    for (items) |item| if (item) |text| out.appendAssumeCapacity(text);
+    return out.items;
 }
 
 /// A policy names a period of at least a second; one that names none
@@ -1657,6 +1771,243 @@ test "decode bucket settings that are malformed as InvalidResponse" {
     try testing.expectEqual(10, loose.lifecycle[0].condition.size_above_bytes.?);
 }
 
+const bodies = @import("production_bodies.zig");
+
+test "decode a bucket's other settings, as production answered them on 2026-10-24" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const every = try decodeBucket(a, bodies.bucket_every_setting);
+    const auto = every.autoclass.?;
+    try testing.expect(auto.enabled);
+    try testing.expectEqualStrings("ARCHIVE", auto.terminal_storage_class.?);
+    // Both times are the create's instant.
+    try testing.expectEqualStrings("2026-10-24T11:40:27.721Z", auto.toggle_time.?);
+    try testing.expectEqualStrings("2026-10-24T11:40:27.721Z", auto.terminal_storage_class_update_time.?);
+    try testing.expectEqual(2, every.cors.len);
+    try expectStrings(&.{ "https://example.com", "https://app.example.com" }, every.cors[0].origins);
+    try expectStrings(&.{ "GET", "HEAD" }, every.cors[0].methods);
+    try expectStrings(&.{ "Content-Type", "x-goog-meta-k" }, every.cors[0].response_headers);
+    try testing.expectEqual(3600, every.cors[0].max_age_s.?);
+    try expectStrings(&.{"*"}, every.cors[1].origins);
+    try expectStrings(&.{"*"}, every.cors[1].methods);
+    try testing.expectEqual(0, every.cors[1].response_headers.len);
+    try testing.expectEqual(null, every.cors[1].max_age_s);
+    try testing.expectEqualStrings("index.html", every.website.?.main_page_suffix.?);
+    try testing.expectEqualStrings("404.html", every.website.?.not_found_page.?);
+    try testing.expectEqualStrings("zigps-7b3007-none", every.logging.?.log_bucket);
+    try testing.expectEqualStrings("acc/", every.logging.?.log_object_prefix.?);
+    const filter = every.ip_filter.?;
+    try testing.expect(filter.enforced);
+    try expectStrings(&.{ "0.0.0.0/0", "::/0" }, filter.public_ranges);
+    try testing.expectEqual(0, filter.vpc_sources.len);
+    try testing.expect(!filter.allow_cross_org_vpcs);
+    try testing.expect(filter.allow_all_service_agent_access);
+    // A regional bucket has no recovery point objective.
+    try testing.expectEqual(null, every.rpo);
+    try testing.expectEqual(0, every.data_locations.len);
+
+    // Nothing set: every one of them absent.
+    const none = try decodeBucket(a, bodies.bucket_no_setting);
+    try testing.expectEqual(null, none.autoclass);
+    try testing.expectEqual(0, none.cors.len);
+    try testing.expectEqual(null, none.website);
+    try testing.expectEqual(null, none.logging);
+    try testing.expectEqual(null, none.ip_filter);
+    try testing.expectEqual(null, none.rpo);
+    try testing.expectEqual(0, none.data_locations.len);
+
+    // Production's defaults: NEARLINE, and the bucket's own name as the
+    // log prefix; a max age of 0 kept, an empty list dropped.
+    const sparse = try decodeBucket(a, bodies.bucket_sparse_settings);
+    try testing.expectEqualStrings("NEARLINE", sparse.autoclass.?.terminal_storage_class.?);
+    try testing.expectEqualStrings("zigps-7b3007-ipoff", sparse.logging.?.log_object_prefix.?);
+    try testing.expectEqualStrings("index.html", sparse.website.?.main_page_suffix.?);
+    try testing.expectEqual(null, sparse.website.?.not_found_page);
+    try testing.expectEqual(2, sparse.cors.len);
+    try expectStrings(&.{"https://only.example"}, sparse.cors[0].origins);
+    try testing.expectEqual(0, sparse.cors[0].methods.len);
+    try testing.expectEqual(0, sparse.cors[1].max_age_s.?);
+    try testing.expectEqual(0, sparse.cors[1].response_headers.len);
+
+    // Turned off, Autoclass keeps its toggle time and loses its class.
+    const off = (try decodeBucket(a, bodies.bucket_autoclass_off)).autoclass.?;
+    try testing.expect(!off.enabled);
+    try testing.expectEqualStrings("2026-10-24T11:40:31.141Z", off.toggle_time.?);
+    try testing.expectEqual(null, off.terminal_storage_class);
+    try testing.expectEqual(null, off.terminal_storage_class_update_time);
+
+    const dual = try decodeBucket(a, bodies.bucket_dual_turbo);
+    try testing.expectEqual(.async_turbo, dual.rpo.?);
+    try testing.expectEqualStrings("NAM4", dual.location);
+    try testing.expectEqual(0, dual.data_locations.len);
+    const configurable = try decodeBucket(a, bodies.bucket_configurable_dual);
+    try testing.expectEqual(.default, configurable.rpo.?);
+    try testing.expectEqualStrings("US", configurable.location);
+    try testing.expectEqualStrings("dual-region", configurable.location_type.?);
+    try expectStrings(&.{ "US-EAST1", "US-WEST1" }, configurable.data_locations);
+
+    const vpc = (try decodeBucket(a, bodies.bucket_vpc_sources)).ip_filter.?;
+    try testing.expect(!vpc.enforced);
+    try expectStrings(&.{ "203.0.113.0/24", "2001:db8::/32" }, vpc.public_ranges);
+    try testing.expectEqual(1, vpc.vpc_sources.len);
+    try testing.expectEqualStrings("projects/extractctl/global/networks/default", vpc.vpc_sources[0].network);
+    try expectStrings(&.{ "10.128.0.0/20", "10.0.0.0/8" }, vpc.vpc_sources[0].ranges);
+    try testing.expect(vpc.allow_cross_org_vpcs);
+    try testing.expect(!vpc.allow_all_service_agent_access);
+    const filled = (try decodeBucket(a, bodies.bucket_filter_flags_filled)).ip_filter.?;
+    try testing.expect(!filled.enforced);
+    try expectStrings(&.{"198.51.100.0/24"}, filled.public_ranges);
+    try testing.expect(!filled.allow_cross_org_vpcs);
+
+    // A reader without storage.buckets.getIpFilter: the rest is there, the
+    // filter is not.
+    const reader = try decodeBucket(a, bodies.bucket_downscoped_reader);
+    try testing.expectEqual(null, reader.ip_filter);
+    try testing.expectEqualStrings("ARCHIVE", reader.autoclass.?.terminal_storage_class.?);
+    try testing.expectEqual(2, reader.cors.len);
+}
+
+test "decode listings of buckets: each IP filter without its ranges" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const page = try decodeBucketPage(a, bodies.bucket_listing);
+    var seen: usize = 0;
+    for (page.buckets) |b| {
+        if (std.mem.endsWith(u8, b.name, "-full")) {
+            seen += 1;
+            const filter = b.ip_filter.?;
+            try testing.expect(filter.enforced);
+            try testing.expect(filter.allow_all_service_agent_access);
+            try testing.expectEqual(0, filter.public_ranges.len);
+            try testing.expectEqual(2, b.cors.len);
+        } else if (std.mem.endsWith(u8, b.name, "-none")) {
+            seen += 1;
+            try testing.expect(!b.ip_filter.?.enforced);
+        } else if (std.mem.endsWith(u8, b.name, "-dual")) {
+            seen += 1;
+            try testing.expectEqual(.default, b.rpo.?);
+        }
+    }
+    try testing.expectEqual(3, seen);
+    const vpc_page = try decodeBucketPage(a, bodies.bucket_listing_vpc);
+    for (vpc_page.buckets) |b| if (std.mem.endsWith(u8, b.name, "-vpc")) {
+        try testing.expect(b.ip_filter.?.allow_cross_org_vpcs);
+        try testing.expectEqual(0, b.ip_filter.?.vpc_sources.len);
+    };
+}
+
+test "decode the bucket settings' odd shapes: nulls dropped, unknown values, empty objects" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const odd = try decodeBucket(a,
+        \\{"rpo":"SOMETHING_NEW","website":{},"logging":{"logObjectPrefix":"p"},
+        \\ "cors":[{"origin":["a",null],"maxAgeSeconds":"60"}],
+        \\ "ipFilter":{"mode":"Paused","publicNetworkSource":{}},
+        \\ "customPlacementConfig":{"dataLocations":[null,"US-EAST1"]},
+        \\ "autoclass":{}}
+    );
+    try testing.expectEqual(.unknown, odd.rpo.?);
+    try testing.expectEqual(null, odd.website);
+    // A prefix without a bucket goes nowhere.
+    try testing.expectEqual(null, odd.logging);
+    try expectStrings(&.{"a"}, odd.cors[0].origins);
+    try testing.expectEqual(60, odd.cors[0].max_age_s.?);
+    // A mode not known is no promise of being applied.
+    try testing.expect(!odd.ip_filter.?.enforced);
+    try testing.expectEqual(0, odd.ip_filter.?.public_ranges.len);
+    // A flag left out is off.
+    try testing.expect(!odd.ip_filter.?.allow_cross_org_vpcs);
+    try testing.expect(!odd.ip_filter.?.allow_all_service_agent_access);
+    try expectStrings(&.{"US-EAST1"}, odd.data_locations);
+    try testing.expect(!odd.autoclass.?.enabled);
+    // An empty string is none.
+    try testing.expectEqual(null, (try decodeBucket(a, "{\"rpo\":\"\"}")).rpo);
+
+    for ([_][]const u8{
+        "{\"cors\":[{\"maxAgeSeconds\":-1}]}",
+        "{\"cors\":[{\"maxAgeSeconds\":4294967296}]}",
+        "{\"cors\":[{\"maxAgeSeconds\":\"x\"}]}",
+        "{\"cors\":[{\"maxAgeSeconds\":true}]}",
+        "{\"cors\":[{\"origin\":\"https://a\"}]}",
+        "{\"cors\":{}}",
+        "{\"autoclass\":{\"enabled\":\"true\"}}",
+        "{\"ipFilter\":{\"vpcNetworkSources\":[{\"allowedIpCidrRanges\":[\"10.0.0.0/8\"]}]}}",
+        "{\"ipFilter\":{\"allowCrossOrgVpcs\":1}}",
+        "{\"ipFilter\":[]}",
+        "{\"rpo\":7}",
+        "{\"customPlacementConfig\":{\"dataLocations\":\"US-EAST1\"}}",
+    }) |body| {
+        errdefer std.debug.print("body: {s}\n", .{body});
+        try testing.expectError(error.InvalidResponse, decodeBucket(a, body));
+    }
+}
+
+fn decodeEverySettingsBody(allocator: Allocator) !void {
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    _ = try decodeBucket(arena.allocator(), bodies.bucket_every_setting);
+    _ = try decodeBucket(arena.allocator(), bodies.bucket_vpc_sources);
+    _ = try decodeBucketPage(arena.allocator(), bodies.bucket_listing);
+    _ = try decodeObjectPage(arena.allocator(), bodies.object_listing_custom_times);
+}
+
+test "decode the new settings under every allocation failure" {
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, decodeEverySettingsBody, .{});
+}
+
+test "decode objects' custom time, media link and class time, as production answered them" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // An offset and milliseconds sent: UTC answered, the milliseconds kept.
+    const millis = try decodeObject(a, bodies.object_custom_time_millis);
+    try testing.expectEqualStrings("2026-10-01T10:34:56.789Z", millis.custom_time.?);
+    try testing.expectEqualStrings(
+        "https://storage.googleapis.com/download/storage/v1/b/zigps-7b3007-none/o/ct%2Fb?generation=1792842034478713&alt=media",
+        millis.media_link.?,
+    );
+    try testing.expectEqualStrings(millis.time_created, millis.time_storage_class_updated.?);
+    // Patched null: kept, and the metageneration moved.
+    const kept = try decodeObject(a, bodies.object_custom_time_null);
+    try testing.expectEqualStrings("2026-10-02T00:00:00Z", kept.custom_time.?);
+    try testing.expectEqual(4, kept.metageneration);
+    const page = try decodeObjectPage(a, bodies.object_listing_custom_times);
+    try testing.expectEqual(3, page.objects.len);
+    for (page.objects) |o| {
+        try testing.expect(o.custom_time != null);
+        try testing.expect(std.mem.indexOf(u8, o.media_link.?, "alt=media") != null);
+    }
+    try testing.expectEqualStrings("2030-01-01T00:00:00Z", page.objects[2].custom_time.?);
+    // The fixture predates these fields: none of them.
+    const plain = try decodeObject(a, fixture_object);
+    try testing.expectEqual(null, plain.custom_time);
+    try testing.expectEqual(null, plain.media_link);
+    try testing.expectEqual(null, plain.time_storage_class_updated);
+}
+
+test "encodeUploadMetadata: a custom time goes after the content fields" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings(
+        "{\"name\":\"a\",\"contentType\":\"text/plain\",\"contentLanguage\":\"en\",\"customTime\":\"2026-10-01T00:00:00Z\",\"metadata\":{\"k\":\"v\"}}",
+        try encodeUploadMetadata(arena.allocator(), "a", .{
+            .content_type = "text/plain",
+            .content_language = "en",
+            .custom_time = "2026-10-01T00:00:00Z",
+            .metadata = &.{.{ .key = "k", .value = "v" }},
+        }, null),
+    );
+}
+
+fn expectStrings(expected: []const []const u8, actual: []const []const u8) !void {
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |e, got| try testing.expectEqualStrings(e, got);
+}
+
 test "decode operations: progress unknown, counts as strings or numbers, and malformed ones" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -1763,6 +2114,11 @@ test "fuzz decoding: arbitrary bodies never crash" {
         "{\"crc32c\":\"\\u0000\"}",
         bucket_with_every_setting,
         bucket_with_every_condition,
+        bodies.bucket_every_setting,
+        bodies.bucket_vpc_sources,
+        bodies.bucket_listing,
+        bodies.object_custom_time_millis,
+        "{\"cors\":[{\"origin\":[null],\"maxAgeSeconds\":-1}],\"ipFilter\":{\"vpcNetworkSources\":[{}]}}",
         "{\"lifecycle\":{\"rule\":[{\"action\":{\"type\":\"Delete\"},\"condition\":{\"age\":-1}}]}}",
         "{\"labels\":{\"k\":null},\"softDeletePolicy\":{\"retentionDurationSeconds\":\"0\"}}",
         "{\"name\":\"projects/_/buckets/b/operations/abc\",\"done\":true,\"error\":{\"code\":1,\"message\":\"x\"}}",

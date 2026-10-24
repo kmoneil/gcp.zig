@@ -4,6 +4,30 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.59.0 (unreleased)
+
+- storage: a bucket's other settings and two object fields, for issue
+  #311, so a console's bucket and object pages show everything. A
+  `BucketInfo` now carries its `autoclass` (`Autoclass`: `enabled`, the
+  terminal class, when each last changed), `cors` (`CorsRule`s),
+  `website` (`Website`), `logging` (`AccessLogging`), `ip_filter`
+  (`IpFilter`: whether it is `enforced`, its public ranges and VPC
+  sources, its two allowances), `rpo` (`Rpo`) and `data_locations` (a
+  configurable dual-region's two regions). These are read, not set. An
+  `ObjectInfo` carries its `custom_time`, `media_link` and
+  `time_storage_class_updated`. `UploadOptions.custom_time` and
+  `MetadataUpdate.custom_time` set the custom time that lifecycle rules
+  count from, checked as RFC 3339 before sending. Every new field has a
+  default, so nothing that builds today changes. Measured in production
+  on 2026-10-24: `listBuckets` gives an IP filter without its ranges;
+  a caller without `storage.buckets.getIpFilter` reads the bucket with
+  the filter left out; a regional bucket has no `rpo`; logging without a
+  prefix gets the bucket's own name; and a custom time can never move
+  earlier or be removed.
+- auth, bigquery, core, dataflow, datatransfer, error_reporting,
+  firestore, kms, logging, monitoring, pubsub, resource_manager, run,
+  scheduler and secret_manager: unchanged.
+
 ## 0.58.0 (2026-10-23)
 
 - run: what a deploy set, for issue #309, so a console's service and

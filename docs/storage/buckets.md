@@ -95,6 +95,65 @@ sends it back is refused: without the part this library could not read,
 the rule would act on objects it now leaves alone. Leave it out of the
 list, which removes it, or change the rules with gcloud.
 
+### Settings read and not set
+
+`get` and `listBuckets` also read six settings that this library does
+not set, so that a bucket's page can show everything about it:
+
+```zig
+var info = try gcs.bucket("my-site").get();
+defer info.deinit();
+if (info.value.autoclass) |a| if (a.enabled) {
+    std.debug.print("Autoclass, down to {s}\n", .{a.terminal_storage_class.?});
+};
+for (info.value.cors) |rule| std.debug.print("CORS for {d} origins\n", .{rule.origins.len});
+if (info.value.ip_filter) |f| std.debug.print("IP filter {s}\n", .{if (f.enforced) "on" else "kept, not applied"});
+```
+
+| Field | What it holds |
+| --- | --- |
+| `autoclass` | `enabled`, the coldest class objects reach (`NEARLINE`, the default, or `ARCHIVE`), and when each last changed. Null when never turned on; once off, `enabled` is false and the class is gone |
+| `cors` | Each rule's `origins`, `methods`, `response_headers` and `max_age_s`, in the bucket's order |
+| `website` | `main_page_suffix` and `not_found_page` |
+| `logging` | `log_bucket` and `log_object_prefix`, which Cloud Storage fills in with the bucket's own name when none was given |
+| `ip_filter` | Whether it is `enforced`, the `public_ranges` and `vpc_sources` let in, and its two allowances |
+| `rpo` | `.default` or `.async_turbo` (turbo replication) on a dual-region or multi-region bucket; null on a regional one |
+| `data_locations` | A configurable dual-region's two regions. A predefined one, such as `NAM4`, names none: its `location` says it |
+
+Two of them depend on how the bucket is read:
+
+- **`listBuckets` gives an IP filter without its ranges**: whether it is
+  enforced and its allowances, never `public_ranges` or `vpc_sources`.
+  `get` gives them.
+- **An IP filter needs `storage.buckets.getIpFilter`** to be read, which
+  Storage Admin grants. A caller without it reads the bucket as usual,
+  with `ip_filter` null, so null means "no filter, or one you may not
+  see".
+
+<details>
+<summary><b>📏 Measured against Cloud Storage on 2026-10-24</b></summary>
+
+- A bucket that sets none of them answers none, and a regional one no
+  `rpo` either.
+- Autoclass takes only `NEARLINE` and `ARCHIVE` as its terminal class,
+  and fills in both times at the create. Objects in an Autoclass bucket
+  are written Standard whatever class an upload names.
+- CORS rules and their lists come back in the order sent. A max age of
+  0 is kept, and an empty list dropped.
+- A log bucket that does not exist is taken.
+- An IP filter that names a VPC network outside the bucket's
+  organization is refused unless it allows other organizations'
+  networks; a project with no organization counts as outside. A create
+  fills in that allowance as false when it was not sent.
+- `DEFAULT` and `ASYNC_TURBO` are both refused on a regional bucket, and
+  `ASYNC_TURBO` on a multi-region one. A configurable dual-region gets
+  `DEFAULT` and takes either. A configurable pair that matches a
+  predefined dual-region is refused in favor of it.
+- A token downscoped to `roles/storage.legacyBucketReader` read a bucket
+  with an IP filter: 200, the filter left out.
+
+</details>
+
 ## Versions and soft delete
 
 A bucket with `versioning` keeps every generation an overwrite or a

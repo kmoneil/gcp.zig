@@ -692,6 +692,10 @@ fn checkUploadOptions(client: *Client, unchecked: types.UploadOptions) Error!typ
     if (options.retention) |r| if (!retention.checkObjectRetention(client.diagnostics, r, options.event_based_hold)) {
         return error.InvalidArgument;
     };
+    if (options.custom_time) |time| if (!metadata.isCustomTime(time)) {
+        if (client.diagnostics) |d| d.print("custom_time: an RFC 3339 time, such as 2026-10-01T00:00:00Z, not \"{s}\"", .{time});
+        return error.InvalidArgument;
+    };
     // An empty key was already refused here; a repeated one was not, and
     // made a body carrying two entries of one name.
     if (validate.metadataFault(options.metadata)) |fault| {
@@ -2030,6 +2034,18 @@ test "copyTo refuses a loop that cannot continue" {
     // Done, but no object resource.
     try testing.expectError(error.InvalidResponse, src.copyTo(dest, .{}));
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "no object resource") != null);
+}
+
+test "upload: a custom time that is not RFC 3339 is refused before anything is sent" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{}, .{});
+    defer h.deinit();
+    const obj = h.client.bucket("b").object("a");
+    try testing.expectError(error.InvalidArgument, obj.upload("x", .{ .custom_time = "2026-10-01" }));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "custom_time") != null);
+    var reader: std.Io.Reader = .fixed("x");
+    try testing.expectError(error.InvalidArgument, obj.uploadFrom(&reader, .{ .custom_time = "" }));
+    try testing.expectEqual(0, h.fake.stream_requests.items.len);
 }
 
 test "upload: a repeated metadata key is refused before anything is sent" {
