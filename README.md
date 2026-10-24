@@ -187,6 +187,7 @@ The [documentation index](docs/README.md) lists every page.
 | [`gcs_notify`](examples/gcs_notify.zig) | Sets up a bucket's notifications, and watches the changes come in, decoded | `zig build example-gcs_notify -- setup my-bucket my-project uploads` |
 | [`gcs_folders`](examples/gcs_folders.zig) | Works a hierarchical bucket's folders, renames trees, and grants on managed folders | `zig build example-gcs_folders -- ls my-bucket reports/` |
 | [`gcs_mv`](examples/gcs_mv.zig) | Renames an object in one atomic step, pinned to the generation it read | `zig build example-gcs_mv -- gs://my-bucket/draft.pdf final.pdf` |
+| [`gcs_bucket`](examples/gcs_bucket.zig) | Prints a bucket's settings page: class, protection, Autoclass, CORS, website, logging, IP filter and replication | `zig build example-gcs_bucket -- my-bucket` |
 | [`iam`](examples/iam.zig) | Reads, grants, revokes and tests permissions on a bucket, topic, subscription or secret | `zig build example-iam -- get gs://my-bucket` |
 | [`secret_rotation`](examples/secret_rotation.zig) | Rotates a secret when Secret Manager says it is time, through its topic | `zig build example-secret_rotation -- setup my-project db-password rotations` |
 | [`firestore`](examples/firestore.zig) | Writes, reads, updates, counts, queries and lists documents, and moves an amount between two in a transaction | `zig build example-firestore -- set cities/LA population=3900000` |

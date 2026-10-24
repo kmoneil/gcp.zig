@@ -5309,3 +5309,234 @@ test "72. move: an unpinned move whose answer was lost, under a token, is repeat
     try testing.expectEqualStrings(first.header("X-Goog-Gcs-Idempotency-Token").?, repeat.header("X-Goog-Gcs-Idempotency-Token").?);
     try f.expectContent(dest, "once\n");
 }
+
+// The settings a bucket's read gives and no call sets: the bucket settings
+// and move spec's section 6, case 7. Each bucket is made raw with the body
+// milestone 0 sent, and read back through `get` and `listBuckets`. The
+// unit test "against milestone 0" in src/storage/bucket_settings.zig holds
+// the fake to production's recorded answers for the same bodies, so a
+// difference on either side fails one of the two.
+
+/// Makes `name` raw in the fixture's project from `fields`, the create's
+/// body after its name, and answers the server's reply.
+fn createRaw(f: *BucketFixture, arena: Allocator, name: []const u8, fields: []const u8) !core.transport.StreamResponse {
+    const url = try arena.print("https://storage.googleapis.com/storage/v1/b?project={s}", .{f.project});
+    const body = try arena.print("{{\"name\":\"{s}\",\"softDeletePolicy\":{{\"retentionDurationSeconds\":\"0\"}},{s}}}", .{ name, fields });
+    const segments = [_][]const u8{body};
+    return f.http.transport().sendStream(.{
+        .method = .POST,
+        .url = url,
+        .bearer = f.token.token,
+        .content_type = "application/json",
+        .body = .{ .segments = &segments },
+    }, arena);
+}
+
+/// A bucket's resource as production sends it.
+fn bucketRaw(f: *BucketFixture, arena: Allocator, name: []const u8) !struct { body: []const u8, object: std.json.ObjectMap } {
+    const url = try arena.print("https://storage.googleapis.com/storage/v1/b/{s}", .{name});
+    const res = try f.http.transport().sendStream(.{ .method = .GET, .url = url, .bearer = f.token.token, .body = .none }, arena);
+    try testing.expectEqual(200, res.status);
+    return .{ .body = res.body, .object = (try std.json.parseFromSliceLeaky(std.json.Value, arena, res.body, .{})).object };
+}
+
+/// An error body's message.
+fn errorWords(arena: Allocator, body: []const u8) ![]const u8 {
+    const Body = struct { @"error": struct { message: []const u8 } };
+    return (try std.json.parseFromSliceLeaky(Body, arena, body, .{ .ignore_unknown_fields = true })).@"error".message;
+}
+
+fn expectStrings(want: []const []const u8, got: []const []const u8) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try testing.expectEqualStrings(w, g);
+}
+
+test "73. read settings: buckets made raw with every setting read back through get and listBuckets as the fake answers them (GCP_TEST_BUCKET_SETTINGS)" {
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    if (f.env.get("GCP_TEST_BUCKET_SETTINGS") == null) return error.SkipZigTest;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const base: []const u8 = &f.name;
+    const named = struct {
+        fn of(arena: Allocator, prefix: []const u8, suffix: []const u8) ![]const u8 {
+            return arena.print("{s}-{s}", .{ prefix, suffix });
+        }
+    }.of;
+
+    var made: std.ArrayList([]const u8) = .empty;
+    defer for (made.items) |name| {
+        // An enforced filter goes first, as milestone 0's cleanup did.
+        if (std.mem.endsWith(u8, name, "-full")) {
+            const url = std.fmt.allocPrint(a, "https://storage.googleapis.com/storage/v1/b/{s}", .{name}) catch continue;
+            const off = [_][]const u8{"{\"ipFilter\":{\"mode\":\"Disabled\",\"publicNetworkSource\":{\"allowedIpCidrRanges\":[\"0.0.0.0/0\",\"::/0\"]},\"allowCrossOrgVpcs\":false,\"allowAllServiceAgentAccess\":true}}"};
+            _ = f.http.transport().sendStream(.{ .method = .PATCH, .url = url, .bearer = f.token.token, .content_type = "application/json", .body = .{ .segments = &off } }, a) catch {};
+        }
+        f.client.bucket(name).delete() catch |err| std.debug.print("cleanup: could not delete bucket {s}: {t}\n", .{ name, err });
+    };
+
+    const none = try named(a, base, "none");
+    const taken = [_]struct { []const u8, []const u8 }{
+        .{ none, "\"location\":\"US-CENTRAL1\"" },
+        .{ try named(a, base, "full"), try a.print(
+            "\"location\":\"US-CENTRAL1\",\"autoclass\":{{\"enabled\":true,\"terminalStorageClass\":\"ARCHIVE\"}}," ++
+                "\"cors\":[{{\"origin\":[\"https://example.com\",\"https://app.example.com\"],\"method\":[\"GET\",\"HEAD\"],\"responseHeader\":[\"Content-Type\",\"x-goog-meta-k\"],\"maxAgeSeconds\":3600}},{{\"origin\":[\"*\"],\"method\":[\"*\"]}}]," ++
+                "\"website\":{{\"mainPageSuffix\":\"index.html\",\"notFoundPage\":\"404.html\"}}," ++
+                "\"logging\":{{\"logBucket\":\"{s}\",\"logObjectPrefix\":\"acc/\"}}," ++
+                "\"ipFilter\":{{\"mode\":\"Enabled\",\"publicNetworkSource\":{{\"allowedIpCidrRanges\":[\"0.0.0.0/0\",\"::/0\"]}},\"allowAllServiceAgentAccess\":true}}," ++
+                "\"iamConfiguration\":{{\"uniformBucketLevelAccess\":{{\"enabled\":true}}}}",
+            .{none},
+        ) },
+        .{ try named(a, base, "sparse"), try a.print(
+            "\"location\":\"US-CENTRAL1\",\"autoclass\":{{\"enabled\":true}}," ++
+                "\"cors\":[{{\"origin\":[\"https://only.example\"],\"method\":[]}},{{\"origin\":[\"https://z.example\"],\"method\":[\"PUT\"],\"maxAgeSeconds\":0,\"responseHeader\":[]}}]," ++
+                "\"website\":{{\"mainPageSuffix\":\"index.html\"}},\"logging\":{{\"logBucket\":\"{s}\"}}",
+            .{none},
+        ) },
+        .{ try named(a, base, "dual"), "\"location\":\"NAM4\",\"rpo\":\"ASYNC_TURBO\"" },
+        .{ try named(a, base, "cdual"), "\"location\":\"US\",\"customPlacementConfig\":{\"dataLocations\":[\"US-EAST1\",\"US-WEST1\"]}" },
+        .{ try named(a, base, "multi"), "\"location\":\"US\"" },
+        .{ try named(a, base, "vpc"), try a.print(
+            "\"location\":\"US-CENTRAL1\",\"ipFilter\":{{\"mode\":\"Disabled\",\"publicNetworkSource\":{{\"allowedIpCidrRanges\":[\"203.0.113.0/24\",\"2001:db8::/32\"]}}," ++
+                "\"vpcNetworkSources\":[{{\"network\":\"projects/{s}/global/networks/default\",\"allowedIpCidrRanges\":[\"10.128.0.0/20\",\"10.0.0.0/8\"]}}],\"allowCrossOrgVpcs\":true}}",
+            .{f.project},
+        ) },
+        .{ try named(a, base, "pub"), "\"location\":\"US-CENTRAL1\",\"ipFilter\":{\"mode\":\"Disabled\",\"publicNetworkSource\":{\"allowedIpCidrRanges\":[\"198.51.100.0/24\"]}}" },
+        .{ try named(a, base, "blank"), "\"location\":\"US-CENTRAL1\",\"cors\":[{},{\"origin\":[],\"method\":[]},{\"maxAgeSeconds\":0}],\"website\":{}" },
+    };
+    for (taken) |case| {
+        const res = try createRaw(&f, a, case[0], case[1]);
+        if (res.status != 200) std.debug.print("create {s}: HTTP {d} {s}\n", .{ case[0], res.status, res.body });
+        try testing.expectEqual(200, res.status);
+        try made.append(a, case[0]);
+    }
+
+    var got: [taken.len]storage.Owned(storage.BucketInfo) = undefined;
+    for (taken, &got) |case, *g| g.* = f.client.bucket(case[0]).get() catch |err| return f.report(err);
+    defer for (&got) |*g| g.deinit();
+
+    const none_info = got[0].value;
+    try testing.expectEqual(null, none_info.autoclass);
+    try testing.expectEqual(0, none_info.cors.len);
+    try testing.expectEqual(null, none_info.website);
+    try testing.expectEqual(null, none_info.logging);
+    try testing.expectEqual(null, none_info.ip_filter);
+    try testing.expectEqual(null, none_info.rpo);
+    try testing.expectEqualStrings("region", none_info.location_type.?);
+
+    const full = got[1].value;
+    try testing.expect(full.autoclass.?.enabled);
+    try testing.expectEqualStrings("ARCHIVE", full.autoclass.?.terminal_storage_class.?);
+    try testing.expect(full.autoclass.?.toggle_time != null and full.autoclass.?.terminal_storage_class_update_time != null);
+    try testing.expectEqual(2, full.cors.len);
+    try expectStrings(&.{ "https://example.com", "https://app.example.com" }, full.cors[0].origins);
+    try expectStrings(&.{ "GET", "HEAD" }, full.cors[0].methods);
+    try expectStrings(&.{ "Content-Type", "x-goog-meta-k" }, full.cors[0].response_headers);
+    try testing.expectEqual(3600, full.cors[0].max_age_s.?);
+    try expectStrings(&.{"*"}, full.cors[1].origins);
+    try testing.expectEqual(null, full.cors[1].max_age_s);
+    try testing.expectEqualStrings("index.html", full.website.?.main_page_suffix.?);
+    try testing.expectEqualStrings("404.html", full.website.?.not_found_page.?);
+    try testing.expectEqualStrings(none, full.logging.?.log_bucket);
+    try testing.expectEqualStrings("acc/", full.logging.?.log_object_prefix.?);
+    const filter = full.ip_filter.?;
+    try testing.expect(filter.enforced);
+    try expectStrings(&.{ "0.0.0.0/0", "::/0" }, filter.public_ranges);
+    try testing.expect(!filter.allow_cross_org_vpcs);
+    try testing.expect(filter.allow_all_service_agent_access);
+    try testing.expectEqual(null, full.rpo);
+
+    const sparse = got[2].value;
+    try testing.expectEqualStrings("NEARLINE", sparse.autoclass.?.terminal_storage_class.?);
+    try testing.expectEqual(2, sparse.cors.len);
+    try testing.expectEqual(0, sparse.cors[0].methods.len);
+    try testing.expectEqual(0, sparse.cors[1].max_age_s.?);
+    try testing.expectEqual(0, sparse.cors[1].response_headers.len);
+    try testing.expectEqual(null, sparse.website.?.not_found_page);
+    try testing.expectEqualStrings(taken[2][0], sparse.logging.?.log_object_prefix.?);
+    try testing.expectEqual(1, got[8].value.cors.len);
+    try testing.expectEqual(0, got[8].value.cors[0].max_age_s.?);
+    try testing.expectEqual(null, got[8].value.website);
+
+    // Raw, since a read gives an empty list left out and one kept the
+    // same: the fake leaves out an empty list, a rule with nothing in it
+    // and a website naming no page.
+    const sparse_raw = try bucketRaw(&f, a, taken[2][0]);
+    errdefer std.debug.print("{s} as production sends it: {s}\n", .{ taken[2][0], sparse_raw.body });
+    for (sparse_raw.object.get("cors").?.array.items, [_]usize{ 1, 3 }) |rule, keys| try testing.expectEqual(keys, rule.object.count());
+    const blank_raw = try bucketRaw(&f, a, taken[8][0]);
+    errdefer std.debug.print("{s} as production sends it: {s}\n", .{ taken[8][0], blank_raw.body });
+    const blank_rules = blank_raw.object.get("cors").?.array.items;
+    try testing.expectEqual(1, blank_rules.len);
+    try testing.expectEqual(1, blank_rules[0].object.count());
+    try testing.expect(blank_raw.object.get("website") == null);
+
+    try testing.expectEqual(.async_turbo, got[3].value.rpo.?);
+    try testing.expectEqualStrings("dual-region", got[3].value.location_type.?);
+    try testing.expectEqual(.default, got[4].value.rpo.?);
+    try testing.expectEqualStrings("dual-region", got[4].value.location_type.?);
+    try expectStrings(&.{ "US-EAST1", "US-WEST1" }, got[4].value.data_locations);
+    try testing.expectEqual(.default, got[5].value.rpo.?);
+    try testing.expectEqualStrings("multi-region", got[5].value.location_type.?);
+
+    const vpc = got[6].value.ip_filter.?;
+    try testing.expect(!vpc.enforced);
+    try testing.expectEqual(1, vpc.vpc_sources.len);
+    try expectStrings(&.{ "10.128.0.0/20", "10.0.0.0/8" }, vpc.vpc_sources[0].ranges);
+    try testing.expect(vpc.allow_cross_org_vpcs);
+    try testing.expect(!vpc.allow_all_service_agent_access);
+    const public = got[7].value.ip_filter.?;
+    try expectStrings(&.{"198.51.100.0/24"}, public.public_ranges);
+    try testing.expect(!public.allow_cross_org_vpcs);
+
+    // A listing gives each filter without its ranges or networks. Raw,
+    // with a prefix, so that no other bucket in the project is read.
+    const list_url = try a.print("https://storage.googleapis.com/storage/v1/b?project={s}&prefix={s}", .{ f.project, base });
+    const listing = try f.http.transport().sendStream(.{ .method = .GET, .url = list_url, .bearer = f.token.token, .body = .none }, a);
+    try testing.expectEqual(200, listing.status);
+    const Listed = struct {
+        items: []const struct {
+            name: []const u8,
+            ipFilter: ?struct {
+                mode: []const u8,
+                publicNetworkSource: ?std.json.Value = null,
+                vpcNetworkSources: ?std.json.Value = null,
+                allowCrossOrgVpcs: ?bool = null,
+            } = null,
+        } = &.{},
+    };
+    const listed = try std.json.parseFromSliceLeaky(Listed, a, listing.body, .{ .ignore_unknown_fields = true });
+    var seen: usize = 0;
+    for (listed.items) |item| {
+        const listed_filter = item.ipFilter orelse continue;
+        seen += 1;
+        try testing.expectEqual(null, listed_filter.publicNetworkSource);
+        try testing.expectEqual(null, listed_filter.vpcNetworkSources);
+        try testing.expectEqualStrings(if (std.mem.endsWith(u8, item.name, "-full")) "Enabled" else "Disabled", listed_filter.mode);
+        try testing.expectEqual(std.mem.endsWith(u8, item.name, "-vpc"), listed_filter.allowCrossOrgVpcs.?);
+    }
+    try testing.expectEqual(3, seen);
+
+    // Refused, in the words the fake uses.
+    const refused = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "rpo", "\"location\":\"US-CENTRAL1\",\"rpo\":\"DEFAULT\"", "RPO: DEFAULT cannot be enabled on REGION bucket '{s}'." },
+        .{ "turbo", "\"location\":\"US\",\"rpo\":\"ASYNC_TURBO\"", "RPO: ASYNC_TURBO cannot be enabled on MULTI_REGION bucket '{s}'." },
+        .{ "cross", try a.print("\"location\":\"US-CENTRAL1\",\"ipFilter\":{{\"mode\":\"Disabled\",\"vpcNetworkSources\":[{{\"network\":\"projects/{s}/global/networks/default\",\"allowedIpCidrRanges\":[\"10.128.0.0/20\"]}}]}}", .{f.project}), "Invalid IP filter configuration. You must either set the vpcNetworkSources within your own organization, or set the allowCrossOrgVpcs flag to true to bypass this validation." },
+        .{ "pair", "\"location\":\"US\",\"customPlacementConfig\":{\"dataLocations\":[\"US-CENTRAL1\",\"US-EAST1\"]}", "Please create your bucket in NAM4, which is made up of the regions (US-CENTRAL1, US-EAST1)" },
+        .{ "cold", "\"location\":\"US-CENTRAL1\",\"autoclass\":{\"enabled\":true,\"terminalStorageClass\":\"COLDLINE\"}", "Invalid value for terminalStorageClass field in Autoclass config. Valid values are NEARLINE and ARCHIVE" },
+        .{ "page", "\"location\":\"US-CENTRAL1\",\"website\":{\"mainPageSuffix\":\"index.html\",\"notFoundPage\":\"\"}", "No object name" },
+    };
+    for (refused) |case| {
+        const name = try named(a, base, case[0]);
+        const res = try createRaw(&f, a, name, case[1]);
+        if (res.status == 200) try made.append(a, name);
+        try testing.expectEqual(400, res.status);
+        const words = if (std.mem.indexOf(u8, case[2], "{s}") != null)
+            try std.mem.replaceOwned(u8, a, case[2], "{s}", name)
+        else
+            case[2];
+        try testing.expectEqualStrings(words, try errorWords(a, res.body));
+    }
+}
