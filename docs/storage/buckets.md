@@ -139,7 +139,10 @@ Two of them depend on how the bucket is read:
   and fills in both times at the create. Objects in an Autoclass bucket
   are written Standard whatever class an upload names.
 - CORS rules and their lists come back in the order sent. A max age of
-  0 is kept, and an empty list dropped.
+  0 is kept, an empty list dropped, and a rule with nothing in it
+  dropped wherever it sits.
+- An empty website page is refused ("No object name"); a website naming
+  neither page is none.
 - A log bucket that does not exist is taken.
 - An IP filter that names a VPC network outside the bucket's
   organization is refused unless it allows other organizations'
@@ -153,6 +156,16 @@ Two of them depend on how the bucket is read:
   with an IP filter: 200, the filter left out.
 
 </details>
+
+[`examples/gcs_bucket.zig`](../../examples/gcs_bucket.zig) prints all
+of a bucket's settings, these included, as a console's bucket page shows
+them: `zig build example-gcs_bucket -- my-bucket`.
+
+The library's own tests read these settings from an in-memory fake that
+takes them at a bucket's create, held to the answers above: a suite
+against real buckets (`GCP_TEST_BUCKET_SETTINGS=1`) and the fake's tests
+check the same creates against the same recorded answers, so either one
+drifting fails a test.
 
 ## Versions and soft delete
 

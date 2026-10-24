@@ -35,6 +35,34 @@
 //! - `enableObjectRetention=true` on a create gives `objectRetention`
 //!   `Enabled`; a patch of `objectRetention` is taken and ignored.
 //!
+//! - The settings this library reads and never sends (2026-10-24), taken
+//!   at create alone, so a test seeds them with `seed`; a patch naming
+//!   one is refused, as any field this library never sends:
+//!   - Autoclass: its terminal class `NEARLINE` unless `ARCHIVE` is named,
+//!     any other refused in production's words, both times the bucket's
+//!     creation. Off, it answers `enabled` false and its toggle time, as a
+//!     bucket whose Autoclass was turned off answered.
+//!   - CORS rules in the order sent, an empty list in a rule dropped, a
+//!     rule with nothing in it dropped wherever it sits, a `maxAgeSeconds`
+//!     of 0 kept, alone too; the website's two pages, an empty one
+//!     refused in production's words; logging, its prefix the bucket's
+//!     own name unless one is given, to any bucket.
+//!   - The IP filter: `allowCrossOrgVpcs` filled in false, the agents'
+//!     access kept only when sent, VPC sources refused without
+//!     `allowCrossOrgVpcs` in production's words (a project in no
+//!     organization, as extractctl is), and at most 200 ranges and 25
+//!     networks. A listing gives each filter without its ranges or
+//!     networks. Nothing here enforces a filter.
+//!   - RPO: refused on a region in production's words, `ASYNC_TURBO`
+//!     refused on a multi-region, either taken on a dual-region, and
+//!     `DEFAULT` filled in on both kinds that have one. NAM4, EUR4, EUR5,
+//!     EUR7, EUR8 and ASIA1 are dual-regions, and so is US, EU or ASIA
+//!     with `customPlacementConfig`'s two regions, the pair NAM4 already
+//!     is refused in production's words.
+//!
+//! - A listing of a project's buckets in name order, `maxResults` to a
+//!   page (1,000 unless asked), the last name served as its page token.
+//!
 //! - Notification configurations (2026-10-01): an ID is the bucket's
 //!   metageneration, which every create and delete moves; `payload_format`
 //!   is required; a topic is taken as `//pubsub.googleapis.com/projects/P/
@@ -113,6 +141,7 @@ pub const FakeBuckets = struct {
 
     pub const Counts = struct {
         creates: u32 = 0,
+        lists: u32 = 0,
         reads: u32 = 0,
         patches: u32 = 0,
         deletes: u32 = 0,
@@ -240,6 +269,9 @@ pub const FakeBuckets = struct {
         predefined_default_object_acl: ?[]const u8 = null,
         /// `.../acl` or `.../defaultObjectAcl`, or one entry of either.
         acl: ?AclTarget = null,
+        /// A listing's `maxResults` and `pageToken`.
+        page_size: u32 = 0,
+        page_token: ?[]const u8 = null,
     };
 
     pub const AclList = enum { bucket, default_object };
@@ -284,12 +316,31 @@ pub const FakeBuckets = struct {
         return stored.resource;
     }
 
+    /// Makes a bucket in `project` from a create's JSON body, as
+    /// `POST /storage/v1/b` would: how a test seeds the settings this
+    /// library reads and never sends. A body production refuses is
+    /// `error.Refused`, its words in `refusal`.
+    pub fn seed(self: *FakeBuckets, project: []const u8, body: []const u8) (Error || error{Refused})!void {
+        // The fake's own arena, so the refusal outlives the call.
+        const reply = try self.create(body, .{ .name = null, .project = project }, self.arena.allocator());
+        if (reply.status != 200) return error.Refused;
+    }
+
     /// One request. A method this fake does not serve fails the test.
     pub fn serve(self: *FakeBuckets, method: Method, target: Target, body: []const u8, arena: Allocator) Error!Reply {
         const name = target.name orelse {
-            if (method != .POST or target.project == null) return error.HttpProtocolError;
-            self.counts.creates += 1;
-            return self.create(body, target, arena);
+            if (target.project == null) return error.HttpProtocolError;
+            switch (method) {
+                .POST => {
+                    self.counts.creates += 1;
+                    return self.create(body, target, arena);
+                },
+                .GET => {
+                    self.counts.lists += 1;
+                    return self.listBuckets(target, arena);
+                },
+                else => return error.HttpProtocolError,
+            }
         };
         if (target.notification) |n| return self.serveNotification(method, name, n, body, arena);
         if (target.acl) |t| return self.serveAcl(method, name, t, arena);
@@ -342,15 +393,15 @@ pub const FakeBuckets = struct {
         try next.put(a, "metageneration", .{ .string = "1" });
         try next.put(a, "location", .{ .string = try std.ascii.allocUpperString(a, location) });
         try next.put(a, "storageClass", .{ .string = class });
-        try next.put(a, "timeCreated", .{ .string = "2026-09-29T14:07:12.505Z" });
-        try next.put(a, "updated", .{ .string = "2026-09-29T14:07:12.505Z" });
+        try next.put(a, "timeCreated", .{ .string = created_time });
+        try next.put(a, "updated", .{ .string = created_time });
         try next.put(a, "softDeletePolicy", try defaultSoftDelete(a));
         var iam: ObjectMap = .empty;
         try iam.put(a, "uniformBucketLevelAccess", try flagObject(a, "enabled", false));
         try iam.put(a, "publicAccessPrevention", .{ .string = "inherited" });
         try next.put(a, "iamConfiguration", .{ .object = iam });
-        const regional = std.mem.indexOfScalar(u8, location, '-') != null;
-        try next.put(a, "locationType", .{ .string = if (regional) "region" else "multi-region" });
+        const location_type = locationType(location, fields.get("customPlacementConfig") != null);
+        try next.put(a, "locationType", .{ .string = location_type });
         if (object_retention) {
             var mode: ObjectMap = .empty;
             try mode.put(a, "mode", .{ .string = "Enabled" });
@@ -362,6 +413,7 @@ pub const FakeBuckets = struct {
             const key = entry.key_ptr.*;
             if (std.mem.eql(u8, key, "name") or std.mem.eql(u8, key, "location") or std.mem.eql(u8, key, "storageClass")) continue;
             if (std.mem.eql(u8, key, "hierarchicalNamespace")) continue; // judged below, against the whole body
+            if (isReadSetting(key)) continue; // judged below, against the location
             self.apply(&next, key, entry.value_ptr.*, true) catch |err| switch (err) {
                 error.Invalid => return self.refused(arena),
                 error.OutOfMemory => return error.OutOfMemory,
@@ -377,6 +429,10 @@ pub const FakeBuckets = struct {
             if (object_retention) return self.invalid(arena, "Object retention config is not supported for hierarchical namespace buckets.");
             try next.put(a, "hierarchicalNamespace", try flagObject(a, "enabled", true));
         }
+        self.applyReadSettings(&next, fields, owned_name, location, location_type) catch |err| switch (err) {
+            error.Invalid => return self.refused(arena),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
         // The canned lists, or `projectPrivate`; uniform access keeps none.
         var lists: [2][]const fake_acl.Entry = .{ fake_acl.project_private, fake_acl.project_private };
         for ([_]?[]const u8{ target.predefined_acl, target.predefined_default_object_acl }, &lists, 0..) |name_param, *list, i| {
@@ -395,6 +451,32 @@ pub const FakeBuckets = struct {
         });
         self.next_generation += 1;
         return .{ .status = 200, .body = try renderStored(arena, self.buckets.getPtr(owned_name).?, target.full) };
+    }
+
+    /// A listing of `target.project`'s buckets, as `listBuckets` reads it.
+    fn listBuckets(self: *FakeBuckets, target: Target, arena: Allocator) Error!Reply {
+        var names: std.ArrayList([]const u8) = .empty;
+        for (self.buckets.keys(), self.buckets.values()) |name, stored| {
+            if (!std.mem.eql(u8, stored.project, target.project.?)) continue;
+            if (target.page_token) |after| if (std.mem.order(u8, name, after) != .gt) continue;
+            try names.append(arena, name);
+        }
+        std.mem.sort([]const u8, names.items, {}, lessThan);
+        const size: usize = if (target.page_size == 0) 1000 else target.page_size;
+        const shown = names.items[0..@min(size, names.items.len)];
+        var page: ObjectMap = .empty;
+        try page.put(arena, "kind", .{ .string = "storage#buckets" });
+        if (shown.len < names.items.len) try page.put(arena, "nextPageToken", .{ .string = shown[shown.len - 1] });
+        if (shown.len > 0) {
+            var items: std.json.Array = .init(arena);
+            for (shown) |name| {
+                var item = try cloneObject(arena, try shownResource(arena, self.buckets.getPtr(name).?, target.full));
+                if (item.get("ipFilter")) |filter| try item.put(arena, "ipFilter", try listedFilter(arena, filter));
+                try items.append(.{ .object = item });
+            }
+            try page.put(arena, "items", .{ .array = items });
+        }
+        return .{ .status = 200, .body = try render(arena, page) };
     }
 
     /// Whether a create's body asks for a hierarchical namespace.
@@ -866,6 +948,220 @@ pub const FakeBuckets = struct {
             return next.put(self.arena.allocator(), "storageClass", .{ .string = class });
         }
         return self.failFmt("this fake does not take the field \"{s}\"", .{key});
+    }
+
+    /// The settings `isReadSetting` names, judged together at create,
+    /// since RPO depends on the location's type.
+    fn applyReadSettings(
+        self: *FakeBuckets,
+        next: *ObjectMap,
+        fields: ObjectMap,
+        name: []const u8,
+        location: []const u8,
+        location_type: []const u8,
+    ) ApplyError!void {
+        if (fields.get("autoclass")) |v| try self.applyAutoclass(next, v);
+        if (fields.get("cors")) |v| try self.applyCors(next, v);
+        if (fields.get("website")) |v| try self.applyWebsite(next, v);
+        if (fields.get("logging")) |v| try self.applyLogging(next, v, name);
+        if (fields.get("ipFilter")) |v| try self.applyIpFilter(next, v);
+        if (fields.get("customPlacementConfig")) |v| try self.applyPlacement(next, v, location);
+        try self.applyRpo(next, fields.get("rpo"), name, location_type);
+    }
+
+    fn applyAutoclass(self: *FakeBuckets, next: *ObjectMap, value: Value) ApplyError!void {
+        if (value == .null) return;
+        const a = self.arena.allocator();
+        const fields = objectOf(value) orelse return self.fail("autoclass is not an object");
+        try self.onlyFields(fields, "autoclass", &.{ "enabled", "terminalStorageClass" });
+        const enabled = if (fields.get("enabled")) |e| switch (e) {
+            .bool => |b| b,
+            else => return self.fail("autoclass.enabled is not a boolean"),
+        } else false;
+        var out: ObjectMap = .empty;
+        try out.put(a, "enabled", .{ .bool = enabled });
+        try out.put(a, "toggleTime", .{ .string = created_time });
+        if (enabled) {
+            const class = if (fields.get("terminalStorageClass")) |t| stringOf(t) orelse return self.fail("autoclass.terminalStorageClass is not a string") else "NEARLINE";
+            if (!std.mem.eql(u8, class, "NEARLINE") and !std.mem.eql(u8, class, "ARCHIVE")) {
+                return self.fail("Invalid value for terminalStorageClass field in Autoclass config. Valid values are NEARLINE and ARCHIVE");
+            }
+            try out.put(a, "terminalStorageClass", .{ .string = try a.dupe(u8, class) });
+            try out.put(a, "terminalStorageClassUpdateTime", .{ .string = created_time });
+        }
+        try next.put(a, "autoclass", .{ .object = out });
+    }
+
+    fn applyCors(self: *FakeBuckets, next: *ObjectMap, value: Value) ApplyError!void {
+        if (value == .null) return;
+        const a = self.arena.allocator();
+        const given = arrayOf(value) orelse return self.fail("cors is not a list");
+        var rules: std.json.Array = .init(a);
+        for (given) |item| {
+            const fields = objectOf(item) orelse return self.fail("a CORS rule is not an object");
+            try self.onlyFields(fields, "a CORS rule", &.{ "origin", "method", "responseHeader", "maxAgeSeconds" });
+            var rule: ObjectMap = .empty;
+            for ([_][]const u8{ "origin", "method", "responseHeader" }) |key| {
+                const list = fields.get(key) orelse continue;
+                const strings = try self.stringList(list, key);
+                // An empty list is dropped, as measured.
+                if (strings.len == 0) continue;
+                try rule.put(a, key, try cloneValue(a, list));
+            }
+            if (fields.get("maxAgeSeconds")) |age| switch (age) {
+                .integer => |seconds| {
+                    if (seconds < 0 or seconds > std.math.maxInt(u32)) return self.fail("maxAgeSeconds is out of range");
+                    try rule.put(a, "maxAgeSeconds", .{ .integer = seconds });
+                },
+                else => return self.fail("maxAgeSeconds is not a number"),
+            };
+            // A rule with nothing in it is dropped, wherever it sits, as
+            // measured on 2026-10-24; a max age alone, even 0, is kept.
+            if (rule.count() == 0) continue;
+            try rules.append(.{ .object = rule });
+        }
+        if (rules.items.len > 0) try next.put(a, "cors", .{ .array = rules });
+    }
+
+    fn applyWebsite(self: *FakeBuckets, next: *ObjectMap, value: Value) ApplyError!void {
+        if (value == .null) return;
+        const a = self.arena.allocator();
+        const fields = objectOf(value) orelse return self.fail("website is not an object");
+        try self.onlyFields(fields, "website", &.{ "mainPageSuffix", "notFoundPage" });
+        var out: ObjectMap = .empty;
+        for ([_][]const u8{ "mainPageSuffix", "notFoundPage" }) |key| {
+            const page = stringOf(fields.get(key) orelse continue) orelse return self.failFmt("website.{s} is not a string", .{key});
+            // Measured on 2026-10-24, either page.
+            if (page.len == 0) return self.fail("No object name");
+            try out.put(a, key, .{ .string = try a.dupe(u8, page) });
+        }
+        if (out.count() > 0) try next.put(a, "website", .{ .object = out });
+    }
+
+    fn applyLogging(self: *FakeBuckets, next: *ObjectMap, value: Value, name: []const u8) ApplyError!void {
+        if (value == .null) return;
+        const a = self.arena.allocator();
+        const fields = objectOf(value) orelse return self.fail("logging is not an object");
+        try self.onlyFields(fields, "logging", &.{ "logBucket", "logObjectPrefix" });
+        const log_bucket = stringOf(fields.get("logBucket") orelse return self.fail("logging names no logBucket")) orelse
+            return self.fail("logging.logBucket is not a string");
+        if (log_bucket.len == 0) return self.fail("logging names no logBucket");
+        const given = if (fields.get("logObjectPrefix")) |p| stringOf(p) orelse return self.fail("logging.logObjectPrefix is not a string") else "";
+        var out: ObjectMap = .empty;
+        try out.put(a, "logBucket", .{ .string = try a.dupe(u8, log_bucket) });
+        // The bucket's own name unless one is given, as measured.
+        try out.put(a, "logObjectPrefix", .{ .string = try a.dupe(u8, if (given.len > 0) given else name) });
+        try next.put(a, "logging", .{ .object = out });
+    }
+
+    fn applyIpFilter(self: *FakeBuckets, next: *ObjectMap, value: Value) ApplyError!void {
+        if (value == .null) return;
+        const a = self.arena.allocator();
+        const fields = objectOf(value) orelse return self.fail("ipFilter is not an object");
+        try self.onlyFields(fields, "ipFilter", &.{ "mode", "publicNetworkSource", "vpcNetworkSources", "allowCrossOrgVpcs", "allowAllServiceAgentAccess" });
+        const mode = stringOf(fields.get("mode") orelse return self.fail("ipFilter names no mode")) orelse
+            return self.fail("ipFilter.mode is not a string");
+        if (!std.mem.eql(u8, mode, "Enabled") and !std.mem.eql(u8, mode, "Disabled")) return self.fail("ipFilter.mode is Enabled or Disabled");
+        var out: ObjectMap = .empty;
+        try out.put(a, "mode", .{ .string = try a.dupe(u8, mode) });
+        var ranges: usize = 0;
+        if (fields.get("publicNetworkSource")) |public| {
+            const source = objectOf(public) orelse return self.fail("ipFilter.publicNetworkSource is not an object");
+            try self.onlyFields(source, "ipFilter.publicNetworkSource", &.{"allowedIpCidrRanges"});
+            const list = source.get("allowedIpCidrRanges") orelse return self.fail("publicNetworkSource names no allowedIpCidrRanges");
+            ranges += (try self.stringList(list, "allowedIpCidrRanges")).len;
+            try out.put(a, "publicNetworkSource", try cloneValue(a, public));
+        }
+        var networks: usize = 0;
+        if (fields.get("vpcNetworkSources")) |vpc| {
+            const sources = arrayOf(vpc) orelse return self.fail("ipFilter.vpcNetworkSources is not a list");
+            for (sources) |item| {
+                const source = objectOf(item) orelse return self.fail("a VPC network source is not an object");
+                try self.onlyFields(source, "a VPC network source", &.{ "network", "allowedIpCidrRanges" });
+                const network = stringOf(source.get("network") orelse return self.fail("a VPC network source names no network")) orelse
+                    return self.fail("a VPC network source's network is not a string");
+                if (network.len == 0) return self.fail("a VPC network source names no network");
+                const list = source.get("allowedIpCidrRanges") orelse return self.fail("a VPC network source names no allowedIpCidrRanges");
+                ranges += (try self.stringList(list, "allowedIpCidrRanges")).len;
+            }
+            networks = sources.len;
+            if (networks > 0) try out.put(a, "vpcNetworkSources", try cloneValue(a, vpc));
+        }
+        if (networks > 25) return self.fail("an IP filter names at most 25 VPC networks");
+        if (ranges > 200) return self.fail("an IP filter names at most 200 IP ranges");
+        const cross = if (fields.get("allowCrossOrgVpcs")) |c| switch (c) {
+            .bool => |b| b,
+            else => return self.fail("ipFilter.allowCrossOrgVpcs is not a boolean"),
+        } else false;
+        if (networks > 0 and !cross) {
+            return self.fail("Invalid IP filter configuration. You must either set the vpcNetworkSources within your own organization, or set the allowCrossOrgVpcs flag to true to bypass this validation.");
+        }
+        try out.put(a, "allowCrossOrgVpcs", .{ .bool = cross });
+        if (fields.get("allowAllServiceAgentAccess")) |agents| switch (agents) {
+            .bool => try out.put(a, "allowAllServiceAgentAccess", agents),
+            else => return self.fail("ipFilter.allowAllServiceAgentAccess is not a boolean"),
+        };
+        try next.put(a, "ipFilter", .{ .object = out });
+    }
+
+    fn applyPlacement(self: *FakeBuckets, next: *ObjectMap, value: Value, location: []const u8) ApplyError!void {
+        const a = self.arena.allocator();
+        const fields = objectOf(value) orelse return self.fail("customPlacementConfig is not an object");
+        try self.onlyFields(fields, "customPlacementConfig", &.{"dataLocations"});
+        const list = fields.get("dataLocations") orelse return self.fail("customPlacementConfig names no dataLocations");
+        const regions = try self.stringList(list, "dataLocations");
+        if (regions.len != 2) return self.fail("customPlacementConfig.dataLocations names two regions");
+        var multi = false;
+        for ([_][]const u8{ "US", "EU", "ASIA" }) |m| multi = multi or std.ascii.eqlIgnoreCase(location, m);
+        if (!multi) return self.fail("this fake takes customPlacementConfig only in US, EU or ASIA");
+        // The one predefined pair measured.
+        const first = regions[0].string;
+        const second = regions[1].string;
+        if ((std.ascii.eqlIgnoreCase(first, "US-CENTRAL1") and std.ascii.eqlIgnoreCase(second, "US-EAST1")) or
+            (std.ascii.eqlIgnoreCase(first, "US-EAST1") and std.ascii.eqlIgnoreCase(second, "US-CENTRAL1")))
+        {
+            return self.fail("Please create your bucket in NAM4, which is made up of the regions (US-CENTRAL1, US-EAST1)");
+        }
+        var out: ObjectMap = .empty;
+        try out.put(a, "dataLocations", try cloneValue(a, list));
+        try next.put(a, "customPlacementConfig", .{ .object = out });
+    }
+
+    fn applyRpo(self: *FakeBuckets, next: *ObjectMap, value: ?Value, name: []const u8, location_type: []const u8) ApplyError!void {
+        const region = std.mem.eql(u8, location_type, "region");
+        const given: ?[]const u8 = if (value) |v| switch (v) {
+            .null => null,
+            .string => |s| s,
+            else => return self.fail("rpo is not a string"),
+        } else null;
+        const rpo = given orelse {
+            // Every kind of location but a region has one, as measured.
+            if (!region) try next.put(self.arena.allocator(), "rpo", .{ .string = "DEFAULT" });
+            return;
+        };
+        if (!std.mem.eql(u8, rpo, "DEFAULT") and !std.mem.eql(u8, rpo, "ASYNC_TURBO")) return self.fail("this fake takes rpo DEFAULT or ASYNC_TURBO");
+        if (region) return self.failFmt("RPO: {s} cannot be enabled on REGION bucket '{s}'.", .{ rpo, name });
+        if (std.mem.eql(u8, location_type, "multi-region") and std.mem.eql(u8, rpo, "ASYNC_TURBO")) {
+            return self.failFmt("RPO: ASYNC_TURBO cannot be enabled on MULTI_REGION bucket '{s}'.", .{name});
+        }
+        try next.put(self.arena.allocator(), "rpo", .{ .string = if (std.mem.eql(u8, rpo, "DEFAULT")) "DEFAULT" else "ASYNC_TURBO" });
+    }
+
+    /// Refuses a field `fields` has that `known` does not name: a body
+    /// this fake does not model fails the test that sent it.
+    fn onlyFields(self: *FakeBuckets, fields: ObjectMap, what: []const u8, known: []const []const u8) ApplyError!void {
+        var it = fields.iterator();
+        outer: while (it.next()) |entry| {
+            for (known) |k| if (std.mem.eql(u8, entry.key_ptr.*, k)) continue :outer;
+            return self.failFmt("this fake does not take {s}'s field \"{s}\"", .{ what, entry.key_ptr.* });
+        }
+    }
+
+    /// `value` as a list of strings, or the refusal of `field`.
+    fn stringList(self: *FakeBuckets, value: Value, field: []const u8) ApplyError![]const Value {
+        const items = arrayOf(value) orelse return self.failFmt("{s} is not a list", .{field});
+        for (items) |item| if (item != .string) return self.failFmt("{s} holds a value that is not a string", .{field});
+        return items;
     }
 
     fn applyLabels(self: *FakeBuckets, next: *ObjectMap, value: Value, creating: bool) ApplyError!void {
@@ -1470,14 +1766,59 @@ fn render(arena: Allocator, object: ObjectMap) Allocator.Error![]const u8 {
 /// lists and owner, unless uniform access hides them. An empty default
 /// object list is left out, as measured.
 fn renderStored(arena: Allocator, stored: *const FakeBuckets.Stored, full: bool) Allocator.Error![]const u8 {
-    if (!full or uniformAccess(stored.resource)) return render(arena, stored.resource);
+    return render(arena, try shownResource(arena, stored, full));
+}
+
+/// The bucket as a read shows it: under `projection=full`, with its lists
+/// and owner, unless uniform access hides them.
+fn shownResource(arena: Allocator, stored: *const FakeBuckets.Stored, full: bool) Allocator.Error!ObjectMap {
+    if (!full or uniformAccess(stored.resource)) return stored.resource;
     var shown = try cloneObject(arena, stored.resource);
     try shown.put(arena, "acl", try entriesValue(arena, stored.acl));
     if (stored.default_acl.len > 0) try shown.put(arena, "defaultObjectAcl", try entriesValue(arena, stored.default_acl));
     var owner: ObjectMap = .empty;
     try owner.put(arena, "entity", .{ .string = fake_acl.owners });
     try shown.put(arena, "owner", .{ .object = owner });
-    return render(arena, shown);
+    return shown;
+}
+
+/// An IP filter as a listing gives it: its mode and its two allowances,
+/// without its ranges or networks, as measured.
+fn listedFilter(arena: Allocator, filter: Value) Allocator.Error!Value {
+    var out: ObjectMap = .empty;
+    var it = filter.object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, "publicNetworkSource") or std.mem.eql(u8, key, "vpcNetworkSources")) continue;
+        try out.put(arena, key, entry.value_ptr.*);
+    }
+    return .{ .object = out };
+}
+
+/// When every bucket here was created, on the fake's word.
+const created_time = "2026-09-29T14:07:12.505Z";
+
+/// The settings a create takes and a patch does not.
+fn isReadSetting(key: []const u8) bool {
+    for ([_][]const u8{ "autoclass", "cors", "website", "logging", "ipFilter", "rpo", "customPlacementConfig" }) |k| {
+        if (std.mem.eql(u8, key, k)) return true;
+    }
+    return false;
+}
+
+/// A location's type: a region's name has a hyphen, the predefined
+/// dual-regions are named, and a multi-region given two regions is a
+/// configurable dual-region.
+fn locationType(location: []const u8, placement: bool) []const u8 {
+    if (std.mem.indexOfScalar(u8, location, '-') != null) return "region";
+    for ([_][]const u8{ "ASIA1", "EUR4", "EUR5", "EUR7", "EUR8", "NAM4" }) |dual| {
+        if (std.ascii.eqlIgnoreCase(location, dual)) return "dual-region";
+    }
+    return if (placement) "dual-region" else "multi-region";
+}
+
+fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
 }
 
 fn entriesValue(arena: Allocator, list: []const fake_acl.Entry) Allocator.Error!Value {
@@ -1711,9 +2052,11 @@ test "the fake keeps what Cloud Storage kept on 2026-09-29" {
     try testing.expectEqualStrings("US-CENTRAL1", fake.resource("b").?.get("location").?.string);
     try testing.expectEqualStrings("STANDARD", fake.resource("b").?.get("storageClass").?.string);
     try testing.expectEqualStrings("region", fake.resource("b").?.get("locationType").?.string);
-    // A name taken is 409, and the collection takes only a create.
+    // A name taken is 409, and the collection takes only a create and a
+    // listing.
     try testing.expectEqual(409, (try fake.serve(.POST, .{ .name = null, .project = "p" }, "{\"name\":\"b\"}", a)).status);
-    try testing.expectError(error.HttpProtocolError, fake.serve(.GET, .{ .name = null, .project = "p" }, "", a));
+    try testing.expectError(error.HttpProtocolError, fake.serve(.DELETE, .{ .name = null, .project = "p" }, "", a));
+    try testing.expectError(error.HttpProtocolError, fake.serve(.GET, .{ .name = null }, "", a));
     try testing.expectError(error.HttpProtocolError, fake.serve(.PUT, .{ .name = "b" }, "{}", a));
 
     // New buckets get 7 days of soft delete; 0 turns it off, and null puts

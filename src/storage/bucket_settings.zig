@@ -718,6 +718,7 @@ fn writeDecimalString(jw: *Stringify, n: u64) Stringify.Error!void {
 
 const testing = std.testing;
 const test_util = @import("test_util.zig");
+const bodies = @import("production_bodies.zig");
 
 const kms_key = "projects/p/locations/us/keyRings/r/cryptoKeys/k";
 
@@ -2291,4 +2292,432 @@ fn modelProperty(_: void, bytes: []const u8) !void {
 
 test "heavy property bucket updates against production's rules: every change lands once, as a model says" {
     try test_util.fuzzBytes({}, modelProperty, .{ .corpus = &.{ "", test_util.repeat("\x01", 96), test_util.repeat("\x00\x01\x02\x03", 32) } });
+}
+
+/// The settings a bucket's read gives and no call here sets, as two
+/// answers give them: production's and the fake's for the same create.
+/// Times are each server's own, so only whether one is there counts.
+fn expectSameReadSettings(want: types.BucketInfo, got: types.BucketInfo) !void {
+    try testing.expectEqualStrings(want.location_type orelse "", got.location_type orelse "");
+    try testing.expectEqual(want.autoclass == null, got.autoclass == null);
+    if (want.autoclass) |w| {
+        const g = got.autoclass.?;
+        try testing.expectEqual(w.enabled, g.enabled);
+        try testing.expectEqualDeep(w.terminal_storage_class, g.terminal_storage_class);
+        try testing.expectEqual(w.toggle_time == null, g.toggle_time == null);
+        try testing.expectEqual(w.terminal_storage_class_update_time == null, g.terminal_storage_class_update_time == null);
+    }
+    try testing.expectEqualDeep(want.cors, got.cors);
+    try testing.expectEqualDeep(want.website, got.website);
+    try testing.expectEqualDeep(want.logging, got.logging);
+    try testing.expectEqualDeep(want.ip_filter, got.ip_filter);
+    try testing.expectEqual(want.rpo, got.rpo);
+    try testing.expectEqualDeep(want.data_locations, got.data_locations);
+}
+
+/// The keys a decoded read cannot tell apart, as production sent them and
+/// as the fake keeps them: a read gives an empty list or page left out and
+/// one kept the same.
+fn expectSameWire(arena: std.mem.Allocator, production: []const u8, fake: std.json.ObjectMap) !void {
+    const want = (try std.json.parseFromSliceLeaky(std.json.Value, arena, production, .{})).object;
+    for ([_][]const u8{ "cors", "website" }) |key| {
+        const sent = if (want.get(key)) |v| try Stringify.valueAlloc(arena, v, .{}) else "";
+        const kept = if (fake.get(key)) |v| try Stringify.valueAlloc(arena, v, .{}) else "";
+        try testing.expectEqualStrings(sent, kept);
+    }
+}
+
+/// An error body's message.
+fn productionWords(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
+    const Body = struct { @"error": struct { message: []const u8 } };
+    return (try std.json.parseFromSliceLeaky(Body, arena, body, .{ .ignore_unknown_fields = true })).@"error".message;
+}
+
+test "against milestone 0: the read settings a create takes, fills in and refuses, as production did on 2026-10-24" {
+    var fake: test_util.FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var diag: core.Diagnostics = .{};
+    var client = try clientOnFake(&fake, &token, &diag);
+    defer client.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Milestone 0's creates, as sent, beside what production answered.
+    const soft = "\"softDeletePolicy\":{\"retentionDurationSeconds\":\"0\"}";
+    const full_settings = "\"autoclass\":{\"enabled\":true,\"terminalStorageClass\":\"ARCHIVE\"}," ++
+        "\"cors\":[{\"origin\":[\"https://example.com\",\"https://app.example.com\"],\"method\":[\"GET\",\"HEAD\"],\"responseHeader\":[\"Content-Type\",\"x-goog-meta-k\"],\"maxAgeSeconds\":3600},{\"origin\":[\"*\"],\"method\":[\"*\"]}]," ++
+        "\"website\":{\"mainPageSuffix\":\"index.html\",\"notFoundPage\":\"404.html\"}," ++
+        "\"logging\":{\"logBucket\":\"zigps-7b3007-none\",\"logObjectPrefix\":\"acc/\"}," ++
+        "\"ipFilter\":{\"mode\":\"Enabled\",\"publicNetworkSource\":{\"allowedIpCidrRanges\":[\"0.0.0.0/0\",\"::/0\"]},\"allowAllServiceAgentAccess\":true}," ++
+        "\"iamConfiguration\":{\"uniformBucketLevelAccess\":{\"enabled\":true}}";
+    const sparse_settings = "\"autoclass\":{\"enabled\":true}," ++
+        "\"cors\":[{\"origin\":[\"https://only.example\"]},{\"origin\":[\"https://z.example\"],\"method\":[\"PUT\"],\"maxAgeSeconds\":0,\"responseHeader\":[]}]," ++
+        "\"website\":{\"mainPageSuffix\":\"index.html\"},\"logging\":{\"logBucket\":\"zigps-7b3007-none\"}";
+    const taken = [_]struct { []const u8, []const u8 }{
+        .{ "{\"name\":\"zigps-7b3007-none\",\"location\":\"US-CENTRAL1\"," ++ soft ++ "}", bodies.bucket_no_setting },
+        .{ "{\"name\":\"zigps-7b3007-full\",\"location\":\"US-CENTRAL1\"," ++ soft ++ "," ++ full_settings ++ "}", bodies.bucket_every_setting },
+        .{ "{\"name\":\"zigps-7b3007-ipoff\",\"location\":\"US-CENTRAL1\"," ++ soft ++ "," ++ sparse_settings ++ "}", bodies.bucket_sparse_settings },
+        .{ "{\"name\":\"zigps-7b3007-dual\",\"location\":\"NAM4\"," ++ soft ++ ",\"rpo\":\"ASYNC_TURBO\"}", bodies.bucket_dual_turbo },
+        .{ "{\"name\":\"zigps-cd4f6e-vpc\",\"location\":\"US-CENTRAL1\"," ++ soft ++ ",\"ipFilter\":{\"mode\":\"Disabled\",\"publicNetworkSource\":{\"allowedIpCidrRanges\":[\"203.0.113.0/24\",\"2001:db8::/32\"]},\"vpcNetworkSources\":[{\"network\":\"projects/extractctl/global/networks/default\",\"allowedIpCidrRanges\":[\"10.128.0.0/20\",\"10.0.0.0/8\"]}],\"allowCrossOrgVpcs\":true}}", bodies.bucket_vpc_sources },
+        .{ "{\"name\":\"zigps-cd4f6e-pub\",\"location\":\"US-CENTRAL1\"," ++ soft ++ ",\"ipFilter\":{\"mode\":\"Disabled\",\"publicNetworkSource\":{\"allowedIpCidrRanges\":[\"198.51.100.0/24\"]}}}", bodies.bucket_filter_flags_filled },
+        .{ "{\"name\":\"zigps-cd4f6e-cdual\",\"location\":\"US\"," ++ soft ++ ",\"customPlacementConfig\":{\"dataLocations\":[\"US-EAST1\",\"US-WEST1\"]}}", bodies.bucket_configurable_dual },
+    };
+    for (taken) |case| {
+        const want = try codec.decodeBucket(a, case[1]);
+        try fake.buckets.seed("extractctl", case[0]);
+        var got = try client.bucket(want.name).get();
+        defer got.deinit();
+        try expectSameReadSettings(want, got.value);
+        try expectSameWire(a, case[1], fake.buckets.resource(want.name).?);
+    }
+    // A multi-region with no RPO named gets DEFAULT.
+    try fake.buckets.seed("extractctl", "{\"name\":\"zigps-cd4f6e-multi\",\"location\":\"US\"," ++ soft ++ "}");
+    var multi = try client.bucket("zigps-cd4f6e-multi").get();
+    defer multi.deinit();
+    try testing.expectEqual(.default, multi.value.rpo.?);
+    try testing.expectEqualStrings("multi-region", multi.value.location_type.?);
+
+    // A listing gives each IP filter without its ranges or networks, as
+    // production's listings did.
+    var page = try client.listBuckets(.{});
+    defer page.deinit();
+    const listings = [_][]const types.BucketInfo{
+        (try codec.decodeBucketPage(a, bodies.bucket_listing)).buckets,
+        (try codec.decodeBucketPage(a, bodies.bucket_listing_vpc)).buckets,
+    };
+    var compared: usize = 0;
+    for (page.value.buckets) |listed| {
+        if (listed.ip_filter == null) continue;
+        for (listings) |production| for (production) |want| if (std.mem.eql(u8, want.name, listed.name)) {
+            try testing.expectEqualDeep(want.ip_filter, listed.ip_filter);
+            compared += 1;
+        };
+    }
+    // full, vpc and pub.
+    try testing.expectEqual(3, compared);
+
+    const refused = [_]struct { []const u8, []const u8 }{
+        .{ "{\"name\":\"zigps-7b3007-full\",\"location\":\"US-CENTRAL1\",\"rpo\":\"DEFAULT\"}", bodies.refusal_rpo_region },
+        .{ "{\"name\":\"zigps-cd4f6e-multi\",\"location\":\"US\",\"rpo\":\"ASYNC_TURBO\"}", bodies.refusal_rpo_turbo_multi },
+        .{ "{\"name\":\"zigps-7b3007-ipoff\",\"location\":\"US-CENTRAL1\",\"ipFilter\":{\"mode\":\"Disabled\",\"publicNetworkSource\":{\"allowedIpCidrRanges\":[\"203.0.113.0/24\",\"2001:db8::/32\"]},\"vpcNetworkSources\":[{\"network\":\"projects/extractctl/global/networks/default\",\"allowedIpCidrRanges\":[\"10.128.0.0/20\"]}],\"allowCrossOrgVpcs\":false}}", bodies.refusal_vpc_cross_org },
+        .{ "{\"name\":\"zigps-7b3007-cdual\",\"location\":\"US\",\"customPlacementConfig\":{\"dataLocations\":[\"US-CENTRAL1\",\"US-EAST1\"]}}", bodies.refusal_predefined_pair },
+        // Measured on a patch; a create is refused in the same words here.
+        .{ "{\"name\":\"zigps-7b3007-cold\",\"location\":\"US-CENTRAL1\",\"autoclass\":{\"enabled\":true,\"terminalStorageClass\":\"COLDLINE\"}}", bodies.refusal_autoclass_coldline },
+    };
+    for (refused) |case| {
+        const name = (try std.json.parseFromSliceLeaky(struct { name: []const u8 }, a, case[0], .{ .ignore_unknown_fields = true })).name;
+        // The bucket a refused create would have made, made already, is
+        // another answer: start each refusal clean.
+        _ = fake.buckets.buckets.orderedRemove(name);
+        try testing.expectError(error.Refused, fake.buckets.seed("extractctl", case[0]));
+        try testing.expectEqualStrings(try productionWords(a, case[1]), fake.buckets.refusal);
+        try testing.expectEqual(null, fake.buckets.resource(name));
+    }
+}
+
+test "the fake's bucket listing: one project's buckets in name order, paged by the last name served" {
+    var fake: test_util.FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var diag: core.Diagnostics = .{};
+    var client = try clientOnFake(&fake, &token, &diag);
+    defer client.deinit();
+    for ([_][]const u8{ "zigps-c", "zigps-a", "zigps-b" }) |name| {
+        var made = try client.bucket(name).create(.{});
+        made.deinit();
+    }
+    try fake.buckets.seed("another", "{\"name\":\"zigps-elsewhere\"}");
+    var first = try client.listBuckets(.{ .page_size = 2 });
+    defer first.deinit();
+    try testing.expectEqual(2, first.value.buckets.len);
+    try testing.expectEqualStrings("zigps-a", first.value.buckets[0].name);
+    try testing.expectEqualStrings("zigps-b", first.value.buckets[1].name);
+    var second = try client.listBuckets(.{ .page_size = 2, .page_token = first.value.next_page_token.? });
+    defer second.deinit();
+    try testing.expectEqual(1, second.value.buckets.len);
+    try testing.expectEqualStrings("zigps-c", second.value.buckets[0].name);
+    try testing.expectEqual(null, second.value.next_page_token);
+    try testing.expectEqual(2, fake.buckets.counts.lists);
+}
+
+test "the fake's read settings: what it refuses that no body from milestone 0 sent, in its own words" {
+    var fake: @import("fake_buckets.zig").FakeBuckets = .init(testing.allocator);
+    defer fake.deinit();
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "{\"name\":\"b\",\"autoclass\":[]}", "autoclass is not an object" },
+        .{ "{\"name\":\"b\",\"autoclass\":{\"enabled\":\"yes\"}}", "autoclass.enabled is not a boolean" },
+        .{ "{\"name\":\"b\",\"autoclass\":{\"enabled\":true,\"mode\":1}}", "this fake does not take autoclass's field \"mode\"" },
+        .{ "{\"name\":\"b\",\"cors\":{}}", "cors is not a list" },
+        .{ "{\"name\":\"b\",\"cors\":[{\"origin\":[1]}]}", "origin holds a value that is not a string" },
+        .{ "{\"name\":\"b\",\"cors\":[{\"maxAgeSeconds\":-1}]}", "maxAgeSeconds is out of range" },
+        .{ "{\"name\":\"b\",\"cors\":[{\"maxAgeSeconds\":\"60\"}]}", "maxAgeSeconds is not a number" },
+        .{ "{\"name\":\"b\",\"website\":{\"mainPageSuffix\":1}}", "website.mainPageSuffix is not a string" },
+        .{ "{\"name\":\"b\",\"logging\":{\"logObjectPrefix\":\"p\"}}", "logging names no logBucket" },
+        .{ "{\"name\":\"b\",\"ipFilter\":{\"publicNetworkSource\":{}}}", "ipFilter names no mode" },
+        .{ "{\"name\":\"b\",\"ipFilter\":{\"mode\":\"Paused\"}}", "ipFilter.mode is Enabled or Disabled" },
+        .{ "{\"name\":\"b\",\"ipFilter\":{\"mode\":\"Disabled\",\"vpcNetworkSources\":[{\"allowedIpCidrRanges\":[]}],\"allowCrossOrgVpcs\":true}}", "a VPC network source names no network" },
+        .{ "{\"name\":\"b\",\"rpo\":\"FAST\",\"location\":\"NAM4\"}", "this fake takes rpo DEFAULT or ASYNC_TURBO" },
+        .{ "{\"name\":\"b\",\"location\":\"US-CENTRAL1\",\"customPlacementConfig\":{\"dataLocations\":[\"US-EAST1\",\"US-WEST1\"]}}", "this fake takes customPlacementConfig only in US, EU or ASIA" },
+        .{ "{\"name\":\"b\",\"location\":\"US\",\"customPlacementConfig\":{\"dataLocations\":[\"US-EAST1\"]}}", "customPlacementConfig.dataLocations names two regions" },
+    };
+    for (cases) |case| {
+        try testing.expectError(error.Refused, fake.seed("p", case[0]));
+        try testing.expectEqualStrings(case[1], fake.refusal);
+        try testing.expectEqual(null, fake.resource("b"));
+    }
+    // The limits: 25 networks, and 200 ranges in all.
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var networks: std.ArrayList(u8) = .empty;
+    for (0..26) |i| try networks.print(a, "{s}{{\"network\":\"n{d}\",\"allowedIpCidrRanges\":[]}}", .{ if (i == 0) "" else ",", i });
+    try testing.expectError(error.Refused, fake.seed("p", try a.print("{{\"name\":\"b\",\"ipFilter\":{{\"mode\":\"Disabled\",\"allowCrossOrgVpcs\":true,\"vpcNetworkSources\":[{s}]}}}}", .{networks.items})));
+    try testing.expectEqualStrings("an IP filter names at most 25 VPC networks", fake.refusal);
+    var ranges: std.ArrayList(u8) = .empty;
+    for (0..201) |i| try ranges.print(a, "{s}\"10.0.{d}.0/24\"", .{ if (i == 0) "" else ",", i % 256 });
+    try testing.expectError(error.Refused, fake.seed("p", try a.print("{{\"name\":\"b\",\"ipFilter\":{{\"mode\":\"Disabled\",\"publicNetworkSource\":{{\"allowedIpCidrRanges\":[{s}]}}}}}}", .{ranges.items})));
+    try testing.expectEqualStrings("an IP filter names at most 200 IP ranges", fake.refusal);
+    // A patch naming any of them is refused, as fields this library never
+    // sends are.
+    try fake.seed("p", "{\"name\":\"b\"}");
+    const patched = try fake.serve(.PATCH, .{ .name = "b" }, "{\"cors\":[]}", a);
+    try testing.expectEqual(400, patched.status);
+    try testing.expectEqualStrings("this fake does not take the field \"cors\"", fake.refusal);
+}
+
+test "the fake's read settings: an empty list or rule left out and an empty page refused, as production did on 2026-10-24" {
+    var fake: @import("fake_buckets.zig").FakeBuckets = .init(testing.allocator);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // Each create's settings as sent, and as production answered them.
+    const taken = [_]struct { []const u8, []const u8 }{
+        .{ "\"website\":{}", "" },
+        .{ "\"cors\":[]", "" },
+        .{ "\"cors\":[{}]", "" },
+        .{ "\"cors\":[{\"origin\":[],\"method\":[],\"responseHeader\":[]}]", "" },
+        .{ "\"cors\":[{\"origin\":[\"https://only.example\"],\"method\":[]}]", "\"cors\":[{\"origin\":[\"https://only.example\"]}]" },
+        .{ "\"cors\":[{\"origin\":[],\"method\":[\"GET\"]}]", "\"cors\":[{\"method\":[\"GET\"]}]" },
+        .{ "\"cors\":[{},{\"origin\":[\"https://a.example\"]}]", "\"cors\":[{\"origin\":[\"https://a.example\"]}]" },
+        .{ "\"cors\":[{\"origin\":[\"https://a.example\"]},{}]", "\"cors\":[{\"origin\":[\"https://a.example\"]}]" },
+        .{ "\"cors\":[{\"maxAgeSeconds\":0}]", "\"cors\":[{\"maxAgeSeconds\":0}]" },
+        .{ "\"cors\":[{\"maxAgeSeconds\":60}]", "\"cors\":[{\"maxAgeSeconds\":60}]" },
+        .{ "\"cors\":[{\"maxAgeSeconds\":0},{\"origin\":[\"https://a.example\"]}]", "\"cors\":[{\"maxAgeSeconds\":0},{\"origin\":[\"https://a.example\"]}]" },
+    };
+    for (taken, 0..) |case, i| {
+        const name = try a.print("b{d}", .{i});
+        try fake.seed("p", try a.print("{{\"name\":\"{s}\",{s}}}", .{ name, case[0] }));
+        try expectSameWire(a, try a.print("{{{s}}}", .{case[1]}), fake.resource(name).?);
+    }
+    for ([_][]const u8{
+        "{\"mainPageSuffix\":\"index.html\",\"notFoundPage\":\"\"}",
+        "{\"mainPageSuffix\":\"\",\"notFoundPage\":\"404.html\"}",
+        "{\"mainPageSuffix\":\"\",\"notFoundPage\":\"\"}",
+    }) |website| {
+        try testing.expectError(error.Refused, fake.seed("p", try a.print("{{\"name\":\"page\",\"website\":{s}}}", .{website})));
+        try testing.expectEqualStrings("No object name", fake.refusal);
+        try testing.expect(fake.resource("page") == null);
+    }
+}
+
+/// A random create naming any of the read settings, and what production's
+/// rules make of it: the settings read back, or a refusal.
+fn readSettingsProperty(_: void, bytes: []const u8) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g: test_util.ByteGen = .init(bytes);
+    var fake: test_util.FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var diag: core.Diagnostics = .{};
+    var client = try clientOnFake(&fake, &token, &diag);
+    defer client.deinit();
+
+    const name = "zigps-prop";
+    var body: std.Io.Writer.Allocating = .init(a);
+    var jw: std.json.Stringify = .{ .writer = &body.writer, .options = .{ .emit_null_optional_fields = false } };
+    var want: types.BucketInfo = .{ .name = name, .location = "", .storage_class = "", .time_created = "", .metageneration = 0 };
+    var refused = false;
+    try jw.beginObject();
+    try jw.objectField("name");
+    try jw.write(name);
+
+    const Place = struct { location: []const u8, kind: []const u8 };
+    const place = g.pick(Place, &.{
+        .{ .location = "US-CENTRAL1", .kind = "region" },
+        .{ .location = "US", .kind = "multi-region" },
+        .{ .location = "NAM4", .kind = "dual-region" },
+        .{ .location = "EU", .kind = "multi-region" },
+    });
+    try jw.objectField("location");
+    try jw.write(place.location);
+    var kind = place.kind;
+    if (std.mem.eql(u8, place.location, "US") and g.boolean()) {
+        kind = "dual-region";
+        const pair: []const []const u8 = if (g.intRange(u8, 0, 3) == 0) &.{ "US-CENTRAL1", "US-EAST1" } else &.{ "US-EAST1", "US-WEST1" };
+        refused = refused or std.mem.eql(u8, pair[0], "US-CENTRAL1");
+        try jw.objectField("customPlacementConfig");
+        try jw.write(.{ .dataLocations = pair });
+        want.data_locations = pair;
+    }
+    want.location_type = kind;
+
+    switch (g.intRange(u8, 0, 4)) {
+        0 => {},
+        1 => {
+            try jw.objectField("autoclass");
+            try jw.write(.{ .enabled = false });
+            want.autoclass = .{ .enabled = false, .toggle_time = "" };
+        },
+        else => |n| {
+            const class: ?[]const u8 = switch (n) {
+                2 => null,
+                3 => "ARCHIVE",
+                else => g.pick([]const u8, &.{ "NEARLINE", "COLDLINE" }),
+            };
+            try jw.objectField("autoclass");
+            try jw.write(.{ .enabled = true, .terminalStorageClass = class });
+            refused = refused or (class != null and std.mem.eql(u8, class.?, "COLDLINE"));
+            want.autoclass = .{ .enabled = true, .toggle_time = "", .terminal_storage_class = class orelse "NEARLINE", .terminal_storage_class_update_time = "" };
+        },
+    }
+
+    const words = [_][]const u8{ "https://a.example", "*", "GET", "PUT", "Content-Type" };
+    if (g.boolean()) {
+        var rules: std.ArrayList(types.CorsRule) = .empty;
+        try jw.objectField("cors");
+        try jw.beginArray();
+        for (0..g.intRange(u8, 0, 3)) |_| {
+            var lists: [3][]const []const u8 = undefined;
+            for (&lists) |*list| {
+                const n = g.intRange(u8, 0, 2);
+                const items = try a.alloc([]const u8, n);
+                for (items) |*item| item.* = g.pick([]const u8, &words);
+                list.* = items;
+            }
+            const max_age: ?u32 = g.pick(?u32, &.{ null, 0, 3600 });
+            try jw.write(.{ .origin = lists[0], .method = lists[1], .responseHeader = lists[2], .maxAgeSeconds = max_age });
+            // A rule with nothing in it is dropped.
+            if (lists[0].len + lists[1].len + lists[2].len == 0 and max_age == null) continue;
+            try rules.append(a, .{ .origins = lists[0], .methods = lists[1], .response_headers = lists[2], .max_age_s = max_age });
+        }
+        try jw.endArray();
+        want.cors = rules.items;
+    }
+
+    if (g.boolean()) {
+        const main = g.pick(?[]const u8, &.{ null, "", "index.html" });
+        const missing = g.pick(?[]const u8, &.{ null, "", "404.html" });
+        try jw.objectField("website");
+        try jw.write(.{ .mainPageSuffix = main, .notFoundPage = missing });
+        // An empty page is refused; a website naming neither is none.
+        refused = refused or (main != null and main.?.len == 0) or (missing != null and missing.?.len == 0);
+        if (main != null or missing != null) want.website = .{ .main_page_suffix = main, .not_found_page = missing };
+    }
+
+    switch (g.intRange(u8, 0, 3)) {
+        0 => {},
+        1 => {
+            try jw.objectField("logging");
+            try jw.write(.{ .logBucket = "zigps-logs" });
+            want.logging = .{ .log_bucket = "zigps-logs", .log_object_prefix = name };
+        },
+        2 => {
+            try jw.objectField("logging");
+            try jw.write(.{ .logBucket = "zigps-logs", .logObjectPrefix = "access/" });
+            want.logging = .{ .log_bucket = "zigps-logs", .log_object_prefix = "access/" };
+        },
+        else => {
+            try jw.objectField("logging");
+            try jw.write(.{ .logObjectPrefix = "access/" });
+            refused = true;
+        },
+    }
+
+    if (g.boolean()) {
+        const enforced = g.boolean();
+        const public = try a.alloc([]const u8, g.intRange(u8, 0, 3));
+        for (public, 0..) |*range, i| range.* = try a.print("198.51.100.{d}/32", .{i});
+        const vpc = try a.alloc(types.IpFilter.VpcSource, g.intRange(u8, 0, 2));
+        for (vpc, 0..) |*source, i| {
+            const ranges = try a.alloc([]const u8, g.intRange(u8, 0, 2));
+            for (ranges, 0..) |*range, j| range.* = try a.print("10.{d}.{d}.0/24", .{ i, j });
+            source.* = .{ .network = try a.print("projects/extractctl/global/networks/n{d}", .{i}), .ranges = ranges };
+        }
+        const cross: ?bool = g.pick(?bool, &.{ null, false, true });
+        const agents: ?bool = g.pick(?bool, &.{ null, false, true });
+        try jw.objectField("ipFilter");
+        try jw.beginObject();
+        try jw.objectField("mode");
+        try jw.write(if (enforced) "Enabled" else "Disabled");
+        if (public.len > 0 or g.boolean()) {
+            try jw.objectField("publicNetworkSource");
+            try jw.write(.{ .allowedIpCidrRanges = public });
+        }
+        if (vpc.len > 0) {
+            try jw.objectField("vpcNetworkSources");
+            try jw.beginArray();
+            for (vpc) |source| try jw.write(.{ .network = source.network, .allowedIpCidrRanges = source.ranges });
+            try jw.endArray();
+        }
+        if (cross) |c| {
+            try jw.objectField("allowCrossOrgVpcs");
+            try jw.write(c);
+        }
+        if (agents) |s| {
+            try jw.objectField("allowAllServiceAgentAccess");
+            try jw.write(s);
+        }
+        try jw.endObject();
+        refused = refused or (vpc.len > 0 and !(cross orelse false));
+        want.ip_filter = .{
+            .enforced = enforced,
+            .public_ranges = public,
+            .vpc_sources = vpc,
+            .allow_cross_org_vpcs = cross orelse false,
+            .allow_all_service_agent_access = agents orelse false,
+        };
+    }
+
+    const rpo = g.pick(?[]const u8, &.{ null, "DEFAULT", "ASYNC_TURBO" });
+    if (rpo) |text| {
+        try jw.objectField("rpo");
+        try jw.write(text);
+    }
+    const region = std.mem.eql(u8, kind, "region");
+    if (rpo) |text| {
+        refused = refused or region or (std.mem.eql(u8, kind, "multi-region") and std.mem.eql(u8, text, "ASYNC_TURBO"));
+    }
+    want.rpo = if (region) null else if (rpo) |text| codec.rpoOf(text) else .default;
+    try jw.endObject();
+
+    if (refused) {
+        try testing.expectError(error.Refused, fake.buckets.seed("extractctl", body.written()));
+        try testing.expectEqual(null, fake.buckets.resource(name));
+        return;
+    }
+    fake.buckets.seed("extractctl", body.written()) catch |err| {
+        std.debug.print("refused: {s}\nbody: {s}\n", .{ fake.buckets.refusal, body.written() });
+        return err;
+    };
+    var got = try client.bucket(name).get();
+    defer got.deinit();
+    try expectSameReadSettings(want, got.value);
+    // A listing gives the same, the filter's ranges and networks aside.
+    var page = try client.listBuckets(.{});
+    defer page.deinit();
+    try testing.expectEqual(1, page.value.buckets.len);
+    if (want.ip_filter) |*filter| {
+        filter.public_ranges = &.{};
+        filter.vpc_sources = &.{};
+    }
+    try expectSameReadSettings(want, page.value.buckets[0]);
+}
+
+test "heavy property read settings: any create naming them reads back as production's rules make it, or is refused" {
+    try test_util.fuzzBytes({}, readSettingsProperty, .{ .corpus = &.{ "", test_util.repeat("\x01", 64), test_util.repeat("\xff\x00\x07", 24) } });
 }

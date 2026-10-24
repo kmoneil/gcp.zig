@@ -38,6 +38,15 @@ including the ones that did not change.
   ends, judges the conditions itself, copies and deletes, with a
   warning. The parallel upload's move into place
   shares its request. New example: `gcs_mv`.
+- storage: the internal fake now takes a bucket's Autoclass, CORS,
+  website, access logging, IP filter, RPO and dual-region pair at
+  create, as production answered them on 2026-10-24, refusals in
+  production's words, and lists a project's buckets, so tests read
+  these settings through `Bucket.get` and `listBuckets` as production
+  gives them. Production refuses an empty website page and drops a
+  CORS rule with nothing in it. Gated test 73
+  (`GCP_TEST_BUCKET_SETTINGS=1`) holds production to the same answers.
+  New example: `gcs_bucket`, a bucket's settings page.
 - auth, bigquery, core, dataflow, datatransfer, error_reporting,
   firestore, kms, logging, monitoring, pubsub, resource_manager, run,
   scheduler and secret_manager: unchanged.

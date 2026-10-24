@@ -3739,6 +3739,10 @@ fn bucketTarget(arena: Allocator, name: ?[]const u8, query: []const u8) core.tra
                 return error.HttpProtocolError;
         } else if (std.mem.eql(u8, param, "enableObjectRetention=true")) {
             target.object_retention = true;
+        } else if (std.mem.startsWith(u8, param, "maxResults=")) {
+            target.page_size = std.fmt.parseInt(u32, param["maxResults=".len..], 10) catch return error.HttpProtocolError;
+        } else if (std.mem.startsWith(u8, param, "pageToken=")) {
+            target.page_token = try decode(arena, param["pageToken=".len..]);
         } else return error.HttpProtocolError;
     }
     return target;
