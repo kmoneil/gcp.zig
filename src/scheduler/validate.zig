@@ -60,6 +60,6 @@ test "locations, job ids, tokens and agents" {
     try testing.expect(isPageToken("CsABCq8BU1BB=="));
     try testing.expect(!isPageToken("a b"));
     try testing.expect(!isPageToken(""));
-    try testing.expect(isUserAgent("gcp-zig-scheduler/0.60"));
+    try testing.expect(isUserAgent("gcp-zig-scheduler/0.61"));
     try testing.expect(!isUserAgent("a\nb"));
 }

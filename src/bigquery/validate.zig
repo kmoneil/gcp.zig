@@ -129,7 +129,7 @@ test "ids, locations and tokens: what goes into a request" {
     try testing.expect(!isPageToken("a b"));
     try testing.expect(isLabelFilter("labels.team:data labels.active"));
     try testing.expect(!isLabelFilter("labels.a\n"));
-    try testing.expect(isUserAgent("gcp-zig-bigquery/0.60"));
+    try testing.expect(isUserAgent("gcp-zig-bigquery/0.61"));
     try testing.expect(!isUserAgent("a\x00"));
 }
 
