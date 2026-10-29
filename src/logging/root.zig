@@ -71,8 +71,7 @@ pub const limits = @import("validate.zig");
 pub const transport = core.transport;
 
 /// What a test of code that reads logs can stand on, with no emulator and
-/// no network. **Experimental**: new in 0.39.0, and free to change between
-/// minor versions until it has been used for a while.
+/// no network.
 pub const testing = struct {
     /// Cloud Logging in memory, behind `Client.Options.transport`: entries
     /// a test writes, listed, ordered, paged and filtered as the API does,

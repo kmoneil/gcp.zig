@@ -5,8 +5,6 @@
 Cloud Logging has no emulator. `logging.testing.FakeLogging` is a Cloud
 Logging in memory for your own tests: it goes where a client's transport
 goes, and answers as production answered when measured on 2026-10-16.
-**Experimental**: new in 0.39.0, and free to change between minor
-versions until it has been used for a while.
 
 <!-- snippet: tests/docs_examples.zig#logging-fake -->
 ```zig

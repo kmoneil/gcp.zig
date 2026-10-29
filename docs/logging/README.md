@@ -5,7 +5,7 @@
 A client for the read side of Cloud Logging's v2 REST API: log entries
 listed a page at a time, as a log explorer's table fetches them; a tail
 that polls; and the logs, buckets and views a picker shows. It writes
-nothing. **Experimental**: new in 0.39.0.
+nothing.
 
 ```zig
 const std = @import("std");
@@ -63,7 +63,7 @@ The principal needs `logging.logEntries.list` (the Logs Viewer role,
 | [Filters](filters.md) | The query language as the client joins your filter to its clauses, and how production read it when measured |
 | [Tailing](tail.md) | A tail by polling: the window, late entries, falling behind, keeping the cursor, and why there is no live tail |
 | [Logs, buckets and views](picker.md) | Log names, buckets and views, and `picker`, which orders them for a person |
-| [Testing](testing.md) | An in-memory Cloud Logging for your own tests, with production's answers and a clock the test moves (experimental) |
+| [Testing](testing.md) | An in-memory Cloud Logging for your own tests, with production's answers and a clock the test moves |
 
 ## The calls
 

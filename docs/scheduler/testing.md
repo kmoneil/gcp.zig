@@ -7,8 +7,7 @@
 pauses and resumes them: a health view's tests, or a console's
 confirmed writes, with no network and no project. It answers the
 module's three reads and three writes as production answered them when
-measured (experimental, as the module is; the writes' side is new in
-0.51.0).
+measured.
 
 `putLocation` and `putJob` stand in for whoever made the jobs, and
 `setLastAttempt` for Scheduler running one on schedule. A job put in

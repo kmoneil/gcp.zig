@@ -7,8 +7,7 @@ with their state, target and last attempt, for a health view that shows
 the failing ones; and three writes a console confirms before sending,
 [run now, pause and resume](#run-now-pause-and-resume), each with a twin
 that builds its exact request without sending it. Nothing here creates,
-updates or deletes a job. **Experimental**: new in 0.47.0; the writes
-are new in 0.51.0.
+updates or deletes a job.
 
 ```zig
 const std = @import("std");
@@ -90,10 +89,6 @@ Measured on 2026-10-19 with real jobs (the gated suite repeats it):
   deadline for HTTP targets.
 
 ## Run now, pause and resume
-
-**Experimental** on their own, new in 0.51.0: they keep the marker
-until they have had seven clean nights of their own, whatever the rest
-of the module is by then.
 
 Each write is a `POST` to the job's name with `:run`, `:pause` or
 `:resume` and the empty message `{}`, and answers the job. A console
