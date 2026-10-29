@@ -66,6 +66,6 @@ test "locations, resource ids, tokens and agents" {
     try testing.expect(isPageToken("CsAB=="));
     try testing.expect(!isPageToken("a b"));
     try testing.expect(!isPageToken(""));
-    try testing.expect(isUserAgent("gcp-zig-run/0.60"));
+    try testing.expect(isUserAgent("gcp-zig-run/0.61"));
     try testing.expect(!isUserAgent("a\nb"));
 }
