@@ -62,7 +62,7 @@ const Fixture = struct {
             .location = f.location,
             .token_provider = f.token.provider(),
             .diagnostics = &f.diag,
-            .user_agent = "zig-gcp-kms-gcp-integration/0.1",
+            .user_agent = "gcp-zig-kms-gcp-integration/0.1",
         });
         errdefer f.client.deinit();
         f.sweep() catch |err| return f.report(err);

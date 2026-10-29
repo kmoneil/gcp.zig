@@ -152,7 +152,7 @@ const Fixture = struct {
         return true;
     }
 
-    const user_agent = "zig-gcp-storage-gcp-integration/0.1";
+    const user_agent = "gcp-zig-storage-gcp-integration/0.1";
 
     fn skip(f: *Fixture) bool {
         f.env.deinit();

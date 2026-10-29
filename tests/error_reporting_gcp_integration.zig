@@ -91,13 +91,13 @@ const Fixture = struct {
         testing.io.random(&bytes);
         f.run = try f.arena.allocator().print("{x}", .{bytes});
         f.service = try f.arena.allocator().print("zigps-er-{s}", .{f.run});
-        f.http = .init(gpa, testing.io, "zig-gcp-error_reporting-gcp-integration/0.1");
+        f.http = .init(gpa, testing.io, "gcp-zig-error_reporting-gcp-integration/0.1");
         errdefer f.http.deinit();
         f.client = try .init(gpa, testing.io, .{
             .project_id = f.project,
             .token_provider = f.token.provider(),
             .diagnostics = &f.diag,
-            .user_agent = "zig-gcp-error_reporting-gcp-integration/0.1",
+            .user_agent = "gcp-zig-error_reporting-gcp-integration/0.1",
         });
         return true;
     }

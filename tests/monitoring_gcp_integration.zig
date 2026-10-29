@@ -99,7 +99,7 @@ const Fixture = struct {
             .project_id = f.project,
             .token_provider = f.token.provider(),
             .diagnostics = &f.diag,
-            .user_agent = "zig-gcp-monitoring-gcp-integration/0.1",
+            .user_agent = "gcp-zig-monitoring-gcp-integration/0.1",
         });
         return true;
     }
@@ -1686,7 +1686,7 @@ test "monitoring: alert policies and snoozes, and the fake seeded with productio
     var recorder: Recorder = .{ .inner = f.client.transport, .arena = .init(testing.allocator) };
     defer recorder.arena.deinit();
     var wdiag: monitoring.Diagnostics = .{};
-    var wc = try monitoring.Client.init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = f.token.provider(), .diagnostics = &wdiag, .transport = recorder.transport(), .user_agent = "zig-gcp-monitoring-gcp-integration/0.1" });
+    var wc = try monitoring.Client.init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = f.token.provider(), .diagnostics = &wdiag, .transport = recorder.transport(), .user_agent = "gcp-zig-monitoring-gcp-integration/0.1" });
     defer wc.deinit();
     var previews: usize = 0;
     for ([_]struct { []const u8, []const u8, bool }{

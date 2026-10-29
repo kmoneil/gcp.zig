@@ -438,7 +438,7 @@ test "bigquery: the public samples, a dataset of our own, queries run, paged, po
     const dataset = try std.fmt.allocPrint(a, "zigps_{x}", .{bytes});
 
     // Production.
-    var http: core.transport.HttpTransport = .init(gpa, testing.io, "zig-gcp-bigquery-gcp-integration/0.1");
+    var http: core.transport.HttpTransport = .init(gpa, testing.io, "gcp-zig-bigquery-gcp-integration/0.1");
     defer http.deinit();
     var recorder: Recorder = .init(http.transport());
     defer recorder.deinit();

@@ -59,7 +59,7 @@ const Fixture = struct {
             .project_id = f.project,
             .token_provider = f.token.provider(),
             .diagnostics = &f.diag,
-            .user_agent = "zig-gcp-scheduler-gcp-integration/0.1",
+            .user_agent = "gcp-zig-scheduler-gcp-integration/0.1",
         });
         return true;
     }
@@ -475,7 +475,7 @@ test "scheduler writes: run, pause and resume through the client, and the fake r
         .token_provider = f.token.provider(),
         .diagnostics = &wdiag,
         .transport = recorder.transport(),
-        .user_agent = "zig-gcp-scheduler-gcp-integration/0.1",
+        .user_agent = "gcp-zig-scheduler-gcp-integration/0.1",
     });
     defer wc.deinit();
 

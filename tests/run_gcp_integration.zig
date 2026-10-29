@@ -70,7 +70,7 @@ const Fixture = struct {
             .token_provider = f.token.provider(),
             .scope = scope,
             .diagnostics = &f.diag,
-            .user_agent = "zig-gcp-run-gcp-integration/0.1",
+            .user_agent = "gcp-zig-run-gcp-integration/0.1",
         });
         return true;
     }
@@ -788,7 +788,7 @@ test "run writes: real runs, cancels and a traffic change, the fake replaying th
 
     // The script against production, through a client that records what
     // it sends, so every preview is held to it.
-    var http: core.transport.HttpTransport = .init(testing.allocator, testing.io, "zig-gcp-run-gcp-integration/0.1");
+    var http: core.transport.HttpTransport = .init(testing.allocator, testing.io, "gcp-zig-run-gcp-integration/0.1");
     defer http.deinit();
     var recorder: Recorder = .{ .inner = http.transport(), .arena = .init(testing.allocator) };
     defer recorder.arena.deinit();

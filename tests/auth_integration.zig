@@ -254,7 +254,7 @@ test "a real impersonation: IAM trades the source's token for one that is the se
 
     // Google's own word on whose token it is: the service account's, not
     // the login's that asked for it.
-    var http: pubsub.transport.HttpTransport = .init(testing.allocator, testing.io, "zig-gcp-auth-integration/0.1");
+    var http: pubsub.transport.HttpTransport = .init(testing.allocator, testing.io, "gcp-zig-auth-integration/0.1");
     defer http.deinit();
     const body = try arena.allocator().print("access_token={s}", .{token});
     const res = try http.transport().send(.{

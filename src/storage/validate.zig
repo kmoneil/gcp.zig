@@ -186,7 +186,7 @@ test "bucket names: one path segment, or nothing" {
 }
 
 test "user agents are printable ASCII" {
-    try testing.expect(isUserAgent("zig-gcp-storage/0.13"));
+    try testing.expect(isUserAgent("gcp-zig-storage/0.13"));
     try testing.expect(!isUserAgent(""));
     try testing.expect(!isUserAgent("agent\r\nX: y"));
     try testing.expect(!isUserAgent("caf\xc3\xa9"));

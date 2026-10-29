@@ -47,7 +47,7 @@ const Fixture = struct {
             .token_provider = f.token.provider(),
             .diagnostics = diag,
             .quota_project = quota,
-            .user_agent = "zig-gcp-resource_manager-gcp-integration/0.1",
+            .user_agent = "gcp-zig-resource_manager-gcp-integration/0.1",
         });
     }
 
@@ -229,7 +229,7 @@ fn runScript(a: std.mem.Allocator, f: *Fixture, transport: ?core.transport.Trans
             .public => .{ .project = public_project },
             .missing => .{ .project = missing_project },
         },
-        .user_agent = "zig-gcp-resource_manager-gcp-integration/0.1",
+        .user_agent = "gcp-zig-resource_manager-gcp-integration/0.1",
     });
     defer client.deinit();
     const arg = try expand(a, s.arg, project, first);

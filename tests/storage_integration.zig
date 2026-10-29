@@ -34,7 +34,7 @@ const Fixture = struct {
             .project_id = f.env.get("STORAGE_PROJECT_ID") orelse "test",
             .endpoint = emulator,
             .diagnostics = &f.diag,
-            .user_agent = "zig-gcp-storage-integration/0.1",
+            .user_agent = "gcp-zig-storage-integration/0.1",
         });
         return true;
     }
@@ -754,7 +754,7 @@ fn smallChunkClient(f: *Fixture, diag: *storage.Diagnostics) !storage.Client {
         .diagnostics = diag,
         .chunk_size = 256 * 1024,
         .single_request_limit = 1024,
-        .user_agent = "zig-gcp-storage-integration/0.1",
+        .user_agent = "gcp-zig-storage-integration/0.1",
     });
 }
 

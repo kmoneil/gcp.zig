@@ -68,7 +68,7 @@ const Fixture = struct {
             .project_id = f.project,
             .token_provider = f.token.provider(),
             .diagnostics = &f.diag,
-            .user_agent = "zig-gcp-dataflow-gcp-integration/0.1",
+            .user_agent = "gcp-zig-dataflow-gcp-integration/0.1",
         });
         return true;
     }
@@ -583,7 +583,7 @@ test "dataflow writes: a batch job cancelled, a streaming one drained, the fake 
         .token_provider = f.token.provider(),
         .diagnostics = &wdiag,
         .transport = recorder.transport(),
-        .user_agent = "zig-gcp-dataflow-gcp-integration/0.1",
+        .user_agent = "gcp-zig-dataflow-gcp-integration/0.1",
     });
     defer wc.deinit();
 
