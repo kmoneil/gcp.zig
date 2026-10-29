@@ -65,8 +65,11 @@ test "a message that is not acknowledged comes again when its lease lapses" {
 - **One fake serves any number of clients**, from any number of tasks:
   a `Publisher` and a `Subscriber` can share one. Each takes the same
   `Client.Options`, with `.transport = fake.transport()`.
-- **A project is there as soon as it is named.** Topics and
-  subscriptions are not: make them, as against production.
+- **A project is there as soon as a client names it**, and so is any
+  project the fake holds something in. Topics and subscriptions are
+  not: make them, as against production. A subscription on a topic in
+  a project the fake holds nothing in is answered as production
+  answers a project that does not exist.
 - **What a test can ask of it**: `backlog` (messages a subscription has
   not had acknowledged), `outstanding` (of those, the ones out on a
   lease now), `publishedCount` (what a topic was sent) and
