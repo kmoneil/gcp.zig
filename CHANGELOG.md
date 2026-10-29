@@ -4,6 +4,23 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.60.0 (2026-10-29)
+
+- The repository is now `kmoneil/gcp.zig`, renamed from
+  `kmoneil/zig-gcp`. GitHub redirects the old URL, and `zig fetch` of
+  v0.59.0 by either URL gives the same hash. The package is still `gcp`
+  and every module keeps its name, so a `build.zig.zon` and its imports
+  do not change; the README's install line names the new URL.
+- auth, bigquery, dataflow, datatransfer, error_reporting, firestore,
+  kms, logging, monitoring, pubsub, resource_manager, run, scheduler,
+  secret_manager and storage: no API changes. The default `User-Agent`
+  is now `gcp-zig-<module>/0.60` (`gcp-zig-secret-manager/0.60` for
+  secret_manager), after the new name; 0.59.0 sent
+  `zig-gcp-<module>/0.59`. An application that sets `user_agent` sends
+  what it set. storage's parallel uploads still write their parts under
+  `zig-gcp-tmp/`, so a lifecycle rule that matches it keeps working.
+- core: unchanged.
+
 ## 0.59.0 (2026-10-24)
 
 - storage: a bucket's other settings and two object fields, for issue
