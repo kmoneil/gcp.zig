@@ -113,6 +113,17 @@ pub fn checkId(client: *Client, kind: []const u8, id: []const u8) Error!void {
     return error.InvalidResourceId;
 }
 
+/// A topic in the client's project by id, or another project's by
+/// `projects/{project}/topics/{id}`.
+pub fn checkTopic(client: *Client, topic: []const u8) Error!void {
+    if (validate.isResourceId(topic) or validate.isTopicName(topic)) return;
+    if (client.diagnostics) |d| d.print(
+        "invalid topic: neither a topic id (3 to 255 characters from [A-Za-z0-9-_.~+%], starting with a letter, not with \"goog\") nor projects/{{project}}/topics/{{id}}",
+        .{},
+    );
+    return error.InvalidResourceId;
+}
+
 /// Reports a 2xx body that did not decode.
 pub fn decodeFailed(client: *Client, err: codec.DecodeError, what: []const u8) Error {
     if (err == error.InvalidResponse) {

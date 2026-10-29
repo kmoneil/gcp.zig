@@ -308,6 +308,55 @@ test "subscription: creating one on a missing topic is NotFound" {
     try testing.expectEqualStrings("NOT_FOUND", f.diag.status());
 }
 
+test "subscription: on a topic in another project, named in full" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const a = f.arena.allocator();
+    if (f.production) {
+        // Google's public topic, which anyone may subscribe to. The
+        // subscription is never pulled, and goes when the test does.
+        if (!std.mem.eql(u8, f.env.get("PUBSUB_CROSS_PROJECT_TEST") orelse "", "1")) return error.SkipZigTest;
+        const public = "projects/pubsub-public-data/topics/taxirides-realtime";
+        const sub = try f.createSubscription("xp", .{ .topic_id = public });
+        var got = sub.get() catch |err| return f.fail(err);
+        defer got.deinit();
+        try testing.expectEqualStrings(public, got.value.topic);
+        // A project that does not exist, and a missing topic in one that
+        // does, in production's words of 2026-10-29.
+        const nowhere = try a.print("projects/{s}/topics/zigps-t1", .{f.id("noproj")});
+        try testing.expectError(error.NotFound, f.client.subscription(f.id("xp-noproj")).create(.{ .topic_id = nowhere }));
+        try testing.expectEqualStrings(try a.print("Requested project not found or user does not have access to it (project={s}). Make sure to specify the unique project identifier and not the Google Cloud Console display name.", .{f.id("noproj")}), f.diag.message());
+        const missing = try a.print("projects/pubsub-public-data/topics/{s}", .{f.id("nope")});
+        try testing.expectError(error.NotFound, f.client.subscription(f.id("xp-nope")).create(.{ .topic_id = missing }));
+        try testing.expectEqualStrings(try a.print("Resource not found (resource={s}).", .{f.id("nope")}), f.diag.message());
+        return;
+    }
+    // The emulator: a topic in a project of its own, its messages pulled
+    // from a subscription in the test's project.
+    var other: pubsub.Client = try .init(testing.allocator, testing.io, .{
+        .project_id = f.id("other"),
+        .endpoint = .{ .url = f.client.base_url, .emulator = true },
+        .diagnostics = &f.diag,
+    });
+    defer other.deinit();
+    const topic = other.topic("shared");
+    var made = topic.create(.{}) catch |err| return f.fail(err);
+    made.deinit();
+    defer topic.delete() catch {};
+    const full = try a.print("projects/{s}/topics/shared", .{f.id("other")});
+    const sub = try f.createSubscription("xp", .{ .topic_id = full });
+    var got = sub.get() catch |err| return f.fail(err);
+    defer got.deinit();
+    try testing.expectEqualStrings(full, got.value.topic);
+    var sent = topic.publish(&.{.{ .data = "ride" }}, .{}) catch |err| return f.fail(err);
+    sent.deinit();
+    var pulled = sub.pull(.{}) catch |err| return f.fail(err);
+    defer pulled.deinit();
+    try testing.expectEqual(1, pulled.value.messages.len);
+    try testing.expectEqualStrings("ride", pulled.value.messages[0].data);
+}
+
 // 4.
 test "round trip: publish 3, pull, compare exactly, ack, then nothing left" {
     var f: Fixture = undefined;

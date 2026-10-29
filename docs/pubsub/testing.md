@@ -187,7 +187,7 @@ Each as production answered when it was measured, refusals in its words:
 
 | Area | Guide |
 | --- | --- |
-| Topics and subscriptions: made, read, updated by mask, deleted, listed in pages; their defaults and bounds | [Topics and subscriptions](topics-and-subscriptions.md) |
+| Topics and subscriptions: made, read, updated by mask, deleted, listed in pages; their defaults and bounds; a subscription on another project's topic | [Topics and subscriptions](topics-and-subscriptions.md) |
 | Publish, gzip-compressed or not, pull, acknowledge, lease changes and nacks; a lease that lapses | [Overview](README.md), [Publishing](publishing.md#compressed-publishing) |
 | Filters, ordering keys, dead letters and delivery attempts, retry policies, retention, exactly-once delivery | [Topics and subscriptions](topics-and-subscriptions.md), [Subscribing](subscribing.md) |
 | Snapshots, seeking to a snapshot or a time, detaching, a topic's retention | [Replaying and purging](replay.md) |
@@ -248,7 +248,10 @@ it, read back as production reads it back, and **not done**:
   each call is done before the next begins.
 - **Callers and permissions.** There are no accounts: every caller holds
   every permission, and a policy is kept and never enforced, except for
-  dead letters when the service agent is named.
+  dead letters when the service agent is named. So a subscription on
+  another project's topic is never refused 403; a project the fake
+  holds nothing in is answered as production answers one that does not
+  exist.
 - **Quotas, regions and CMEK**: the settings are kept and nothing is
   enforced.
 
