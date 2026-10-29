@@ -24,21 +24,23 @@ client: *Client,
 /// The client builds the full name, `projects/{project}/subscriptions/{id}`.
 id: []const u8,
 
-/// Creates the subscription on `config.topic_id` in the same project.
-/// Messages published before this call are not delivered to it. Every
+/// Creates the subscription on `config.topic_id`: a topic in the same
+/// project, or another project's by its full name. The subscription is in
+/// this client's project either way. Messages published before this call
+/// are not delivered to it. Every
 /// setting is checked first, including the rules the emulator does not
 /// enforce, so what works there does not fail in production.
 pub fn create(self: Subscription, config: types.SubscriptionConfig) Error!Owned(types.SubscriptionInfo) {
     const c = self.client;
     rpc.begin(c);
     try rpc.checkId(c, "subscription", self.id);
-    try rpc.checkId(c, "topic", config.topic_id);
+    try rpc.checkTopic(c, config.topic_id);
     try validate.subscriptionConfig(config, c.emulator, c.diagnostics);
     var scratch: std.heap.ArenaAllocator = .init(c.gpa);
     defer scratch.deinit();
     const a = scratch.allocator();
     const path = try url.resourcePath(a, c.project_id, .subscriptions, self.id, "");
-    const topic_name = try url.resourceName(a, c.project_id, .topics, config.topic_id);
+    const topic_name = try topicName(a, c, config.topic_id);
     const dead_letter: ?[]const u8 = if (config.dead_letter_policy) |policy| try topicName(a, c, policy.topic) else null;
     const body = try codec.encodeSubscription(a, topic_name, config, dead_letter);
     return fetch(c, .{ .method = .PUT, .path = path, .body = body });
@@ -794,6 +796,42 @@ test "a subscription whose topic was deleted" {
     defer got.deinit();
     try testing.expectEqualStrings("_deleted-topic_", got.value.topic);
     try testing.expectEqual(0, got.value.ack_deadline_seconds);
+}
+
+test "golden: create on a topic in another project, named in full" {
+    // Production's answer, 2026-10-29, on Google's public topic.
+    var h: Harness = undefined;
+    try h.init(&.{.{ .respond = .{ .body =
+        \\{"name":"projects/p/subscriptions/work","topic":"projects/pubsub-public-data/topics/taxirides-realtime","pushConfig":{},"ackDeadlineSeconds":10,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"state":"ACTIVE"}
+    } }}, .{});
+    defer h.deinit();
+    var created = try h.client.subscription("work").create(.{ .topic_id = "projects/pubsub-public-data/topics/taxirides-realtime" });
+    defer created.deinit();
+    try h.expectRequest(0, .PUT, base_url, "{\"topic\":\"projects/pubsub-public-data/topics/taxirides-realtime\",\"enableMessageOrdering\":false}");
+    try testing.expectEqualStrings("projects/p/subscriptions/work", created.value.name);
+    try testing.expectEqualStrings("projects/pubsub-public-data/topics/taxirides-realtime", created.value.topic);
+}
+
+test "create: a topic that is neither an id nor a full topic name fails before any request" {
+    var h: Harness = undefined;
+    try h.init(&.{}, .{});
+    defer h.deinit();
+    const work = h.client.subscription("work");
+    for ([_][]const u8{
+        "projects/other/topics/",
+        "projects//topics/orders",
+        "projects/other/topics/x",
+        "projects/other/topics/goog-orders",
+        "projects/other/subscriptions/orders",
+        "projects/bad project/topics/orders",
+        "other/topics/orders",
+        "orders/",
+    }) |topic| {
+        h.diag = .{};
+        try testing.expectError(error.InvalidResourceId, work.create(.{ .topic_id = topic }));
+        try testing.expect(std.mem.startsWith(u8, h.diag.message(), "invalid topic: neither a topic id"));
+    }
+    try h.expectRequestCount(0);
 }
 
 /// Production's refusal of late acks on an exactly-once subscription, as

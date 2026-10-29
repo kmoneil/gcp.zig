@@ -3,6 +3,7 @@
 # Topics and subscriptions
 
 **On this page:** [Subscription settings](#subscription-settings) ·
+[A topic in another project](#a-topic-in-another-project) ·
 [Updates](#updates) · [Topic settings](#topic-settings) ·
 [Tags](#tags) ·
 [What the emulator and production do](#what-the-emulator-and-production-do) ·
@@ -62,6 +63,32 @@ Every rule is checked before anything is sent. The emulator takes
 several settings production refuses, such as ack deadlines of 1 to 9 s,
 labels with capitals and expirations under a day, so code tested
 against it would otherwise fail later.
+
+## A topic in another project
+
+A subscription takes messages from another project's topic when
+`topic_id` names it in full, and the caller may attach subscriptions to
+it: `pubsub.topics.attachSubscription` on the topic, which
+`roles/pubsub.subscriber` carries.
+
+```zig
+var rides = try client.subscription("taxi-rides").create(.{
+    .topic_id = "projects/pubsub-public-data/topics/taxirides-realtime",
+});
+defer rides.deinit();
+// rides.value.topic is that full name, as for any subscription.
+```
+
+The subscription is in the client's project, and is pulled, leased,
+updated and deleted there like any other. Production, measured on
+2026-10-29 against Google's public topic above, answers both misses
+404, `error.NotFound`, in different words: a project that does not
+exist, or that the caller cannot see, "Requested project not found or
+user does not have access to it (project=...)", and a missing topic in
+one that does "Resource not found (resource=...)", as in the client's
+own project. The emulator takes such a subscription and delivers to
+it, but answers "Subscription topic does not exist" for every topic it
+lacks, whatever the project.
 
 ## Updates
 

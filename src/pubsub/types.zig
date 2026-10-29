@@ -376,7 +376,9 @@ pub const DeliveryInfo = union(enum) {
 pub const ExportState = enum { active, permission_denied, not_found, schema_mismatch, location_restriction, unknown };
 
 pub const SubscriptionConfig = struct {
-    /// Id of a topic in the same project.
+    /// Id of a topic in the same project, or `projects/{project}/topics/{id}`
+    /// for another project's, which the caller needs
+    /// `pubsub.topics.attachSubscription` on.
     topic_id: []const u8,
     /// Any kind but `.pull` refuses exactly-once delivery, and only
     /// `.pull` answers `pull` and lease calls.

@@ -28,7 +28,23 @@ including the ones that did not change.
   (0.51.0) with it. No call changes. Its two jobs, `scheduler` and
   `slow-scheduler`, ran 2026-10-21 to 2026-10-29 without a failure,
   from the first nightly after the writes landed.
-- auth, bigquery, core, dataflow, datatransfer, firestore, pubsub,
+- pubsub: a subscription on a topic in another project, for issue
+  #314. `SubscriptionConfig.topic_id` now takes a topic id in the
+  client's project or `projects/{project}/topics/{id}` for another
+  project's, as `DeadLetterPolicy.topic` does. The subscription is in
+  the client's project either way, and `SubscriptionInfo.topic` reads
+  the full name back, as it always did. No call changes. Measured in
+  production on 2026-10-29 against Google's public topic: a project
+  that does not exist, or that the caller cannot see, is 404
+  ("Requested project not found or user does not have access to it"),
+  and a missing topic in one that does is 404 ("Resource not found"),
+  both `error.NotFound`; anything that is neither an id nor a full
+  topic name is refused before sending. `FakePubSub` finds another
+  project's topic by its full name and answers a project it holds
+  nothing in as production answers one that does not exist; its model
+  property puts a topic in a second project. A gated test
+  (`PUBSUB_CROSS_PROJECT_TEST=1`) holds production to the same answers.
+- auth, bigquery, core, dataflow, datatransfer, firestore,
   resource_manager, run, secret_manager and storage: unchanged.
   resource_manager and run stay experimental for now: their IAM reads,
   and run's deploy settings, landed on 2026-10-23, so their seven

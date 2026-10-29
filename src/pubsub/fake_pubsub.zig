@@ -19,7 +19,10 @@
 //!   defaults production fills in (a 10 second ack deadline, 7 days of
 //!   retention, expiry after 31 days), its bounds on each, and the fields
 //!   it will not change. A deleted topic leaves its subscriptions reading
-//!   `_deleted-topic_`, with what they hold.
+//!   `_deleted-topic_`, with what they hold. A subscription's topic may be
+//!   another project's, by its full name; a project the fake holds nothing
+//!   in is refused as production refuses one that does not exist, or that
+//!   the caller cannot see.
 //! - Publish: ids, decimal and consecutive; the limits on a request, its
 //!   messages, their attributes and their ordering key, each refused in
 //!   production's words; one ordering key a request.
@@ -787,6 +790,17 @@ pub const FakePubSub = struct {
         return null;
     }
 
+    /// Whether the fake holds anything in `project`: a topic, a
+    /// subscription, a snapshot or a schema.
+    fn holdsProject(f: *const FakePubSub, project: []const u8) bool {
+        inline for (.{ "topics", "subscriptions", "snapshots", "schemas" }) |field| {
+            for (@field(f, field).keys()) |name| {
+                if (std.mem.eql(u8, projectOf(name), project)) return true;
+            }
+        }
+        return false;
+    }
+
     fn findSubscription(f: *FakePubSub, project: []const u8, subscription: []const u8) ?*Subscription {
         var buf: [1024]u8 = undefined;
         const name = fullName(&buf, project, "subscriptions", subscription) orelse return null;
@@ -1399,7 +1413,16 @@ pub const FakePubSub = struct {
         }
         if (expirationRefusal(arena, sub.retention_s, sub.expiration_ttl_s, expiration_given)) |refusal| return try refusal;
         if (f.subscriptions.contains(name)) return alreadyExists(arena, route.id);
-        const topic = f.topics.get(topic_name) orelse return notFound(arena, idOf(topic_name));
+        const topic = f.topics.get(topic_name) orelse {
+            // Production answers a project that does not exist, or that
+            // the caller cannot see, in words of its own, and a missing
+            // topic in one that does as any missing resource. The fake
+            // knows a project by what it holds in it, and the
+            // subscription's own is there.
+            const project = projectOf(topic_name);
+            if (!std.mem.eql(u8, project, route.project) and !f.holdsProject(project)) return projectNotFound(arena, project);
+            return notFound(arena, idOf(topic_name));
+        };
         sub.topic = topic;
         sub.joined = topic.messages.items.len;
         sub.uid = f.next_uid;
@@ -3059,6 +3082,14 @@ fn idOf(name: []const u8) []const u8 {
     return name[slash + 1 ..];
 }
 
+/// The project of `projects/{project}/...`, or "" for any other name.
+fn projectOf(name: []const u8) []const u8 {
+    const prefix = "projects/";
+    if (!std.mem.startsWith(u8, name, prefix)) return "";
+    const rest = name[prefix.len..];
+    return rest[0 .. std.mem.indexOfScalar(u8, rest, '/') orelse rest.len];
+}
+
 /// 3 to 255 characters from `[A-Za-z0-9-_.~+%]`, the first a letter, and
 /// not beginning `goog` in any case.
 fn isResourceId(id: []const u8) bool {
@@ -3559,6 +3590,12 @@ fn notFound(arena: Allocator, id: []const u8) Allocator.Error!FakePubSub.Reply {
 
 fn alreadyExists(arena: Allocator, id: []const u8) Allocator.Error!FakePubSub.Reply {
     return fail(arena, 409, "ALREADY_EXISTS", try std.fmt.allocPrint(arena, "Resource already exists in the project (resource={s}).", .{id}));
+}
+
+/// Production's answer, 2026-10-29, for a project that does not exist or
+/// that the caller cannot see.
+fn projectNotFound(arena: Allocator, project: []const u8) Allocator.Error!FakePubSub.Reply {
+    return fail(arena, 404, "NOT_FOUND", try std.fmt.allocPrint(arena, "Requested project not found or user does not have access to it (project={s}). Make sure to specify the unique project identifier and not the Google Cloud Console display name.", .{project}));
 }
 
 fn invalidName(arena: Allocator, name: []const u8) Allocator.Error!FakePubSub.Reply {
@@ -5538,6 +5575,56 @@ test "subscriptions: production's defaults, its bounds, what an update may chang
     try b.client.subscription("worker").delete();
     try testing.expectError(error.NotFound, b.client.subscription("worker").pull(.{}));
     try testing.expectEqual(0, b.fake.backlog("p", "worker"));
+}
+
+test "a subscription on another project's topic: found by its full name, and refused as production refuses one" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    // Production's answers, 2026-10-29, for a subscription in its own
+    // project. That project is there though the fake holds nothing yet.
+    try expectRefused(try b.raw(a, .PUT, "projects/p/subscriptions/zigps-own", "{\"topic\":\"projects/p/topics/zigps-nope\"}"), 404, "NOT_FOUND", "Resource not found (resource=zigps-nope).");
+    // A project the fake holds nothing in reads as one that does not exist.
+    try expectRefused(try b.raw(a, .PUT, "projects/p/subscriptions/zigps-noproj", "{\"topic\":\"projects/zigps-noproj/topics/zigps-t1\"}"), 404, "NOT_FOUND", "Requested project not found or user does not have access to it (project=zigps-noproj). Make sure to specify the unique project identifier and not the Google Cloud Console display name.");
+    // A topic id too short is a bad name in any project, its own too.
+    for ([_][]const u8{ "p", "zigps-noproj" }) |project| {
+        const name = try std.fmt.allocPrint(a, "projects/{s}/topics/t1", .{project});
+        try expectRefused(try b.raw(a, .PUT, "projects/p/subscriptions/zigps-short", try std.fmt.allocPrint(a, "{{\"topic\":\"{s}\"}}", .{name})), 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(a, "Invalid resource name given (name={s}). Refer to https://cloud.google.com/pubsub/docs/pubsub-basics#resource_names for more information.", .{name}));
+    }
+    try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/pubsub-public-data/topics/taxirides-realtime", "{}")).status);
+    try expectRefused(try b.raw(a, .PUT, "projects/p/subscriptions/zigps-other", "{\"topic\":\"projects/pubsub-public-data/topics/zigps-nope\"}"), 404, "NOT_FOUND", "Resource not found (resource=zigps-nope).");
+    try testing.expectEqualStrings(
+        \\{"name":"projects/p/subscriptions/zigps-taxis","topic":"projects/pubsub-public-data/topics/taxirides-realtime","pushConfig":{},"ackDeadlineSeconds":10,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"state":"ACTIVE"}
+    , (try b.raw(a, .PUT, "projects/p/subscriptions/zigps-taxis", "{\"topic\":\"projects/pubsub-public-data/topics/taxirides-realtime\"}")).body);
+
+    // Through the client: what is published there is pulled here.
+    var made = try b.client.subscription("zigps-rides").create(.{ .topic_id = "projects/pubsub-public-data/topics/taxirides-realtime" });
+    defer made.deinit();
+    try testing.expectEqualStrings("projects/pubsub-public-data/topics/taxirides-realtime", made.value.topic);
+    try testing.expectEqual(200, (try b.raw(a, .POST, "projects/pubsub-public-data/topics/taxirides-realtime:publish", "{\"messages\":[{\"data\":\"cmlkZQ==\"}]}")).status);
+    var got = try b.client.subscription("zigps-rides").pull(.{});
+    defer got.deinit();
+    try testing.expectEqual(1, got.value.messages.len);
+    try testing.expectEqualStrings("ride", got.value.messages[0].data);
+    try testing.expectError(error.NotFound, b.client.subscription("zigps-gone").create(.{ .topic_id = "projects/zigps-noproj/topics/zigps-t1" }));
+    try testing.expectEqualStrings("Requested project not found or user does not have access to it (project=zigps-noproj). Make sure to specify the unique project identifier and not the Google Cloud Console display name.", b.diag.message());
+
+    // A project is there by anything the fake holds in it, not only a
+    // topic: a subscription, a snapshot whose subscription is gone, or a
+    // schema.
+    const public = "{\"topic\":\"projects/pubsub-public-data/topics/taxirides-realtime\"}";
+    try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/zigps-subs/subscriptions/zigps-s", public)).status);
+    try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/zigps-snaps/subscriptions/zigps-s", public)).status);
+    try testing.expectEqual(200, (try b.raw(a, .PUT, "projects/zigps-snaps/snapshots/zigps-snap", "{\"subscription\":\"projects/zigps-snaps/subscriptions/zigps-s\"}")).status);
+    try testing.expectEqual(200, (try b.raw(a, .DELETE, "projects/zigps-snaps/subscriptions/zigps-s", "")).status);
+    try testing.expectEqual(200, (try b.raw(a, .POST, "projects/zigps-schemas/schemas?schemaId=zigps-avro", try schemaBody(a, "AVRO", two_fields))).status);
+    for ([_][]const u8{ "zigps-subs", "zigps-snaps", "zigps-schemas" }) |project| {
+        try expectRefused(try b.raw(a, .PUT, "projects/p/subscriptions/zigps-held", try std.fmt.allocPrint(a, "{{\"topic\":\"projects/{s}/topics/zigps-none\"}}", .{project})), 404, "NOT_FOUND", "Resource not found (resource=zigps-none).");
+    }
 }
 
 test "leases: a message out on one comes again when it lapses, and an ack takes only while it is out" {
@@ -9866,6 +9953,25 @@ pub const Reference = struct {
 
 const sub_ids = [3][]const u8{ "sub0", "sub1", "sub2" };
 const topic_ids = [2][]const u8{ "top0", "top1" };
+/// The project topic 1 is made in when a script puts it in another.
+const model_elsewhere = "zigps-q";
+
+/// Where the model's topics are: both in the subscriptions' project, or
+/// topic 1 in another, which its subscriptions name in full.
+const ModelTopics = struct {
+    here: *Client,
+    there: *Client,
+    elsewhere: bool,
+
+    fn client(t: ModelTopics, topic: u8) *Client {
+        return if (t.elsewhere and topic == 1) t.there else t.here;
+    }
+
+    /// What a subscription names topic `topic` by.
+    fn name(t: ModelTopics, topic: u8) []const u8 {
+        return if (t.elsewhere and topic == 1) "projects/" ++ model_elsewhere ++ "/topics/top1" else topic_ids[topic];
+    }
+};
 pub const key_names = [3]?[]const u8{ null, "a", "b" };
 
 const snapshot_ids = [3][]const u8{ "snap0", "snap1", "snap2" };
@@ -9897,14 +10003,14 @@ pub fn modelSubscription(s: usize, topic_id: []const u8, first_topic_id: []const
     };
 }
 
-fn makeModelTopic(b: *Bench, topic: u8) !void {
-    var made = try b.client.topic(topic_ids[topic]).create(modelTopic(topic));
+fn makeModelTopic(topics: ModelTopics, topic: u8) !void {
+    var made = try topics.client(topic).topic(topic_ids[topic]).create(modelTopic(topic));
     made.deinit();
 }
 
 /// Makes subscription `s` of the model on `topic`, with its rules.
-fn makeModelSubscription(b: *Bench, s: usize, topic: u8) !void {
-    var made = try b.client.subscription(sub_ids[s]).create(modelSubscription(s, topic_ids[topic], topic_ids[0]));
+fn makeModelSubscription(b: *Bench, topics: ModelTopics, s: usize, topic: u8) !void {
+    var made = try b.client.subscription(sub_ids[s]).create(modelSubscription(s, topics.name(topic), topic_ids[0]));
     made.deinit();
 }
 
@@ -9980,8 +10086,10 @@ fn modelRun(input: []const u8) !ModelRun {
     // under the fuzzer the session has a plain one. The corpus and the
     // random runs of every test run keep the one that looks.
     const gpa = if (@import("builtin").fuzz) std.heap.smp_allocator else testing.allocator;
-    // The first byte: the order of the fake's pulls, and whether Pub/Sub's
-    // service agent is named, with no grant, so that nothing is forwarded.
+    // The first byte: the order of the fake's pulls, whether Pub/Sub's
+    // service agent is named, with no grant, so that nothing is forwarded,
+    // and whether topic 1 is in another project, which changes nothing a
+    // subscription holds.
     const first = g.byte();
     const granted = first & 2 == 0;
     var b: Bench = undefined;
@@ -9991,9 +10099,18 @@ fn modelRun(input: []const u8) !ModelRun {
     defer scratch.deinit();
     const a = scratch.allocator();
 
+    var there: Client = try .init(gpa, b.clock.io(), .{
+        .project_id = model_elsewhere,
+        .token_provider = b.tokens.provider(),
+        .transport = b.fake.transport(),
+        .diagnostics = &b.diag,
+    });
+    defer there.deinit();
+    const topics: ModelTopics = .{ .here = &b.client, .there = &there, .elsewhere = first & 4 != 0 };
+
     var ref: Reference = .{ .forwards = granted };
-    for (0..2) |topic| try makeModelTopic(&b, @intCast(topic));
-    for (0..3) |s| try makeModelSubscription(&b, s, ref.on[s].topic);
+    for (0..2) |topic| try makeModelTopic(topics, @intCast(topic));
+    for (0..3) |s| try makeModelSubscription(&b, topics, s, ref.on[s].topic);
     var deliveries: std.ArrayList(ModelDelivery) = .empty;
     var incarnation: [3]u32 = @splat(0);
     // Deliveries before this one are from before a seek of the
@@ -10021,7 +10138,7 @@ fn modelRun(input: []const u8) !ModelRun {
                     m.* = .{ .data = try std.fmt.bufPrint(buf, "m{d}", .{published}), .attributes = if (skip.*) &.{.{ .key = "skip", .value = "1" }} else &.{} };
                     published += 1;
                 }
-                var sent = try b.client.topic(topic_ids[topic]).publish(messages[0..count], .{ .ordering_key = key_names[k] });
+                var sent = try topics.client(topic).topic(topic_ids[topic]).publish(messages[0..count], .{ .ordering_key = key_names[k] });
                 defer sent.deinit();
                 // Ids in order, the dead letters' among them.
                 for (sent.value.message_ids, skips[0..count]) |text, skip| {
@@ -10171,7 +10288,7 @@ fn modelRun(input: []const u8) !ModelRun {
                     const s = g.intRange(u8, 0, 2);
                     const topic = g.intRange(u8, 0, 1);
                     try b.client.subscription(sub_ids[s]).delete();
-                    try makeModelSubscription(&b, s, topic);
+                    try makeModelSubscription(&b, topics, s, topic);
                     ref.counts[s] = 0;
                     ref.on[s] = .{ .topic = topic, .made = ref.made[topic] };
                     ref.joined[s] = ref.next_id;
@@ -10183,8 +10300,8 @@ fn modelRun(input: []const u8) !ModelRun {
                 else => {
                     ran.remade += 1;
                     const topic = g.intRange(u8, 0, 1);
-                    try b.client.topic(topic_ids[topic]).delete();
-                    try makeModelTopic(&b, topic);
+                    try topics.client(topic).topic(topic_ids[topic]).delete();
+                    try makeModelTopic(topics, topic);
                     ref.made[topic] += 1;
                 },
             },
@@ -10331,9 +10448,9 @@ pub const model_corpus = [_][]const u8{
 
 test "fake property: after any script of calls each subscription holds exactly what a reference says" {
     try test_util.fuzzBytes({}, modelProperty, .{
-        // A script is a byte for the order of pulls (its first bit) and
-        // for the service agent named without a grant (its second), and
-        // then steps: a
+        // A script is a byte for the order of pulls (its first bit), for
+        // the service agent named without a grant (its second) and for
+        // topic 1 in another project (its third), and then steps: a
         // publish (0, topic, count less one, key, a byte a message for
         // `skip`), a pull (2, subscription, most less one), an ack, a
         // nack or a lease change of a delivery made so far (5, 6 or 7,
