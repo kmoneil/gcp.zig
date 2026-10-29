@@ -1,6 +1,6 @@
-[zig-gcp](../README.md) › Docs
+[gcp.zig](../README.md) › Docs
 
-# zig-gcp documentation
+# gcp.zig documentation
 
 Start with [Essentials](essentials.md), which every module shares, and
 [Credentials](auth.md), which every production program needs; then the
@@ -151,7 +151,7 @@ Google, not only what Google documents, and where the emulators differ.
 | [Overview](datatransfer/README.md) | Scheduled queries and other transfer configs, one location at a time; their runs and each run's messages; a run now with the exact request shown first, sent once; the scopes and permissions; and what production showed when measured (experimental) |
 | [Testing](datatransfer/testing.md) | An in-memory Data Transfer for your own tests: configs, runs and messages put in, a run now whose outcome the test says, held to production's answers (experimental) |
 
-## 🛠️ Working on zig-gcp
+## 🛠️ Working on gcp.zig
 
 | Guide | What's in it |
 | --- | --- |

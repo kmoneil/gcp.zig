@@ -9,7 +9,7 @@ sends may crash the client or pass a partial response off as a whole one.
 ## Reporting a vulnerability
 
 Email **kevin@oneil.xyz**, or use GitHub's
-[private vulnerability reporting](https://github.com/kmoneil/zig-gcp/security/advisories/new).
+[private vulnerability reporting](https://github.com/kmoneil/gcp.zig/security/advisories/new).
 Please do not open a public issue for a vulnerability.
 
 You will get an acknowledgement within 3 working days. Fixed issues are

@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title">
-  <title id="title">zig-gcp</title>
+  <title id="title">gcp.zig</title>
   <defs>
     <linearGradient id="cloud" x1="34" y1="59" x2="222" y2="197" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#6FA3FF"/>
