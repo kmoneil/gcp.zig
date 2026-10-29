@@ -120,7 +120,7 @@ pub fn main(init: std.process.Init) !void {
         .name = metric,
         .label_keys = &.{"outcome"},
         .unit = "{message}",
-        .description = "Messages a zig-gcp subscriber handled, by outcome",
+        .description = "Messages a gcp.zig subscriber handled, by outcome",
     }, .cumulative, std.Io.Clock.real.now(io), counts.observer());
 
     var handler: Handler = .{};
