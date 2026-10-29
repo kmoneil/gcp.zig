@@ -6,7 +6,7 @@ A client for Cloud Error Reporting's read side, for an error dashboard:
 what is failing in a project now, how often over time in buckets a trend
 chart draws, whether each group is new, its errors with their stack
 traces, and a group's status to resolve, acknowledge or mute it. It
-reports no errors. **Experimental**: new in 0.43.0.
+reports no errors.
 
 ```zig
 const std = @import("std");
@@ -66,7 +66,7 @@ terminal, and runs offline with `--fake`.
 
 | Guide | What's in it |
 | --- | --- |
-| [Testing](testing.md) | An in-memory Error Reporting for your own tests, held to production's answers (experimental) |
+| [Testing](testing.md) | An in-memory Error Reporting for your own tests, held to production's answers |
 
 ## The calls
 

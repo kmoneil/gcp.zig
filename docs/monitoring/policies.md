@@ -6,9 +6,7 @@ An alert policy says when Cloud Monitoring opens an [alert](alerts.md)
 and what it tells people when it does. The client reads policies, and
 enables or disables one; nothing else about a policy changes here.
 Making, editing and deleting policies, and notification channels, are
-not in this module. **Experimental**: new in 0.52.0; the write keeps
-its own experimental marker until it has had seven clean nights,
-whatever the rest of the module is by then.
+not in this module.
 
 ```zig
 var page = try client.listAlertPolicies(.{ .filter = "enabled=true", .order_by = "display_name" });

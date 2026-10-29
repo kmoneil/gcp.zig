@@ -6,7 +6,7 @@
 memory, behind `Client.Options.transport`: errors a test reports, grouped,
 counted and listed as production answered when measured, on a clock the
 test sets. A dashboard's offline checks get deterministic data with no
-network. **Experimental**, as the module is.
+network.
 
 <!-- snippet: tests/docs_examples.zig#er-fake -->
 ```zig

@@ -5,10 +5,6 @@
 //! exact request without sending it. Nothing here creates, updates or
 //! deletes a job.
 //!
-//! **Experimental**: new in 0.47.0, and free to change between minor
-//! versions until it has been used in anger. The writes are new in
-//! 0.51.0.
-//!
 //! Jobs live under a location, so a reader lists `listLocations` once and
 //! `listJobs` per location. `Job.failing` answers the health view's
 //! question: the job could not be updated, or its last attempt failed.
@@ -56,7 +52,6 @@ pub const limits = @import("validate.zig");
 pub const transport = core.transport;
 
 /// What a test of code that reads jobs can stand on, with no network.
-/// **Experimental**, as the module is.
 pub const testing = struct {
     /// Cloud Scheduler in memory, behind `Client.Options.transport`:
     /// locations and jobs a test puts in, read back as production

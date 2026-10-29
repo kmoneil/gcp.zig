@@ -5,7 +5,7 @@
 Cloud KMS has no emulator, so `kms.testing.FakeKms` is the test double:
 key rings, keys and versions in memory, behind
 `Client.Options.transport`, with real cryptography and the refusals
-production gave, in its words. **Experimental**, as the module is.
+production gave, in its words.
 
 <!-- snippet: tests/docs_examples.zig#kms-fake -->
 ```zig

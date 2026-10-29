@@ -6,9 +6,7 @@
 //! creates, reads and deletes a metric's descriptor; `Client.listMetrics`
 //! and the resource type calls list what the project has. There is no
 //! emulator and no unauthenticated mode: every client needs a
-//! `TokenProvider`, which the `auth` module supplies. **Experimental**: new
-//! in 0.44.0, and free to change between minor versions until it has been
-//! used for a while.
+//! `TokenProvider`, which the `auth` module supplies.
 
 const core = @import("core");
 
@@ -87,7 +85,7 @@ pub const limits = @import("validate.zig");
 pub const transport = core.transport;
 
 /// What a test of code that writes or reads metrics can stand on, with no
-/// emulator and no network. **Experimental**, as the module is.
+/// emulator and no network.
 pub const testing = struct {
     /// Cloud Monitoring in memory, behind `Client.Options.transport`:
     /// descriptors and points, held to the rules production enforced when

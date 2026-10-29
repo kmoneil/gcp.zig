@@ -5,7 +5,7 @@
 Cloud Monitoring has no emulator, so `monitoring.testing.FakeMonitoring`
 is the test double: descriptors and points in memory, behind
 `Client.Options.transport`, held to the rules production enforced when
-measured. **Experimental**, as the module is.
+measured.
 
 <!-- snippet: tests/docs_examples.zig#mon-fake -->
 ```zig

@@ -6,7 +6,7 @@ A client for Cloud KMS's v1 API: encrypt and decrypt with keys the server
 holds, sign and MAC with them, check signatures on this machine, and
 manage key rings, keys and their versions from creation to deletion.
 Every answer is checked against its CRC-32C checksums, and decrypted
-bytes are wiped. **Experimental**: new in 0.45.0.
+bytes are wiped.
 
 ```zig
 const std = @import("std");
@@ -64,7 +64,7 @@ offline with `--fake`.
 | [Encrypting](encrypting.md) | Encrypt and decrypt, AAD, which version is used, the plaintext wiped, more than 64 KiB, integrity |
 | [Signing and MACs](signing.md) | Signing messages and digests, public keys, checking a signature here, MAC tags |
 | [Keys](keys.md) | Key rings, keys and versions; states, rotation, destroying and deleting; what is billed; IAM |
-| [Testing](testing.md) | An in-memory Cloud KMS for your own tests, held to production's answers (experimental) |
+| [Testing](testing.md) | An in-memory Cloud KMS for your own tests, held to production's answers |
 
 ## The calls
 

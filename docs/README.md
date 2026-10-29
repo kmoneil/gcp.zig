@@ -70,12 +70,12 @@ Google, not only what Google documents, and where the emulators differ.
 
 | Guide | What's in it |
 | --- | --- |
-| [Overview](logging/README.md) | A first program, the calls, and what production showed when measured (experimental) |
+| [Overview](logging/README.md) | A first program, the calls, and what production showed when measured |
 | [Listing entries](logging/listing.md) | Queries and their pages, page tokens, the time range, order and page size, the read quota and `ReadBudget`, what an entry carries, errors |
 | [Filters](logging/filters.md) | How the client joins your filter to its clauses, and how production read the query language |
 | [Tailing](logging/tail.md) | A tail by polling: the window, late entries, falling behind, keeping the cursor, and why there is no live tail |
 | [Logs, buckets and views](logging/picker.md) | Log names, buckets and views, and a picker that orders them for a person |
-| [Testing](logging/testing.md) | An in-memory Cloud Logging for your own tests, with production's answers (experimental) |
+| [Testing](logging/testing.md) | An in-memory Cloud Logging for your own tests, with production's answers |
 
 ## 🗂️ Resource Manager
 
@@ -90,38 +90,38 @@ Google, not only what Google documents, and where the emulators differ.
 
 | Guide | What's in it |
 | --- | --- |
-| [Overview](error_reporting/README.md) | A dashboard's first program, periods and buckets, statuses and muted groups, the quota, locations, and what production showed when measured (experimental) |
-| [Testing](error_reporting/testing.md) | An in-memory Error Reporting for your own tests, held to production's answers (experimental) |
+| [Overview](error_reporting/README.md) | A dashboard's first program, periods and buckets, statuses and muted groups, the quota, locations, and what production showed when measured |
+| [Testing](error_reporting/testing.md) | An in-memory Error Reporting for your own tests, held to production's answers |
 
 ## 📈 Monitoring
 
 | Guide | What's in it |
 | --- | --- |
-| [Overview](monitoring/README.md) | A program's first write, the calls, who is writing, errors, and what production showed when measured (experimental) |
+| [Overview](monitoring/README.md) | A program's first write, the calls, who is writing, errors, and what production showed when measured |
 | [Writing](monitoring/writing.md) | A write and its result, the rules production holds each series to, kinds and values, descriptors, retries, limits |
 | [Reading](monitoring/reading.md) | Filters, aligning and reducing, pages of points, incomplete answers, cost |
 | [Alerts](monitoring/alerts.md) | The incidents open in the project, read only: their policy snapshots, the filter production really parses, what a real incident showed |
-| [Alert policies](monitoring/policies.md) | The policies behind the incidents, every condition kind, and enabling or disabling one with its exact request first (experimental) |
-| [Snoozes](monitoring/snoozes.md) | Silencing policies for a while: making, listing and ending snoozes, and what a real alert did (experimental) |
+| [Alert policies](monitoring/policies.md) | The policies behind the incidents, every condition kind, and enabling or disabling one with its exact request first |
+| [Snoozes](monitoring/snoozes.md) | Silencing policies for a while: making, listing and ending snoozes, and what a real alert did |
 | [The Recorder](monitoring/recorder.md) | Counters, gauges, histograms and observers written every interval from a task of their own; stopping, descriptors, stats |
-| [Testing](monitoring/testing.md) | An in-memory Cloud Monitoring for your own tests, held to production's answers (experimental) |
+| [Testing](monitoring/testing.md) | An in-memory Cloud Monitoring for your own tests, held to production's answers |
 
 ## 🔐 KMS
 
 | Guide | What's in it |
 | --- | --- |
-| [Overview](kms/README.md) | A first program, the calls, integrity, errors, and what production showed when measured (experimental) |
+| [Overview](kms/README.md) | A first program, the calls, integrity, errors, and what production showed when measured |
 | [Encrypting](kms/encrypting.md) | Encrypt and decrypt, AAD, which version is used, the plaintext wiped, more than 64 KiB |
 | [Signing and MACs](kms/signing.md) | Signing messages and digests, public keys, checking a signature on this machine, MAC tags |
 | [Keys](kms/keys.md) | Key rings, keys and versions; states, rotation, destroying and deleting; what is billed; IAM |
-| [Testing](kms/testing.md) | An in-memory Cloud KMS for your own tests, held to production's answers (experimental) |
+| [Testing](kms/testing.md) | An in-memory Cloud KMS for your own tests, held to production's answers |
 
 ## ⏰ Scheduler
 
 | Guide | What's in it |
 | --- | --- |
-| [Overview](scheduler/README.md) | The jobs a project schedules: states, targets, last attempts, `Job.failing`; run now, pause and resume with the exact request first; what production showed when measured (experimental) |
-| [Testing](scheduler/testing.md) | An in-memory Cloud Scheduler for your own tests, reads and runs, pauses and resumes, held to production's answers (experimental) |
+| [Overview](scheduler/README.md) | The jobs a project schedules: states, targets, last attempts, `Job.failing`; run now, pause and resume with the exact request first; what production showed when measured |
+| [Testing](scheduler/testing.md) | An in-memory Cloud Scheduler for your own tests, reads and runs, pauses and resumes, held to production's answers |
 
 ## 🏃 Run
 

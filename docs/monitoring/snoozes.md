@@ -4,9 +4,7 @@
 
 A snooze names up to 16 [alert policies](policies.md) and an interval.
 From its start, Cloud Monitoring closes their open [alerts](alerts.md)
-and opens none until its end; then they alert again. **Experimental**:
-new in 0.52.0, the writes with their own marker, as the policy write
-has.
+and opens none until its end; then they alert again.
 
 ```zig
 const now = std.Io.Clock.real.now(io);

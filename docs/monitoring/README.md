@@ -6,7 +6,6 @@ A client for Cloud Monitoring's v3 API, for a program's own metrics:
 write points, read series back filtered, aligned and reduced, manage the
 descriptors that say what a metric is, and a `Recorder` that writes
 counters, gauges and histograms every interval from a task of its own.
-**Experimental**: new in 0.44.0.
 
 ```zig
 const std = @import("std");
@@ -66,7 +65,7 @@ subscriber's counts into metrics through a `Recorder`.
 | [Alert policies](policies.md) | The policies behind the incidents, every condition kind, and enabling or disabling one with its exact request first |
 | [Snoozes](snoozes.md) | Silencing policies for a while: making, listing and ending snoozes, production's three ways to end one, what a real alert did |
 | [The Recorder](recorder.md) | Counters, gauges, histograms and observers written every interval, stopping, descriptors, stats |
-| [Testing](testing.md) | An in-memory Cloud Monitoring for your own tests, held to production's answers (experimental) |
+| [Testing](testing.md) | An in-memory Cloud Monitoring for your own tests, held to production's answers |
 
 ## The calls
 

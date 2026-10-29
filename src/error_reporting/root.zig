@@ -11,9 +11,7 @@
 //! The per-user quota is 60 calls a minute, so a client counts its calls
 //! and refuses one past the count at once, saying how long to wait. There
 //! is no emulator and no unauthenticated mode: every client needs a
-//! `TokenProvider`, which the `auth` module supplies. **Experimental**: new
-//! in 0.43.0, and free to change between minor versions until it has been
-//! used for a while.
+//! `TokenProvider`, which the `auth` module supplies.
 
 const core = @import("core");
 
@@ -68,7 +66,7 @@ pub const limits = @import("validate.zig");
 pub const transport = core.transport;
 
 /// What a test of code that reads errors can stand on, with no emulator and
-/// no network. **Experimental**, as the module is.
+/// no network.
 pub const testing = struct {
     /// Cloud Error Reporting in memory, behind `Client.Options.transport`:
     /// errors a test reports, grouped, counted in buckets, listed and read

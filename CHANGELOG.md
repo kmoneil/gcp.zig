@@ -4,6 +4,36 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.61.0 (unreleased)
+
+- logging: now **beta**, as `pubsub`, `firestore`, `storage`,
+  `secret_manager`, `auth` and `core` are. No call changes. It earned
+  the label on the rule firestore's promotion set: the module's work
+  merged, and its own nightly fuzz jobs, `logging` and `slow-logging`,
+  seven nights without a failure since its last change; they ran
+  2026-10-21 to 2026-10-29 clean.
+- error_reporting: now **beta**, on the same rule. No call changes. Its
+  nightly fuzz job, `error_reporting`, ran 2026-10-21 to 2026-10-29
+  without a failure.
+- monitoring: now **beta**, on the same rule, alert policies' enable and
+  disable and the snooze writes (0.52.0) with it. No call changes.
+  `slow-monitoring` failed on 2026-10-21 and 2026-10-22 in a property's
+  own clock, fixed that day, so its week counts from 2026-10-23: both
+  jobs, `monitoring` and `slow-monitoring`, ran 2026-10-23 to
+  2026-10-29 without a failure.
+- kms: now **beta**, on the same rule. No call changes. Its two jobs,
+  `kms` and `slow-kms`, ran 2026-10-21 to 2026-10-29 without a
+  failure, from the first nightly after its last change.
+- scheduler: now **beta**, on the same rule, run now, pause and resume
+  (0.51.0) with it. No call changes. Its two jobs, `scheduler` and
+  `slow-scheduler`, ran 2026-10-21 to 2026-10-29 without a failure,
+  from the first nightly after the writes landed.
+- auth, bigquery, core, dataflow, datatransfer, firestore, pubsub,
+  resource_manager, run, secret_manager and storage: unchanged.
+  resource_manager and run stay experimental for now: their IAM reads,
+  and run's deploy settings, landed on 2026-10-23, so their seven
+  nights end with 2026-10-30's.
+
 ## 0.60.0 (2026-10-29)
 
 - The repository is now `kmoneil/gcp.zig`, renamed from

@@ -6,8 +6,6 @@
 //! destroyed, restored and deleted, the primary version and automatic
 //! rotation. There is no emulator and no unauthenticated mode: every
 //! client needs a `TokenProvider`, which the `auth` module supplies.
-//! **Experimental**: new in 0.45.0, and free to change between minor
-//! versions until it has been used for a while.
 
 const core = @import("core");
 
@@ -69,7 +67,7 @@ pub const limits = @import("validate.zig");
 pub const transport = core.transport;
 
 /// What a test of code that uses keys can stand on, with no emulator and
-/// no network. **Experimental**, as the module is.
+/// no network.
 pub const testing = struct {
     /// Cloud KMS in memory, behind `Client.Options.transport`: key rings,
     /// keys and versions with the state machine production documents,
