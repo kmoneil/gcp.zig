@@ -49,7 +49,7 @@ const Fixture = struct {
             .project_id = f.project,
             .token_provider = f.token.provider(),
             .diagnostics = &f.diag,
-            .user_agent = "zig-gcp-logging-gcp-integration/0.1",
+            .user_agent = "gcp-zig-logging-gcp-integration/0.1",
         });
         return true;
     }

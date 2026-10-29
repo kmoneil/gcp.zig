@@ -66,7 +66,7 @@ const Fixture = struct {
             .location = if (regional) location else null,
             .token_provider = f.token.provider(),
             .diagnostics = &f.diag,
-            .user_agent = "zig-gcp-secret-manager-integration/0.1",
+            .user_agent = "gcp-zig-secret-manager-integration/0.1",
         });
         return true;
     }

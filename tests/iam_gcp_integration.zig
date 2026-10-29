@@ -115,7 +115,7 @@ test "iam reads: a project's, a Cloud Run service's and job's, and an object's p
 
     // --- The project -----------------------------------------------------
     {
-        var rm = try resource_manager.Client.init(gpa, testing.io, .{ .token_provider = token.provider(), .diagnostics = &diag, .user_agent = "zig-gcp-iam-gcp-integration/0.1" });
+        var rm = try resource_manager.Client.init(gpa, testing.io, .{ .token_provider = token.provider(), .diagnostics = &diag, .user_agent = "gcp-zig-iam-gcp-integration/0.1" });
         defer rm.deinit();
         var info = try rm.getProject(project);
         defer info.deinit();
@@ -163,7 +163,7 @@ test "iam reads: a project's, a Cloud Run service's and job's, and an object's p
 
     // --- Cloud Run -------------------------------------------------------
     {
-        var client = try run_mod.Client.init(gpa, testing.io, .{ .project_id = project, .token_provider = token.provider(), .scope = .cloud_platform, .diagnostics = &diag, .user_agent = "zig-gcp-iam-gcp-integration/0.1" });
+        var client = try run_mod.Client.init(gpa, testing.io, .{ .project_id = project, .token_provider = token.provider(), .scope = .cloud_platform, .diagnostics = &diag, .user_agent = "gcp-zig-iam-gcp-integration/0.1" });
         defer client.deinit();
         const svc = try a.print("zigps-{s}", .{run});
         const job = try a.print("zigps-{s}-job", .{run});
@@ -251,7 +251,7 @@ test "iam reads: a project's, a Cloud Run service's and job's, and an object's p
 
     // --- Cloud Storage ---------------------------------------------------
     {
-        var gcs = try storage.Client.init(gpa, testing.io, .{ .project_id = project, .token_provider = token.provider(), .scope = .cloud_platform, .diagnostics = &diag, .user_agent = "zig-gcp-iam-gcp-integration/0.1" });
+        var gcs = try storage.Client.init(gpa, testing.io, .{ .project_id = project, .token_provider = token.provider(), .scope = .cloud_platform, .diagnostics = &diag, .user_agent = "gcp-zig-iam-gcp-integration/0.1" });
         defer gcs.deinit();
         const fine_name = try a.print("zigps-{s}-fine", .{run});
         const uniform_name = try a.print("zigps-{s}-uniform", .{run});

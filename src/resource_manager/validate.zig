@@ -89,7 +89,7 @@ test "queryProblem: each refusal, and a tab is a separator" {
 }
 
 test "isUserAgent" {
-    try testing.expect(isUserAgent("zig-gcp-resource_manager/0.40"));
+    try testing.expect(isUserAgent("gcp-zig-resource_manager/0.40"));
     try testing.expect(!isUserAgent(""));
     try testing.expect(!isUserAgent("a\r\nb"));
     try testing.expect(!isUserAgent("é"));

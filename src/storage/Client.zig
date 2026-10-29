@@ -128,7 +128,7 @@ pub const Options = struct {
     /// charge for quota, as a user's own credentials do.
     send_quota_project: bool = true,
     /// Printable ASCII.
-    user_agent: []const u8 = "zig-gcp-storage/0.59",
+    user_agent: []const u8 = "gcp-zig-storage/0.59",
     /// Filled with details of every failed call; cleared by each new call.
     diagnostics: ?*Diagnostics = null,
     /// Sends requests through this instead of `std.http.Client`. Useful for
@@ -591,7 +591,7 @@ test "sibling: the same settings, a connection of its own, and diagnostics of it
         .token_provider = token.provider(),
         .retry = .{ .max_attempts = 7 },
         .request_timeout_ms = 1234,
-        .user_agent = "zig-gcp-test/1",
+        .user_agent = "gcp-zig-test/1",
         .diagnostics = &diag,
     });
     defer client.deinit();
@@ -606,7 +606,7 @@ test "sibling: the same settings, a connection of its own, and diagnostics of it
     try testing.expect(s.base_url.ptr != client.base_url.ptr);
     try testing.expectEqualStrings(client.base_url, s.base_url);
     try testing.expectEqualStrings("extractctl", s.project_id.?);
-    try testing.expectEqualStrings("zig-gcp-test/1", s.user_agent);
+    try testing.expectEqualStrings("gcp-zig-test/1", s.user_agent);
     try testing.expectEqual(7, s.retry.max_attempts);
     try testing.expectEqual(1234, s.request_timeout_ms);
     try testing.expectEqual(client.token_provider.?.ptr, s.token_provider.?.ptr);

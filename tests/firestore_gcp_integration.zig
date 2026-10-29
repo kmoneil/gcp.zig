@@ -54,7 +54,7 @@ const Fixture = struct {
             .database_id = database,
             .token_provider = f.token.provider(),
             .diagnostics = &f.diag,
-            .user_agent = "zig-gcp-firestore-gcp-integration/0.1",
+            .user_agent = "gcp-zig-firestore-gcp-integration/0.1",
         });
         return true;
     }

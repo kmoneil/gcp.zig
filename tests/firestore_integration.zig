@@ -102,7 +102,7 @@ const Fixture = struct {
             .database_id = f.database,
             .endpoint = f.emulator,
             .token_provider = if (f.emulator == null) f.token.provider() else null,
-            .user_agent = "zig-gcp-firestore-integration/0.1",
+            .user_agent = "gcp-zig-firestore-integration/0.1",
         };
     }
 

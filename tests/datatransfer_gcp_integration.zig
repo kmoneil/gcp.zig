@@ -305,7 +305,7 @@ test "datatransfer: scheduled queries listed, read, run now and followed to thei
     const run_id = try std.fmt.allocPrint(a, "{x}", .{bytes});
     const dataset = try std.fmt.allocPrint(a, "zigps_dt_{s}", .{run_id});
 
-    var http: core.transport.HttpTransport = .init(gpa, testing.io, "zig-gcp-datatransfer-gcp-integration/0.1");
+    var http: core.transport.HttpTransport = .init(gpa, testing.io, "gcp-zig-datatransfer-gcp-integration/0.1");
     defer http.deinit();
     const tp = http.transport();
     sweep(tp, token.token, a, project, &.{}, null);

@@ -118,7 +118,7 @@ test "isPageToken and isUserAgent" {
     try testing.expect(!isPageToken(""));
     try testing.expect(!isPageToken("a b"));
     try testing.expect(!isPageToken("é"));
-    try testing.expect(isUserAgent("zig-gcp-error_reporting/0.42"));
+    try testing.expect(isUserAgent("gcp-zig-error_reporting/0.42"));
     try testing.expect(!isUserAgent(""));
     try testing.expect(!isUserAgent("a\r\nb"));
 }
