@@ -1290,6 +1290,8 @@ const FakeSubscription = struct {
     modacks: std.ArrayList(Modack) = .empty,
     /// The maxMessages of each pull request, in order.
     pull_wants: std.ArrayList(u32) = .empty,
+    /// Pull requests being answered or held right now.
+    open_pulls: usize = 0,
     ack_calls: usize = 0,
     next_id: usize = 0,
     ack_deadline_s: u32 = 10,
@@ -1621,6 +1623,8 @@ const FakeSubscription = struct {
             return .{ .status = 200, .body = "{\"receivedMessages\":[]}" };
         }
         if (f.push_subscription) return push_reply;
+        f.open_pulls += 1;
+        defer f.open_pulls -= 1;
         // A held pull, as the real server does when there is nothing yet.
         while (f.pending.items.len == 0) {
             if (f.detached) return detached_reply;
@@ -2075,6 +2079,45 @@ const Harness = struct {
         h.subscriber.deinit();
         h.handler.deinit();
         h.fake.deinit();
+    }
+
+    /// Unless canceled within `limit_ms`, prints where the subscriber, its
+    /// server and its handler stand and panics, so that a run that never
+    /// returns fails with its state and, under the fuzzer, its input
+    /// saved, rather than holding the job until its timeout.
+    fn watchdog(h: *Harness, limit_ms: i64) std.Io.Cancelable!void {
+        try testing.io.sleep(.fromMilliseconds(limit_ms), .awake);
+        h.dump();
+        @panic("the subscriber did not stop within the test's limit");
+    }
+
+    /// Each part's state, read only where its lock is free: a part stuck
+    /// holding its lock is reported as such instead of stopping the dump.
+    fn dump(h: *Harness) void {
+        const s = &h.subscriber;
+        if (s.mutex.tryLock()) {
+            defer s.mutex.unlock(s.io);
+            std.debug.print("subscriber: stopping {} halted {} fatal {s}, {d} in flight, {d} to ack, {d} to release, {any}\n", .{
+                s.stopping,           s.halted,           if (s.fatal) |e| @errorName(e) else "none",
+                s.inflight.items.len, s.to_ack.items.len, s.to_nack.items.len,
+                s.counts,
+            });
+            for (s.waiters, 0..) |w, i| std.debug.print("  waiter {d}: waiting {} outcome {s}\n", .{
+                i, w.waiting, if (w.outcome) |o| @tagName(o) else "none",
+            });
+        } else std.debug.print("subscriber: its mutex is held\n", .{});
+        const f = &h.fake;
+        if (f.mutex.tryLock()) {
+            defer f.mutex.unlock(f.io);
+            std.debug.print("server: {d} pending, {d} leased, {d} open pulls, {d} held acks, {d} ack calls, {d} pulls\n", .{
+                f.pending.items.len, f.leased.count(), f.open_pulls, f.held_acks, f.ack_calls, f.pull_wants.items.len,
+            });
+        } else std.debug.print("server: its mutex is held\n", .{});
+        const t = &h.handler;
+        if (t.mutex.tryLock()) {
+            defer t.mutex.unlock(t.io);
+            std.debug.print("handler: {d} seen, {d} active\n", .{ t.seen.items.len, t.active });
+        } else std.debug.print("handler: its mutex is held\n", .{});
     }
 };
 
@@ -2898,6 +2941,11 @@ fn chaosProperty(_: void, input: []const u8) !void {
     }
 
     // Whatever the mix, every message is handled and the loop stops clean.
+    // A run takes well under a second. One the 2026-10-28 nightly met
+    // never ended and held its job until the timeout, with nothing to say
+    // where; this one says, and fails.
+    var watchdog = try testing.io.concurrent(Harness.watchdog, .{ &h, 60_000 });
+    defer watchdog.cancel(testing.io) catch {};
     if (with_results) {
         try h.subscriber.runDeliveries(h.handler.deliveryHandler());
     } else {
