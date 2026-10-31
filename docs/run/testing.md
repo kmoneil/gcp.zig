@@ -7,8 +7,7 @@
 revisions, jobs and executions, and of code that runs a job, cancels an
 execution or sends a service's traffic to one revision: a console's
 tests, say, with no network and no project. It answers the module's
-calls as production answered them when measured (experimental, as the
-module is; its jobs, executions and writes carry their own marker).
+calls as production answered them when measured.
 
 What production holds is the test's to put in: `putLocation`,
 `putService`, `putRevision`, `putJob` and `putExecution` stand in for
