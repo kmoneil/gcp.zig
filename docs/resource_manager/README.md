@@ -6,7 +6,7 @@ A client for the projects a credential can see, from Cloud Resource
 Manager's v3 REST API: every project in one list, for a project switcher
 to cache and filter as a person types; one project read as it is now;
 and display text for the folders and organizations above them. It
-changes nothing. **Experimental**: new in 0.40.0.
+changes nothing.
 
 ```zig
 const std = @import("std");
@@ -53,7 +53,7 @@ everything the credential can see.
 | --- | --- |
 | [Listing projects](projects.md) | The walk a switcher wants, matching letters locally, searching page by page, the query language as production read it, a project read as it is now, projects pending deletion, and where a project sits |
 | [The project charged](quota-project.md) | Which project each call is charged to and checked for the API, why none is named by default, and the two refusals that name it |
-| [Testing](testing.md) | An in-memory Resource Manager for your own tests, with production's answers (experimental) |
+| [Testing](testing.md) | An in-memory Resource Manager for your own tests, with production's answers |
 
 ## The calls
 

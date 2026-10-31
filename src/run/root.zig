@@ -8,11 +8,6 @@
 //! service's or a job's IAM policy and test the caller's permissions.
 //! Nothing here deploys, creates or deletes anything.
 //!
-//! **Experimental**: new in 0.48.0, and free to change between minor
-//! versions until it has been used in anger. Jobs, executions,
-//! operations and the writes are new in 0.54.0 and carry their own
-//! marker.
-//!
 //! Services live in a location, so a reader lists `listLocations` once
 //! (v1's list on the same host: v2 has none) and asks per location, or
 //! gives `-` for every region at once, which production answers with
@@ -78,8 +73,6 @@ pub const ServicePage = @import("types.zig").ServicePage;
 pub const RevisionPage = @import("types.zig").RevisionPage;
 pub const Location = @import("types.zig").Location;
 pub const LocationPage = @import("types.zig").LocationPage;
-/// Jobs, executions and operations: **Experimental** on their own, new
-/// in 0.54.0.
 pub const ExecutionStatus = @import("types.zig").ExecutionStatus;
 pub const ExecutionReference = @import("types.zig").ExecutionReference;
 pub const Job = @import("types.zig").Job;
@@ -100,7 +93,7 @@ pub const limits = @import("validate.zig");
 pub const transport = core.transport;
 
 /// What a test of code that reads services and revisions can stand on,
-/// with no network. **Experimental**, as the module is.
+/// with no network.
 pub const testing = struct {
     /// Cloud Run in memory, behind `Client.Options.transport`: locations,
     /// services and revisions a test puts in, read back as production

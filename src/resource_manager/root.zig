@@ -63,8 +63,7 @@ pub const limits = @import("validate.zig");
 pub const transport = core.transport;
 
 /// What a test of code that lists projects can stand on, with no emulator
-/// and no network. **Experimental**: new in 0.40.0, and free to change
-/// between minor versions until it has been used for a while.
+/// and no network.
 pub const testing = struct {
     /// Cloud Resource Manager in memory, behind `Client.Options.transport`:
     /// projects, folders and callers a test adds, searched, paged and read

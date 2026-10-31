@@ -8,8 +8,7 @@ revisions behind them, with their conditions, for a health view's
 it runs, with their executions; and three writes a console confirms
 before sending: run a job, cancel an execution, send all of a service's
 traffic to one revision. Nothing here deploys, creates or deletes
-anything. **Experimental**: new in 0.48.0; jobs, executions,
-operations and the writes are new in 0.54.0 and carry their own marker.
+anything.
 
 ```zig
 const std = @import("std");
@@ -129,8 +128,6 @@ Measured on 2026-10-23, with services and a job deployed for it:
 
 ## Jobs and executions
 
-**Experimental** on their own, new in 0.54.0.
-
 A `Job` carries its `latest_created_execution` (name, times and a
 `status`), its `terminal_condition`, `execution_count`, and what each
 execution runs: `task_count`, `parallelism`, `task_timeout_s`,
@@ -175,8 +172,6 @@ What production showed, on 2026-10-21 with Google's sample job image:
   the full name.
 
 ## Writes
-
-**Experimental** on their own, new in 0.54.0.
 
 | Call | Sends | Answers |
 | --- | --- | --- |

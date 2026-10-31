@@ -5,9 +5,7 @@
 Resource Manager has no emulator.
 `resource_manager.testing.FakeResourceManager` is one in memory for your
 own tests: it goes where a client's transport goes, and answers as
-production answered when measured on 2026-10-17. **Experimental**: new in
-0.40.0, and free to change between minor versions until it has been
-used for a while.
+production answered when measured on 2026-10-17.
 
 <!-- snippet: tests/docs_examples.zig#rm-fake -->
 ```zig

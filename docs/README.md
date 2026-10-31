@@ -81,10 +81,10 @@ Google, not only what Google documents, and where the emulators differ.
 
 | Guide | What's in it |
 | --- | --- |
-| [Overview](resource_manager/README.md) | A first program, the calls, and what production showed when measured (experimental) |
+| [Overview](resource_manager/README.md) | A first program, the calls, and what production showed when measured |
 | [Listing projects](resource_manager/projects.md) | The list a project switcher caches, matching letters locally, searching page by page, the query language as production read it, a project as it is now, and where each sits |
 | [The project charged](resource_manager/quota-project.md) | Which project each call is charged to, why none is named by default, and the refusals that name it |
-| [Testing](resource_manager/testing.md) | An in-memory Resource Manager for your own tests, with production's answers (experimental) |
+| [Testing](resource_manager/testing.md) | An in-memory Resource Manager for your own tests, with production's answers |
 
 ## 🚨 Error Reporting
 
@@ -127,8 +127,8 @@ Google, not only what Google documents, and where the emulators differ.
 
 | Guide | What's in it |
 | --- | --- |
-| [Overview](run/README.md) | The services and revisions a project runs: conditions, traffic, `ready()`, deploy markers; jobs and executions with `Execution.status()`; run a job, cancel an execution and send all traffic to one revision with the exact request first; and what production showed when measured (experimental) |
-| [Testing](run/testing.md) | An in-memory Cloud Run for your own tests: reads, runs, cancels and traffic changes held to production's answers (experimental) |
+| [Overview](run/README.md) | The services and revisions a project runs: conditions, traffic, `ready()`, deploy markers; jobs and executions with `Execution.status()`; run a job, cancel an execution and send all traffic to one revision with the exact request first; and what production showed when measured |
+| [Testing](run/testing.md) | An in-memory Cloud Run for your own tests: reads, runs, cancels and traffic changes held to production's answers |
 
 ## 🌊 Dataflow
 

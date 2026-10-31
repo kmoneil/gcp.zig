@@ -4,6 +4,28 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.62.0 (unreleased)
+
+- resource_manager: now **beta**, as every module but `bigquery`,
+  `dataflow` and `datatransfer` is. No call changes. It earned the
+  label on the rule firestore's promotion set: the module's work
+  merged, and its own nightly fuzz jobs seven nights without a failure
+  since its last change. That change, the project IAM reads (0.57.0),
+  landed on 2026-10-23 after that night's run, so its week counts from
+  2026-10-24: both jobs, `resource_manager` and
+  `slow-resource_manager`, ran 2026-10-24 to 2026-10-30 without a
+  failure.
+- run: now **beta**, on the same rule, jobs, executions, operations and
+  the writes (0.54.0) with it. No call changes. Its last changes, the
+  IAM reads (0.57.0) and what a deploy set (0.58.0), landed on
+  2026-10-23 after that night's run, so its week counts from
+  2026-10-24: both jobs, `run` and `slow-run`, ran 2026-10-24 to
+  2026-10-30 without a failure.
+- auth, bigquery, core, dataflow, datatransfer, error_reporting,
+  firestore, kms, logging, monitoring, pubsub, scheduler,
+  secret_manager and storage: unchanged. bigquery, dataflow and
+  datatransfer stay experimental.
+
 ## 0.61.0 (2026-10-29)
 
 - logging: now **beta**, as `pubsub`, `firestore`, `storage`,

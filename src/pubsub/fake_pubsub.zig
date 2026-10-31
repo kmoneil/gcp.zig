@@ -6,8 +6,8 @@
 //! from what production did, not from this library's encoder: it parses
 //! request JSON and masks with code of its own, so a body or a mask the
 //! encoder gets wrong is refused or misapplied here as production would.
-//! Exported as `pubsub.testing.FakePubSub`, experimental, for a caller's
-//! own tests: `docs/pubsub/testing.md`.
+//! Exported as `pubsub.testing.FakePubSub`, for a caller's own tests:
+//! `docs/pubsub/testing.md`.
 //!
 //! What it models:
 //!
