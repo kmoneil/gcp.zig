@@ -91,7 +91,7 @@ pub const Options = struct {
     /// charge for quota, as a user's own credentials do.
     send_quota_project: bool = true,
     /// Printable ASCII.
-    user_agent: []const u8 = "gcp-zig-logging/0.61",
+    user_agent: []const u8 = "gcp-zig-logging/0.62",
     /// Filled with details of every failed call; cleared by each new call.
     diagnostics: ?*Diagnostics = null,
     /// Sends requests through this instead of `std.http.Client`. Useful for

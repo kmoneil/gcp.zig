@@ -84,7 +84,7 @@ Zig **0.17.0** (`minimum_zig_version` enforces it). For Zig 0.16.0, use
 v0.30.0, the last release that builds with it.
 
 ```sh
-zig fetch --save git+https://github.com/kmoneil/gcp.zig#v0.61.0
+zig fetch --save git+https://github.com/kmoneil/gcp.zig#v0.62.0
 ```
 
 ```zig

@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.62.0 (unreleased)
+## 0.62.0 (2026-10-31)
 
 - resource_manager: now **beta**, as every module but `bigquery`,
   `dataflow` and `datatransfer` is. No call changes. It earned the

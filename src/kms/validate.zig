@@ -173,7 +173,7 @@ test "ids, locations, tokens and user agents at their boundaries" {
     for ([_][]const u8{ "", "US", "us central1", "us/central1", repeat("a", 64) }) |bad| try testing.expect(!isLocation(bad));
     try testing.expect(isPageToken("CgRrZXkx"));
     try testing.expect(!isPageToken("a b"));
-    try testing.expect(isUserAgent("gcp-zig-kms/0.61"));
+    try testing.expect(isUserAgent("gcp-zig-kms/0.62"));
     try testing.expect(!isUserAgent("a\nb"));
 }
 
