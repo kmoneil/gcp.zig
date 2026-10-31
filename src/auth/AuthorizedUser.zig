@@ -62,7 +62,7 @@ pub const Options = struct {
     /// removes the limit.
     request_timeout_ms: u32 = 30_000,
     /// Printable ASCII.
-    user_agent: []const u8 = "gcp-zig-auth/0.61",
+    user_agent: []const u8 = "gcp-zig-auth/0.62",
     /// Filled with the details of the last failure, while reading the file
     /// or from the token endpoint. Never holds a secret.
     diagnostics: ?*Diagnostics = null,
