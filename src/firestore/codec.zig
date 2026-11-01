@@ -527,7 +527,7 @@ pub fn decodeAggregation(arena: Allocator, body: []const u8, count: usize, strea
         const fields = objectOf(present(result, "aggregateFields") orelse return error.InvalidResponse) orelse return error.InvalidResponse;
         const out = try arena.alloc(Value, count);
         for (out, 0..) |*v, i| {
-            var buf: [8]u8 = undefined;
+            var buf: [@import("query.zig").alias_len]u8 = undefined;
             v.* = try valueFrom(arena, fields.get(@import("query.zig").alias(&buf, i)) orelse return error.InvalidResponse, 0);
         }
         values = out;

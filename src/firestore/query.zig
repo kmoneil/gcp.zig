@@ -308,15 +308,20 @@ fn writeBody(jw: *Stringify, query: types.Query, aggregations: ?[]const types.Ag
     try jw.endObject();
 }
 
+/// Room for any aggregation's alias: "a" and the 20 digits of the largest
+/// usize. max_aggregations keeps the index to one digit, but `alias` takes
+/// any usize, and a buffer sized for the check alone would panic past it.
+pub const alias_len = 21;
+
 /// The alias of the `i`th aggregation: the answer is matched by it.
-pub fn alias(buf: *[8]u8, i: usize) []const u8 {
+pub fn alias(buf: *[alias_len]u8, i: usize) []const u8 {
     return std.fmt.bufPrint(buf, "a{d}", .{i}) catch unreachable;
 }
 
 fn writeAggregation(jw: *Stringify, agg: types.Aggregation, i: usize) Stringify.Error!void {
     try jw.beginObject();
     try jw.objectField("alias");
-    var buf: [8]u8 = undefined;
+    var buf: [alias_len]u8 = undefined;
     try jw.write(alias(&buf, i));
     switch (agg) {
         .count => |c| {
@@ -750,6 +755,12 @@ test "golden: aggregations, under aliases of the library's own, answered in orde
     try testing.expectEqual(6, r.value.values[1].integer);
     try testing.expectEqual(2.0, r.value.values[2].double);
     try testing.expectEqual(1_791_204_222_235_453_000, r.value.read_time.nanoseconds);
+}
+
+test "alias: the largest index fits its buffer" {
+    var buf: [alias_len]u8 = undefined;
+    try testing.expectEqualStrings("a0", alias(&buf, 0));
+    try testing.expectEqualStrings("a" ++ std.fmt.comptimePrint("{d}", .{std.math.maxInt(usize)}), alias(&buf, std.math.maxInt(usize)));
 }
 
 test "decode: query and aggregation answers, and the ones that are wrong" {
