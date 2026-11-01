@@ -5,8 +5,14 @@ small fix, open an issue first so the approach can be agreed on.
 
 ## Setup
 
-You need Zig 0.17.0. [docs/development.md](docs/development.md) lists
-every build step; these are the ones to know:
+You need Zig 0.17.0, and two programs on the PATH that `zig build test`
+runs: [zigvet](https://github.com/kmoneil/zigvet), which reports code
+the compiler accepts that is almost certainly wrong, and
+[gnarl](https://github.com/kmoneil/gnarl), which measures each
+function's complexity (`brew install kmoneil/tap/zigvet
+kmoneil/tap/gnarl`, or a binary from either's releases).
+[docs/development.md](docs/development.md) lists every build step; these
+are the ones to know:
 
 ```
 zig build test          # unit, property and fuzz-corpus tests
@@ -107,6 +113,17 @@ run `zig build coverage`; the report is `zig-out/coverage/index.html`.
   job's 180 minutes. A local run can be three times faster than CI, so
   it only compares properties with each other.
   `zig build test` runs both kinds alike.
+- A function over a critical complexity limit for its class fails
+  `zig build test`, unless `complexity.baseline` holds it there already and
+  it got no worse. The classes are in `complexity.zon`: hot for what runs
+  per request, message, chunk or row, cold for the build, tools, tests,
+  examples and test-only code, normal for the rest. Before committing,
+  `gnarl --diff HEAD` lists each function the change touched, its numbers
+  before and after. A new function over a limit is split rather than
+  baselined (`gnarl --explain path:line` names the lines worth lifting
+  out); a change that improves, renames or moves a baselined function
+  runs `gnarl --update-baseline .` and commits the file with it.
+- A zigvet finding is fixed in the code, not worked around.
 - User-visible changes go in `CHANGELOG.md`. Until 1.0, minor versions may
   break the API; say how in the changelog entry.
 - Follow the existing code: `zig fmt`, doc comments on public declarations,

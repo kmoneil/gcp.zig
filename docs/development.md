@@ -25,14 +25,19 @@ zig build example-publish -- orders 5
 zig build example-worker -- orders orders-worker
 zig build example-whoami               # which credentials, and the topics they see
 zig build fmt                          # zig fmt --check
+zig build lint                         # zigvet: code that compiles but is wrong
+zig build complexity                   # gnarl --check: complexity against complexity.baseline
 python3 tools/check_docs.py            # the docs' links, anchors and snippets
 python3 -I tools/discovery_drift.py OLD.json NEW.json  # what changed between two discovery documents
 ```
 
 `zig build test` also compiles every example and the suites that run
-against Google, so none of them can rot between runs. `zig build
-test-unit` runs the same tests and compiles nothing else, which is what
-CI's optimized jobs run.
+against Google, so none of them can rot between runs, and runs `lint` and
+`complexity`, so a zigvet finding or a function newly over its complexity
+limit fails it as a failing test does; both need their program on the
+PATH ([CONTRIBUTING.md](../CONTRIBUTING.md#setup)), and print nothing on a
+clean tree. `zig build test-unit` runs the same tests and compiles nothing
+else, which is what CI's optimized jobs run.
 
 ## Fuzzing
 
@@ -59,11 +64,13 @@ branches, and sees only code the compiler kept.
 
 ## Continuous integration
 
-CI runs the unit tests on Linux, macOS and Windows, and on Linux also in
-ReleaseSafe and ReleaseFast, and core's on a baseline CPU, whose build
-computes CRC-32C with tables rather than instructions; the docs check;
-the integration tests and examples against the emulators; and coverage,
-whose summary and report are attached to each run.
+CI runs the unit tests on Linux, macOS and Windows, with zigvet and
+gnarl (the releases `.github/actions/vet-tools` pins, each checked
+against its binary's digest), and on Linux also in ReleaseSafe and
+ReleaseFast, and core's on a baseline CPU, whose build computes CRC-32C
+with tables rather than instructions; the docs check; the integration
+tests and examples against the emulators; and coverage, whose summary
+and report are attached to each run.
 
 Every night it also fuzzes, one job per module, each starting from the
 corpus that earlier nights built up for it (kept for 30 days as the

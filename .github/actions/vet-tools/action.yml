@@ -1,0 +1,53 @@
+# zigvet and gnarl on the PATH, for `zig build test`, which runs both
+# (build.zig's lint and complexity steps). Each is a release pinned here,
+# its binary checked against the digest written below rather than one
+# fetched beside it, so a release asset replaced later cannot change what
+# CI runs. To move to a new release, change its version and take its four
+# digests from that release's SHA256SUMS.
+name: Install zigvet and gnarl
+description: Put the pinned zigvet and gnarl releases on the PATH, each checked against its digest
+runs:
+  using: composite
+  steps:
+    - name: Install zigvet and gnarl
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64) platform=linux-amd64 exe= ;;
+          macOS-ARM64) platform=darwin-arm64 exe= ;;
+          macOS-X64) platform=darwin-amd64 exe= ;;
+          Windows-X64) platform=windows-amd64 exe=.exe ;;
+          *) echo "::error::no zigvet or gnarl release for $RUNNER_OS $RUNNER_ARCH"; exit 1 ;;
+        esac
+        if command -v sha256sum > /dev/null; then sum=sha256sum; else sum="shasum -a 256"; fi
+        dir="$RUNNER_TEMP/vet-tools"
+        mkdir -p "$dir"
+
+        # The tool, its release, and the digest of its binary for this runner.
+        install() {
+          local name=$1 version=$2 want
+          case "$name-$platform" in
+            zigvet-linux-amd64) want=feab088680cb7cca1ad518e272ea45417b6a63dc5c444087186775ca93c46e04 ;;
+            zigvet-darwin-arm64) want=e7be3e403531739e69f9e75bf59d77338320fa0dd496603dbce900bf9b745f33 ;;
+            zigvet-darwin-amd64) want=7f9fbf74d16ed712ef4b8745883152c8034b83e597378c8629187b5443b75848 ;;
+            zigvet-windows-amd64) want=f04f59af244e89993d08f3ac2167d664b473f804d89f218567af3236fc201757 ;;
+            gnarl-linux-amd64) want=7e47113d7506176fa83bc544139654b8f900050b1c37483d5043de07ffe74db6 ;;
+            gnarl-darwin-arm64) want=a32ca2882e25154d18b3a5ffc7168beb5364d364294339ca63ff56bea784e162 ;;
+            gnarl-darwin-amd64) want=01cd21d3a0b7bd902fd93959eb3117284282049099dc6b6ccb959668f631dd4f ;;
+            gnarl-windows-amd64) want=61bd62b17562a3f956abc0516492e08d976ec0d7e5ce3d5db3cc9068b86ed3b9 ;;
+          esac
+          curl -fsSLo "$dir/$name$exe" "https://github.com/kmoneil/$name/releases/download/$version/$name-$platform$exe"
+          local got
+          got=$($sum "$dir/$name$exe" | cut -d' ' -f1)
+          if [ "$got" != "$want" ]; then
+            echo "::error::$name $version for $platform has digest $got, not the $want pinned here"
+            exit 1
+          fi
+          chmod +x "$dir/$name$exe"
+          "$dir/$name$exe" --version
+        }
+        install zigvet v0.20.0
+        install gnarl v0.3.1
+
+        if [ "$RUNNER_OS" = Windows ]; then cygpath -w "$dir"; else echo "$dir"; fi >> "$GITHUB_PATH"
