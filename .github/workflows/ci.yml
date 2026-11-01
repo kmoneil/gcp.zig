@@ -49,18 +49,10 @@ jobs:
           python3 -I tools/await_pr.py --self-test
           python3 -I tools/discovery_drift.py --self-test
 
-      # zigvet (github.com/kmoneil/zigvet): code the compiler accepts that
-      # is almost certainly wrong, such as a pointer to stack memory that
-      # leaves its function. Pinned to a release and to its binary's
-      # digest; its first run here found one in the KMS fake. Reports land
-      # on the pull request's diff as annotations, and the log says how
-      # many files were checked, so a clean run is not an empty one.
-      - name: Vet
-        run: |
-          curl -fsSLo "$RUNNER_TEMP/zigvet" https://github.com/kmoneil/zigvet/releases/download/v0.5.1/zigvet-linux-amd64
-          echo "734bf9deac0165ae1b95857180d4b1fbe423a984b9de8167ca04d2c963df1074  $RUNNER_TEMP/zigvet" | sha256sum --check --strict
-          chmod +x "$RUNNER_TEMP/zigvet"
-          "$RUNNER_TEMP/zigvet" --summary --format github src tests examples tools build.zig
+      # zigvet and gnarl, pinned releases, which `zig build test` runs: a
+      # zigvet finding, or a function newly over its complexity limit,
+      # fails the build as a failing test does.
+      - uses: ./.github/actions/vet-tools
 
       - name: Unit, property and fuzz-corpus tests
         run: zig build test --summary all
@@ -345,6 +337,8 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
+
+      - uses: ./.github/actions/vet-tools
 
       - name: Unit, property and fuzz-corpus tests
         run: zig build test --summary all
@@ -716,6 +710,8 @@ jobs:
           mkdir -p .zig-cache/f
           unzip -q -o "$RUNNER_TEMP/corpus.zip" -d .zig-cache/f
           echo "Restored artifact $id: $(find .zig-cache/f -type f | wc -l) files"
+
+      - uses: ./.github/actions/vet-tools
 
       - name: Coverage-guided fuzzing
         env:

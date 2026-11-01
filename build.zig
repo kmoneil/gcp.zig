@@ -814,8 +814,32 @@ pub fn build(b: *std.Build) void {
     b.step("bench-crc32c", "Measure CRC-32C throughput, in ReleaseFast").dependOn(&b.addRunArtifact(bench_crc32c).step);
     test_step.dependOn(&bench_crc32c.step);
 
+    // zigvet (github.com/kmoneil/zigvet): code the compiler accepts that is
+    // almost certainly wrong, such as a pointer to stack memory that leaves
+    // its function. Its first run here found one in the KMS fake. A program
+    // on the PATH, not a package; CI installs the release it pins. Quiet on
+    // a clean tree, and run every time: a command whose output is not
+    // captured has side effects, so the build never caches it.
+    const lint = b.addSystemCommand(&.{ "zigvet", "build.zig", "src", "tests", "examples", "tools" });
+    lint.setCwd(b.path("."));
+    b.step("lint", "Report code that compiles but is wrong (zigvet, from the PATH; test runs it too)").dependOn(&lint.step);
+    test_step.dependOn(&lint.step);
+
+    // gnarl (github.com/kmoneil/gnarl), also on the PATH: a function over a
+    // critical complexity limit for its class (complexity.zon: hot, normal,
+    // cold) fails the build, unless complexity.baseline holds it there
+    // already and it got no worse. A pass prints nothing; a failure names
+    // the `gnarl --explain` to run. `.` from the repository's root, where
+    // gnarl finds both files. Run every time: what gnarl reads is not among
+    // the step's inputs, so a cached pass would let a regression through.
+    const complexity = b.addSystemCommand(&.{ "gnarl", "--check", "." });
+    complexity.setCwd(b.path("."));
+    complexity.has_side_effects = true;
+    b.step("complexity", "Fail a function newly over its complexity limit, or worse than complexity.baseline (gnarl, from the PATH; test runs it too)").dependOn(&complexity.step);
+    test_step.dependOn(&complexity.step);
+
     const fmt = b.addFmt(.{
-        .paths = b.pathList(&.{ "build.zig", "build.zig.zon", "src", "tests", "examples", "tools" }),
+        .paths = b.pathList(&.{ "build.zig", "build.zig.zon", "complexity.zon", "src", "tests", "examples", "tools" }),
         .check = true,
     });
     b.step("fmt", "Check formatting (zig fmt --check)").dependOn(&fmt.step);
