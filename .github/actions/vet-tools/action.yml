@@ -38,8 +38,11 @@ runs:
             gnarl-windows-amd64) want=61bd62b17562a3f956abc0516492e08d976ec0d7e5ce3d5db3cc9068b86ed3b9 ;;
           esac
           curl -fsSLo "$dir/$name$exe" "https://github.com/kmoneil/$name/releases/download/$version/$name-$platform$exe"
+          # The file on stdin: given a path with a backslash, as Windows'
+          # $RUNNER_TEMP is, sha256sum escapes it and prefixes the digest
+          # with a backslash.
           local got
-          got=$($sum "$dir/$name$exe" | cut -d' ' -f1)
+          got=$($sum < "$dir/$name$exe" | cut -d' ' -f1)
           if [ "$got" != "$want" ]; then
             echo "::error::$name $version for $platform has digest $got, not the $want pinned here"
             exit 1
