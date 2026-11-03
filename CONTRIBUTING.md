@@ -10,7 +10,10 @@ runs: [zigvet](https://github.com/kmoneil/zigvet), which reports code
 the compiler accepts that is almost certainly wrong, and
 [gnarl](https://github.com/kmoneil/gnarl), which measures each
 function's complexity (`brew install kmoneil/tap/zigvet
-kmoneil/tap/gnarl`, or a binary from either's releases).
+kmoneil/tap/gnarl`, or a binary from either's releases). gnarl must be
+the release CI installs, the one `.github/actions/vet-tools/action.yml`
+pins: two releases can count the same function differently, so the
+complexity step fails, naming both, when the PATH has another.
 [docs/development.md](docs/development.md) lists every build step; these
 are the ones to know:
 
@@ -139,7 +142,10 @@ a fake Google.
   before and after. A new function over a limit is split rather than
   baselined (`gnarl --explain path:line` names the lines worth lifting
   out); a change that improves, renames or moves a baselined function
-  runs `gnarl --update-baseline .` and commits the file with it.
+  runs `gnarl --update-baseline .` and commits the file with it. Moving to
+  a new gnarl is one change: its version and digests in
+  `.github/actions/vet-tools/action.yml`, and `gnarl --update-baseline .`
+  run with the new release.
 - A zigvet finding is fixed in the code, not worked around.
 - User-visible changes go in `CHANGELOG.md`. Until 1.0, minor versions may
   break the API; say how in the changelog entry.
