@@ -3,7 +3,6 @@
 # above its number here; gnarl --update-baseline rewrites this file.
 # path, name, cyclomatic, cognitive, lines, nesting, params, params_weighted
 build.zig	build	49	52	564	3	1	1
-examples/bigquery_query.zig	main	21	28	57	3	1	1
 examples/dataflow_stop.zig	main	39	48	108	3	1	1
 examples/error_dashboard.zig	main	31	42	75	3	1	1
 examples/firestore.zig	main	82	135	154	4	1	1
@@ -15,12 +14,7 @@ examples/gcs_sign.zig	main	37	39	100	2	1	1
 examples/kms.zig	main	33	40	93	2	1	1
 examples/logs_read.zig	main	30	44	71	3	1	1
 examples/logs_tail.zig	main	32	47	73	3	1	1
-examples/monitoring.zig	main	24	30	82	2	1	1
-examples/monitoring_policies.zig	main	22	29	78	3	1	1
 examples/permissions.zig	main	28	46	113	4	1	1
-examples/projects_list.zig	main	25	35	61	3	1	1
-examples/pubsub_metrics.zig	main	22	31	77	3	1	1
-examples/run_actions.zig	main	30	30	59	2	1	1
 examples/run_service.zig	main	42	50	101	3	1	1
 examples/scheduler_run.zig	main	28	38	88	3	1	1
 examples/secret_rotation.zig	main	37	61	100	4	1	1
@@ -39,38 +33,28 @@ src/auth/ServiceAccount.zig	initFromJson	34	48	76	3	2	2
 src/auth/adc_file.zig	parse	25	36	59	4	2	2
 src/auth/adc_file.zig	parseSource	17	23	32	3	2	2
 src/auth/adc_file.zig	structuredProperty	33	36	75	3	2	2
-src/auth/token_response.zig	idTokenIdentity	17	13	24	1	2	2
 src/bigquery/Client.zig	init	17	27	48	3	1	1
 src/bigquery/codec.zig	jobOf	24	37	37	3	1	1
 src/bigquery/codec.zig	tableOf	26	25	40	1	1	1
 src/bigquery/fake_bigquery.zig	FakeBigQuery.listJobs	24	36	28	3	2	2
-src/bigquery/fake_bigquery.zig	FakeBigQuery.parseRequest	21	29	26	4	1	1
-src/bigquery/fake_bigquery.zig	FakeBigQuery.parseRoute	21	25	30	3	1	1
-src/bigquery/fake_bigquery.zig	FakeBigQuery.route	21	12	29	2	3	3
-src/bigquery/fake_bigquery.zig	FakeBigQuery.runQuery	24	27	33	3	2	2
 src/bigquery/fake_bigquery.zig	queriesProperty	47	104	143	5	2	2
 src/bigquery/values.zig	decimalSeconds	24	33	34	2	1	1
 src/bigquery/values.zig	genScalar	25	13	27	3	2	2
 src/bigquery/values.zig	interval	14	13	27	1	1	1
 src/bigquery/values.zig	isDecimal	21	23	19	2	2	2
 src/bigquery/values.zig	sameValue	15	19	18	3	2	2
-src/bigquery/values.zig	scalar	22	6	19	2	2	2
 src/bigquery/values.zig	valueFits	15	15	11	3	3	3
-src/bigquery/values.zig	writeText	18	10	23	3	2	2
 src/core/JsonArraySplitter.zig	gatherNested	11	19	22	4	2	2
 src/core/JsonArraySplitter.zig	scan	19	29	33	4	1	1
 src/core/JsonArraySplitter.zig	splitProperty	12	17	38	3	2	2
 src/core/duration.zig	parse	21	26	23	2	1	1
 src/core/endpoint.zig	baseUrl	18	17	22	2	2	2
-src/core/errors.zig	fromRpcCode	17	1	19	1	1	1
 src/core/iam.zig	memberProblem	14	27	16	3	2	2
-src/core/retry_after.zig	rfc850Date	13	8	10	1	1	1
 src/core/rpc.zig	Engine.execute	21	39	61	4	2	2
 src/core/rpc.zig	Engine.stream	31	62	80	5	3	3
 src/core/rpc.zig	retryPolicyProperty	13	15	45	2	2	2
 src/core/rsa.zig	PublicKey.fromSpki	27	24	28	1	1	1
 src/core/rsa.zig	parsePkcs1	19	18	28	1	1	1
-src/core/testing.zig	FaultTransport.sendStream	26	29	44	3	2	2
 src/core/timestamp.zig	parse	24	29	45	3	1	1
 src/core/transport.zig	Dechunker.stream	13	19	16	3	3	3
 src/core/transport.zig	HttpTransport.exchange	65	77	131	4	3	3
@@ -81,11 +65,9 @@ src/dataflow/fake_dataflow.zig	FakeDataflow.listMessages	51	95	64	4	2	2
 src/datatransfer/Client.zig	init	17	27	48	3	1	1
 src/datatransfer/codec.zig	configOf	17	17	30	2	1	1
 src/datatransfer/fake_datatransfer.zig	FakeDataTransfer.listRuns	23	36	33	4	2	2
-src/datatransfer/fake_datatransfer.zig	FakeDataTransfer.route	24	18	32	2	3	3
 src/datatransfer/fake_datatransfer.zig	runsProperty	41	82	128	5	2	2
 src/error_reporting/Client.zig	init	27	42	66	3	1	1
 src/error_reporting/fake_error_reporting.zig	FakeErrorReporting.groupStats	30	37	39	2	2	2
-src/error_reporting/fake_error_reporting.zig	FakeErrorReporting.serve	28	32	39	2	1	1
 src/error_reporting/fake_error_reporting.zig	statsProperty	26	49	84	4	2	2
 src/firestore/Client.zig	init	22	36	57	3	1	1
 src/firestore/Transaction.zig	run	17	25	39	3	3	3
@@ -93,20 +75,16 @@ src/firestore/batch_get.zig	batchGet	18	25	45	3	4	4
 src/firestore/codec.zig	checkStreamed	10	18	12	3	2	2
 src/firestore/codec.zig	decodeAggregation	14	22	20	2	3	3
 src/firestore/codec.zig	decodeCommit	13	26	17	4	1	1
-src/firestore/codec.zig	expectValueEqual	13	3	18	2	2	2
 src/firestore/codec.zig	randomValue	22	15	35	3	3	3
 src/firestore/codec.zig	valueFrom	38	37	49	3	2	2
-src/firestore/codec.zig	writeValue	13	3	51	2	2	2
 src/firestore/emulator_diff.zig	differential	33	93	91	5	2	2
 src/firestore/fake_firestore.zig	FakeFirestore.batchGet	28	51	46	4	2	2
 src/firestore/fake_firestore.zig	FakeFirestore.commit	26	40	47	3	2	2
 src/firestore/fake_firestore.zig	FakeFirestore.evaluate	24	38	38	3	2	2
 src/firestore/fake_firestore.zig	FakeFirestore.runAggregation	44	78	51	5	2	2
-src/firestore/fake_firestore.zig	FakeFirestore.serve	31	31	23	2	3	3
 src/firestore/fake_firestore.zig	FakeFirestore.stage	32	51	61	4	5	5
 src/firestore/fake_firestore.zig	ValueParser.value	52	71	60	2	4	4
 src/firestore/fake_firestore.zig	applyTransforms	38	158	56	8	3	3
-src/firestore/fake_firestore.zig	equivalent	25	27	24	3	2	2
 src/firestore/fake_firestore.zig	matches	37	41	36	4	2	2
 src/firestore/fake_firestore.zig	modelProperty	68	166	176	6	2	2
 src/firestore/fake_firestore.zig	parseFilter	47	72	60	3	2	2
@@ -124,11 +102,8 @@ src/kms/KeyVersion.zig	publicKey	25	40	54	3	0	0
 src/kms/KeyVersion.zig	transition	16	41	35	4	2	2
 src/kms/KeyVersion.zig	waitUntilEnabled	13	26	33	4	1	1
 src/kms/fake_kms.zig	FakeKms.createKey	34	39	51	3	3	3
-src/kms/fake_kms.zig	FakeKms.iamRoute	24	28	29	2	5	5
-src/kms/fake_kms.zig	FakeKms.route	34	30	31	3	3	3
 src/kms/fake_kms.zig	FakeKms.sign	26	45	43	4	4	4
 src/kms/fake_kms.zig	FakeKms.updateKey	22	39	42	3	3	3
-src/kms/fake_kms.zig	parseTarget	32	35	42	2	1	1
 src/kms/fake_kms.zig	test "integrity faults: each check catches its fault, once tried again and past the attempts refused"	22	59	67	4	0	0
 src/kms/property.zig	encryptStep	20	27	34	3	6	6
 src/kms/property.zig	property	65	133	117	5	2	2
@@ -142,11 +117,8 @@ src/logging/Tail.zig	tailProperty	20	27	53	2	2	2
 src/logging/codec.zig	decodeEntry	34	27	63	3	2	2
 src/logging/codec.zig	httpRequest	18	17	18	1	1	1
 src/logging/fake_filter.zig	Parser.advance	39	63	64	5	0	0
-src/logging/fake_filter.zig	compare	22	14	26	3	2	2
-src/logging/fake_filter.zig	joinProperty	22	20	60	1	2	2
 src/logging/fake_logging.zig	FakeLogging.config	27	40	39	3	2	2
 src/logging/fake_logging.zig	FakeLogging.list	51	73	77	4	1	1
-src/logging/production_bodies.zig	sameValue	23	26	19	3	2	2
 src/monitoring/Client.zig	createSnoozeCall	17	24	27	3	1	1
 src/monitoring/Client.zig	endSnooze	15	38	33	4	2	2
 src/monitoring/Client.zig	init	17	27	48	3	1	1
@@ -166,20 +138,14 @@ src/monitoring/codec.zig	decodeSummary	20	28	27	4	1	1
 src/monitoring/codec.zig	policyOf	23	28	36	3	1	1
 src/monitoring/fake_monitoring.zig	FakeMonitoring.createDescriptor	31	42	37	3	1	1
 src/monitoring/fake_monitoring.zig	FakeMonitoring.judge	42	55	50	3	3	3
-src/monitoring/fake_monitoring.zig	FakeMonitoring.parseSeries	25	26	43	2	1	1
 src/monitoring/fake_monitoring.zig	FakeMonitoring.puttable	49	119	49	5	1	1
 src/monitoring/fake_monitoring.zig	FakeMonitoring.read	64	105	81	4	1	1
 src/monitoring/fake_monitoring.zig	FakeMonitoring.reduce	21	54	46	5	3	3
-src/monitoring/fake_monitoring.zig	FakeMonitoring.route	31	35	51	3	3	3
 src/monitoring/fake_monitoring.zig	FakeMonitoring.write	38	75	44	4	1	1
 src/monitoring/fake_monitoring.zig	distributionOf	33	43	33	2	1	1
 src/monitoring/fake_monitoring.zig	parseFilter	24	50	35	3	1	1
-src/monitoring/fake_monitoring.zig	writeRead	21	33	72	4	5	5
-src/monitoring/fake_policies.zig	Store.createSnooze	24	32	50	5	2	2
 src/monitoring/fake_policies.zig	Store.patchSnooze	30	46	47	4	4	4
-src/monitoring/fake_policies.zig	holds	23	19	29	3	2	2
 src/monitoring/fake_policies.zig	snoozesProperty	27	61	84	5	2	2
-src/monitoring/fake_policies.zig	writeCondition	30	30	71	3	2	2
 src/monitoring/rpc.zig	write	12	37	32	6	5	5
 src/monitoring/validate.zig	distributionProblem	30	44	25	3	1	1
 src/monitoring/validate.zig	modelMetricType	24	30	17	3	1	1
@@ -208,7 +174,6 @@ src/pubsub/Subscription.zig	ackOutcomesProperty	51	115	127	6	2	2
 src/pubsub/Subscription.zig	sendAckIds	16	26	42	3	3	3
 src/pubsub/Subscription.zig	sendChunk	23	73	66	6	5	5
 src/pubsub/codec.zig	SubscriptionUpdateBody.write	19	14	59	2	1	1
-src/pubsub/codec.zig	TopicUpdateBody.write	18	7	50	1	1	1
 src/pubsub/codec.zig	decodePull	13	13	17	2	1	1
 src/pubsub/codec.zig	deliveryFromWire	27	33	40	3	1	1
 src/pubsub/codec.zig	genDelivery	12	17	30	2	1	1
@@ -218,17 +183,12 @@ src/pubsub/codec.zig	subscriptionFromWire	19	21	31	2	1	1
 src/pubsub/codec.zig	updateMaskProperty	28	21	95	2	2	2
 src/pubsub/emulator_diff.zig	differential	34	65	77	5	3	3
 src/pubsub/emulator_diff.zig	run	49	63	99	4	3	3
-src/pubsub/fake_filter.zig	Made.term	21	27	62	4	2	2
 src/pubsub/fake_filter.zig	Parser.check	34	42	46	4	1	1
-src/pubsub/fake_filter.zig	Parser.lex	24	31	40	4	0	0
 src/pubsub/fake_pubsub.zig	FakePubSub.createSnapshot	25	36	50	3	2	2
 src/pubsub/fake_pubsub.zig	FakePubSub.createSubscription	68	103	103	4	2	2
 src/pubsub/fake_pubsub.zig	FakePubSub.createTopic	29	45	45	3	2	2
 src/pubsub/fake_pubsub.zig	FakePubSub.deliver	31	53	44	2	3	3
 src/pubsub/fake_pubsub.zig	FakePubSub.dispatch	81	108	62	4	3	3
-src/pubsub/fake_pubsub.zig	FakePubSub.listRevisions	21	24	35	2	1	1
-src/pubsub/fake_pubsub.zig	FakePubSub.listSchemas	21	27	31	3	1	1
-src/pubsub/fake_pubsub.zig	FakePubSub.listTopicSubscriptions	21	28	28	3	1	1
 src/pubsub/fake_pubsub.zig	FakePubSub.publish	53	96	87	4	2	2
 src/pubsub/fake_pubsub.zig	FakePubSub.schemaSettingsOf	30	47	42	3	3	3
 src/pubsub/fake_pubsub.zig	FakePubSub.seek	32	54	48	3	2	2
@@ -244,7 +204,6 @@ src/pubsub/fake_pubsub.zig	modelRun	57	135	176	6	1	1
 src/pubsub/fake_pubsub.zig	pushOf	31	67	47	4	1	1
 src/pubsub/fake_pubsub.zig	test "ordering keys: a key gives what it has waiting together and in order, and no more until that is acknowledged or comes back"	21	46	194	4	0	0
 src/pubsub/fake_pubsub.zig	transformsOf	28	77	50	5	1	1
-src/pubsub/fake_pubsub.zig	writeSubscription	23	20	104	2	3	3
 src/pubsub/fake_pubsub.zig	writeTopic	27	49	89	4	3	3
 src/pubsub/production_replay.zig	Replay.act	39	53	52	4	2	2
 src/pubsub/production_replay.zig	Replay.pull	29	75	54	5	3	3
@@ -258,7 +217,6 @@ src/pubsub/validate.zig	subscriptionUpdate	26	18	27	2	3	3
 src/pubsub/validate.zig	tagFormProperty	18	16	27	2	2	2
 src/resource_manager/Client.zig	init	20	30	48	3	1	1
 src/resource_manager/codec.zig	roundTripProperty	21	40	80	4	2	2
-src/resource_manager/fake_query.zig	genQuery	21	24	39	3	4	4
 src/resource_manager/fake_query.zig	lexTerm	49	64	58	3	2	2
 src/resource_manager/fake_resource_manager.zig	FakeResourceManager.search	40	44	55	2	3	3
 src/resource_manager/fake_resource_manager.zig	iamProperty	41	125	87	6	2	2
@@ -270,12 +228,9 @@ src/run/Client.zig	init	17	27	48	3	1	1
 src/run/codec.zig	serviceOf	17	17	35	2	1	1
 src/run/codec.zig	volumeSource	20	25	30	3	1	1
 src/run/fake_run.zig	FakeRun.changeTraffic	33	53	59	4	3	3
-src/run/fake_run.zig	FakeRun.listServices	23	27	28	3	2	2
 src/run/fake_run.zig	FakeRun.parseRoute	31	42	37	3	1	1
 src/run/fake_run.zig	FakeRun.route	51	55	70	2	3	3
 src/run/fake_run.zig	FakeRun.writeContainers	29	75	99	5	2	2
-src/run/fake_run.zig	FakeRun.writeJob	21	24	75	3	2	2
-src/run/fake_run.zig	FakeRun.writeOperation	21	25	48	3	4	4
 src/run/fake_run.zig	FakeRun.writeServiceObject	36	48	99	3	3	3
 src/run/fake_run.zig	FakeRun.writeVolumes	20	44	77	5	2	2
 src/run/fake_run.zig	iamProperty	40	143	82	6	2	2
@@ -284,22 +239,16 @@ src/run/fake_run.zig	writesProperty	40	91	119	5	2	2
 src/run/types.zig	decimalTimes	16	19	15	2	2	2
 src/scheduler/Client.zig	init	17	27	47	3	1	1
 src/scheduler/codec.zig	jobOf	30	35	59	2	1	1
-src/scheduler/fake_scheduler.zig	FakeScheduler.listLocations	23	34	31	3	1	1
 src/scheduler/fake_scheduler.zig	FakeScheduler.writeJob	42	54	128	4	2	2
 src/scheduler/fake_scheduler.zig	writesProperty	24	38	85	4	2	2
 src/secret_manager/Client.zig	init	16	26	48	3	1	1
-src/secret_manager/codec.zig	writeUpdate	22	14	35	2	3	3
 src/secret_manager/events.zig	decodeEvent	33	39	78	3	2	3
 src/secret_manager/events.zig	decodeProperty	17	19	31	3	2	2
 src/secret_manager/fake_secrets.zig	FakeSecrets.checkDraft	22	36	30	2	2	2
-src/secret_manager/fake_secrets.zig	FakeSecrets.create	32	32	52	2	2	2
 src/secret_manager/fake_secrets.zig	FakeSecrets.patch	57	101	79	4	3	3
 src/secret_manager/fake_secrets.zig	FakeSecrets.readReplication	24	42	32	3	1	1
 src/secret_manager/fake_secrets.zig	FakeSecrets.version	34	60	71	4	4	4
 src/secret_manager/fake_secrets.zig	modelProperty	80	184	207	6	2	2
-src/secret_manager/fake_secrets.zig	parseBody	21	35	42	3	1	1
-src/secret_manager/fake_secrets.zig	parseUrl	24	34	45	3	1	1
-src/secret_manager/faults.zig	FaultyTransport.send	21	9	36	3	2	2
 src/secret_manager/rpc.zig	checkConfig	20	29	31	3	2	2
 src/secret_manager/rpc.zig	checkUpdate	31	30	42	3	2	2
 src/secret_manager/validate.zig	idProperty	21	16	16	2	2	2
@@ -309,11 +258,8 @@ src/storage/Object.zig	checkUploadOptions	19	36	32	3	2	2
 src/storage/Object.zig	downloadBilled	57	144	113	7	2	2
 src/storage/Object.zig	finishStream	18	37	38	5	9	9
 src/storage/bucket_settings.zig	Model.apply	21	17	27	3	1	1
-src/storage/bucket_settings.zig	changesSomething	16	2	11	1	1	1
 src/storage/bucket_settings.zig	checkRule	33	42	41	3	3	3
-src/storage/bucket_settings.zig	checkUpdate	16	13	18	2	2	2
 src/storage/bucket_settings.zig	configRoundTripProperty	19	18	43	2	2	2
-src/storage/bucket_settings.zig	drawRule	17	14	27	1	1	1
 src/storage/bucket_settings.zig	drawUpdate	19	19	32	3	1	1
 src/storage/bucket_settings.zig	modelProperty	27	48	77	5	2	2
 src/storage/bucket_settings.zig	readSettingsProperty	54	70	153	4	2	2
@@ -338,16 +284,13 @@ src/storage/fake_buckets.zig	FakeBuckets.createNotification	41	70	62	4	3	3
 src/storage/fake_buckets.zig	FakeBuckets.normalizedRule	52	99	85	4	2	2
 src/storage/fake_buckets.zig	FakeBuckets.patch	35	58	40	3	3	3
 src/storage/fake_buckets.zig	FakeBuckets.setPolicy	28	60	35	4	3	3
-src/storage/fake_hmac.zig	FakeHmacKeys.list	22	31	25	3	1	1
 src/storage/fake_multipart.zig	FakeMultipart.handle	89	76	123	3	6	6
-src/storage/fake_multipart.zig	FakeMultipart.insertObject	23	17	42	2	4	4
 src/storage/fake_multipart.zig	FakeMultipart.json	29	45	48	4	6	6
 src/storage/fake_multipart.zig	FakeMultipart.multipartRequest	30	44	87	2	6	6
 src/storage/fake_multipart.zig	FakeMultipart.patchObject	40	68	64	4	3	3
 src/storage/fake_multipart.zig	FakeMultipart.serveFolders	58	116	89	4	3	3
 src/storage/fake_multipart.zig	FakeMultipart.serveManaged	46	76	79	4	3	3
 src/storage/fake_multipart.zig	FakeMultipart.sessionPut	24	40	38	3	4	4
-src/storage/fake_multipart.zig	FakeMultipart.sessionStart	21	21	66	1	4	4
 src/storage/fake_multipart.zig	parseTarget	151	294	279	6	1	1
 src/storage/folders.zig	create	12	39	38	5	4	4
 src/storage/gzip_download.zig	Pull.fetchInto	21	69	53	6	1	1
@@ -405,26 +348,15 @@ src/storage/xml.zig	decodeText	22	39	31	3	2	2
 src/storage/xml_multipart.zig	listParts	18	31	41	3	5	5
 tests/bigquery_gcp_integration.zig	script	33	49	180	3	1	1
 tests/dataflow_gcp_integration.zig	test "dataflow writes: a batch job cancelled, a streaming one drained, the fake answering alike"	26	41	138	3	0	0
-tests/datatransfer_gcp_integration.zig	script	22	31	108	3	1	1
-tests/datatransfer_gcp_integration.zig	sweep	24	29	27	2	5	5
 tests/iam_gcp_integration.zig	test "iam reads: a project's, a Cloud Run service's and job's, and an object's policy and permissions; the fakes answer as production did"	37	45	184	3	0	0
-tests/integration.zig	test "a topic with a schema: what fits is taken and says what it fit, what does not is refused, and the settings change, clear and outlive their schema"	22	32	91	3	0	0
-tests/integration.zig	test "schema revisions: one is committed, read, listed, rolled back to and deleted, and a schema's only one cannot be"	24	29	85	2	0	0
-tests/integration.zig	test "schemas: one is made, read in both views and by its revision, found in its project's list, asked about messages both ways, and deleted"	25	32	80	3	0	0
-tests/integration.zig	test "snapshots: one is made, read, found in its project's list and its topic's, relabelled, and outlives its subscription and its topic"	22	29	85	3	0	0
 tests/kms_gcp_integration.zig	Fixture.sweep	18	37	38	4	0	0
 tests/kms_gcp_integration.zig	outcome	63	44	122	2	2	2
-tests/kms_gcp_integration.zig	test "kms: what only production shows: locations, random bytes, the key ring and its policy, pages, retired keys"	24	32	67	3	0	0
 tests/monitoring_gcp_integration.zig	outcome	27	44	67	3	5	5
 tests/monitoring_gcp_integration.zig	test "monitoring: Cloud's quota metrics, and the fake given production's points answers as production did"	33	64	161	5	0	0
 tests/monitoring_gcp_integration.zig	test "monitoring: Pub/Sub's own metrics, and the fake given production's points answers as production did"	49	88	245	4	0	0
 tests/monitoring_gcp_integration.zig	test "monitoring: alert policies and snoozes, and the fake seeded with production's answers as production did"	29	45	155	3	0	0
-tests/run_gcp_integration.zig	Script.run	24	32	112	2	1	1
 tests/scheduler_gcp_integration.zig	test "scheduler writes: run, pause and resume through the client, and the fake replaying them agrees"	31	48	129	4	0	0
 tests/secret_manager_integration.zig	test "regional: topics refused before the grant, then every event received and decoded"	22	36	54	4	0	0
 tests/storage_gcp_integration.zig	test "59. retention: a policy and holds keep objects as measured, refused as ObjectRetained, and let them go"	25	38	81	3	0	0
-tests/storage_gcp_integration.zig	test "63. folders: a flat bucket has none, and a rename moves the tree, its objects, and keeps its times"	24	31	71	2	0	0
-tests/storage_gcp_integration.zig	test "66. ACLs: a predefined list on every write, read back as production keeps it, and the refusals of public access prevention and uniform access"	21	25	85	3	0	0
-tests/storage_gcp_integration.zig	test "sweep: delete anything a crashed run left under zig-gcp-test/ or zig-gcp-tmp/ more than a day ago"	21	32	37	4	0	0
 tools/test_runner.zig	mainServer	20	55	127	5	1	1
 tools/test_runner.zig	mainTerminal	19	37	65	4	1	1
