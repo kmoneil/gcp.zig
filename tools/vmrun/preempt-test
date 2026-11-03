@@ -1,0 +1,60 @@
+#!/bin/bash
+# preempt-test: vmrun's preemption path, against Google. It runs
+# jobs/sleep.sh on a spot VM, asks Compute to simulate a maintenance
+# event once the job is running (on a spot VM that is a preemption, about
+# a minute and a half later), and passes when vmrun says the VM was
+# preempted and exits 75. About 4 minutes and a cent of spot time; run it
+# after changing how vmrun waits or tells a preemption from a failure.
+#
+#   tools/vmrun/preempt-test
+#
+# The key as vmrun takes it: GCP_KEY, else ~/.gcp-keys/zig-gcp-sa-key.json.
+set -u
+HERE=$(cd "$(dirname "$0")" && pwd -P)
+ROOT=$(cd "$(git -C "$HERE" rev-parse --show-toplevel)" && pwd -P)
+KEY=${GCP_KEY:-$HOME/.gcp-keys/zig-gcp-sa-key.json}
+LOG=$(mktemp)
+trap 'rm -f "$LOG"' EXIT
+cd "$ROOT"
+
+"$HERE/vmrun" --spot tools/vmrun/jobs/sleep.sh 900 > "$LOG" 2>&1 &
+pid=$!
+running=""
+for _ in $(seq 1 120); do
+  grep -q '^vmrun: running tools/vmrun/jobs/sleep.sh' "$LOG" && { running=1; break; }
+  kill -0 "$pid" 2> /dev/null || break
+  sleep 5
+done
+if [ -z "$running" ]; then
+  kill "$pid" 2> /dev/null; wait "$pid"
+  cat "$LOG"; echo "preempt-test: FAIL, the job never started running"; exit 1
+fi
+line=$(grep -m1 ' started in ' "$LOG")
+VM=$(echo "$line" | awk '{print $2}') ZONE=$(echo "$line" | awk '{print $5}')
+
+# A token as vmrun mints one: a JWT signed with the key, traded at Google.
+b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+now=$(date +%s)
+hdr=$(printf '{"alg":"RS256","typ":"JWT"}' | b64)
+claim=$(printf '{"iss":"%s","scope":"https://www.googleapis.com/auth/cloud-platform","aud":"https://oauth2.googleapis.com/token","iat":%d,"exp":%d}' "$(jq -r .client_email "$KEY")" "$now" $((now + 3600)) | b64)
+pem=$(mktemp); (umask 077; jq -r .private_key "$KEY" > "$pem")
+sig=$(printf '%s.%s' "$hdr" "$claim" | openssl dgst -sha256 -sign "$pem" | b64); rm -f "$pem"
+T=$(curl -s https://oauth2.googleapis.com/token --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer \
+  --data-urlencode assertion="$hdr.$claim.$sig" | jq -r .access_token)
+
+r=$(curl -s -X POST -H "Authorization: Bearer $T" -H "Content-Length: 0" \
+  "https://compute.googleapis.com/compute/v1/projects/$(jq -r .project_id "$KEY")/zones/$ZONE/instances/$VM/simulateMaintenanceEvent")
+err=$(printf '%s' "$r" | jq -r '.error.message // empty')
+if [ -n "$err" ]; then
+  kill "$pid" 2> /dev/null; wait "$pid"
+  cat "$LOG"; echo "preempt-test: FAIL, simulateMaintenanceEvent: $err"; exit 1
+fi
+echo "preempt-test: preempting $VM in $ZONE"
+
+wait "$pid"; code=$?
+cat "$LOG"
+if [ "$code" = 75 ] && grep -q "^vmrun: $VM was preempted" "$LOG"; then
+  echo "preempt-test: ok, vmrun told the preemption apart and exited 75"
+else
+  echo "preempt-test: FAIL, vmrun exited $code, want 75 and a line saying $VM was preempted"; exit 1
+fi

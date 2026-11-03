@@ -74,6 +74,18 @@ To fuzz, run `zig build test -Dfuzz-runner -Dtest-filter=fuzz --fuzz=100K`.
 For line coverage, install [kcov](https://github.com/SimonKagstrom/kcov) and
 run `zig build coverage`; the report is `zig-out/coverage/index.html`.
 
+For a campaign longer than a nightly's, `tools/vmrun/vmrun
+tools/vmrun/jobs/fuzz.sh [JOB...]` fuzzes the nightly's jobs (all of them,
+or those named) on every core of a throwaway Linux spot VM, in the project
+a service account key names (`GCP_KEY`), for three hours unless
+`--timeout MINUTES` says otherwise. It brings the lanes' logs, their grown
+corpora and every failure home to `_vmrun/`, and deletes the VM and its
+bucket. Run `tools/vmrun/fetch-seeds` first to start from the corpora the
+nightlies kept. A fuzzer that sits on one input for ten minutes is called
+stalled, and its threads' stacks are kept with the input. The job's header
+has the rest; `tools/vmrun/blip-test` checks vmrun itself offline, against
+a fake Google.
+
 ## Changes
 
 - `main` is protected: open a pull request, and CI must pass before it

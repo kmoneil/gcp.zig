@@ -1,0 +1,45 @@
+#!/bin/bash
+# fetch-seeds: the newest corpus each nightly fuzz job kept on main (its
+# fuzz-corpus-<job> artifact), gathered into tools/vmrun/seeds.tgz, one
+# directory a job. git ignores the file and vmrun ships it by name, and
+# tools/vmrun/jobs/fuzz.sh starts each lane from its jobs' corpora, so a
+# campaign goes on from where the nightlies are rather than from the
+# seed corpus alone.
+#
+#   tools/vmrun/fetch-seeds                   # every nightly job
+#   tools/vmrun/fetch-seeds slow-subscriber   # the jobs named
+#
+# Needs gh (signed in), unzip and tar. A job with no corpus yet is said
+# and left out.
+set -euo pipefail
+ROOT=$(cd "$(git rev-parse --show-toplevel)" && pwd -P)
+cd "$ROOT"
+for tool in gh unzip tar; do command -v $tool > /dev/null || { echo "fetch-seeds: needs $tool" >&2; exit 2; }; done
+REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+if [ $# -eq 0 ]; then
+  set -- $(awk '/^ *- \{ job: / { sub(/.*job: /, ""); sub(/,.*/, ""); print }' .github/workflows/ci.yml)
+fi
+got=()
+for j in "$@"; do
+  id=$(gh api "repos/$REPO/actions/artifacts?name=fuzz-corpus-$j&per_page=100" --jq '
+    [.artifacts[] | select(.expired | not) | select(.workflow_run.head_branch == "main")]
+    | sort_by(.created_at) | last | .id // empty')
+  if [ -z "$id" ]; then
+    echo "fetch-seeds: $j has no corpus on main yet"
+    continue
+  fi
+  gh api "repos/$REPO/actions/artifacts/$id/zip" > "$TMP/$j.zip"
+  mkdir -p "$TMP/$j"
+  unzip -q -o "$TMP/$j.zip" -d "$TMP/$j"
+  # A fuzzer's in<N> files and a crash are the run's, not the corpus.
+  rm -f "$TMP/$j"/in* "$TMP/$j/crash"
+  rm -f "$TMP/$j.zip"
+  echo "fetch-seeds: $j: artifact $id, $(find "$TMP/$j" -type f | wc -l | tr -d ' ') file(s)"
+  got+=("$j")
+done
+[ ${#got[@]} -gt 0 ] || { echo "fetch-seeds: no corpus to gather" >&2; exit 1; }
+COPYFILE_DISABLE=1 tar --no-xattrs -czf tools/vmrun/seeds.tgz -C "$TMP" "${got[@]}"
+echo "fetch-seeds: tools/vmrun/seeds.tgz, ${#got[@]} job(s), $(( $(wc -c < tools/vmrun/seeds.tgz) / 1024 )) KB"
