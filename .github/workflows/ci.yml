@@ -713,7 +713,12 @@ jobs:
 
       - uses: ./.github/actions/vet-tools
 
+      # Its own limit, below the job's: a fuzzer that stalls is still
+      # running when this step ends, and the job's last 30 minutes are for
+      # the step below that asks it where it is stuck. The counts aim at
+      # about 90 minutes, and the slowest night so far took 101.
       - name: Coverage-guided fuzzing
+        timeout-minutes: 150
         env:
           ITERATIONS: ${{ inputs.fuzz_iterations || matrix.iterations }}
           MODULE: ${{ matrix.module }}
@@ -736,6 +741,50 @@ jobs:
             exit 1
           fi
 
+      # On 2026-10-28 and 11-01 the Subscriber property stalled: the job
+      # sat silent until its timeout, and its test process was still alive
+      # at the job's cleanup. A step that runs out of time leaves the build
+      # runner and the test processes it started running, so each thread's
+      # stack, and the input each fuzzer was on, say where they are stuck.
+      # Every process running from this workspace's Zig cache is ours: the
+      # build runner and the test binaries it built. A failure with nothing
+      # left running (a crash the fuzzer caught) has nothing to dump.
+      - name: Dump the stacks of a fuzzer still running
+        if: failure() || cancelled()
+        timeout-minutes: 15
+        run: |
+          set -u
+          out=.zig-cache/tmp/fuzz-stacks.txt
+          mkdir -p .zig-cache/tmp
+          pids=()
+          for exe in /proc/[0-9]*/exe; do
+            target=$(readlink "$exe" 2>/dev/null) || continue
+            case "$target" in
+              "$GITHUB_WORKSPACE"/.zig-cache/*) pid=${exe#/proc/}; pids+=("${pid%/exe}") ;;
+            esac
+          done
+          if [ ${#pids[@]} -eq 0 ]; then
+            echo "Nothing from the Zig cache is still running."
+            exit 0
+          fi
+          command -v gdb > /dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq gdb > /dev/null; }
+          # An in<N> file is a fuzzer's current input: a 20-byte header
+          # (u64 pc digest, then u32 instance, test index and length), then
+          # the input. The test index counts the fuzz tests the filter kept.
+          for f in .zig-cache/f/in*; do
+            if [ -e "$f" ]; then
+              echo "$f: instance, test index, length:$(od -A n -t u4 -j 8 -N 12 "$f" | tr -s " ")"
+            fi
+          done | tee -a "$out"
+          for pid in "${pids[@]}"; do
+            {
+              echo "=== pid $pid: $(tr '\0' ' ' < "/proc/$pid/cmdline")"
+              # Yama lets only root attach to a process it did not start.
+              sudo timeout 300 gdb -p "$pid" -batch -nx \
+                -ex 'set pagination off' -ex 'info threads' -ex 'thread apply all bt'
+            } 2>&1 | tee -a "$out"
+          done
+
       # 30 days, so a corpus outlasts a few nights without a run.
       - name: Save the fuzz corpus
         if: always()
@@ -749,13 +798,17 @@ jobs:
 
       # `crash` is the failing input: a 4-byte little-endian length, then the
       # bytes. CONTRIBUTING.md says how to turn it into a regression test.
+      # A fuzzer that stalled leaves no crash, but its in<N> file holds the
+      # input it was on, and fuzz-stacks.txt what each thread was doing.
       - name: Keep the failing input
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-failure-${{ matrix.job }}
           path: |
             .zig-cache/f/crash
+            .zig-cache/f/in*
             .zig-cache/tmp/libfuzzer.log
+            .zig-cache/tmp/fuzz-stacks.txt
           include-hidden-files: true
           if-no-files-found: ignore
