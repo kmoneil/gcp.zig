@@ -4,6 +4,27 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.63.0 (unreleased)
+
+- compute: a new module, **experimental**, for Compute Engine's v1 API,
+  for issue #346. This first part reads: `Client.listInstances` and
+  `listAllInstances` (one zone or every zone, filtered, ordered and
+  paged), `getInstance` with each VM's status, scheduling (spot or
+  standard, a run limit and what happens at it), disks, network,
+  labels, metadata and the fingerprints a change must send back;
+  `serialOutput`, a VM's console by byte offset, and `guestAttributes`;
+  `listZones`, `getZone`, `listMachineTypes`, `getMachineType`,
+  `getImage` and `imageFromFamily`; and Compute's own operations:
+  `getOperation`, `listOperations` (which says what ended a VM: a
+  preemption, a run limit or its guest) and `waitOperation`, which loops
+  Compute's two-minute wait to a deadline. `compute.testing.FakeCompute`
+  answers them all as production did when measured on 2026-11-03, its
+  refusals in production's words. Creating, changing and deleting VMs,
+  templates and managed groups come next.
+- auth, bigquery, core, dataflow, datatransfer, error_reporting,
+  firestore, kms, logging, monitoring, pubsub, resource_manager, run,
+  scheduler, secret_manager and storage: unchanged.
+
 ## 0.62.1 (2026-11-03)
 
 - firestore: an aggregation's alias (`a0`, `a1`, ...) was printed into

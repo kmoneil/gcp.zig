@@ -627,6 +627,11 @@ jobs:
         # now, state moves, lists and lost answers to a model, the client
         # against the fake for up to 24 steps a run: about 0.65 ms a run on
         # the Mac (200K in 130 s; 1M since, clean), so 1400K, about an hour
+        # at four times the Mac, to be priced by its first nights. compute
+        # (0.63.0) starts at estimates from a local run: its three fuzz
+        # properties (the decoders, the fake's pages, the wait loop) took
+        # about 1.8 ms a run together on the Mac (2K in 16 s and 20K in
+        # 49 s, the build cancelled out, clean), so 700K, about 85 minutes
         # at four times the Mac, to be priced by its first nights.
         # heavy-pubsub took 103, 102, 98 and 113 minutes at 9M on the
         # nightlies of 10-20 to 10-23 (runs 39393583152, 39569725428,
@@ -670,6 +675,7 @@ jobs:
           - { job: bigquery, module: bigquery, filter: fuzz, iterations: 6M }
           - { job: slow-bigquery, module: bigquery, filter: slow property, iterations: 1400K }
           - { job: datatransfer, module: datatransfer, filter: fuzz, iterations: 8M }
+          - { job: compute, module: compute, filter: fuzz, iterations: 700K }
           - { job: slow-datatransfer, module: datatransfer, filter: slow property, iterations: 1400K }
     runs-on: ubuntu-latest
     timeout-minutes: 180
