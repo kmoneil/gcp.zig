@@ -151,6 +151,12 @@ Google, not only what Google documents, and where the emulators differ.
 | [Overview](datatransfer/README.md) | Scheduled queries and other transfer configs, one location at a time; their runs and each run's messages; a run now with the exact request shown first, sent once; the scopes and permissions; and what production showed when measured (experimental) |
 | [Testing](datatransfer/testing.md) | An in-memory Data Transfer for your own tests: configs, runs and messages put in, a run now whose outcome the test says, held to production's answers (experimental) |
 
+## 🖥️ Compute Engine
+
+| Guide | What's in it |
+| --- | --- |
+| [Overview](compute/README.md) | VMs in one zone or every zone, with their status, scheduling, disks, network and fingerprints; serial consoles and guest attributes; zones, machine types and images; operations waited on, the two ways a write is refused, and what ended a VM; an in-memory Compute Engine for tests; and what production showed when measured (experimental) |
+
 ## 🛠️ Working on gcp.zig
 
 | Guide | What's in it |
