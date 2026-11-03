@@ -262,6 +262,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "dataflow", .module = dataflow },
                 .{ .name = "bigquery", .module = bigquery },
                 .{ .name = "datatransfer", .module = datatransfer },
+                .{ .name = "compute", .module = compute },
                 .{ .name = "core", .module = core },
             },
         }),
@@ -638,6 +639,28 @@ pub fn build(b: *std.Build) void {
     });
     gcp_step.dependOn(&streamed(b, datatransfer_gcp_tests).step);
     test_step.dependOn(&datatransfer_gcp_tests.step);
+    // Compute Engine against a real project: COMPUTE_TEST=1 beside the
+    // usual two variables. The suite creates four zigps- e2 VMs through
+    // the client (each deleting itself after 30 minutes should the suite
+    // die) and one instance template raw, runs them through their life,
+    // holds every preview to what was sent and the fake to production's
+    // answers, and deletes everything it made.
+    const compute_gcp_tests = b.addTest(.{
+        .name = "compute-gcp-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/compute_gcp_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "compute", .module = compute },
+                .{ .name = "core", .module = core },
+            },
+        }),
+        .filters = test_filters,
+        .test_runner = test_runner,
+    });
+    gcp_step.dependOn(&streamed(b, compute_gcp_tests).step);
+    test_step.dependOn(&compute_gcp_tests.step);
     // The IAM reads against a real project: IAM_READS_TEST=1 beside the
     // usual two variables, a cloud-platform token. The suite reads the
     // project's policy, deploys a zigps- service and job raw and makes two
@@ -741,54 +764,40 @@ pub fn build(b: *std.Build) void {
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "gcs_mv", "gcs_bucket", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "monitoring_policies", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "run_actions", "dataflow_jobs", "dataflow_stop", "bigquery_query", "datatransfer_runs", "permissions", "run_service" }) |name| {
+    // The modules each example imports; one not named here imports pubsub
+    // alone.
+    const example_imports = [_]ExampleImports{
+        .{ &.{"whoami"}, &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } } },
+        .{ &.{"secret"}, &.{ .{ .name = "secret_manager", .module = secret_manager }, .{ .name = "auth", .module = auth } } },
+        .{ &.{ "gcs_cp", "gcs_sign", "gcs_folders", "gcs_mv", "gcs_bucket" }, &.{ .{ .name = "storage", .module = storage }, .{ .name = "auth", .module = auth } } },
+        .{ &.{"iam"}, &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "secret_manager", .module = secret_manager }, .{ .name = "auth", .module = auth } } },
+        .{ &.{"secret_rotation"}, &.{ .{ .name = "secret_manager", .module = secret_manager }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } } },
+        .{ &.{"firestore"}, &.{ .{ .name = "firestore", .module = firestore }, .{ .name = "auth", .module = auth } } },
+        .{ &.{ "logs_read", "logs_tail" }, &.{ .{ .name = "logging", .module = logging }, .{ .name = "auth", .module = auth } } },
+        .{ &.{"projects_list"}, &.{ .{ .name = "resource_manager", .module = resource_manager }, .{ .name = "auth", .module = auth } } },
+        .{ &.{"error_dashboard"}, &.{ .{ .name = "error_reporting", .module = error_reporting }, .{ .name = "auth", .module = auth } } },
+        .{ &.{ "monitoring", "monitoring_alerts", "monitoring_policies" }, &.{ .{ .name = "monitoring", .module = monitoring }, .{ .name = "auth", .module = auth } } },
+        .{ &.{"pubsub_metrics"}, &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "monitoring", .module = monitoring }, .{ .name = "auth", .module = auth } } },
+        .{ &.{"kms"}, &.{ .{ .name = "kms", .module = kms }, .{ .name = "auth", .module = auth } } },
+        .{ &.{ "scheduler_jobs", "scheduler_run" }, &.{ .{ .name = "scheduler", .module = scheduler }, .{ .name = "auth", .module = auth } } },
+        .{ &.{ "run_revisions", "run_actions", "run_service" }, &.{ .{ .name = "run", .module = cloud_run }, .{ .name = "auth", .module = auth } } },
+        .{ &.{ "dataflow_jobs", "dataflow_stop" }, &.{ .{ .name = "dataflow", .module = dataflow }, .{ .name = "auth", .module = auth } } },
+        .{ &.{"bigquery_query"}, &.{ .{ .name = "bigquery", .module = bigquery }, .{ .name = "auth", .module = auth } } },
+        .{ &.{"datatransfer_runs"}, &.{ .{ .name = "datatransfer", .module = datatransfer }, .{ .name = "auth", .module = auth } } },
+        .{ &.{"compute"}, &.{ .{ .name = "compute", .module = compute }, .{ .name = "auth", .module = auth } } },
+        .{ &.{"permissions"}, &.{ .{ .name = "resource_manager", .module = resource_manager }, .{ .name = "run", .module = cloud_run }, .{ .name = "storage", .module = storage }, .{ .name = "auth", .module = auth } } },
+        .{ &.{ "gcs_notify", "quickstart" }, &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } } },
+    };
+    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "gcs_mv", "gcs_bucket", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "monitoring_policies", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "run_actions", "dataflow_jobs", "dataflow_stop", "bigquery_query", "datatransfer_runs", "permissions", "run_service", "compute" }) |name| {
         // whoami, secret, gcs_cp, gcs_sign, gcs_notify, gcs_mv, gcs_bucket, quickstart, iam,
         // secret_rotation, firestore, logs_read, logs_tail, projects_list,
         // error_dashboard, monitoring, monitoring_alerts,
         // monitoring_policies, pubsub_metrics,
         // kms, scheduler_jobs, scheduler_run, run_revisions, run_actions, run_service,
-        // dataflow_jobs, dataflow_stop, bigquery_query, datatransfer_runs
-        // and permissions pick their own credentials.
-        const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
-            &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "secret"))
-            &.{ .{ .name = "secret_manager", .module = secret_manager }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "gcs_cp") or std.mem.eql(u8, name, "gcs_sign") or std.mem.eql(u8, name, "gcs_folders") or std.mem.eql(u8, name, "gcs_mv") or std.mem.eql(u8, name, "gcs_bucket"))
-            &.{ .{ .name = "storage", .module = storage }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "iam"))
-            &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "secret_manager", .module = secret_manager }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "secret_rotation"))
-            &.{ .{ .name = "secret_manager", .module = secret_manager }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "firestore"))
-            &.{ .{ .name = "firestore", .module = firestore }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "logs_read") or std.mem.eql(u8, name, "logs_tail"))
-            &.{ .{ .name = "logging", .module = logging }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "projects_list"))
-            &.{ .{ .name = "resource_manager", .module = resource_manager }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "error_dashboard"))
-            &.{ .{ .name = "error_reporting", .module = error_reporting }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "monitoring") or std.mem.eql(u8, name, "monitoring_alerts") or std.mem.eql(u8, name, "monitoring_policies"))
-            &.{ .{ .name = "monitoring", .module = monitoring }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "pubsub_metrics"))
-            &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "monitoring", .module = monitoring }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "kms"))
-            &.{ .{ .name = "kms", .module = kms }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "scheduler_jobs") or std.mem.eql(u8, name, "scheduler_run"))
-            &.{ .{ .name = "scheduler", .module = scheduler }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "run_revisions") or std.mem.eql(u8, name, "run_actions") or std.mem.eql(u8, name, "run_service"))
-            &.{ .{ .name = "run", .module = cloud_run }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "dataflow_jobs") or std.mem.eql(u8, name, "dataflow_stop"))
-            &.{ .{ .name = "dataflow", .module = dataflow }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "bigquery_query"))
-            &.{ .{ .name = "bigquery", .module = bigquery }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "datatransfer_runs"))
-            &.{ .{ .name = "datatransfer", .module = datatransfer }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "permissions"))
-            &.{ .{ .name = "resource_manager", .module = resource_manager }, .{ .name = "run", .module = cloud_run }, .{ .name = "storage", .module = storage }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "gcs_notify") or std.mem.eql(u8, name, "quickstart"))
-            &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
-        else
-            &.{.{ .name = "pubsub", .module = mod }};
+        // dataflow_jobs, dataflow_stop, bigquery_query, datatransfer_runs,
+        // permissions and compute pick their own credentials.
+        const pubsub_only: []const std.Build.Module.Import = &.{.{ .name = "pubsub", .module = mod }};
+        const imports = importsOf(&example_imports, name) orelse pubsub_only;
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
@@ -896,4 +905,14 @@ fn judgeByCiGnarl(b: *std.Build, complexity: *std.Build.Step.Run, test_step: *st
     gnarl_pin.addFileArg(gnarl_version.captureStdOut(.{}));
     complexity.step.dependOn(&gnarl_pin.step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = vet_pin.root_module })).step);
+}
+
+/// An example's names and the modules each imports.
+const ExampleImports = struct { []const []const u8, []const std.Build.Module.Import };
+
+/// The imports `table` gives the example `name`, or null when it names
+/// none.
+fn importsOf(table: []const ExampleImports, name: []const u8) ?[]const std.Build.Module.Import {
+    for (table) |row| for (row[0]) |n| if (std.mem.eql(u8, n, name)) return row[1];
+    return null;
 }

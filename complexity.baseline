@@ -2,7 +2,6 @@
 # written. gnarl --check fails a function that is new and over one, or
 # above its number here; gnarl --update-baseline rewrites this file.
 # path, name, cyclomatic, cognitive, lines, nesting, params, params_weighted
-build.zig	build	49	52	564	3	1	1
 examples/dataflow_stop.zig	main	39	48	108	3	1	1
 examples/error_dashboard.zig	main	31	42	75	3	1	1
 examples/firestore.zig	main	82	135	154	4	1	1

@@ -7,9 +7,11 @@ project runs, in one zone or every zone at once, each with its status,
 scheduling, disks, network, labels, metadata and the fingerprints a
 change must send back; a VM's serial console and the guest attributes
 its guest wrote; the zones, machine types and images a create needs;
-and Compute's own operations, read, listed and waited on. Nothing here
-creates, changes or deletes a VM yet: those calls are the module's next
-milestones (issue #346).
+Compute's own operations, read, listed and waited on; and the writes
+that create a VM and run it through its life, each shown before it is
+sent if the caller asks. Changing a live VM (labels, metadata, machine
+type, disks) and managed groups are the module's next milestones
+(issue #346).
 
 ```zig
 const std = @import("std");
@@ -49,6 +51,12 @@ pub fn main(init: std.process.Init) !void {
 | `listOperations(scope, options)` | A zone's, region's or the project's operations |
 | `getOperation(ref)` | One operation as it stands |
 | `waitOperation(ref, options)` | One operation once it is DONE, or at a deadline |
+| `insertInstance(zone, spec, options)` | Creates a VM from an `InstanceSpec` |
+| `insertInstanceJson(zone, json, options)` | Creates a VM from an instance body written by the caller |
+| `insertFromTemplate(zone, name, template, options)` | Creates a VM from an instance template |
+| `startInstance`, `stopInstance`, `suspendInstance`, `resumeInstance`, `resetInstance`, `deleteInstance` | A VM's life, `(zone, name, options)` |
+| `insertInstanceRequest` and the other `*Request` twins | The exact request a write would send, unsent |
+| `newRequestId(buf)` | A request id, a random UUID |
 
 Every list takes `ListOptions`: a `filter` in Compute's own syntax
 (`labels.env = prod`, `name = "web-.*"`, `status = RUNNING`), an
@@ -99,6 +107,134 @@ A VM's guest writes them to its metadata server (with the metadata
 back: `"app/"` for a namespace, `"app/state"` for one key. A path with
 nothing under it is `error.NotFound`.
 
+## Creating a VM
+
+```zig
+var client = try compute.Client.init(gpa, io, .{
+    .project_id = "my-project",
+    .token_provider = creds.provider(),
+    .scope = .read_write,
+});
+defer client.deinit();
+var op = try client.insertInstance("us-central1-a", .{
+    .name = "batch-1",
+    .machine_type = "e2-micro",
+    .image = .{ .family = .{ .project = "debian-cloud", .name = "debian-12" } },
+    .spot = true,
+    .max_run_duration_s = 3600,
+    .termination_action = .delete,
+    .labels = &.{.{ .key = "team", .value = "data" }},
+    .metadata = &.{.{ .key = "startup-script", .value = "#!/bin/bash\n./run-batch\n" }},
+}, .{});
+defer op.deinit();
+var done = try client.waitOperation(op.value.ref(), .{});
+defer done.deinit();
+// No room in the zone: the caller's to try another.
+const no_room = if (done.value.failure) |failure| failure.stockout() else false;
+```
+
+`InstanceSpec` holds the shape most VMs take: one boot disk from an
+image (`.family`, `.image` or a `.path`, with its size and type), one
+network interface (`network`, `subnetwork`, `external_ip`), `labels`,
+`metadata` (a startup script is the item `startup-script`), network
+`tags`, a `service_account` (given the `cloud-platform` scope when it
+names none, so its IAM roles alone say what it may do), `spot`, a run
+limit and what happens at it, `automatic_restart` and
+`deletion_protection`. The client writes it as production took it when
+measured, and checks it before sending: names, label and metadata
+rules, a boot disk of at least 10 GB, a spot VM not asked to restart on
+its own.
+
+What it leaves out (GPUs, local SSDs, more disks or interfaces,
+confidential VMs and the rest of Compute's schema) `insertInstanceJson`
+sends as written: Compute's `Instance` resource as JSON, paths relative
+to the project (`zones/Z/machineTypes/M`) or full URLs, checked only for
+a JSON object with an instance name. `insertFromTemplate` names a
+global or regional template and the VM; the template gives the rest.
+
+A write needs a client whose `scope` is `.read_write` (or
+`.cloud_platform`): `compute.readonly`, the default, takes no write,
+and the client refuses one before sending.
+
+## A VM's life
+
+| Call | From | Through | To | Measured |
+| --- | --- | --- | --- | --- |
+| `insertInstance` | | PROVISIONING, STAGING | RUNNING | DONE in 9 to 13 s |
+| `stopInstance` | RUNNING | STOPPING | TERMINATED | 52 to 54 s |
+| `startInstance` | TERMINATED | STAGING | RUNNING | 9 to 23 s |
+| `suspendInstance` | RUNNING | SUSPENDING | SUSPENDED | 87 to 93 s standard, 281 s spot |
+| `resumeInstance` | SUSPENDED | | RUNNING | 12 to 22 s |
+| `resetInstance` | RUNNING | | RUNNING | 2 s |
+| `deleteInstance` | any | STOPPING | gone | about 50 s |
+
+A write answers its operation before it is DONE as a rule: RUNNING, or
+PENDING (production answered a start each way on two days). Wait on
+either the same way.
+
+Stopping a stopped VM and starting a running one are no refusals: each
+answers an operation, the start DONE at once. A spot VM can be
+suspended. `stopInstance` and `deleteInstance` take
+`no_graceful_shutdown`, `stopInstance` and `suspendInstance`
+`discard_local_ssd`, which a VM with local SSDs must give.
+
+`examples/compute.zig` is the whole life: it shows the insert it would
+send, creates a spot VM with a startup script, reads what the script
+wrote to the serial console, stops, starts and deletes it
+(`zig build example-compute -- --fake --yes` runs it with no network).
+
+## Previews and request ids
+
+Every write has a `*Request` twin (`insertInstanceRequest`,
+`stopInstanceRequest`, ...) that runs the same checks and builds the
+exact request without sending it: the method, the whole URL and the
+body, byte for byte, for a console's confirmation or a log. Credentials
+are not part of it.
+
+Every write carries a `requestId`, so a write sent again lands once:
+production answered a repeated id with the same operation, while it ran
+and after it was DONE. The client makes one for each call when the
+caller gives none, and every retry of that call sends it, so a write is
+retried as the reads are; a retry begins no later than ten minutes after
+the first attempt. A preview makes its own id too, so to send exactly
+what was shown, make one with `newRequestId` and give it to both:
+
+<!-- snippet: tests/docs_examples.zig#compute-confirm -->
+```zig
+test "the exact stop a console would send, for the user to confirm, then sent" {
+    var fake: compute.testing.FakeCompute = .init(std.testing.allocator, std.testing.io, .{});
+    defer fake.deinit();
+    try fake.putInstance(.{ .zone = "us-central1-a", .name = "batch-1" });
+    var token: compute.StaticToken = .{ .token = "none" };
+    var client = try compute.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .scope = .read_write,
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    // One request id for the preview and the stop: the stop sends byte
+    // for byte what the user confirmed, and lands once if retried.
+    var buf: [36]u8 = undefined;
+    const id = client.newRequestId(&buf);
+    var confirm = try client.stopInstanceRequest("us-central1-a", "batch-1", .{ .request_id = id });
+    defer confirm.deinit();
+    try std.testing.expectEqual(.POST, confirm.value.method);
+    try std.testing.expect(std.mem.indexOf(u8, confirm.value.url, "/zones/us-central1-a/instances/batch-1/stop?requestId=") != null);
+    // Confirmed: sent, then waited on.
+    var op = try client.stopInstance("us-central1-a", "batch-1", .{ .request_id = id });
+    defer op.deinit();
+    var done = try client.waitOperation(op.value.ref(), .{});
+    defer done.deinit();
+    try std.testing.expect(done.value.succeeded());
+    var vm = try client.getInstance("us-central1-a", "batch-1");
+    defer vm.deinit();
+    try std.testing.expectEqual(.terminated, vm.value.status);
+}
+```
+
+A request id is a UUID, not all zeros.
+
 ## Operations and waiting
 
 Every write Compute takes answers an `Operation` at once, and the work
@@ -121,7 +257,9 @@ A write can be refused two ways, and a caller must handle both:
   starting or running."; deleting a template a group uses ends
   `RESOURCE_IN_USE_BY_ANOTHER_RESOURCE`. `Operation.succeeded()` is done
   and not failed; `Operation.Failure.stockout()` says the zone had no
-  room, worth trying another zone.
+  room (`ZONE_RESOURCE_POOL_EXHAUSTED`), worth trying another zone. The
+  client never moves a VM on its own: where it runs is the caller's
+  choice.
 
 Every write sends a `requestId`; production answered a repeated one with
 the same operation, while it ran and after, so a write retried after a
@@ -147,7 +285,8 @@ client calls, so `Operation.target` keeps only the path.
 ## The scope
 
 A client asks for one OAuth scope: `compute.readonly` by default, which
-every call here takes, the wait on an operation included.
+every read takes, the wait on an operation included, and no write;
+`.read_write` (`compute`) for a client that writes.
 
 ## Testing
 
@@ -155,20 +294,63 @@ every call here takes, the wait on an operation included.
 `Client.Options.transport`: zones, VMs, serial output, guest attributes,
 machine types, images and operations a test puts in, read back as
 production answered when measured, its refusals in production's words.
-An operation finishes after the number of waits the test gives it, with
-the failure the test gives it. Writes answer 501 until the module's next
-milestones.
+An operation a test puts in finishes after the number of waits it
+gives, with the failure it gives.
 
+The writes work on it as on production: an insert makes the VM
+PROVISIONING and its operation RUNNING, and when the operation's wait
+answers DONE (after `Options.write_waits`, one by default) the VM is
+RUNNING; the lifecycle moves it the same way, from the states
+production took each write in, and a write from another state is 501,
+saying which. A repeated `requestId` answers its first operation and
+changes nothing; a name taken, an unknown machine type or image and a
+delete under protection are refused in production's words. Every zone
+has e2-micro, e2-small, e2-medium and e2-standard-2, and debian-12's
+image is there from the start. `setStockout(zone, true)` puts a zone out
+of room, so a caller's next-zone path can be tested; `putTemplate` puts
+in a template for `insertFromTemplate`; `finishOperations` finishes
+everything still running. Changing a live VM answers 501 until the
+module's next milestone.
+
+<!-- snippet: tests/docs_examples.zig#compute-fake -->
 ```zig
-var fake: compute.testing.FakeCompute = .init(gpa, io, .{});
-defer fake.deinit();
-try fake.putInstance(.{ .zone = "us-central1-a", .name = "web-1", .spot = true });
-const op = try fake.putOperation(.{ .scope = .{ .zone = "us-central1-a" }, .waits_to_finish = 2 });
-var client = try compute.Client.init(gpa, io, .{
-    .project_id = "my-project",
-    .token_provider = token.provider(),
-    .transport = fake.transport(),
-});
+/// Creates the VM in the first of `zones` with room for it.
+fn createSomewhere(client: *compute.Client, zones: []const []const u8, spec: compute.InstanceSpec) ![]const u8 {
+    for (zones) |zone| {
+        var op = try client.insertInstance(zone, spec, .{});
+        defer op.deinit();
+        var done = try client.waitOperation(op.value.ref(), .{});
+        defer done.deinit();
+        const failure = done.value.failure orelse return zone;
+        if (!failure.stockout()) return error.InsertFailed;
+    }
+    return error.NoRoom;
+}
+
+test "a spot VM in the first zone with room, against the in-memory Compute Engine" {
+    var fake: compute.testing.FakeCompute = .init(std.testing.allocator, std.testing.io, .{});
+    defer fake.deinit();
+    // How production answers is the test's to arrange: no room in -a.
+    try fake.setStockout("us-central1-a", true);
+    var token: compute.StaticToken = .{ .token = "none" };
+    var client = try compute.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .scope = .read_write,
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    const zone = try createSomewhere(&client, &.{ "us-central1-a", "us-central1-b" }, .{
+        .name = "batch-1",
+        .machine_type = "e2-micro",
+        .image = .{ .family = .{ .project = "debian-cloud", .name = "debian-12" } },
+        .spot = true,
+    });
+    try std.testing.expectEqualStrings("us-central1-b", zone);
+    var vm = try client.getInstance(zone, "batch-1");
+    defer vm.deinit();
+    try std.testing.expectEqual(.running, vm.value.status);
+}
 ```
 
 ## What production showed

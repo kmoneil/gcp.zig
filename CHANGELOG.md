@@ -19,8 +19,29 @@ including the ones that did not change.
   preemption, a run limit or its guest) and `waitOperation`, which loops
   Compute's two-minute wait to a deadline. `compute.testing.FakeCompute`
   answers them all as production did when measured on 2026-11-03, its
-  refusals in production's words. Creating, changing and deleting VMs,
-  templates and managed groups come next.
+  refusals in production's words.
+- compute: creating a VM and running it through its life.
+  `insertInstance` from an `InstanceSpec` (machine type, a boot disk
+  from an image or family, network, external address, labels, metadata
+  such as a startup script, tags, a service account, spot or standard,
+  a run limit and what happens at it, deletion protection), written as
+  production took it; `insertInstanceJson`, a caller's own instance
+  body for what the spec leaves out; `insertFromTemplate`; and
+  `startInstance`, `stopInstance`, `suspendInstance`, `resumeInstance`,
+  `resetInstance` and `deleteInstance`. Each answers its operation, and
+  each has a `*Request` twin that builds the exact request without
+  sending it. Every write carries a `requestId`, made by the client when
+  the caller gives none (`newRequestId`), so a write retried after a
+  lost answer lands once, and writes retry as the reads do. A write
+  needs `Options.scope` `.read_write`: the default, `compute.readonly`,
+  is refused before sending. `FakeCompute` takes the writes too: VMs
+  move through PROVISIONING, STAGING, STOPPING and SUSPENDING as their
+  operations finish, a repeated request id answers its first operation,
+  `setStockout` puts a zone out of room, and `putTemplate` and
+  `finishOperations` are new. Its zones now start with four e2 machine
+  types and debian-12's image. Changing a live VM and managed groups
+  come next. `examples/compute.zig` creates a spot VM, reads what its
+  startup script wrote, stops, starts and deletes it.
 - auth, bigquery, core, dataflow, datatransfer, error_reporting,
   firestore, kms, logging, monitoring, pubsub, resource_manager, run,
   scheduler, secret_manager and storage: unchanged.

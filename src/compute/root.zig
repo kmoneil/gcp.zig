@@ -3,9 +3,11 @@
 //! limit and what happens at it), disks, network, labels, metadata and the
 //! fingerprints a change must send back; a VM's serial console and the
 //! guest attributes its guest wrote; the zones, machine types and images a
-//! create needs; and Compute's own operations, read, listed and waited on.
-//! Nothing here creates, changes or deletes anything yet: those calls come
-//! in the module's next milestones. **Experimental.**
+//! create needs; Compute's own operations, read, listed and waited on;
+//! and the writes that create a VM (from `InstanceSpec`, a raw instance
+//! body, or a template) and run it through its life: start, stop,
+//! suspend, resume, reset and delete. Changing a live VM and managed
+//! groups come in the module's next milestones. **Experimental.**
 //!
 //! Every write Compute takes answers an `Operation` at once, which a
 //! caller waits on with `Client.waitOperation`. What Compute can refuse at
@@ -15,8 +17,14 @@
 //! set. A zone's operations also say what ended a VM: a preemption, a run
 //! limit or its guest powering off.
 //!
+//! Every write has a `*Request` twin that builds the exact request
+//! without sending it, and carries a `requestId` (made by the client when
+//! the caller gives none), so a write retried after a lost answer lands
+//! once.
+//!
 //! A client asks for one OAuth scope, `Client.Options.scope`:
-//! `compute.readonly` by default, which every call here takes.
+//! `compute.readonly` by default, which every read takes and no write;
+//! `.read_write` for a client that writes.
 
 pub const Client = @import("Client.zig");
 
@@ -66,6 +74,16 @@ pub const OperationStatus = @import("types.zig").OperationStatus;
 pub const Operation = @import("types.zig").Operation;
 pub const OperationPage = @import("types.zig").OperationPage;
 pub const WaitOptions = @import("types.zig").WaitOptions;
+pub const InstanceSpec = @import("types.zig").InstanceSpec;
+pub const ImageRef = @import("types.zig").ImageRef;
+pub const BootDisk = @import("types.zig").BootDisk;
+pub const TemplateRef = @import("types.zig").TemplateRef;
+pub const WriteOptions = @import("types.zig").WriteOptions;
+pub const StopOptions = @import("types.zig").StopOptions;
+pub const SuspendOptions = @import("types.zig").SuspendOptions;
+pub const DeleteOptions = @import("types.zig").DeleteOptions;
+/// A request as a write would send it, built by its `*Request` twin.
+pub const PreparedRequest = core.PreparedRequest;
 
 /// The fixed limits and naming rules the client checks before sending.
 pub const limits = @import("validate.zig");
@@ -93,6 +111,7 @@ test {
     _ = @import("production_bodies.zig");
     _ = @import("test_util.zig");
     @import("std").testing.refAllDecls(@This());
+    _ = @import("body.zig");
     _ = @import("Client.zig");
     _ = @import("Client_test.zig");
     _ = @import("codec.zig");
@@ -102,6 +121,7 @@ test {
     _ = @import("rpc.zig");
     _ = @import("types.zig");
     _ = @import("validate.zig");
+    _ = @import("writes_test.zig");
 }
 
 test "every public declaration of types.zig is public here too" {

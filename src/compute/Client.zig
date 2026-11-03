@@ -1,8 +1,11 @@
 //! A Compute Engine client: the VMs in a zone or every zone, each with its
 //! status, scheduling, disks, network and the fingerprints a change must
 //! send back; a VM's serial console and guest attributes; the zones,
-//! machine types and images a create needs; and operations, read and
-//! waited on. Nothing here creates, changes or deletes anything yet.
+//! machine types and images a create needs; operations, read and waited
+//! on; and the writes that create a VM and run it through its life: start,
+//! stop, suspend, resume, reset and delete. Each write has a `*Request`
+//! twin that builds the exact request without sending it, and carries a
+//! `requestId`, so a retry lands once.
 //!
 //! Every call blocks the calling task until it completes, using the
 //! `std.Io` and allocator passed to `init`. A client must not be used from
@@ -14,6 +17,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("core");
 
+const body = @import("body.zig");
 const codec = @import("codec.zig");
 const errors = @import("errors.zig");
 const logging = @import("logging.zig");
@@ -23,6 +27,7 @@ const validate = @import("validate.zig");
 const Diagnostics = core.Diagnostics;
 const Error = errors.Error;
 const HttpTransport = core.transport.HttpTransport;
+const PreparedRequest = core.PreparedRequest;
 const RetryPolicy = core.RetryPolicy;
 const TokenProvider = core.TokenProvider;
 const Transport = core.transport.Transport;
@@ -58,7 +63,8 @@ pub const Options = struct {
     token_provider: TokenProvider,
     /// The OAuth scope asked of the token provider for every call. The
     /// default, `compute.readonly`, takes every read and the wait on an
-    /// operation. A provider made from a key file, workload identity or
+    /// operation, and no write: a client that writes asks for
+    /// `.read_write`. A provider made from a key file, workload identity or
     /// impersonation is fixed to the scope its first token was minted for
     /// (`auth.Credentials.bindsScopes`), so a client asks for one scope
     /// only.
@@ -69,8 +75,8 @@ pub const Options = struct {
     /// Sends the credentials' quota project as `x-goog-user-project`, as
     /// every module does.
     send_quota_project: bool = true,
-    /// The reads, and the wait on an operation, retry 5xx, 429 and dropped
-    /// connections.
+    /// Every call retries 5xx, 429 and dropped connections, the writes
+    /// too: each carries its `requestId`, so a resend lands once.
     retry: RetryPolicy = .{},
     /// How long one request may take before it is `error.TimedOut`, which
     /// is retried. 0 removes the limit. A wait on an operation is given
@@ -387,10 +393,408 @@ fn waitOnce(self: *Client, path: []const u8) Error!types.Owned(types.Operation) 
     errdefer result.deinit();
     var scratch: std.heap.ArenaAllocator = .init(self.gpa);
     defer scratch.deinit();
-    const body = try rpc.executeLong(self, result.arena, .{ .method = .POST, .path = path, .body = "" });
-    result.value = codec.decodeOperation(result.arena.allocator(), scratch.allocator(), body) catch |err|
+    const answer = try rpc.executeLong(self, result.arena, .{ .method = .POST, .path = path, .body = "" });
+    result.value = codec.decodeOperation(result.arena.allocator(), scratch.allocator(), answer) catch |err|
         return rpc.decodeFailed(self, err, "operation");
     return result;
+}
+
+// Writes. Each answers its operation as production answered it, not yet
+// DONE as a rule (RUNNING, or PENDING: a start answered each when
+// measured); `waitOperation` waits for it. A refusal comes one of two
+// ways: at once, as the call's error, for what Compute checks before
+// acting (a name taken, an unknown machine type or image, a VM under
+// deletion protection), or in the operation, which ends DONE with
+// `failure` set, for what it finds while acting (no room in the zone:
+// `Operation.Failure.stockout()`).
+
+/// How long after a write's first attempt a retry may still begin.
+/// Production answered a repeated `requestId` with the same operation,
+/// while it ran and after it was DONE (measured); how long it keeps one
+/// is not documented, so retries stay well inside an hour.
+pub const request_id_window_ms = 10 * std.time.ms_per_min;
+
+/// Creates a VM from `spec` in `zone`. An insert was DONE 9 to 13 s
+/// later and the VM RUNNING at once after (measured). A name taken is
+/// `error.AlreadyExists` at once, even while the first insert still runs;
+/// an unknown machine type is `error.InvalidArgument`, an unknown image or
+/// family `error.NotFound`. Takes `compute.instances.create` and a client
+/// whose scope is not `.read_only`.
+pub fn insertInstance(self: *Client, zone: []const u8, spec: types.InstanceSpec, options: types.WriteOptions) Error!types.Owned(types.Operation) {
+    return self.write(insertCall, .{ zone, spec, options });
+}
+
+/// Creates a VM from an instance body written by the caller, Compute's
+/// `Instance` resource as JSON, for what `InstanceSpec` leaves out
+/// (accelerators, local SSDs, more disks or interfaces, confidential
+/// computing). It is sent as written; the client checks only that it is
+/// a JSON object whose `name` is an instance name. Paths in it are
+/// relative to the project (`zones/Z/machineTypes/M`) or full URLs.
+pub fn insertInstanceJson(self: *Client, zone: []const u8, instance_json: []const u8, options: types.WriteOptions) Error!types.Owned(types.Operation) {
+    return self.write(jsonCall, .{ zone, instance_json, options });
+}
+
+/// Creates the VM `name` in `zone` from an instance template, which gives
+/// the rest. An unknown template is `error.NotFound`.
+pub fn insertFromTemplate(self: *Client, zone: []const u8, name: []const u8, template: types.TemplateRef, options: types.WriteOptions) Error!types.Owned(types.Operation) {
+    return self.write(templateCall, .{ zone, name, template, options });
+}
+
+/// Starts a stopped VM: DONE 9 to 23 s later (measured). Starting a
+/// running VM is no refusal: its operation answered DONE at once.
+pub fn startInstance(self: *Client, zone: []const u8, name: []const u8, options: types.WriteOptions) Error!types.Owned(types.Operation) {
+    return self.write(startCall, .{ zone, name, options });
+}
+
+/// Stops a VM: DONE 52 to 54 s later, the VM then `.terminated`
+/// (measured). Stopping a stopped VM is no refusal, an operation like
+/// any other.
+pub fn stopInstance(self: *Client, zone: []const u8, name: []const u8, options: types.StopOptions) Error!types.Owned(types.Operation) {
+    return self.write(stopCall, .{ zone, name, options });
+}
+
+/// Suspends a running VM, its memory kept: DONE 87 to 93 s later for a
+/// standard VM and 281 s for a spot one, which can be suspended
+/// (measured).
+pub fn suspendInstance(self: *Client, zone: []const u8, name: []const u8, options: types.SuspendOptions) Error!types.Owned(types.Operation) {
+    return self.write(suspendCall, .{ zone, name, options });
+}
+
+/// Resumes a suspended VM: DONE 12 to 19 s later (measured).
+pub fn resumeInstance(self: *Client, zone: []const u8, name: []const u8, options: types.WriteOptions) Error!types.Owned(types.Operation) {
+    return self.write(resumeCall, .{ zone, name, options });
+}
+
+/// Resets a running VM, as a power cycle would, without a shutdown:
+/// DONE 2 s later (measured).
+pub fn resetInstance(self: *Client, zone: []const u8, name: []const u8, options: types.WriteOptions) Error!types.Owned(types.Operation) {
+    return self.write(resetCall, .{ zone, name, options });
+}
+
+/// Deletes a VM, and its boot disk when that auto-deletes: DONE about
+/// 50 s later, with `no_graceful_shutdown` (measured). A VM under
+/// deletion protection is `error.InvalidArgument` at once, "Invalid
+/// resource usage: 'Resource cannot be deleted if it's protected against
+/// deletion.'." (measured).
+pub fn deleteInstance(self: *Client, zone: []const u8, name: []const u8, options: types.DeleteOptions) Error!types.Owned(types.Operation) {
+    return self.write(deleteCall, .{ zone, name, options });
+}
+
+/// The request `insertInstance` sends for the same arguments, built
+/// without sending it, after the same checks with the same errors: to
+/// show before the call, or to record after it. Credentials and other
+/// headers are not part of it. With `options.request_id` null each call
+/// makes its own id, so the preview and the write would differ in it
+/// alone: to send exactly what was shown, make one with `newRequestId`
+/// and give it to both.
+pub fn insertInstanceRequest(self: *Client, zone: []const u8, spec: types.InstanceSpec, options: types.WriteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(insertCall, .{ zone, spec, options });
+}
+
+/// The request `insertInstanceJson` sends, as `insertInstanceRequest`
+/// says.
+pub fn insertInstanceJsonRequest(self: *Client, zone: []const u8, instance_json: []const u8, options: types.WriteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(jsonCall, .{ zone, instance_json, options });
+}
+
+/// The request `insertFromTemplate` sends, as `insertInstanceRequest`
+/// says.
+pub fn insertFromTemplateRequest(self: *Client, zone: []const u8, name: []const u8, template: types.TemplateRef, options: types.WriteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(templateCall, .{ zone, name, template, options });
+}
+
+/// The request `startInstance` sends, as `insertInstanceRequest` says.
+pub fn startInstanceRequest(self: *Client, zone: []const u8, name: []const u8, options: types.WriteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(startCall, .{ zone, name, options });
+}
+
+/// The request `stopInstance` sends, as `insertInstanceRequest` says.
+pub fn stopInstanceRequest(self: *Client, zone: []const u8, name: []const u8, options: types.StopOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(stopCall, .{ zone, name, options });
+}
+
+/// The request `suspendInstance` sends, as `insertInstanceRequest` says.
+pub fn suspendInstanceRequest(self: *Client, zone: []const u8, name: []const u8, options: types.SuspendOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(suspendCall, .{ zone, name, options });
+}
+
+/// The request `resumeInstance` sends, as `insertInstanceRequest` says.
+pub fn resumeInstanceRequest(self: *Client, zone: []const u8, name: []const u8, options: types.WriteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(resumeCall, .{ zone, name, options });
+}
+
+/// The request `resetInstance` sends, as `insertInstanceRequest` says.
+pub fn resetInstanceRequest(self: *Client, zone: []const u8, name: []const u8, options: types.WriteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(resetCall, .{ zone, name, options });
+}
+
+/// The request `deleteInstance` sends, as `insertInstanceRequest` says.
+pub fn deleteInstanceRequest(self: *Client, zone: []const u8, name: []const u8, options: types.DeleteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(deleteCall, .{ zone, name, options });
+}
+
+/// A request id as the writes make one: a random UUID (version 4),
+/// written into `buf`.
+pub fn newRequestId(self: *Client, buf: *[36]u8) []const u8 {
+    var bytes: [16]u8 = undefined;
+    self.io.random(&bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = std.fmt.bytesToHex(bytes, .lower);
+    return std.fmt.bufPrint(buf, "{s}-{s}-{s}-{s}-{s}", .{ hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32] }) catch unreachable;
+}
+
+/// Sends the call `build` makes and decodes the operation it answers.
+fn write(self: *Client, comptime build: anytype, args: anytype) Error!types.Owned(types.Operation) {
+    rpc.begin(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var call: rpc.Call = try @call(.auto, build, .{ self, a } ++ args);
+    call.retry_window_ms = request_id_window_ms;
+    var result: types.Owned(types.Operation) = try .init(self.gpa);
+    errdefer result.deinit();
+    const answer = try rpc.execute(self, result.arena, call);
+    result.value = codec.decodeOperation(result.arena.allocator(), a, answer) catch |err|
+        return rpc.decodeFailed(self, err, "operation");
+    return result;
+}
+
+/// The request the call `build` makes, unsent.
+fn preview(self: *Client, comptime build: anytype, args: anytype) Error!types.Owned(PreparedRequest) {
+    rpc.begin(self);
+    var result: types.Owned(PreparedRequest) = try .init(self.gpa);
+    errdefer result.deinit();
+    const a = result.arena.allocator();
+    result.value = try .fromCall(a, self.base_url, try @call(.auto, build, .{ self, a } ++ args));
+    return result;
+}
+
+/// `POST .../zones/Z/instances` with the spec written as an instance.
+fn insertCall(self: *Client, a: Allocator, zone: []const u8, spec: types.InstanceSpec, options: types.WriteOptions) Error!rpc.Call {
+    try self.checkWrite();
+    try self.checkZone(zone);
+    try self.checkSpec(spec);
+    const path = try self.writePath(a, zone, null, &.{}, options.request_id);
+    return .{ .method = .POST, .path = path, .body = try body.instance(a, zone, spec) };
+}
+
+fn jsonCall(self: *Client, a: Allocator, zone: []const u8, instance_json: []const u8, options: types.WriteOptions) Error!rpc.Call {
+    try self.checkWrite();
+    try self.checkZone(zone);
+    try self.checkInstanceJson(a, instance_json);
+    const path = try self.writePath(a, zone, null, &.{}, options.request_id);
+    return .{ .method = .POST, .path = path, .body = instance_json };
+}
+
+/// `POST .../zones/Z/instances?sourceInstanceTemplate=T` with the name
+/// alone.
+fn templateCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, template: types.TemplateRef, options: types.WriteOptions) Error!rpc.Call {
+    try self.checkWrite();
+    try self.checkZone(zone);
+    try self.checkName(name, "instance");
+    try self.checkTemplate(template);
+    const source = try body.templatePath(a, self.project, template);
+    const path = try self.writePath(a, zone, null, &.{.{ .name = "sourceInstanceTemplate", .value = source }}, options.request_id);
+    return .{ .method = .POST, .path = path, .body = try body.nameOnly(a, name) };
+}
+
+fn startCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, options: types.WriteOptions) Error!rpc.Call {
+    return self.verbCall(a, zone, name, "start", &.{}, options.request_id);
+}
+
+fn stopCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, options: types.StopOptions) Error!rpc.Call {
+    var flags: std.ArrayList(Flag) = .empty;
+    if (options.discard_local_ssd) |d| try flags.append(a, .{ .name = "discardLocalSsd", .value = if (d) "true" else "false" });
+    if (options.no_graceful_shutdown) try flags.append(a, .{ .name = "noGracefulShutdown", .value = "true" });
+    return self.verbCall(a, zone, name, "stop", flags.items, options.request_id);
+}
+
+fn suspendCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, options: types.SuspendOptions) Error!rpc.Call {
+    var flags: std.ArrayList(Flag) = .empty;
+    if (options.discard_local_ssd) |d| try flags.append(a, .{ .name = "discardLocalSsd", .value = if (d) "true" else "false" });
+    return self.verbCall(a, zone, name, "suspend", flags.items, options.request_id);
+}
+
+fn resumeCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, options: types.WriteOptions) Error!rpc.Call {
+    return self.verbCall(a, zone, name, "resume", &.{}, options.request_id);
+}
+
+fn resetCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, options: types.WriteOptions) Error!rpc.Call {
+    return self.verbCall(a, zone, name, "reset", &.{}, options.request_id);
+}
+
+/// `DELETE .../zones/Z/instances/N`.
+fn deleteCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, options: types.DeleteOptions) Error!rpc.Call {
+    try self.checkWrite();
+    try self.checkZone(zone);
+    try self.checkName(name, "instance");
+    const flags: []const Flag = if (options.no_graceful_shutdown) &.{.{ .name = "noGracefulShutdown", .value = "true" }} else &.{};
+    return .{ .method = .DELETE, .path = try self.writePath(a, zone, name, flags, options.request_id) };
+}
+
+/// `POST .../zones/Z/instances/N/<verb>` with no body.
+fn verbCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, comptime verb: []const u8, flags: []const Flag, request_id: ?[]const u8) Error!rpc.Call {
+    try self.checkWrite();
+    try self.checkZone(zone);
+    try self.checkName(name, "instance");
+    const path = try self.writePath(a, zone, try std.fmt.allocPrint(a, "{s}/" ++ verb, .{name}), flags, request_id);
+    return .{ .method = .POST, .path = path, .body = "" };
+}
+
+const Flag = struct { name: []const u8, value: []const u8 };
+
+/// `/compute/v1/projects/P/zones/Z/instances[/<tail>]?<flags>&requestId=<id>`,
+/// the id `request_id` or a new one.
+fn writePath(self: *Client, a: Allocator, zone: []const u8, tail: ?[]const u8, flags: []const Flag, request_id: ?[]const u8) Error![]const u8 {
+    const id = try self.requestIdFor(a, request_id);
+    var w: std.Io.Writer.Allocating = .init(a);
+    w.writer.print("/compute/v1/projects/{s}/zones/{s}/instances", .{ self.project, zone }) catch return error.OutOfMemory;
+    if (tail) |t| w.writer.print("/{s}", .{t}) catch return error.OutOfMemory;
+    var params: core.query.Params = .init(&w.writer);
+    for (flags) |f| params.add(f.name, f.value) catch return error.OutOfMemory;
+    params.add("requestId", id) catch return error.OutOfMemory;
+    return w.written();
+}
+
+fn requestIdFor(self: *Client, a: Allocator, given: ?[]const u8) Error![]const u8 {
+    if (given) |id| {
+        if (validate.isRequestId(id)) return id;
+        if (self.diagnostics) |d| d.print("invalid request id: expected a UUID such as 8068f1b8-03fc-4f7f-a5bd-d5e775aa7212, not all zeros", .{});
+        return error.InvalidOptions;
+    }
+    return self.newRequestId(try a.create([36]u8));
+}
+
+/// A write needs a scope that takes one: `compute.readonly` takes none.
+fn checkWrite(self: *Client) Error!void {
+    if (self.scope != .read_only) return;
+    if (self.diagnostics) |d| d.print("this client asks for compute.readonly, which takes no write; give Options.scope .read_write", .{});
+    return error.InvalidOptions;
+}
+
+fn checkSpec(self: *Client, spec: types.InstanceSpec) Error!void {
+    try self.checkName(spec.name, "instance");
+    try self.checkName(spec.machine_type, "machine type");
+    try self.checkImage(spec.image);
+    try self.checkBootDisk(spec.boot_disk);
+    try self.checkScheduling(spec);
+    try self.checkMetadata(spec.metadata);
+    try self.checkLabels(spec.labels);
+    for (spec.tags) |t| try self.checkName(t, "network tag");
+    if (spec.service_account) |account| try self.checkAccount(account);
+    try self.checkReference(spec.network, "network");
+    if (spec.subnetwork) |s| try self.checkReference(s, "subnetwork");
+    if (spec.description) |d| if (!std.unicode.utf8ValidateSlice(d) or d.len > 2048) {
+        if (self.diagnostics) |x| x.print("invalid description: expected UTF-8, at most 2048 bytes", .{});
+        return error.InvalidOptions;
+    };
+}
+
+fn checkImage(self: *Client, ref: types.ImageRef) Error!void {
+    switch (ref) {
+        .family, .image => |named| {
+            if (!validate.isProject(named.project)) {
+                if (self.diagnostics) |d| d.print("invalid image project: expected a project id, such as debian-cloud", .{});
+                return error.InvalidName;
+            }
+            try self.checkName(named.name, if (ref == .family) "image family" else "image");
+        },
+        .path => |p| try self.checkReference(p, "image path"),
+    }
+}
+
+fn checkBootDisk(self: *Client, disk: types.BootDisk) Error!void {
+    if (disk.size_gb) |gb| if (gb < validate.min_disk_gb) {
+        if (self.diagnostics) |d| d.print("invalid boot disk size {d} GB: Compute makes none under {d}", .{ gb, validate.min_disk_gb });
+        return error.InvalidOptions;
+    };
+    if (disk.type) |t| try self.checkReference(t, "disk type");
+}
+
+fn checkScheduling(self: *Client, spec: types.InstanceSpec) Error!void {
+    const d = self.diagnostics;
+    if (spec.spot and spec.automatic_restart == true) {
+        if (d) |x| x.print("invalid scheduling: a spot VM cannot restart on its own (\"Preemptible instances cannot be automatically restarted.\")", .{});
+        return error.InvalidOptions;
+    }
+    if (spec.termination_action == .unknown) {
+        if (d) |x| x.print("invalid termination action: .unknown is what a read answers for one this library does not know; give .stop or .delete", .{});
+        return error.InvalidOptions;
+    }
+    if (spec.max_run_duration_s == 0) {
+        if (d) |x| x.print("invalid run limit: 0 s; give null for none", .{});
+        return error.InvalidOptions;
+    }
+}
+
+fn checkMetadata(self: *Client, items: []const types.MetadataItem) Error!void {
+    for (items) |m| {
+        if (!validate.isMetadataKey(m.key)) {
+            if (self.diagnostics) |d| d.print("invalid metadata key: expected letters, digits, - and _, under 128 bytes", .{});
+            return error.InvalidOptions;
+        }
+        const v = m.value orelse continue;
+        if (v.len > validate.max_metadata_value or !std.unicode.utf8ValidateSlice(v)) {
+            if (self.diagnostics) |d| d.print("invalid metadata value: expected UTF-8, at most 256 KiB", .{});
+            return error.InvalidOptions;
+        }
+    }
+}
+
+fn checkLabels(self: *Client, labels: []const types.Label) Error!void {
+    if (labels.len > 64) {
+        if (self.diagnostics) |d| d.print("invalid labels: a VM takes at most 64", .{});
+        return error.InvalidOptions;
+    }
+    for (labels) |l| if (!validate.isLabelText(l.key, true) or !validate.isLabelText(l.value, false)) {
+        if (self.diagnostics) |d| d.print("invalid label: a key starts with a lowercase letter; keys and values are lowercase letters, digits, _ and -, at most 63 characters", .{});
+        return error.InvalidOptions;
+    };
+}
+
+fn checkAccount(self: *Client, account: types.ServiceAccount) Error!void {
+    try self.checkReference(account.email, "service account email");
+    for (account.scopes) |s| try self.checkReference(s, "service account scope");
+}
+
+/// A path, URL or email a body carries: visible ASCII.
+fn checkReference(self: *Client, text: []const u8, what: []const u8) Error!void {
+    if (validate.isReference(text)) return;
+    if (self.diagnostics) |d| d.print("invalid {s}: expected a name, path or URL, visible ASCII", .{what});
+    return error.InvalidOptions;
+}
+
+fn checkTemplate(self: *Client, ref: types.TemplateRef) Error!void {
+    switch (ref) {
+        .global => |name| try self.checkName(name, "instance template"),
+        .regional => |r| {
+            try self.checkScope(.{ .region = r.region });
+            try self.checkName(r.name, "instance template");
+        },
+    }
+}
+
+/// A JSON object whose `name` is an instance name.
+fn checkInstanceJson(self: *Client, a: Allocator, text: []const u8) Error!void {
+    const d = self.diagnostics;
+    const value = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            if (d) |x| x.print("invalid instance body: expected a JSON object", .{});
+            return error.InvalidOptions;
+        },
+    };
+    if (value != .object) {
+        if (d) |x| x.print("invalid instance body: expected a JSON object", .{});
+        return error.InvalidOptions;
+    }
+    const name = value.object.get("name") orelse .null;
+    if (name != .string) {
+        if (d) |x| x.print("invalid instance body: it needs a name", .{});
+        return error.InvalidName;
+    }
+    try self.checkName(name.string, "instance");
 }
 
 // The plumbing.
@@ -407,8 +811,8 @@ fn read(
     errdefer result.deinit();
     var scratch: std.heap.ArenaAllocator = .init(self.gpa);
     defer scratch.deinit();
-    const body = try rpc.execute(self, result.arena, .{ .method = .GET, .path = path });
-    result.value = decode(result.arena.allocator(), scratch.allocator(), body) catch |err|
+    const answer = try rpc.execute(self, result.arena, .{ .method = .GET, .path = path });
+    result.value = decode(result.arena.allocator(), scratch.allocator(), answer) catch |err|
         return rpc.decodeFailed(self, err, what);
     return result;
 }
