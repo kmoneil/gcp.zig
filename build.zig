@@ -835,6 +835,7 @@ pub fn build(b: *std.Build) void {
     const complexity = b.addSystemCommand(&.{ "gnarl", "--check", "." });
     complexity.setCwd(b.path("."));
     complexity.has_side_effects = true;
+    judgeByCiGnarl(b, complexity, test_step);
     b.step("complexity", "Fail a function newly over its complexity limit, or worse than complexity.baseline (gnarl, from the PATH; test runs it too)").dependOn(&complexity.step);
     test_step.dependOn(&complexity.step);
 
@@ -857,4 +858,32 @@ fn streamed(b: *std.Build, tests: *std.Build.Step.Compile) *std.Build.Step.Run {
     run.addArtifactArg2(tests, .{});
     run.stdio = .inherit;
     return run;
+}
+
+/// Holds the complexity step to the gnarl CI installs, not whichever one
+/// the PATH has: two releases can count the same function differently, so
+/// a commit could pass here and fail in CI. tools/vet_pin.zig compares
+/// `gnarl --version` with the pin in .github/actions/vet-tools/action.yml
+/// and fails naming both. It reads the pin when the step runs, not while
+/// configuring: build.zig ships in the package and .github does not, so
+/// embedding the file would break every build that depends on this one,
+/// and a file read while configuring makes Zig configure every build
+/// afresh. The tool's own tests run with `test`.
+fn judgeByCiGnarl(b: *std.Build, complexity: *std.Build.Step.Run, test_step: *std.Build.Step) void {
+    const gnarl_version = b.addSystemCommand(&.{ "gnarl", "--version" });
+    gnarl_version.has_side_effects = true;
+    const vet_pin = b.addExecutable(.{
+        .name = "vet-pin",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/vet_pin.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const gnarl_pin = b.addRunArtifact(vet_pin);
+    gnarl_pin.addArg("gnarl");
+    gnarl_pin.addFileArg(b.path(".github/actions/vet-tools/action.yml"));
+    gnarl_pin.addFileArg(gnarl_version.captureStdOut(.{}));
+    complexity.step.dependOn(&gnarl_pin.step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = vet_pin.root_module })).step);
 }
