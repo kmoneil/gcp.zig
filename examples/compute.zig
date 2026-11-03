@@ -1,6 +1,6 @@
 //! Create a spot VM with a startup script, wait for it, read what the
-//! script wrote to its serial console, stop it, start it and delete it:
-//! the life of a VM, each write shown before it is sent.
+//! script wrote to its serial console, stop it, start it, label it and
+//! delete it: the life of a VM, the insert shown before it is sent.
 //!
 //!     GOOGLE_CLOUD_PROJECT=my-project zig build example-compute -- --yes
 //!     GOOGLE_CLOUD_PROJECT=my-project zig build example-compute -- --zone europe-west1-b --name batch-1 --yes
@@ -11,8 +11,8 @@
 //! one-hour run limit that deletes it, so a VM left behind by a crash
 //! goes on its own; it costs well under a cent. Credentials come from
 //! `auth.findDefault`, with the `compute` scope (`.read_write`); IAM
-//! asks `compute.instances.create`, `.start`, `.stop`, `.delete` and
-//! `.getSerialPortOutput`. A zone out of spot VMs ends the insert's
+//! asks `compute.instances.create`, `.start`, `.stop`, `.setLabels`,
+//! `.delete` and `.getSerialPortOutput`. A zone out of spot VMs ends the insert's
 //! operation failed: the example says so, and `--zone` names another.
 //! `--fake` works on `compute.testing.FakeCompute` instead, and writes
 //! the script's line to the console itself.
@@ -124,6 +124,13 @@ pub fn main(init: std.process.Init) !void {
     var start = client.startInstance(zone, name, .{}) catch |err| return report(err, &diag);
     _ = try finished(out, &client, &diag, "start", &start);
     try show(out, &client, zone, name);
+    // One label more, the others kept: read, changed and sent under the
+    // fingerprint just read.
+    var label = client.updateLabels(zone, name, .{ .set = &.{.{ .key = "stage", .value = "restarted" }} }) catch |err| return report(err, &diag);
+    _ = try finished(out, &client, &diag, "label", &label);
+    var labelled = try client.getInstance(zone, name);
+    defer labelled.deinit();
+    try out.print("  labels: made-by={s} stage={s}\n", .{ labelled.value.label("made-by").?, labelled.value.label("stage").? });
     var delete = client.deleteInstance(zone, name, .{}) catch |err| return report(err, &diag);
     _ = try finished(out, &client, &diag, "delete", &delete);
     try out.print("{s} deleted\n", .{name});

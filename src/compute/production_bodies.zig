@@ -2372,3 +2372,488 @@ pub const template_not_found =
     \\ }
     \\}
 ;
+
+/// setTags with a stale fingerprint. HTTP 412.
+pub const stale_tags_fingerprint_status = 412;
+pub const stale_tags_fingerprint =
+    \\{
+    \\ "error": {
+    \\  "code": 412,
+    \\  "message": "Tags fingerprint either invalid or resource tags have changed.",
+    \\  "errors": [
+    \\   {
+    \\    "message": "Tags fingerprint either invalid or resource tags have changed.",
+    \\    "domain": "global",
+    \\    "reason": "conditionNotMet",
+    \\    "location": "If-Match",
+    \\    "locationType": "header"
+    \\   }
+    \\  ]
+    \\ }
+    \\}
+;
+
+/// setLabels's operation as the call answered it: RUNNING, type compute.instance.setLabels (milestone 3's probe). HTTP 200.
+pub const operation_set_labels_status = 200;
+pub const operation_set_labels =
+    \\{
+    \\ "kind": "compute#operation",
+    \\ "id": "4937613828071874033",
+    \\ "name": "operation-1793745693885-65f66f6e6c5b7-0947e7f2-3f41758d",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "operationType": "compute.instance.setLabels",
+    \\ "targetLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m3-11032241-a",
+    \\ "targetId": "6724670434841189882",
+    \\ "status": "RUNNING",
+    \\ "user": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\ "progress": 0,
+    \\ "insertTime": "2026-11-03T14:41:34.096-08:00",
+    \\ "startTime": "2026-11-03T14:41:34.098-08:00",
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/operations/operation-1793745693885-65f66f6e6c5b7-0947e7f2-3f41758d"
+    \\}
+;
+
+/// The VM read right after setLabels was answered, its operation not yet DONE: the new labels and fingerprint already there (milestone 3's probe). GET instance. HTTP 200.
+pub const instance_relabelled_status = 200;
+pub const instance_relabelled =
+    \\{
+    \\ "kind": "compute#instance",
+    \\ "id": "6724670434841189882",
+    \\ "creationTimestamp": "2026-11-03T14:41:25.274-08:00",
+    \\ "name": "zigps-m3-11032241-a",
+    \\ "tags": {
+    \\  "fingerprint": "42WmSpB8rSM="
+    \\ },
+    \\ "machineType": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/machineTypes/e2-micro",
+    \\ "status": "RUNNING",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "networkInterfaces": [
+    \\  {
+    \\   "kind": "compute#networkInterface",
+    \\   "network": "https://www.googleapis.com/compute/v1/projects/extractctl/global/networks/default",
+    \\   "subnetwork": "https://www.googleapis.com/compute/v1/projects/extractctl/regions/us-central1/subnetworks/default",
+    \\   "networkIP": "10.128.0.30",
+    \\   "name": "nic0",
+    \\   "fingerprint": "JJ1-Lv6ijKY=",
+    \\   "stackType": "IPV4_ONLY"
+    \\  }
+    \\ ],
+    \\ "disks": [
+    \\  {
+    \\   "kind": "compute#attachedDisk",
+    \\   "type": "PERSISTENT",
+    \\   "mode": "READ_WRITE",
+    \\   "source": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/disks/zigps-m3-11032241-a",
+    \\   "deviceName": "persistent-disk-0",
+    \\   "index": 0,
+    \\   "boot": true,
+    \\   "autoDelete": true,
+    \\   "licenses": [
+    \\    "https://www.googleapis.com/compute/v1/projects/debian-cloud/global/licenses/debian-12-bookworm"
+    \\   ],
+    \\   "interface": "SCSI",
+    \\   "guestOsFeatures": [
+    \\    {
+    \\     "type": "UEFI_COMPATIBLE"
+    \\    },
+    \\    {
+    \\     "type": "VIRTIO_SCSI_MULTIQUEUE"
+    \\    },
+    \\    {
+    \\     "type": "GVNIC"
+    \\    },
+    \\    {
+    \\     "type": "SEV_CAPABLE"
+    \\    },
+    \\    {
+    \\     "type": "SEV_LIVE_MIGRATABLE_V2"
+    \\    },
+    \\    {
+    \\     "type": "SUSPEND_SAFE_FPR"
+    \\    }
+    \\   ],
+    \\   "diskSizeGb": "10",
+    \\   "architecture": "X86_64"
+    \\  }
+    \\ ],
+    \\ "metadata": {
+    \\  "kind": "compute#metadata",
+    \\  "fingerprint": "osKZ0PQ-g6U=",
+    \\  "items": [
+    \\   {
+    \\    "key": "startup-script",
+    \\    "value": "#!/bin/bash\necho zigps-m3 up > /dev/ttyS0\n"
+    \\   },
+    \\   {
+    \\    "key": "enable-guest-attributes",
+    \\    "value": "TRUE"
+    \\   }
+    \\  ]
+    \\ },
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m3-11032241-a",
+    \\ "scheduling": {
+    \\  "maxRunDuration": {
+    \\   "seconds": "3600",
+    \\   "nanos": 0
+    \\  },
+    \\  "onHostMaintenance": "TERMINATE",
+    \\  "automaticRestart": false,
+    \\  "preemptible": true,
+    \\  "provisioningModel": "SPOT",
+    \\  "instanceTerminationAction": "DELETE"
+    \\ },
+    \\ "cpuPlatform": "Intel Broadwell",
+    \\ "labels": {
+    \\  "purpose": "gcp-zig-test",
+    \\  "tool": "compute-m3",
+    \\  "probe": "one"
+    \\ },
+    \\ "labelFingerprint": "GlFen7VtVrc=",
+    \\ "startRestricted": false,
+    \\ "deletionProtection": false,
+    \\ "shieldedInstanceConfig": {
+    \\  "enableSecureBoot": false,
+    \\  "enableVtpm": true,
+    \\  "enableIntegrityMonitoring": true
+    \\ },
+    \\ "shieldedInstanceIntegrityPolicy": {
+    \\  "updateAutoLearnPolicy": true
+    \\ },
+    \\ "fingerprint": "9TSze8FIiZw=",
+    \\ "lastStartTimestamp": "2026-11-03T14:41:33.068-08:00",
+    \\ "satisfiesPzi": true,
+    \\ "resourceStatus": {
+    \\  "effectiveInstanceMetadata": {
+    \\   "vmDnsSettingMetadataValue": "ZonalOnly",
+    \\   "enableGuestAttributesMetadataValue": true
+    \\  },
+    \\  "scheduling": {
+    \\   "terminationTimestamp": "2026-11-03T23:41:26.671838Z"
+    \\  }
+    \\ }
+    \\}
+;
+
+/// setScheduling on a running spot VM with a run limit, the scheduling unchanged (milestone 3's probe). HTTP 400.
+pub const scheduling_running_status = 400;
+pub const scheduling_running =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Termination time cannot be changed while the instance is running.",
+    \\  "errors": [
+    \\   {
+    \\    "message": "Termination time cannot be changed while the instance is running.",
+    \\    "domain": "global",
+    \\    "reason": "badRequest"
+    \\   }
+    \\  ]
+    \\ }
+    \\}
+;
+
+/// setScheduling on a running VM, its run limit changed (milestone 3's probe). HTTP 400.
+pub const scheduling_limit_running_status = 400;
+pub const scheduling_limit_running =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Max run duration cannot be changed while the instance is running.",
+    \\  "errors": [
+    \\   {
+    \\    "message": "Max run duration cannot be changed while the instance is running.",
+    \\    "domain": "global",
+    \\    "reason": "badRequest"
+    \\   }
+    \\  ]
+    \\ }
+    \\}
+;
+
+/// setScheduling to STANDARD on a spot VM without preemptible false (milestone 3's probe). HTTP 400.
+pub const scheduling_standard_preemptible_status = 400;
+pub const scheduling_standard_preemptible =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Invalid value for field 'resource.provisioningModel': 'STANDARD'. For preemptible, only allowed provisioning_model value is SPOT.",
+    \\  "errors": [
+    \\   {
+    \\    "message": "Invalid value for field 'resource.provisioningModel': 'STANDARD'. For preemptible, only allowed provisioning_model value is SPOT.",
+    \\    "domain": "global",
+    \\    "reason": "invalid"
+    \\   }
+    \\  ]
+    \\ }
+    \\}
+;
+
+/// setMachineType to a machine type the zone lacks, on a running VM (milestone 3's probe). HTTP 400.
+pub const machine_type_unknown_status = 400;
+pub const machine_type_unknown =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Invalid value for field 'machineType': 'zones/us-central1-a/machineTypes/e2-nonesuch'. Machine type with name 'e2-nonesuch' does not exist in zone 'us-central1-a'.",
+    \\  "errors": [
+    \\   {
+    \\    "message": "Invalid value for field 'machineType': 'zones/us-central1-a/machineTypes/e2-nonesuch'. Machine type with name 'e2-nonesuch' does not exist in zone 'us-central1-a'.",
+    \\    "domain": "global",
+    \\    "reason": "invalid"
+    \\   }
+    \\  ]
+    \\ }
+    \\}
+;
+
+/// A VM with a disk attached beside its boot disk (milestone 3's probe). GET instance. HTTP 200.
+pub const instance_two_disks_status = 200;
+pub const instance_two_disks =
+    \\{
+    \\ "kind": "compute#instance",
+    \\ "id": "6724670434841189882",
+    \\ "creationTimestamp": "2026-11-03T14:41:25.274-08:00",
+    \\ "name": "zigps-m3-11032241-a",
+    \\ "tags": {
+    \\  "fingerprint": "42WmSpB8rSM="
+    \\ },
+    \\ "machineType": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/machineTypes/e2-micro",
+    \\ "status": "RUNNING",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "networkInterfaces": [
+    \\  {
+    \\   "kind": "compute#networkInterface",
+    \\   "network": "https://www.googleapis.com/compute/v1/projects/extractctl/global/networks/default",
+    \\   "subnetwork": "https://www.googleapis.com/compute/v1/projects/extractctl/regions/us-central1/subnetworks/default",
+    \\   "networkIP": "10.128.0.30",
+    \\   "name": "nic0",
+    \\   "fingerprint": "JJ1-Lv6ijKY=",
+    \\   "stackType": "IPV4_ONLY"
+    \\  }
+    \\ ],
+    \\ "disks": [
+    \\  {
+    \\   "kind": "compute#attachedDisk",
+    \\   "type": "PERSISTENT",
+    \\   "mode": "READ_WRITE",
+    \\   "source": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/disks/zigps-m3-11032241-a",
+    \\   "deviceName": "persistent-disk-0",
+    \\   "index": 0,
+    \\   "boot": true,
+    \\   "autoDelete": true,
+    \\   "licenses": [
+    \\    "https://www.googleapis.com/compute/v1/projects/debian-cloud/global/licenses/debian-12-bookworm"
+    \\   ],
+    \\   "interface": "SCSI",
+    \\   "guestOsFeatures": [
+    \\    {
+    \\     "type": "UEFI_COMPATIBLE"
+    \\    },
+    \\    {
+    \\     "type": "VIRTIO_SCSI_MULTIQUEUE"
+    \\    },
+    \\    {
+    \\     "type": "GVNIC"
+    \\    },
+    \\    {
+    \\     "type": "SEV_CAPABLE"
+    \\    },
+    \\    {
+    \\     "type": "SEV_LIVE_MIGRATABLE_V2"
+    \\    },
+    \\    {
+    \\     "type": "SUSPEND_SAFE_FPR"
+    \\    }
+    \\   ],
+    \\   "diskSizeGb": "10",
+    \\   "architecture": "X86_64"
+    \\  },
+    \\  {
+    \\   "kind": "compute#attachedDisk",
+    \\   "type": "PERSISTENT",
+    \\   "mode": "READ_WRITE",
+    \\   "source": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/disks/zigps-m3-11032241-d",
+    \\   "deviceName": "zigps-data",
+    \\   "index": 1,
+    \\   "boot": false,
+    \\   "autoDelete": false,
+    \\   "interface": "SCSI",
+    \\   "diskSizeGb": "10"
+    \\  }
+    \\ ],
+    \\ "metadata": {
+    \\  "kind": "compute#metadata",
+    \\  "fingerprint": "osKZ0PQ-g6U=",
+    \\  "items": [
+    \\   {
+    \\    "key": "startup-script",
+    \\    "value": "#!/bin/bash\necho zigps-m3 up > /dev/ttyS0\n"
+    \\   },
+    \\   {
+    \\    "key": "enable-guest-attributes",
+    \\    "value": "TRUE"
+    \\   }
+    \\  ]
+    \\ },
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m3-11032241-a",
+    \\ "scheduling": {
+    \\  "maxRunDuration": {
+    \\   "seconds": "3600",
+    \\   "nanos": 0
+    \\  },
+    \\  "onHostMaintenance": "TERMINATE",
+    \\  "automaticRestart": false,
+    \\  "preemptible": true,
+    \\  "provisioningModel": "SPOT",
+    \\  "instanceTerminationAction": "DELETE"
+    \\ },
+    \\ "cpuPlatform": "Intel Broadwell",
+    \\ "labels": {
+    \\  "purpose": "gcp-zig-test",
+    \\  "tool": "compute-m3",
+    \\  "probe": "one"
+    \\ },
+    \\ "labelFingerprint": "GlFen7VtVrc=",
+    \\ "startRestricted": false,
+    \\ "deletionProtection": false,
+    \\ "shieldedInstanceConfig": {
+    \\  "enableSecureBoot": false,
+    \\  "enableVtpm": true,
+    \\  "enableIntegrityMonitoring": true
+    \\ },
+    \\ "shieldedInstanceIntegrityPolicy": {
+    \\  "updateAutoLearnPolicy": true
+    \\ },
+    \\ "fingerprint": "6F8Fnl4LLFE=",
+    \\ "lastStartTimestamp": "2026-11-03T14:41:33.068-08:00",
+    \\ "satisfiesPzi": true,
+    \\ "resourceStatus": {
+    \\  "effectiveInstanceMetadata": {
+    \\   "vmDnsSettingMetadataValue": "ZonalOnly",
+    \\   "enableGuestAttributesMetadataValue": true
+    \\  },
+    \\  "scheduling": {
+    \\   "terminationTimestamp": "2026-11-03T23:41:26.671838Z"
+    \\  }
+    \\ }
+    \\}
+;
+
+/// An attach of a disk the VM has already: the call taken, its operation DONE with RESOURCE_IN_USE_BY_ANOTHER_RESOURCE (milestone 3's probe). HTTP 200.
+pub const operation_disk_in_use_status = 200;
+pub const operation_disk_in_use =
+    \\{
+    \\ "kind": "compute#operation",
+    \\ "id": "3841534716684000708",
+    \\ "name": "operation-1793745707240-65f66f7b28c91-ea597ad0-b99fa280",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "operationType": "attachDisk",
+    \\ "targetLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m3-11032241-a",
+    \\ "targetId": "6724670434841189882",
+    \\ "status": "DONE",
+    \\ "user": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\ "progress": 100,
+    \\ "insertTime": "2026-11-03T14:41:47.494-08:00",
+    \\ "startTime": "2026-11-03T14:41:47.500-08:00",
+    \\ "endTime": "2026-11-03T14:41:49.816-08:00",
+    \\ "error": {
+    \\  "errors": [
+    \\   {
+    \\    "code": "RESOURCE_IN_USE_BY_ANOTHER_RESOURCE",
+    \\    "message": "The disk resource 'projects/extractctl/zones/us-central1-a/disks/zigps-m3-11032241-d' is already being used by 'projects/extractctl/zones/us-central1-a/instances/zigps-m3-11032241-a'"
+    \\   }
+    \\  ]
+    \\ },
+    \\ "httpErrorStatusCode": 400,
+    \\ "httpErrorMessage": "BAD REQUEST",
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/operations/operation-1793745707240-65f66f7b28c91-ea597ad0-b99fa280"
+    \\}
+;
+
+/// An attach of a disk nobody has (milestone 3's probe). HTTP 404.
+pub const disk_not_found_status = 404;
+pub const disk_not_found =
+    \\{
+    \\ "error": {
+    \\  "code": 404,
+    \\  "message": "The resource 'projects/extractctl/zones/us-central1-a/disks/zigps-m3-nonesuch' was not found",
+    \\  "errors": [
+    \\   {
+    \\    "message": "The resource 'projects/extractctl/zones/us-central1-a/disks/zigps-m3-nonesuch' was not found",
+    \\    "domain": "global",
+    \\    "reason": "notFound"
+    \\   }
+    \\  ]
+    \\ }
+    \\}
+;
+
+/// A detach of a device the VM has none of: the call taken, its operation DONE with INVALID_USAGE (milestone 3's probe). HTTP 200.
+pub const operation_no_such_device_status = 200;
+pub const operation_no_such_device =
+    \\{
+    \\ "kind": "compute#operation",
+    \\ "id": "8827830900814765532",
+    \\ "name": "operation-1793745714924-65f66f827ca11-e827d1a2-86ac0a09",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "operationType": "detachDisk",
+    \\ "targetLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m3-11032241-a",
+    \\ "targetId": "6724670434841189882",
+    \\ "status": "DONE",
+    \\ "user": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\ "progress": 100,
+    \\ "insertTime": "2026-11-03T14:41:55.044-08:00",
+    \\ "startTime": "2026-11-03T14:41:55.051-08:00",
+    \\ "endTime": "2026-11-03T14:41:55.738-08:00",
+    \\ "error": {
+    \\  "errors": [
+    \\   {
+    \\    "code": "INVALID_USAGE",
+    \\    "message": "No attached disk found with device name 'zigps-data'"
+    \\   }
+    \\  ]
+    \\ },
+    \\ "httpErrorStatusCode": 400,
+    \\ "httpErrorMessage": "BAD REQUEST",
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/operations/operation-1793745714924-65f66f827ca11-e827d1a2-86ac0a09"
+    \\}
+;
+
+/// setDeletionProtection's operation as the call answered it: DONE at once (milestone 3's probe). HTTP 200.
+pub const operation_protection_status = 200;
+pub const operation_protection =
+    \\{
+    \\ "kind": "compute#operation",
+    \\ "id": "2783908838339239387",
+    \\ "name": "operation-1793745716041-65f66f838d89f-44e290ac-425d0d01",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "operationType": "setDeletionProtection",
+    \\ "targetLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m3-11032241-a",
+    \\ "targetId": "6724670434841189882",
+    \\ "status": "DONE",
+    \\ "user": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\ "progress": 100,
+    \\ "insertTime": "2026-11-03T14:41:56.201-08:00",
+    \\ "startTime": "2026-11-03T14:41:56.213-08:00",
+    \\ "endTime": "2026-11-03T14:41:56.350-08:00",
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/operations/operation-1793745716041-65f66f838d89f-44e290ac-425d0d01"
+    \\}
+;
+
+/// setScheduling to SPOT on a stopped standard VM without preemptible true (milestone 3's live suite). HTTP 400.
+pub const scheduling_spot_not_preemptible_status = 400;
+pub const scheduling_spot_not_preemptible =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Invalid value for field 'resource.provisioningModel': 'SPOT'. preemptible=false and provisioning_model=SPOT is contradicting.",
+    \\  "errors": [
+    \\   {
+    \\    "message": "Invalid value for field 'resource.provisioningModel': 'SPOT'. preemptible=false and provisioning_model=SPOT is contradicting.",
+    \\    "domain": "global",
+    \\    "reason": "invalid"
+    \\   }
+    \\  ]
+    \\ }
+    \\}
+;

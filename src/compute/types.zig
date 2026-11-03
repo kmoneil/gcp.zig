@@ -622,6 +622,61 @@ pub const DeleteOptions = struct {
     no_graceful_shutdown: bool = false,
 };
 
+// Changes to a live VM.
+
+/// What a host's maintenance does to a VM.
+pub const HostMaintenance = enum {
+    /// Moved to another host while it runs: a standard VM's default.
+    migrate,
+    /// Stopped, and restarted after when `automatic_restart` allows: what
+    /// a spot VM must take.
+    terminate,
+};
+
+/// A change to a VM's scheduling, for `Client.setScheduling`: each field
+/// given is sent, and each left null is kept as the VM has it, as
+/// production kept them (measured).
+pub const SchedulingChange = struct {
+    /// Spot, or standard.
+    spot: ?bool = null,
+    automatic_restart: ?bool = null,
+    on_host_maintenance: ?HostMaintenance = null,
+    /// A run limit, in seconds.
+    max_run_duration_s: ?u64 = null,
+    /// What happens at the run limit, or when a spot VM is taken back.
+    termination_action: ?TerminationAction = null,
+};
+
+/// A disk to attach to a VM, one that exists already.
+pub const AttachSpec = struct {
+    /// A disk's name in the VM's zone, or its path or URL (a regional
+    /// disk's, say).
+    disk: []const u8,
+    /// The name the guest sees it by, under `/dev/disk/by-id/google-*`,
+    /// and the one `Client.detachDisk` takes. Null lets Compute choose
+    /// one, `persistent-disk-<n>`.
+    device_name: ?[]const u8 = null,
+    read_only: bool = false,
+    /// Deleted with the VM.
+    auto_delete: bool = false,
+    /// Attach a regional disk even while another VM has it.
+    force: bool = false,
+};
+
+/// Labels to set and to remove, for `Client.updateLabels`: the rest are
+/// kept.
+pub const LabelChange = struct {
+    set: []const Label = &.{},
+    remove: []const []const u8 = &.{},
+};
+
+/// Metadata items to set and to remove, for `Client.updateMetadata`: the
+/// rest are kept.
+pub const MetadataChange = struct {
+    set: []const MetadataItem = &.{},
+    remove: []const []const u8 = &.{},
+};
+
 const testing = std.testing;
 
 test "Status.parse: every state, and one this library does not know" {

@@ -533,6 +533,223 @@ pub fn deleteInstanceRequest(self: *Client, zone: []const u8, name: []const u8, 
     return self.preview(deleteCall, .{ zone, name, options });
 }
 
+// Changes to a live VM. Labels, metadata and tags are each replaced whole,
+// under the fingerprint the VM was read with: a VM changed since is
+// refused `error.FailedPrecondition` (412 `conditionNotMet`), and so is a
+// change with no fingerprint (measured). Such a refusal is never retried:
+// read the VM again, and send the change again. `updateLabels` and
+// `updateMetadata` do that for a change to some entries.
+
+/// Sets the VM's labels to `labels`, every one: a label left out is
+/// removed. `fingerprint` is `Instance.label_fingerprint` as read; a stale
+/// one is refused, "Labels fingerprint either invalid or resource labels
+/// have changed" (measured). The operation's type is
+/// "compute.instance.setLabels".
+pub fn setLabels(self: *Client, zone: []const u8, name: []const u8, labels: []const types.Label, fingerprint: []const u8, options: types.WriteOptions) Error!types.Owned(types.Operation) {
+    return self.write(labelsCall, .{ zone, name, labels, fingerprint, options });
+}
+
+/// Sets the VM's metadata to `items`, every one: an item left out is
+/// removed. `fingerprint` is `Instance.metadata.fingerprint` as read; a
+/// stale one is refused, "Supplied fingerprint does not match current
+/// metadata fingerprint." (measured).
+pub fn setMetadata(self: *Client, zone: []const u8, name: []const u8, items: []const types.MetadataItem, fingerprint: []const u8, options: types.WriteOptions) Error!types.Owned(types.Operation) {
+    return self.write(metadataCall, .{ zone, name, items, fingerprint, options });
+}
+
+/// Sets the VM's network tags to `tags`, every one. `fingerprint` is
+/// `Instance.tags.fingerprint` as read; a stale one is refused, "Tags
+/// fingerprint either invalid or resource tags have changed." (measured).
+pub fn setTags(self: *Client, zone: []const u8, name: []const u8, tags: []const []const u8, fingerprint: []const u8, options: types.WriteOptions) Error!types.Owned(types.Operation) {
+    return self.write(tagsCall, .{ zone, name, tags, fingerprint, options });
+}
+
+/// Moves a stopped VM to another machine type in its zone. On a running
+/// VM the call is taken and its operation ends DONE failed,
+/// UNSUPPORTED_OPERATION "Instance is starting or running." (measured):
+/// stop it first. A machine type the zone lacks is refused at once,
+/// running or not, `error.InvalidArgument` (measured).
+pub fn setMachineType(self: *Client, zone: []const u8, name: []const u8, machine_type: []const u8, options: types.WriteOptions) Error!types.Owned(types.Operation) {
+    return self.write(machineTypeCall, .{ zone, name, machine_type, options });
+}
+
+/// Changes how the VM is scheduled: what `scheduling` gives, the rest
+/// kept (measured). A running VM with a run limit refuses every change,
+/// `error.InvalidArgument` "Termination time cannot be changed while the
+/// instance is running." or "Max run duration cannot be changed while the
+/// instance is running." (measured): stop it first. `.spot` is sent as
+/// the provisioning model with the `preemptible` that agrees with it:
+/// production refused STANDARD alone for a spot VM ("For preemptible, only
+/// allowed provisioning_model value is SPOT.") and SPOT alone for a
+/// standard one ("preemptible=false and provisioning_model=SPOT is
+/// contradicting."), and took each with it, stopped (measured).
+pub fn setScheduling(self: *Client, zone: []const u8, name: []const u8, scheduling: types.SchedulingChange, options: types.WriteOptions) Error!types.Owned(types.Operation) {
+    return self.write(schedulingCall, .{ zone, name, scheduling, options });
+}
+
+/// Turns deletion protection on or off: its operation answered DONE at
+/// once, either way (measured).
+pub fn setDeletionProtection(self: *Client, zone: []const u8, name: []const u8, protect: bool, options: types.WriteOptions) Error!types.Owned(types.Operation) {
+    return self.write(protectionCall, .{ zone, name, protect, options });
+}
+
+/// Attaches a disk that exists already, to a running VM too: DONE 3 s
+/// later (measured). A disk nobody has is `error.NotFound` at once; one
+/// another VM uses, or this one, is taken and its operation ends DONE
+/// failed, RESOURCE_IN_USE_BY_ANOTHER_RESOURCE "The disk resource '<d>'
+/// is already being used by '<vm>'" (measured).
+pub fn attachDisk(self: *Client, zone: []const u8, name: []const u8, disk: types.AttachSpec, options: types.WriteOptions) Error!types.Owned(types.Operation) {
+    return self.write(attachCall, .{ zone, name, disk, options });
+}
+
+/// Detaches the disk the VM knows as `device_name`
+/// (`AttachedDisk.device_name`): DONE 4 s later (measured). A device the
+/// VM has none of is taken, and its operation ends DONE failed,
+/// INVALID_USAGE "No attached disk found with device name '<d>'"
+/// (measured).
+pub fn detachDisk(self: *Client, zone: []const u8, name: []const u8, device_name: []const u8, options: types.WriteOptions) Error!types.Owned(types.Operation) {
+    return self.write(detachCall, .{ zone, name, device_name, options });
+}
+
+/// The request `setLabels` sends, as `insertInstanceRequest` says.
+pub fn setLabelsRequest(self: *Client, zone: []const u8, name: []const u8, labels: []const types.Label, fingerprint: []const u8, options: types.WriteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(labelsCall, .{ zone, name, labels, fingerprint, options });
+}
+
+/// The request `setMetadata` sends, as `insertInstanceRequest` says.
+pub fn setMetadataRequest(self: *Client, zone: []const u8, name: []const u8, items: []const types.MetadataItem, fingerprint: []const u8, options: types.WriteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(metadataCall, .{ zone, name, items, fingerprint, options });
+}
+
+/// The request `setTags` sends, as `insertInstanceRequest` says.
+pub fn setTagsRequest(self: *Client, zone: []const u8, name: []const u8, tags: []const []const u8, fingerprint: []const u8, options: types.WriteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(tagsCall, .{ zone, name, tags, fingerprint, options });
+}
+
+/// The request `setMachineType` sends, as `insertInstanceRequest` says.
+pub fn setMachineTypeRequest(self: *Client, zone: []const u8, name: []const u8, machine_type: []const u8, options: types.WriteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(machineTypeCall, .{ zone, name, machine_type, options });
+}
+
+/// The request `setScheduling` sends, as `insertInstanceRequest` says.
+pub fn setSchedulingRequest(self: *Client, zone: []const u8, name: []const u8, scheduling: types.SchedulingChange, options: types.WriteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(schedulingCall, .{ zone, name, scheduling, options });
+}
+
+/// The request `setDeletionProtection` sends, as `insertInstanceRequest`
+/// says.
+pub fn setDeletionProtectionRequest(self: *Client, zone: []const u8, name: []const u8, protect: bool, options: types.WriteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(protectionCall, .{ zone, name, protect, options });
+}
+
+/// The request `attachDisk` sends, as `insertInstanceRequest` says.
+pub fn attachDiskRequest(self: *Client, zone: []const u8, name: []const u8, disk: types.AttachSpec, options: types.WriteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(attachCall, .{ zone, name, disk, options });
+}
+
+/// The request `detachDisk` sends, as `insertInstanceRequest` says.
+pub fn detachDiskRequest(self: *Client, zone: []const u8, name: []const u8, device_name: []const u8, options: types.WriteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(detachCall, .{ zone, name, device_name, options });
+}
+
+/// Sets some labels and removes others, keeping the rest: reads the VM,
+/// sends `setLabels` with the labels changed under the fingerprint just
+/// read, and reads and sends again when another change landed in between
+/// (412), up to `Options.retry.max_attempts` rounds. Answers the
+/// operation of the change that was taken.
+pub fn updateLabels(self: *Client, zone: []const u8, name: []const u8, change: types.LabelChange) Error!types.Owned(types.Operation) {
+    try self.checkLabelChange(change);
+    var round: u32 = 0;
+    while (true) {
+        round += 1;
+        var vm = try self.getInstance(zone, name);
+        defer vm.deinit();
+        var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+        defer scratch.deinit();
+        const labels = try mergeLabels(scratch.allocator(), vm.value.labels, change);
+        return self.setLabels(zone, name, labels, vm.value.label_fingerprint, .{}) catch |err| {
+            if (err != error.FailedPrecondition or round >= self.retry.max_attempts) return err;
+            logging.debug("labels of {s} changed under the read; reading again", .{name});
+            continue;
+        };
+    }
+}
+
+/// Sets some metadata items and removes others, keeping the rest, as
+/// `updateLabels` does labels.
+pub fn updateMetadata(self: *Client, zone: []const u8, name: []const u8, change: types.MetadataChange) Error!types.Owned(types.Operation) {
+    try self.checkMetadataChange(change);
+    var round: u32 = 0;
+    while (true) {
+        round += 1;
+        var vm = try self.getInstance(zone, name);
+        defer vm.deinit();
+        var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+        defer scratch.deinit();
+        const items = try mergeMetadata(scratch.allocator(), vm.value.metadata.items, change);
+        return self.setMetadata(zone, name, items, vm.value.metadata.fingerprint, .{}) catch |err| {
+            if (err != error.FailedPrecondition or round >= self.retry.max_attempts) return err;
+            logging.debug("metadata of {s} changed under the read; reading again", .{name});
+            continue;
+        };
+    }
+}
+
+/// `current` with `change` made: a label set keeps its place, a new one
+/// goes last, a removed one goes.
+fn mergeLabels(a: Allocator, current: []const types.Label, change: types.LabelChange) Allocator.Error![]const types.Label {
+    var out: std.ArrayList(types.Label) = .empty;
+    for (current) |l| {
+        if (listed(change.remove, l.key)) continue;
+        try out.append(a, labelIn(change.set, l.key) orelse l);
+    }
+    for (change.set) |l| if (labelIn(current, l.key) == null) try out.append(a, l);
+    return out.items;
+}
+
+fn mergeMetadata(a: Allocator, current: []const types.MetadataItem, change: types.MetadataChange) Allocator.Error![]const types.MetadataItem {
+    var out: std.ArrayList(types.MetadataItem) = .empty;
+    for (current) |m| {
+        if (listed(change.remove, m.key)) continue;
+        try out.append(a, itemIn(change.set, m.key) orelse m);
+    }
+    for (change.set) |m| if (itemIn(current, m.key) == null) try out.append(a, m);
+    return out.items;
+}
+
+fn listed(keys: []const []const u8, key: []const u8) bool {
+    for (keys) |k| if (std.mem.eql(u8, k, key)) return true;
+    return false;
+}
+
+fn labelIn(list: []const types.Label, key: []const u8) ?types.Label {
+    for (list) |l| if (std.mem.eql(u8, l.key, key)) return l;
+    return null;
+}
+
+fn itemIn(list: []const types.MetadataItem, key: []const u8) ?types.MetadataItem {
+    for (list) |m| if (std.mem.eql(u8, m.key, key)) return m;
+    return null;
+}
+
+fn checkLabelChange(self: *Client, change: types.LabelChange) Error!void {
+    try self.checkLabels(change.set);
+    for (change.remove) |k| {
+        if (validate.isLabelText(k, true) and labelIn(change.set, k) == null) continue;
+        if (self.diagnostics) |d| d.print("invalid label change: a key to remove is a label key, and not one also set", .{});
+        return error.InvalidOptions;
+    }
+}
+
+fn checkMetadataChange(self: *Client, change: types.MetadataChange) Error!void {
+    try self.checkMetadata(change.set);
+    for (change.remove) |k| {
+        if (validate.isMetadataKey(k) and itemIn(change.set, k) == null) continue;
+        if (self.diagnostics) |d| d.print("invalid metadata change: a key to remove is a metadata key, and not one also set", .{});
+        return error.InvalidOptions;
+    }
+}
+
 /// A request id as the writes make one: a random UUID (version 4),
 /// written into `buf`.
 pub fn newRequestId(self: *Client, buf: *[36]u8) []const u8 {
@@ -600,28 +817,73 @@ fn templateCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8,
 }
 
 fn startCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, options: types.WriteOptions) Error!rpc.Call {
-    return self.verbCall(a, zone, name, "start", &.{}, options.request_id);
+    return self.verbCall(a, zone, name, .{ .name = "start" }, options.request_id);
 }
 
 fn stopCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, options: types.StopOptions) Error!rpc.Call {
     var flags: std.ArrayList(Flag) = .empty;
     if (options.discard_local_ssd) |d| try flags.append(a, .{ .name = "discardLocalSsd", .value = if (d) "true" else "false" });
     if (options.no_graceful_shutdown) try flags.append(a, .{ .name = "noGracefulShutdown", .value = "true" });
-    return self.verbCall(a, zone, name, "stop", flags.items, options.request_id);
+    return self.verbCall(a, zone, name, .{ .name = "stop", .flags = flags.items }, options.request_id);
 }
 
 fn suspendCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, options: types.SuspendOptions) Error!rpc.Call {
     var flags: std.ArrayList(Flag) = .empty;
     if (options.discard_local_ssd) |d| try flags.append(a, .{ .name = "discardLocalSsd", .value = if (d) "true" else "false" });
-    return self.verbCall(a, zone, name, "suspend", flags.items, options.request_id);
+    return self.verbCall(a, zone, name, .{ .name = "suspend", .flags = flags.items }, options.request_id);
 }
 
 fn resumeCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, options: types.WriteOptions) Error!rpc.Call {
-    return self.verbCall(a, zone, name, "resume", &.{}, options.request_id);
+    return self.verbCall(a, zone, name, .{ .name = "resume" }, options.request_id);
 }
 
 fn resetCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, options: types.WriteOptions) Error!rpc.Call {
-    return self.verbCall(a, zone, name, "reset", &.{}, options.request_id);
+    return self.verbCall(a, zone, name, .{ .name = "reset" }, options.request_id);
+}
+
+fn labelsCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, labels: []const types.Label, fingerprint: []const u8, options: types.WriteOptions) Error!rpc.Call {
+    try self.checkLabels(labels);
+    try self.checkFingerprint(fingerprint, "label_fingerprint");
+    return self.verbCall(a, zone, name, .{ .name = "setLabels", .body = try body.labels(a, labels, fingerprint) }, options.request_id);
+}
+
+fn metadataCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, items: []const types.MetadataItem, fingerprint: []const u8, options: types.WriteOptions) Error!rpc.Call {
+    try self.checkMetadata(items);
+    try self.checkFingerprint(fingerprint, "metadata.fingerprint");
+    return self.verbCall(a, zone, name, .{ .name = "setMetadata", .body = try body.metadata(a, items, fingerprint) }, options.request_id);
+}
+
+fn tagsCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, tags: []const []const u8, fingerprint: []const u8, options: types.WriteOptions) Error!rpc.Call {
+    for (tags) |t| try self.checkName(t, "network tag");
+    try self.checkFingerprint(fingerprint, "tags.fingerprint");
+    return self.verbCall(a, zone, name, .{ .name = "setTags", .body = try body.tags(a, tags, fingerprint) }, options.request_id);
+}
+
+fn machineTypeCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, machine_type: []const u8, options: types.WriteOptions) Error!rpc.Call {
+    try self.checkName(machine_type, "machine type");
+    return self.verbCall(a, zone, name, .{ .name = "setMachineType", .body = try body.machineType(a, zone, machine_type) }, options.request_id);
+}
+
+fn schedulingCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, scheduling: types.SchedulingChange, options: types.WriteOptions) Error!rpc.Call {
+    try self.checkSchedulingChange(scheduling);
+    return self.verbCall(a, zone, name, .{ .name = "setScheduling", .body = try body.scheduling(a, scheduling) }, options.request_id);
+}
+
+fn protectionCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, protect: bool, options: types.WriteOptions) Error!rpc.Call {
+    const flags: []const Flag = &.{.{ .name = "deletionProtection", .value = if (protect) "true" else "false" }};
+    return self.verbCall(a, zone, name, .{ .name = "setDeletionProtection", .flags = flags }, options.request_id);
+}
+
+fn attachCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, disk: types.AttachSpec, options: types.WriteOptions) Error!rpc.Call {
+    try self.checkReference(disk.disk, "disk");
+    if (disk.device_name) |d| try self.checkDeviceName(d);
+    const flags: []const Flag = if (disk.force) &.{.{ .name = "forceAttach", .value = "true" }} else &.{};
+    return self.verbCall(a, zone, name, .{ .name = "attachDisk", .flags = flags, .body = try body.attach(a, zone, disk) }, options.request_id);
+}
+
+fn detachCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, device_name: []const u8, options: types.WriteOptions) Error!rpc.Call {
+    try self.checkDeviceName(device_name);
+    return self.verbCall(a, zone, name, .{ .name = "detachDisk", .flags = &.{.{ .name = "deviceName", .value = device_name }} }, options.request_id);
 }
 
 /// `DELETE .../zones/Z/instances/N`.
@@ -633,14 +895,17 @@ fn deleteCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, o
     return .{ .method = .DELETE, .path = try self.writePath(a, zone, name, flags, options.request_id) };
 }
 
-/// `POST .../zones/Z/instances/N/<verb>` with no body.
-fn verbCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, comptime verb: []const u8, flags: []const Flag, request_id: ?[]const u8) Error!rpc.Call {
+/// `POST .../zones/Z/instances/N/<verb>?<flags>` with the verb's body,
+/// none for most.
+fn verbCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, verb: Verb, request_id: ?[]const u8) Error!rpc.Call {
     try self.checkWrite();
     try self.checkZone(zone);
     try self.checkName(name, "instance");
-    const path = try self.writePath(a, zone, try std.fmt.allocPrint(a, "{s}/" ++ verb, .{name}), flags, request_id);
-    return .{ .method = .POST, .path = path, .body = "" };
+    const path = try self.writePath(a, zone, try std.fmt.allocPrint(a, "{s}/{s}", .{ name, verb.name }), verb.flags, request_id);
+    return .{ .method = .POST, .path = path, .body = verb.body };
 }
+
+const Verb = struct { name: []const u8, flags: []const Flag = &.{}, body: []const u8 = "" };
 
 const Flag = struct { name: []const u8, value: []const u8 };
 
@@ -664,6 +929,39 @@ fn requestIdFor(self: *Client, a: Allocator, given: ?[]const u8) Error![]const u
         return error.InvalidOptions;
     }
     return self.newRequestId(try a.create([36]u8));
+}
+
+fn checkFingerprint(self: *Client, fingerprint: []const u8, field: []const u8) Error!void {
+    if (validate.isFingerprint(fingerprint)) return;
+    if (self.diagnostics) |d| d.print("invalid fingerprint: expected Instance.{s} as the VM was read; production refuses a change with none as one with a stale one (412)", .{field});
+    return error.InvalidOptions;
+}
+
+fn checkDeviceName(self: *Client, device_name: []const u8) Error!void {
+    if (validate.isDeviceName(device_name)) return;
+    if (self.diagnostics) |d| d.print("invalid device name: expected 1 to 63 letters, digits, - and _, as AttachedDisk.device_name reads", .{});
+    return error.InvalidName;
+}
+
+fn checkSchedulingChange(self: *Client, change: types.SchedulingChange) Error!void {
+    const d = self.diagnostics;
+    if (std.meta.eql(change, types.SchedulingChange{})) {
+        if (d) |x| x.print("invalid scheduling change: it changes nothing; give at least one field", .{});
+        return error.InvalidOptions;
+    }
+    const spot = change.spot == true;
+    if (spot and change.automatic_restart == true) {
+        if (d) |x| x.print("invalid scheduling: a spot VM cannot restart on its own (\"Preemptible instances cannot be automatically restarted.\")", .{});
+        return error.InvalidOptions;
+    }
+    if (spot and change.on_host_maintenance == .migrate) {
+        if (d) |x| x.print("invalid scheduling: a spot VM's host maintenance is TERMINATE, the only one it takes", .{});
+        return error.InvalidOptions;
+    }
+    if (change.termination_action == .unknown or change.max_run_duration_s == 0) {
+        if (d) |x| x.print("invalid scheduling: a termination action is .stop or .delete, and a run limit at least a second", .{});
+        return error.InvalidOptions;
+    }
 }
 
 /// A write needs a scope that takes one: `compute.readonly` takes none.

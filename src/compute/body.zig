@@ -157,6 +157,133 @@ fn writeScheduling(jw: *Stringify, spec: types.InstanceSpec) !void {
     try jw.endObject();
 }
 
+/// `setLabels`'s body: every label the VM is to have, and the fingerprint
+/// it was read with, in the order milestone 0 sent them.
+pub fn labels(arena: Allocator, list: []const types.Label, fingerprint: []const u8) Allocator.Error![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeLabels(&jw, list, fingerprint) catch return error.OutOfMemory;
+    return out.written();
+}
+
+fn writeLabels(jw: *Stringify, list: []const types.Label, fingerprint: []const u8) !void {
+    try jw.beginObject();
+    try jw.objectField("labels");
+    try jw.beginObject();
+    for (list) |l| {
+        try jw.objectField(l.key);
+        try jw.write(l.value);
+    }
+    try jw.endObject();
+    try jw.objectField("labelFingerprint");
+    try jw.write(fingerprint);
+    try jw.endObject();
+}
+
+/// `setMetadata`'s body: the fingerprint, then every item the VM is to
+/// have.
+pub fn metadata(arena: Allocator, items: []const types.MetadataItem, fingerprint: []const u8) Allocator.Error![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeMetadata(&jw, items, fingerprint) catch return error.OutOfMemory;
+    return out.written();
+}
+
+fn writeMetadata(jw: *Stringify, items: []const types.MetadataItem, fingerprint: []const u8) !void {
+    try jw.beginObject();
+    try jw.objectField("fingerprint");
+    try jw.write(fingerprint);
+    try jw.objectField("items");
+    try jw.beginArray();
+    for (items) |m| {
+        try jw.beginObject();
+        try jw.objectField("key");
+        try jw.write(m.key);
+        if (m.value) |v| {
+            try jw.objectField("value");
+            try jw.write(v);
+        }
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.endObject();
+}
+
+/// `setTags`'s body: every tag, then the fingerprint.
+pub fn tags(arena: Allocator, list: []const []const u8, fingerprint: []const u8) Allocator.Error![]const u8 {
+    return Stringify.valueAlloc(arena, .{ .items = list, .fingerprint = fingerprint }, .{});
+}
+
+/// `setMachineType`'s body.
+pub fn machineType(arena: Allocator, zone: []const u8, name: []const u8) Allocator.Error![]const u8 {
+    return Stringify.valueAlloc(arena, .{ .machineType = try zonal(arena, zone, "machineTypes", name) }, .{});
+}
+
+/// `setScheduling`'s body: the fields the change gives, the rest left out
+/// so the VM keeps them. The provisioning model goes with the
+/// `preemptible` that agrees with it: production refused STANDARD for a
+/// preemptible VM, and SPOT for one that was not, as contradicting.
+pub fn scheduling(arena: Allocator, change: types.SchedulingChange) Allocator.Error![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeSchedulingChange(&jw, change) catch return error.OutOfMemory;
+    return out.written();
+}
+
+fn writeSchedulingChange(jw: *Stringify, change: types.SchedulingChange) !void {
+    try jw.beginObject();
+    if (change.automatic_restart) |r| {
+        try jw.objectField("automaticRestart");
+        try jw.write(r);
+    }
+    if (change.on_host_maintenance) |m| {
+        try jw.objectField("onHostMaintenance");
+        try jw.write(if (m == .migrate) "MIGRATE" else "TERMINATE");
+    }
+    if (change.spot) |spot| {
+        try jw.objectField("provisioningModel");
+        try jw.write(if (spot) "SPOT" else "STANDARD");
+        try jw.objectField("preemptible");
+        try jw.write(spot);
+    }
+    if (change.termination_action) |action| {
+        try jw.objectField("instanceTerminationAction");
+        try jw.write(switch (action) {
+            .stop => "STOP",
+            .delete => "DELETE",
+            .unknown => unreachable, // The client refuses it first.
+        });
+    }
+    if (change.max_run_duration_s) |secs| {
+        try jw.objectField("maxRunDuration");
+        try jw.print("{{\"seconds\":\"{d}\"}}", .{secs});
+    }
+    try jw.endObject();
+}
+
+/// `attachDisk`'s body: the disk as an `AttachedDisk`.
+pub fn attach(arena: Allocator, zone: []const u8, spec: types.AttachSpec) Allocator.Error![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeAttach(&jw, try zonal(arena, zone, "disks", spec.disk), spec) catch return error.OutOfMemory;
+    return out.written();
+}
+
+fn writeAttach(jw: *Stringify, source: []const u8, spec: types.AttachSpec) !void {
+    try jw.beginObject();
+    try jw.objectField("source");
+    try jw.write(source);
+    if (spec.device_name) |d| {
+        try jw.objectField("deviceName");
+        try jw.write(d);
+    }
+    try jw.objectField("mode");
+    try jw.write(if (spec.read_only) "READ_ONLY" else "READ_WRITE");
+    try jw.objectField("autoDelete");
+    try jw.write(spec.auto_delete);
+    try jw.endObject();
+}
+
 /// `projects/P/global/images/family/F`, `projects/P/global/images/N`, or
 /// the path as given.
 pub fn imagePath(arena: Allocator, ref: types.ImageRef) Allocator.Error![]const u8 {
@@ -247,6 +374,36 @@ test "instance: the least, and every other field" {
         .deletion_protection = true,
     }));
     try testing.expectEqualStrings("{\"name\":\"web-3\"}", try nameOnly(a, "web-3"));
+}
+
+test "the changes' bodies, in milestone 0's order" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        \\{"labels":{"purpose":"gcp-zig-test","tool":"compute-m0","probe":"one"},"labelFingerprint":"rNhSjTzLR00="}
+    , try labels(a, &.{ .{ .key = "purpose", .value = "gcp-zig-test" }, .{ .key = "tool", .value = "compute-m0" }, .{ .key = "probe", .value = "one" } }, "rNhSjTzLR00="));
+    try testing.expectEqualStrings("{\"labels\":{},\"labelFingerprint\":\"f=\"}", try labels(a, &.{}, "f="));
+    try testing.expectEqualStrings(
+        \\{"fingerprint":"inPgXPhJXaM=","items":[{"key":"zigps","value":"stale"},{"key":"flag"}]}
+    , try metadata(a, &.{ .{ .key = "zigps", .value = "stale" }, .{ .key = "flag" } }, "inPgXPhJXaM="));
+    try testing.expectEqualStrings(
+        \\{"items":["zigps-probe"],"fingerprint":"42WmSpB8rSM="}
+    , try tags(a, &.{"zigps-probe"}, "42WmSpB8rSM="));
+    try testing.expectEqualStrings(
+        \\{"machineType":"zones/us-central1-a/machineTypes/e2-small"}
+    , try machineType(a, "us-central1-a", "e2-small"));
+    try testing.expectEqualStrings(
+        \\{"automaticRestart":false,"onHostMaintenance":"TERMINATE","provisioningModel":"SPOT","preemptible":true,"instanceTerminationAction":"DELETE","maxRunDuration":{"seconds":"3600"}}
+    , try scheduling(a, .{ .spot = true, .automatic_restart = false, .on_host_maintenance = .terminate, .termination_action = .delete, .max_run_duration_s = 3600 }));
+    try testing.expectEqualStrings("{\"automaticRestart\":false}", try scheduling(a, .{ .automatic_restart = false }));
+    try testing.expectEqualStrings("{\"onHostMaintenance\":\"MIGRATE\",\"provisioningModel\":\"STANDARD\",\"preemptible\":false}", try scheduling(a, .{ .spot = false, .on_host_maintenance = .migrate }));
+    try testing.expectEqualStrings(
+        \\{"source":"zones/us-central1-a/disks/data-1","deviceName":"data","mode":"READ_WRITE","autoDelete":false}
+    , try attach(a, "us-central1-a", .{ .disk = "data-1", .device_name = "data" }));
+    try testing.expectEqualStrings(
+        \\{"source":"projects/p/regions/us-central1/disks/shared","mode":"READ_ONLY","autoDelete":true}
+    , try attach(a, "us-central1-a", .{ .disk = "projects/p/regions/us-central1/disks/shared", .read_only = true, .auto_delete = true }));
 }
 
 test "paths: images, templates, regions" {

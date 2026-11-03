@@ -404,7 +404,7 @@ test "FakeCompute: refusals in production's words" {
     }
 }
 
-test "FakeCompute: a change to a live VM is not modelled yet, and says so" {
+test "FakeCompute: what it does not model, it says so" {
     var f: Fixture = undefined;
     try f.init(testing.allocator);
     defer f.deinit();
@@ -412,9 +412,11 @@ test "FakeCompute: a change to a live VM is not modelled yet, and says so" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const labels = try f.fake.serve(.{ .method = .POST, .url = base ++ "zones/us-central1-a/instances/web-1/setLabels", .bearer = "t", .body = "{}" }, a);
-    try testing.expectEqual(501, labels.status);
-    try testing.expect(std.mem.indexOf(u8, labels.body, "next milestone") != null);
+    const boot = try f.fake.serve(.{ .method = .POST, .url = base ++ "zones/us-central1-a/instances/web-1/detachDisk?deviceName=persistent-disk-0", .bearer = "t" }, a);
+    try testing.expectEqual(501, boot.status);
+    try testing.expect(std.mem.indexOf(u8, boot.body, "detaching a boot disk") != null);
+    const verb = try f.fake.serve(.{ .method = .POST, .url = base ++ "zones/us-central1-a/instances/web-1/setServiceAccount", .bearer = "t", .body = "{}" }, a);
+    try testing.expectEqual(501, verb.status);
     const no_name = try f.fake.serve(.{ .method = .POST, .url = base ++ "zones/us-central1-a/instances", .bearer = "t", .body = "{}" }, a);
     try testing.expectEqual(501, no_name.status);
     const template = try f.fake.serve(.{ .method = .POST, .url = base ++ "global/instanceTemplates", .bearer = "t", .body = "{}" }, a);

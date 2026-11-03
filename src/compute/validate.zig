@@ -89,6 +89,25 @@ pub fn isRequestId(id: []const u8) bool {
     return nonzero;
 }
 
+/// A fingerprint as Compute writes them, base64 (`rNhSjTzLR00=`): visible
+/// ASCII, not empty.
+pub fn isFingerprint(text: []const u8) bool {
+    if (text.len == 0 or text.len > 128) return false;
+    for (text) |c| if (c <= ' ' or c >= 0x7f) return false;
+    return true;
+}
+
+/// A disk's device name on a VM: 1 to 63 letters, digits, `-` and `_`
+/// (`persistent-disk-0`, `zigps-data`).
+pub fn isDeviceName(text: []const u8) bool {
+    if (text.len == 0 or text.len > 63) return false;
+    for (text) |c| switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9', '-', '_' => {},
+        else => return false,
+    };
+    return true;
+}
+
 /// The smallest boot disk Compute makes, in GB.
 pub const min_disk_gb = 10;
 /// The longest metadata key, in bytes, and the largest value.

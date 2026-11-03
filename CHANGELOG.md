@@ -39,9 +39,19 @@ including the ones that did not change.
   operations finish, a repeated request id answers its first operation,
   `setStockout` puts a zone out of room, and `putTemplate` and
   `finishOperations` are new. Its zones now start with four e2 machine
-  types and debian-12's image. Changing a live VM and managed groups
-  come next. `examples/compute.zig` creates a spot VM, reads what its
-  startup script wrote, stops, starts and deletes it.
+  types and debian-12's image. `examples/compute.zig` creates a spot VM,
+  reads what its startup script wrote, stops, starts and deletes it.
+- compute: changing a live VM. `setLabels`, `setMetadata` and `setTags`
+  replace each whole under the fingerprint the VM was read with, a stale
+  or missing one refused `error.FailedPrecondition`; `updateLabels` and
+  `updateMetadata` set some entries and remove others, reading the VM
+  and sending again when it changed in between. `setMachineType`,
+  `setScheduling` (a `SchedulingChange`: the fields given, the rest
+  kept), `setDeletionProtection`, and `attachDisk` and `detachDisk` for
+  disks that exist already. Each has its `*Request` twin and its request
+  id, as the other writes do. `FakeCompute` takes them all as production
+  did when measured, its refusals and failed operations in production's
+  words, with `putDisk` for disks to attach. Managed groups come next.
 - auth, bigquery, core, dataflow, datatransfer, error_reporting,
   firestore, kms, logging, monitoring, pubsub, resource_manager, run,
   scheduler, secret_manager and storage: unchanged.
