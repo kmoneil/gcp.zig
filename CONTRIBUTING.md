@@ -93,7 +93,12 @@ run `zig build coverage`; the report is `zig-out/coverage/index.html`.
   -Dtest-filter=fuzz --fuzz` fuzzes one module the way its job does. A
   test that fails while being fuzzed does not fail `zig build`, which
   exits 0 all the same; the saved input and the `input saved to` line
-  are the signs, and the nightly job fails on either.
+  are the signs, and the nightly job fails on either. A fuzzer that
+  stalls saves nothing and holds its job until the fuzzing step's 150
+  minutes run out; then the job attaches gdb to whatever is still
+  running, and the same artifact holds every thread's backtrace
+  (`fuzz-stacks.txt`) and the input each fuzzer was on (`in<N>`: a
+  20-byte header whose last four bytes are the length, then the input).
 - Name a property test `fuzz <what>: <what it holds>`, and the nightly job
   fuzzes it. A property that costs more than a few milliseconds a run,
   such as one that signs with RSA every time, is named `slow property
