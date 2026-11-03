@@ -82,6 +82,11 @@ pub const WriteOptions = @import("types.zig").WriteOptions;
 pub const StopOptions = @import("types.zig").StopOptions;
 pub const SuspendOptions = @import("types.zig").SuspendOptions;
 pub const DeleteOptions = @import("types.zig").DeleteOptions;
+pub const HostMaintenance = @import("types.zig").HostMaintenance;
+pub const SchedulingChange = @import("types.zig").SchedulingChange;
+pub const AttachSpec = @import("types.zig").AttachSpec;
+pub const LabelChange = @import("types.zig").LabelChange;
+pub const MetadataChange = @import("types.zig").MetadataChange;
 /// A request as a write would send it, built by its `*Request` twin.
 pub const PreparedRequest = core.PreparedRequest;
 
@@ -112,6 +117,7 @@ test {
     _ = @import("test_util.zig");
     @import("std").testing.refAllDecls(@This());
     _ = @import("body.zig");
+    _ = @import("changes_test.zig");
     _ = @import("Client.zig");
     _ = @import("Client_test.zig");
     _ = @import("codec.zig");

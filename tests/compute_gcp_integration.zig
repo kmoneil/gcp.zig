@@ -157,6 +157,36 @@ const Side = struct {
         } else try s.say("{s} waited: {t}", .{ label, done.value.status });
     }
 
+    /// A VM's labels, tags and metadata keys, as a line, each sorted.
+    fn readChanges(s: *Side, name: []const u8, label: []const u8) !void {
+        var got = try s.client.getInstance(s.zone, name);
+        defer got.deinit();
+        const i = got.value;
+        var pairs: std.ArrayList([]const u8) = .empty;
+        for (i.labels) |l| if (!std.mem.eql(u8, l.key, "run")) try pairs.append(s.a, try s.a.print("{s}={s}", .{ l.key, l.value }));
+        var keys: std.ArrayList([]const u8) = .empty;
+        for (i.metadata.items) |m| try keys.append(s.a, m.key);
+        std.mem.sort([]const u8, pairs.items, {}, less);
+        std.mem.sort([]const u8, keys.items, {}, less);
+        const tag_list = try s.a.dupe([]const u8, i.tags.items);
+        std.mem.sort([]const u8, tag_list, {}, less);
+        try s.say("{s}: labels {s}; tags {s}; metadata {s}", .{ label, try std.mem.join(s.a, ",", pairs.items), try std.mem.join(s.a, ",", tag_list), try std.mem.join(s.a, ",", keys.items) });
+    }
+
+    /// A VM's disks, as a line: each device, boot or not, mode, auto
+    /// delete.
+    fn readDisks(s: *Side, name: []const u8, label: []const u8) !void {
+        var got = try s.client.getInstance(s.zone, name);
+        defer got.deinit();
+        var parts: std.ArrayList([]const u8) = .empty;
+        for (got.value.disks) |d| try parts.append(s.a, try s.a.print("{s} boot={} {s} auto_delete={} {?d} GB", .{ if (d.boot) "boot" else d.device_name, d.boot, d.mode, d.auto_delete, d.size_gb }));
+        try s.say("{s}: {s}", .{ label, try std.mem.join(s.a, "; ", parts.items) });
+    }
+
+    fn less(_: void, x: []const u8, y: []const u8) bool {
+        return std.mem.lessThan(u8, x, y);
+    }
+
     /// A VM as it reads, as a line, its automatic restart too.
     fn read(s: *Side, name: []const u8, label: []const u8) !void {
         var got = s.client.getInstance(s.zone, name) catch |err| {
@@ -193,8 +223,57 @@ const Side = struct {
     }
 };
 
+/// The changes to a running VM, milestone 3's: labels, metadata and tags
+/// under fresh and stale fingerprints, the update helpers, the changes a
+/// running VM refuses, a disk attached and detached, deletion protection.
+fn runningChanges(s: *Side, a: []const u8, disk: []const u8) !void {
+    const c = s.client;
+    const z = s.zone;
+    var buf: [36]u8 = undefined;
+    var vm = try c.getInstance(z, a);
+    defer vm.deinit();
+    const fp = vm.value.label_fingerprint;
+    const labels = try std.mem.concat(s.a, compute.Label, &.{ s.labels(), &.{.{ .key = "stage", .value = "running" }} });
+    try s.step("set a's labels", c.setLabels(z, a, labels, fp, .{ .request_id = c.newRequestId(&buf) }), c.setLabelsRequest(z, a, labels, fp, .{ .request_id = &buf }));
+    try s.waited("set a's labels, the fingerprint used", try s.wrote("set a's labels, the fingerprint used", c.setLabels(z, a, labels, fp, .{})));
+    try s.waited("update a's labels", try s.wrote("update a's labels", c.updateLabels(z, a, .{ .set = &.{.{ .key = "stage", .value = "updated" }} })));
+    try s.waited("update a's metadata", try s.wrote("update a's metadata", c.updateMetadata(z, a, .{ .set = &.{.{ .key = "zigps-note", .value = "m3" }} })));
+    const tfp = vm.value.tags.fingerprint;
+    try s.step("set a's tags", c.setTags(z, a, &.{"zigps-it"}, tfp, .{ .request_id = c.newRequestId(&buf) }), c.setTagsRequest(z, a, &.{"zigps-it"}, tfp, .{ .request_id = &buf }));
+    try s.waited("set a's tags, the fingerprint used", try s.wrote("set a's tags, the fingerprint used", c.setTags(z, a, &.{}, tfp, .{})));
+    try s.readChanges(a, "a changed");
+    try s.waited("set a's scheduling while it runs", try s.wrote("set a's scheduling while it runs", c.setScheduling(z, a, .{ .automatic_restart = false }, .{})));
+    try s.waited("set a's machine type while it runs", try s.wrote("set a's machine type while it runs", c.setMachineType(z, a, "e2-small", .{})));
+    try s.waited("set a's machine type to one nobody has", try s.wrote("set a's machine type to one nobody has", c.setMachineType(z, a, "e2-nonesuch", .{})));
+    const attach: compute.AttachSpec = .{ .disk = disk, .device_name = "zigps-data" };
+    try s.step("attach the disk", c.attachDisk(z, a, attach, .{ .request_id = c.newRequestId(&buf) }), c.attachDiskRequest(z, a, attach, .{ .request_id = &buf }));
+    try s.readDisks(a, "a's disks");
+    try s.waited("attach it again", try s.wrote("attach it again", c.attachDisk(z, a, attach, .{})));
+    try s.waited("attach a disk nobody has", try s.wrote("attach a disk nobody has", c.attachDisk(z, a, .{ .disk = s.vm("nodisk") }, .{})));
+    try s.step("detach the disk", c.detachDisk(z, a, "zigps-data", .{ .request_id = c.newRequestId(&buf) }), c.detachDiskRequest(z, a, "zigps-data", .{ .request_id = &buf }));
+    try s.readDisks(a, "a's disks after");
+    try s.waited("detach it again", try s.wrote("detach it again", c.detachDisk(z, a, "zigps-data", .{})));
+    try s.step("protect a", c.setDeletionProtection(z, a, true, .{ .request_id = c.newRequestId(&buf) }), c.setDeletionProtectionRequest(z, a, true, .{ .request_id = &buf }));
+    try s.waited("delete a, protected", try s.wrote("delete a, protected", c.deleteInstance(z, a, .{})));
+    try s.step("unprotect a", c.setDeletionProtection(z, a, false, .{ .request_id = c.newRequestId(&buf) }), c.setDeletionProtectionRequest(z, a, false, .{ .request_id = &buf }));
+}
+
+/// The changes a stopped VM takes: its machine type, and its scheduling
+/// to standard and back to spot.
+fn stoppedChanges(s: *Side, a: []const u8) !void {
+    const c = s.client;
+    const z = s.zone;
+    var buf: [36]u8 = undefined;
+    try s.step("set a's machine type, stopped", c.setMachineType(z, a, "e2-small", .{ .request_id = c.newRequestId(&buf) }), c.setMachineTypeRequest(z, a, "e2-small", .{ .request_id = &buf }));
+    const standard: compute.SchedulingChange = .{ .spot = false, .on_host_maintenance = .migrate };
+    try s.step("make a standard", c.setScheduling(z, a, standard, .{ .request_id = c.newRequestId(&buf) }), c.setSchedulingRequest(z, a, standard, .{ .request_id = &buf }));
+    try s.read(a, "a standard");
+    try s.waited("make a spot again", try s.wrote("make a spot again", c.setScheduling(z, a, .{ .spot = true, .on_host_maintenance = .terminate }, .{})));
+    try s.read(a, "a spot again");
+}
+
 /// The writes, read back after each: the same calls on either side.
-fn scenario(s: *Side, template: []const u8) !void {
+fn scenario(s: *Side, template: []const u8, disk: []const u8) !void {
     const c = s.client;
     const z = s.zone;
     const a = s.vm("a");
@@ -218,6 +297,7 @@ fn scenario(s: *Side, template: []const u8) !void {
     }
     try s.waited("insert a", first);
     try s.read(a, "a");
+    try runningChanges(s, a, disk);
 
     // Its life. Each write's id is made in `buf` as its argument is, so
     // the preview after it, built from `buf`, names the same request.
@@ -225,6 +305,7 @@ fn scenario(s: *Side, template: []const u8) !void {
     try s.read(a, "a stopped");
     try s.waited("stop a again", try s.wrote("stop a again", c.stopInstance(z, a, .{})));
     try s.read(a, "a stopped again");
+    try stoppedChanges(s, a);
     try s.step("start a", c.startInstance(z, a, .{ .request_id = c.newRequestId(&buf) }), c.startInstanceRequest(z, a, .{ .request_id = &buf }));
     try s.read(a, "a started");
     try s.waited("start a again", try s.wrote("start a again", c.startInstance(z, a, .{})));
@@ -278,13 +359,19 @@ fn waitRaw(client: *compute.Client, body: []const u8, scope: compute.OperationSc
     defer op.deinit();
 }
 
-/// Deletes every VM labelled tool=compute-it (lifting deletion
-/// protection first) and every `zigps-` template, `run` alone when
+/// Deletes every VM and disk labelled tool=compute-it (lifting deletion
+/// protection first) and every `zigps-` template, `run`'s alone when
 /// given.
 fn sweep(f: *Fixture, client: *compute.Client, run: ?[]const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    try sweepVms(f, client, a, run);
+    try sweepDisks(f, client, a, run);
+    try sweepTemplates(f, client, a, run);
+}
+
+fn sweepVms(f: *Fixture, client: *compute.Client, a: Allocator, run: ?[]const u8) !void {
     var page = client.listAllInstances(.{ .filter = "labels.tool = compute-it", .partial_success = true }) catch |err| {
         fact("sweep: listing VMs failed: {t}", .{err});
         return;
@@ -305,6 +392,30 @@ fn sweep(f: *Fixture, client: *compute.Client, run: ?[]const u8) !void {
         done.deinit();
         fact("sweep: deleted {s}", .{i.name});
     }
+}
+
+fn sweepDisks(f: *Fixture, client: *compute.Client, a: Allocator, run: ?[]const u8) !void {
+    const res = try raw(f, client, a, .GET, "aggregated/disks?filter=labels.tool%20%3D%20compute-it&returnPartialSuccess=true", null);
+    if (res.status != 200) return;
+    const listed = try std.json.parseFromSliceLeaky(std.json.Value, a, res.body, .{});
+    const scopes = listed.object.get("items") orelse return;
+    for (scopes.object.values()) |scope| {
+        const in_scope = scope.object.get("disks") orelse continue;
+        for (in_scope.array.items) |d| try sweepDisk(f, client, a, d.object, run);
+    }
+}
+
+fn sweepDisk(f: *Fixture, client: *compute.Client, a: Allocator, disk: std.json.ObjectMap, run: ?[]const u8) !void {
+    const name = disk.get("name").?.string;
+    if (run) |r| if (std.mem.indexOf(u8, name, r) == null) return;
+    const zone_url = disk.get("zone").?.string;
+    const zone = zone_url[std.mem.lastIndexOfScalar(u8, zone_url, '/').? + 1 ..];
+    const res = try raw(f, client, a, .DELETE, try a.print("zones/{s}/disks/{s}", .{ zone, name }), null);
+    if (res.status == 200) try waitRaw(client, res.body, .{ .zone = zone });
+    fact("sweep: deleted disk {s} ({d})", .{ name, res.status });
+}
+
+fn sweepTemplates(f: *Fixture, client: *compute.Client, a: Allocator, run: ?[]const u8) !void {
     const list = try raw(f, client, a, .GET, "global/instanceTemplates?filter=name%20eq%20zigps-.*", null);
     if (list.status != 200) return;
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, list.body, .{});
@@ -351,9 +462,17 @@ test "compute against production: the lifecycle, previews and request ids, the f
     try testing.expectEqual(200, made.status);
     try waitRaw(&client, made.body, .global);
     fact("made template {s}", .{template});
+    const disk = try a.print("zigps-{s}-disk", .{f.run});
+    const disk_body = try a.print(
+        \\{{"name":"{s}","sizeGb":"10","type":"zones/{s}/diskTypes/pd-standard","labels":{{"purpose":"gcp-zig-test","tool":"compute-it","run":"{s}"}}}}
+    , .{ disk, f.zone, f.run });
+    const made_disk = try raw(&f, &client, a, .POST, try a.print("zones/{s}/disks", .{f.zone}), disk_body);
+    try testing.expectEqual(200, made_disk.status);
+    try waitRaw(&client, made_disk.body, .{ .zone = f.zone });
+    fact("made disk {s}", .{disk});
 
     var prod: Side = .{ .a = a, .client = &client, .diag = &diag, .recorder = &recorder, .zone = f.zone, .run = f.run };
-    try scenario(&prod, template);
+    try scenario(&prod, template, disk);
 
     // B is under deletion protection, which the client cannot lift yet.
     {
@@ -385,6 +504,7 @@ test "compute against production: the lifecycle, previews and request ids, the f
         .max_run_duration_s = 1800,
         .termination_action = .delete,
     });
+    try fake.putDisk(.{ .zone = f.zone, .name = disk });
     var fake_recorder: Recorder = .{ .inner = fake.transport(), .arena = .init(gpa) };
     defer fake_recorder.arena.deinit();
     var fake_diag: compute.Diagnostics = .{};
@@ -397,7 +517,7 @@ test "compute against production: the lifecycle, previews and request ids, the f
     });
     defer fake_client.deinit();
     var mem: Side = .{ .a = a, .client = &fake_client, .diag = &fake_diag, .recorder = &fake_recorder, .zone = f.zone, .run = f.run };
-    try scenario(&mem, template);
+    try scenario(&mem, template, disk);
 
     var differences: usize = 0;
     for (prod.lines.items, 0..) |line, n| {

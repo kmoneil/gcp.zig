@@ -55,6 +55,10 @@ pub fn main(init: std.process.Init) !void {
 | `insertInstanceJson(zone, json, options)` | Creates a VM from an instance body written by the caller |
 | `insertFromTemplate(zone, name, template, options)` | Creates a VM from an instance template |
 | `startInstance`, `stopInstance`, `suspendInstance`, `resumeInstance`, `resetInstance`, `deleteInstance` | A VM's life, `(zone, name, options)` |
+| `setLabels`, `setMetadata`, `setTags` | A VM's labels, metadata or tags, replaced whole under their fingerprint |
+| `updateLabels`, `updateMetadata` | Some labels or items set or removed, the rest kept: read, change, send, again if the VM changed in between |
+| `setMachineType`, `setScheduling`, `setDeletionProtection` | A stopped VM's machine type; how a VM is scheduled; its protection from deletion |
+| `attachDisk`, `detachDisk` | A disk that exists already, attached by name, detached by device name |
 | `insertInstanceRequest` and the other `*Request` twins | The exact request a write would send, unsent |
 | `newRequestId(buf)` | A request id, a random UUID |
 
@@ -183,6 +187,56 @@ send, creates a spot VM with a startup script, reads what the script
 wrote to the serial console, stops, starts and deletes it
 (`zig build example-compute -- --fake --yes` runs it with no network).
 
+## Changing a live VM
+
+Labels, metadata and tags are each replaced whole: `setLabels` sends
+every label the VM is to have, a label left out is removed, and so for
+metadata items and tags. Each goes under the fingerprint the VM was read
+with (`Instance.label_fingerprint`, `metadata.fingerprint`,
+`tags.fingerprint`), so a change made by someone else in between is not
+overwritten: a stale fingerprint is refused `error.FailedPrecondition`
+(412), and so is none. Production showed the new labels and a new
+fingerprint at once, before the change's operation was DONE.
+
+`updateLabels` and `updateMetadata` do the read for you: they set some
+entries and remove others, keep the rest, and when another change landed
+between their read and their write, read and send again, up to the
+retry policy's attempts.
+
+```zig
+var op = try client.updateLabels("us-central1-a", "batch-1", .{
+    .set = &.{.{ .key = "stage", .value = "done" }},
+    .remove = &.{"owner"},
+});
+defer op.deinit();
+```
+
+What a running VM refuses, as production refused it:
+
+- `setMachineType` is taken and its operation ends failed,
+  UNSUPPORTED_OPERATION "Instance is starting or running.": stop the VM
+  first. A machine type the zone lacks is refused at once, running or
+  not.
+- `setScheduling` on a VM with a run limit is refused at once,
+  "Termination time cannot be changed while the instance is running."
+  (or "Max run duration...", when the limit is what changes): stop it
+  first. A `SchedulingChange` sends only the fields it gives, and the VM
+  keeps the rest, as production kept them. `.spot` moves a stopped VM
+  between spot and standard: the client sends the `preemptible` that
+  agrees with it, since production refused STANDARD alone for a spot VM
+  ("For preemptible, only allowed provisioning_model value is SPOT.")
+  and SPOT alone for a standard one ("preemptible=false and
+  provisioning_model=SPOT is contradicting.").
+
+`attachDisk` attaches a disk that exists already, to a running VM too,
+by its name in the VM's zone or its path, under a device name of your
+choosing; `detachDisk` takes that device name. An attach of a disk
+nobody has is refused at once (`error.NotFound`); an attach of a disk in
+use, by this VM or another, and a detach of a device the VM does not
+have, are taken, and their operations end failed
+(RESOURCE_IN_USE_BY_ANOTHER_RESOURCE, INVALID_USAGE).
+`setDeletionProtection` answered DONE at once, either way.
+
 ## Previews and request ids
 
 Every write has a `*Request` twin (`insertInstanceRequest`,
@@ -309,8 +363,16 @@ has e2-micro, e2-small, e2-medium and e2-standard-2, and debian-12's
 image is there from the start. `setStockout(zone, true)` puts a zone out
 of room, so a caller's next-zone path can be tested; `putTemplate` puts
 in a template for `insertFromTemplate`; `finishOperations` finishes
-everything still running. Changing a live VM answers 501 until the
-module's next milestone.
+everything still running.
+
+Changes work on it too: fingerprints checked and replaced, the change
+shown at once; a machine type or a scheduling change refused where
+production refused one, in its words. `putDisk` puts in a disk a VM can
+attach, and every VM's boot disk is one, named as the VM; an attach of
+one in use and a detach of a device the VM lacks fail in their
+operations as production's did, and a VM deleted frees its disks and
+deletes those that auto-delete. A scheduling change to a running VM
+with no run limit was not measured, and answers 501.
 
 <!-- snippet: tests/docs_examples.zig#compute-fake -->
 ```zig
