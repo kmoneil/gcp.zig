@@ -4,6 +4,25 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.62.1 (2026-11-03)
+
+- firestore: an aggregation's alias (`a0`, `a1`, ...) was printed into
+  an 8-byte buffer under `catch unreachable`, room for an index of up
+  to seven digits. No query reached that: a query is held to
+  Firestore's five aggregations before an alias is made. But the
+  function that prints it took any index and checked nothing, so the
+  buffer is now 21 bytes, room for any index, and a test prints the
+  largest. No call changes. Found by zigvet's fit rule.
+- The package's own `zig build test` now runs
+  [zigvet](https://github.com/kmoneil/zigvet) (code that compiles but
+  is almost certainly wrong) and [gnarl](https://github.com/kmoneil/gnarl)
+  (each function's complexity, held to `complexity.zon` and
+  `complexity.baseline`), so both must be on the PATH to run its tests.
+  A build that uses the package as a dependency needs neither.
+- auth, bigquery, core, dataflow, datatransfer, error_reporting, kms,
+  logging, monitoring, pubsub, resource_manager, run, scheduler,
+  secret_manager and storage: unchanged.
+
 ## 0.62.0 (2026-10-31)
 
 - resource_manager: now **beta**, as every module but `bigquery`,
