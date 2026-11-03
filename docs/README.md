@@ -155,7 +155,7 @@ Google, not only what Google documents, and where the emulators differ.
 
 | Guide | What's in it |
 | --- | --- |
-| [Overview](compute/README.md) | VMs in one zone or every zone, with their status, scheduling, disks, network and fingerprints; serial consoles and guest attributes; zones, machine types and images; operations waited on, the two ways a write is refused, and what ended a VM; an in-memory Compute Engine for tests; and what production showed when measured (experimental) |
+| [Overview](compute/README.md) | VMs in one zone or every zone, with their status, scheduling, disks, network and fingerprints; serial consoles and guest attributes; zones, machine types and images; creating VMs and their life (start, stop, suspend, resume, reset, delete), previews and request ids; operations waited on, the two ways a write is refused, and what ended a VM; an in-memory Compute Engine for tests; and what production showed when measured (experimental) |
 
 ## 🛠️ Working on gcp.zig
 

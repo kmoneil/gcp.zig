@@ -150,6 +150,8 @@ pub const TerminationAction = enum {
 /// TERMINATE and `preemptible` true for a spot VM on its own (measured
 /// 2026-11-03).
 pub const Scheduling = struct {
+    /// Production wrote STANDARD or SPOT for every VM measured; none is
+    /// read as the API's default, `.standard`.
     provisioning_model: ProvisioningModel = .standard,
     preemptible: bool = false,
     /// Null when the server sent none (it means true).
@@ -495,6 +497,129 @@ pub const WaitOptions = struct {
     /// about two minutes past it, since the server holds each one that
     /// long while the operation runs. 0 means a single wait call.
     timeout_ms: u32 = 600_000,
+};
+
+// Writes.
+
+/// A VM to create, in the shape most VMs take: one boot disk from an
+/// image, one network interface, labels, metadata, tags, a service
+/// account and how it is scheduled. What it leaves out (accelerators,
+/// local SSDs, more disks or interfaces, confidential computing and the
+/// rest of Compute's schema) `Client.insertInstanceJson` sends as written.
+pub const InstanceSpec = struct {
+    /// RFC 1035: a lowercase letter, then up to 62 lowercase letters,
+    /// digits and `-`, not ending in `-`.
+    name: []const u8,
+    /// A machine type in the VM's zone: `e2-micro`, `n2-standard-4`.
+    machine_type: []const u8,
+    /// The boot disk's image.
+    image: ImageRef,
+    boot_disk: BootDisk = .{},
+    /// A spot VM, taken back when Google needs the room. Production fills
+    /// in `on_host_maintenance` TERMINATE and `preemptible` for one
+    /// (measured), and a spot VM cannot restart on its own, so the client
+    /// sends `automaticRestart` false with it.
+    spot: bool = false,
+    /// A run limit, in seconds, at which `termination_action` happens.
+    max_run_duration_s: ?u64 = null,
+    /// What happens at the run limit, or when a spot VM is taken back.
+    /// Null sends none, and Compute's default is to stop it.
+    termination_action: ?TerminationAction = null,
+    /// A standard VM restarts after Compute ends it (a host failure, say)
+    /// unless this is false. Null sends none: Compute's default, true.
+    /// Must not be true for a spot VM.
+    automatic_restart: ?bool = null,
+    /// Keys `[a-zA-Z0-9-_]`, under 128 bytes; each value at most 256 KiB.
+    /// A startup script is the item `startup-script`.
+    metadata: []const MetadataItem = &.{},
+    labels: []const Label = &.{},
+    /// Network tags, each an RFC 1035 name, for firewall rules.
+    tags: []const []const u8 = &.{},
+    /// The account the VM acts as. Null gives it none, so code on the VM
+    /// has no Google credentials.
+    service_account: ?ServiceAccount = null,
+    /// A network's name in the project (`default`), or its path or URL.
+    network: []const u8 = "default",
+    /// A subnetwork's name in the zone's region, or its path or URL. Null
+    /// lets Compute choose, which an auto mode network allows.
+    subnetwork: ?[]const u8 = null,
+    /// An external address, ephemeral, so the VM is reachable from (and
+    /// can reach) the internet without Cloud NAT.
+    external_ip: bool = false,
+    /// While true, a delete is refused (`error.InvalidArgument`,
+    /// "Resource cannot be deleted if it's protected against deletion.").
+    deletion_protection: bool = false,
+    description: ?[]const u8 = null,
+};
+
+/// An image a boot disk is made from.
+pub const ImageRef = union(enum) {
+    /// The newest in a family that is not deprecated:
+    /// `.{ .family = .{ .project = "debian-cloud", .name = "debian-12" } }`.
+    family: Named,
+    /// One image by name.
+    image: Named,
+    /// A path or URL as Compute takes it:
+    /// `projects/debian-cloud/global/images/family/debian-12`.
+    path: []const u8,
+
+    pub const Named = struct {
+        /// The project the image lives in: a public one's (`debian-cloud`)
+        /// or the client's own.
+        project: []const u8,
+        name: []const u8,
+    };
+};
+
+/// A VM's boot disk.
+pub const BootDisk = struct {
+    /// At least 10. Null: the image's size.
+    size_gb: ?u64 = null,
+    /// `pd-balanced`, `pd-standard`, `pd-ssd`, `hyperdisk-balanced` and
+    /// the like, by what the machine type takes. Null: Compute's default.
+    type: ?[]const u8 = null,
+    /// Deleted with the VM.
+    auto_delete: bool = true,
+};
+
+/// An instance template, global or in one region, in the client's
+/// project.
+pub const TemplateRef = union(enum) {
+    global: []const u8,
+    regional: struct { region: []const u8, name: []const u8 },
+};
+
+/// What every write takes.
+pub const WriteOptions = struct {
+    /// Sent as `requestId`, so a write sent again lands once: production
+    /// answered the same operation for a repeated id, while it ran and
+    /// after (measured). A UUID, not all zeros. Null: the client makes
+    /// one, and every retry of the call sends it.
+    request_id: ?[]const u8 = null,
+};
+
+/// What `Client.stopInstance` takes.
+pub const StopOptions = struct {
+    request_id: ?[]const u8 = null,
+    /// Skips the guest's graceful shutdown.
+    no_graceful_shutdown: bool = false,
+    /// Required for a VM with local SSDs: true discards what they hold.
+    /// Null sends none.
+    discard_local_ssd: ?bool = null,
+};
+
+/// What `Client.suspendInstance` takes.
+pub const SuspendOptions = struct {
+    request_id: ?[]const u8 = null,
+    /// As `StopOptions.discard_local_ssd`.
+    discard_local_ssd: ?bool = null,
+};
+
+/// What `Client.deleteInstance` takes.
+pub const DeleteOptions = struct {
+    request_id: ?[]const u8 = null,
+    /// Skips the guest's graceful shutdown.
+    no_graceful_shutdown: bool = false,
 };
 
 const testing = std.testing;

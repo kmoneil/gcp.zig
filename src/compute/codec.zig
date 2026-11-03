@@ -262,8 +262,10 @@ fn accountList(out: Allocator, obj: ObjectMap) DecodeError![]const types.Service
 fn schedulingOf(out: Allocator, obj: ObjectMap) DecodeError!types.Scheduling {
     const s = try field(obj, "scheduling", .object) orelse return .{};
     const action = try text(out, s, "instanceTerminationAction");
+    const model = try text(out, s, "provisioningModel");
     return .{
-        .provisioning_model = types.ProvisioningModel.parse(try text(out, s, "provisioningModel")),
+        // None is the API's default, STANDARD.
+        .provisioning_model = if (model.len == 0) .standard else types.ProvisioningModel.parse(model),
         .preemptible = try boolean(s, "preemptible") orelse false,
         .automatic_restart = try boolean(s, "automaticRestart"),
         .on_host_maintenance = try text(out, s, "onHostMaintenance"),
@@ -546,6 +548,14 @@ test "decodeInstance: standard, suspended, powered off" {
     try testing.expect(off.last_stop_time != null);
     const limited = try decodeInstance(out, s, production.instance_run_limit);
     try testing.expectEqual(120, limited.scheduling.max_run_duration_s.?);
+    const restartless = try decodeInstance(out, s, production.instance_standard_restartless);
+    try testing.expectEqual(types.ProvisioningModel.standard, restartless.scheduling.provisioning_model);
+    try testing.expectEqual(false, restartless.scheduling.automatic_restart.?);
+    try testing.expectEqual(1800, restartless.scheduling.max_run_duration_s.?);
+    try testing.expectEqual(types.TerminationAction.delete, restartless.scheduling.termination_action.?);
+    // None at all is the API's default.
+    const bare = try decodeInstance(out, s, "{\"name\":\"a\",\"scheduling\":{}}");
+    try testing.expectEqual(types.ProvisioningModel.standard, bare.scheduling.provisioning_model);
 }
 
 test "decodeInstancePage: an empty list has no items key" {

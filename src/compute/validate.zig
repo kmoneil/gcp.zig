@@ -74,6 +74,61 @@ pub fn isUserAgent(agent: []const u8) bool {
     return true;
 }
 
+/// A request id as Compute takes one: a UUID, `8-4-4-4-12` hex digits,
+/// not all zeros (the API's documented rule).
+pub fn isRequestId(id: []const u8) bool {
+    if (id.len != 36) return false;
+    var nonzero = false;
+    for (id, 0..) |c, i| switch (i) {
+        8, 13, 18, 23 => if (c != '-') return false,
+        else => {
+            if (!std.ascii.isHex(c)) return false;
+            if (c != '0') nonzero = true;
+        },
+    };
+    return nonzero;
+}
+
+/// The smallest boot disk Compute makes, in GB.
+pub const min_disk_gb = 10;
+/// The longest metadata key, in bytes, and the largest value.
+pub const max_metadata_key = 127;
+pub const max_metadata_value = 256 * 1024;
+
+/// A metadata key: `[a-zA-Z0-9-_]+`, under 128 bytes.
+pub fn isMetadataKey(key: []const u8) bool {
+    if (key.len == 0 or key.len > max_metadata_key) return false;
+    for (key) |c| switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9', '-', '_' => {},
+        else => return false,
+    };
+    return true;
+}
+
+/// A label's key or value: lowercase letters, digits, `_`, `-` and any
+/// non-ASCII letter, at most 63 characters; a key not empty and starting
+/// with a lowercase letter.
+pub fn isLabelText(text: []const u8, is_key: bool) bool {
+    if (!std.unicode.utf8ValidateSlice(text)) return false;
+    const chars = std.unicode.utf8CountCodepoints(text) catch return false;
+    if (chars > 63) return false;
+    if (is_key and (text.len == 0 or !(std.ascii.isLower(text[0]) or text[0] >= 0x80))) return false;
+    for (text) |c| switch (c) {
+        'a'...'z', '0'...'9', '_', '-', 0x80...0xff => {},
+        else => return false,
+    };
+    return true;
+}
+
+/// A path or URL a body carries (an image, a network, a disk type), a
+/// service account's email or an OAuth scope: visible ASCII, no spaces.
+/// What it names is Compute's to judge.
+pub fn isReference(text: []const u8) bool {
+    if (text.len == 0 or text.len > 2048) return false;
+    for (text) |c| if (c <= ' ' or c >= 0x7f) return false;
+    return true;
+}
+
 const testing = std.testing;
 
 test "zones and names" {
@@ -110,4 +165,32 @@ test "projects, tokens, paths, expressions and agents" {
     try testing.expect(!isListExpression(""));
     try testing.expect(isUserAgent("gcp-zig-compute/0.62"));
     try testing.expect(!isUserAgent("a\nb"));
+}
+
+test "request ids, metadata keys, labels and references" {
+    try testing.expect(isRequestId("8068f1b8-03fc-4f7f-a5bd-d5e775aa7212"));
+    try testing.expect(isRequestId("8068F1B8-03FC-4F7F-A5BD-D5E775AA7212"));
+    try testing.expect(!isRequestId("00000000-0000-0000-0000-000000000000"));
+    try testing.expect(!isRequestId("8068f1b8-03fc-4f7f-a5bd-d5e775aa721"));
+    try testing.expect(!isRequestId("8068f1b8x03fc-4f7f-a5bd-d5e775aa7212"));
+    try testing.expect(!isRequestId("g068f1b8-03fc-4f7f-a5bd-d5e775aa7212"));
+    try testing.expect(isMetadataKey("startup-script"));
+    try testing.expect(isMetadataKey("enable_OS-login"));
+    try testing.expect(!isMetadataKey("a.b"));
+    try testing.expect(!isMetadataKey(""));
+    var long: [128]u8 = undefined;
+    @memset(&long, 'k');
+    try testing.expect(!isMetadataKey(&long));
+    try testing.expect(isMetadataKey(long[0..127]));
+    try testing.expect(isLabelText("purpose", true));
+    try testing.expect(isLabelText("gcp-zig-test", false));
+    try testing.expect(isLabelText("", false));
+    try testing.expect(!isLabelText("", true));
+    try testing.expect(!isLabelText("Env", true));
+    try testing.expect(!isLabelText("1env", true));
+    try testing.expect(!isLabelText("a b", false));
+    try testing.expect(isReference("projects/debian-cloud/global/images/family/debian-12"));
+    try testing.expect(isReference("https://www.googleapis.com/auth/devstorage.read_write"));
+    try testing.expect(!isReference("a b"));
+    try testing.expect(!isReference(""));
 }

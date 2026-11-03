@@ -31,6 +31,11 @@ pub const Harness = struct {
     client: Client,
 
     pub fn init(h: *Harness, script: []const FakeTransport.Reply) !void {
+        return h.initScope(script, .read_only);
+    }
+
+    /// `init` for a client asking for `scope`: `.read_write` to write.
+    pub fn initScope(h: *Harness, script: []const FakeTransport.Reply, scope: @import("rpc.zig").Scope) !void {
         h.* = .{
             .fake = .init(std.testing.allocator, script),
             .clock = .{},
@@ -42,6 +47,7 @@ pub const Harness = struct {
         h.client = try .init(std.testing.allocator, h.clock.io(), .{
             .project_id = "my-project",
             .token_provider = h.token.provider(),
+            .scope = scope,
             .diagnostics = &h.diag,
             .transport = h.fake.transport(),
         });

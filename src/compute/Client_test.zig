@@ -404,14 +404,21 @@ test "FakeCompute: refusals in production's words" {
     }
 }
 
-test "FakeCompute: writes are not modelled yet, and say so" {
+test "FakeCompute: a change to a live VM is not modelled yet, and says so" {
     var f: Fixture = undefined;
     try f.init(testing.allocator);
     defer f.deinit();
+    try f.fake.putInstance(.{ .zone = "us-central1-a", .name = "web-1" });
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
-    const got = try f.fake.serve(.{ .method = .POST, .url = base ++ "zones/us-central1-a/instances", .bearer = "t", .body = "{}" }, arena_state.allocator());
-    try testing.expectEqual(501, got.status);
+    const a = arena_state.allocator();
+    const labels = try f.fake.serve(.{ .method = .POST, .url = base ++ "zones/us-central1-a/instances/web-1/setLabels", .bearer = "t", .body = "{}" }, a);
+    try testing.expectEqual(501, labels.status);
+    try testing.expect(std.mem.indexOf(u8, labels.body, "next milestone") != null);
+    const no_name = try f.fake.serve(.{ .method = .POST, .url = base ++ "zones/us-central1-a/instances", .bearer = "t", .body = "{}" }, a);
+    try testing.expectEqual(501, no_name.status);
+    const template = try f.fake.serve(.{ .method = .POST, .url = base ++ "global/instanceTemplates", .bearer = "t", .body = "{}" }, a);
+    try testing.expectEqual(501, template.status);
 }
 
 /// Pages hold every VM once, in order: a zone's by name, the aggregated

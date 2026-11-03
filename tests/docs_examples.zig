@@ -2731,3 +2731,78 @@ test "a scheduled query's run now, against the in-memory Data Transfer" {
     try std.testing.expectEqual(1, fake.runsStarted());
 }
 // end snippet
+
+const compute = @import("compute");
+
+// snippet: compute-confirm
+test "the exact stop a console would send, for the user to confirm, then sent" {
+    var fake: compute.testing.FakeCompute = .init(std.testing.allocator, std.testing.io, .{});
+    defer fake.deinit();
+    try fake.putInstance(.{ .zone = "us-central1-a", .name = "batch-1" });
+    var token: compute.StaticToken = .{ .token = "none" };
+    var client = try compute.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .scope = .read_write,
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    // One request id for the preview and the stop: the stop sends byte
+    // for byte what the user confirmed, and lands once if retried.
+    var buf: [36]u8 = undefined;
+    const id = client.newRequestId(&buf);
+    var confirm = try client.stopInstanceRequest("us-central1-a", "batch-1", .{ .request_id = id });
+    defer confirm.deinit();
+    try std.testing.expectEqual(.POST, confirm.value.method);
+    try std.testing.expect(std.mem.indexOf(u8, confirm.value.url, "/zones/us-central1-a/instances/batch-1/stop?requestId=") != null);
+    // Confirmed: sent, then waited on.
+    var op = try client.stopInstance("us-central1-a", "batch-1", .{ .request_id = id });
+    defer op.deinit();
+    var done = try client.waitOperation(op.value.ref(), .{});
+    defer done.deinit();
+    try std.testing.expect(done.value.succeeded());
+    var vm = try client.getInstance("us-central1-a", "batch-1");
+    defer vm.deinit();
+    try std.testing.expectEqual(.terminated, vm.value.status);
+}
+// end snippet
+
+// snippet: compute-fake
+/// Creates the VM in the first of `zones` with room for it.
+fn createSomewhere(client: *compute.Client, zones: []const []const u8, spec: compute.InstanceSpec) ![]const u8 {
+    for (zones) |zone| {
+        var op = try client.insertInstance(zone, spec, .{});
+        defer op.deinit();
+        var done = try client.waitOperation(op.value.ref(), .{});
+        defer done.deinit();
+        const failure = done.value.failure orelse return zone;
+        if (!failure.stockout()) return error.InsertFailed;
+    }
+    return error.NoRoom;
+}
+
+test "a spot VM in the first zone with room, against the in-memory Compute Engine" {
+    var fake: compute.testing.FakeCompute = .init(std.testing.allocator, std.testing.io, .{});
+    defer fake.deinit();
+    // How production answers is the test's to arrange: no room in -a.
+    try fake.setStockout("us-central1-a", true);
+    var token: compute.StaticToken = .{ .token = "none" };
+    var client = try compute.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .scope = .read_write,
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    const zone = try createSomewhere(&client, &.{ "us-central1-a", "us-central1-b" }, .{
+        .name = "batch-1",
+        .machine_type = "e2-micro",
+        .image = .{ .family = .{ .project = "debian-cloud", .name = "debian-12" } },
+        .spot = true,
+    });
+    try std.testing.expectEqualStrings("us-central1-b", zone);
+    var vm = try client.getInstance(zone, "batch-1");
+    defer vm.deinit();
+    try std.testing.expectEqual(.running, vm.value.status);
+}
+// end snippet

@@ -124,7 +124,7 @@ pub const instance_spot =
     \\}
 ;
 
-/// A standard e2-micro VM running under deletion protection: no provisioning model on the wire. GET instance. HTTP 200.
+/// A standard e2-micro VM running under deletion protection: provisioningModel STANDARD, though the insert sent none. GET instance. HTTP 200.
 pub const instance_standard_status = 200;
 pub const instance_standard =
     \\{
@@ -1846,6 +1846,527 @@ pub const e2_terminate =
     \\    "message": "e2 instances do not support onHostMaintenance=TERMINATE unless they are preemptible.",
     \\    "domain": "global",
     \\    "reason": "badRequest"
+    \\   }
+    \\  ]
+    \\ }
+    \\}
+;
+
+/// An insert naming a machine type the zone does not have. HTTP 400.
+pub const insert_bad_machine_type_status = 400;
+pub const insert_bad_machine_type =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Invalid value for field 'resource.machineType': 'zones/us-central1-a/machineTypes/e2-nonesuch'. Machine type with name 'e2-nonesuch' does not exist in zone 'us-central1-a'.",
+    \\  "errors": [
+    \\   {
+    \\    "message": "Invalid value for field 'resource.machineType': 'zones/us-central1-a/machineTypes/e2-nonesuch'. Machine type with name 'e2-nonesuch' does not exist in zone 'us-central1-a'.",
+    \\    "domain": "global",
+    \\    "reason": "invalid"
+    \\   }
+    \\  ]
+    \\ }
+    \\}
+;
+
+/// An insert from an image family nobody has. HTTP 404.
+pub const insert_bad_image_status = 404;
+pub const insert_bad_image =
+    \\{
+    \\ "error": {
+    \\  "code": 404,
+    \\  "message": "The resource 'projects/debian-cloud/global/images/family/nonesuch-99' was not found",
+    \\  "errors": [
+    \\   {
+    \\    "message": "The resource 'projects/debian-cloud/global/images/family/nonesuch-99' was not found",
+    \\    "domain": "global",
+    \\    "reason": "notFound"
+    \\   }
+    \\  ]
+    \\ }
+    \\}
+;
+
+/// An insert of a name that is not RFC 1035, with its ErrorInfo and LocalizedMessage details. HTTP 400.
+pub const insert_bad_name_status = 400;
+pub const insert_bad_name =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Invalid value for field 'resource.name': 'Bad_Name'. Must be a match of regex '(?:[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?)'",
+    \\  "errors": [
+    \\   {
+    \\    "message": "Invalid value for field 'resource.name': 'Bad_Name'. Must be a match of regex '(?:[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?)'",
+    \\    "domain": "global",
+    \\    "reason": "invalid"
+    \\   }
+    \\  ],
+    \\  "details": [
+    \\   {
+    \\    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+    \\    "reason": "INVALID_FIELD_VALUE",
+    \\    "domain": "compute.googleapis.com",
+    \\    "metadata": {
+    \\     "field": "resource.name",
+    \\     "value": "Bad_Name",
+    \\     "reason": "Must be a match of regex '(?:[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?)'"
+    \\    }
+    \\   },
+    \\   {
+    \\    "@type": "type.googleapis.com/google.rpc.LocalizedMessage",
+    \\    "locale": "en-US",
+    \\    "message": "Invalid value for field 'resource.name': 'Bad_Name'. Must be a match of regex '(?:[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?)'"
+    \\   }
+    \\  ]
+    \\ }
+    \\}
+;
+
+/// A stop's operation as the stop answered it: RUNNING. HTTP 200.
+pub const operation_stop_status = 200;
+pub const operation_stop =
+    \\{
+    \\ "kind": "compute#operation",
+    \\ "id": "5698577931505735531",
+    \\ "name": "operation-1793730948208-65f6387fd992a-0f6970de-a1404bb1",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "clientOperationId": "67bef999-9f07-49ba-b7ad-1c4a54856d2d",
+    \\ "operationType": "stop",
+    \\ "targetLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m0-11031830-a",
+    \\ "targetId": "6231655708778534534",
+    \\ "status": "RUNNING",
+    \\ "user": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\ "progress": 0,
+    \\ "insertTime": "2026-11-03T10:35:48.397-08:00",
+    \\ "startTime": "2026-11-03T10:35:48.406-08:00",
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/operations/operation-1793730948208-65f6387fd992a-0f6970de-a1404bb1"
+    \\}
+;
+
+/// The stop, DONE, as the first wait answered it. HTTP 200.
+pub const operation_stop_done_status = 200;
+pub const operation_stop_done =
+    \\{
+    \\ "kind": "compute#operation",
+    \\ "id": "5698577931505735531",
+    \\ "name": "operation-1793730948208-65f6387fd992a-0f6970de-a1404bb1",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "clientOperationId": "67bef999-9f07-49ba-b7ad-1c4a54856d2d",
+    \\ "operationType": "stop",
+    \\ "targetLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m0-11031830-a",
+    \\ "targetId": "6231655708778534534",
+    \\ "status": "DONE",
+    \\ "user": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\ "progress": 100,
+    \\ "insertTime": "2026-11-03T10:35:48.397-08:00",
+    \\ "startTime": "2026-11-03T10:35:48.406-08:00",
+    \\ "endTime": "2026-11-03T10:36:41.509-08:00",
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/operations/operation-1793730948208-65f6387fd992a-0f6970de-a1404bb1"
+    \\}
+;
+
+/// The VM after the stop: TERMINATED. GET instance. HTTP 200.
+pub const instance_stopped_status = 200;
+pub const instance_stopped =
+    \\{
+    \\ "kind": "compute#instance",
+    \\ "id": "6231655708778534534",
+    \\ "creationTimestamp": "2026-11-03T10:31:05.869-08:00",
+    \\ "name": "zigps-m0-11031830-a",
+    \\ "tags": {
+    \\  "items": [
+    \\   "zigps-probe"
+    \\  ],
+    \\  "fingerprint": "V8n1wV8vUmg="
+    \\ },
+    \\ "machineType": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/machineTypes/e2-micro",
+    \\ "status": "TERMINATED",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "networkInterfaces": [
+    \\  {
+    \\   "kind": "compute#networkInterface",
+    \\   "network": "https://www.googleapis.com/compute/v1/projects/extractctl/global/networks/default",
+    \\   "subnetwork": "https://www.googleapis.com/compute/v1/projects/extractctl/regions/us-central1/subnetworks/default",
+    \\   "networkIP": "10.128.0.13",
+    \\   "name": "nic0",
+    \\   "fingerprint": "2FVvlW2Vfn8=",
+    \\   "stackType": "IPV4_ONLY"
+    \\  }
+    \\ ],
+    \\ "disks": [
+    \\  {
+    \\   "kind": "compute#attachedDisk",
+    \\   "type": "PERSISTENT",
+    \\   "mode": "READ_WRITE",
+    \\   "source": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/disks/zigps-m0-11031830-a",
+    \\   "deviceName": "persistent-disk-0",
+    \\   "index": 0,
+    \\   "boot": true,
+    \\   "autoDelete": true,
+    \\   "licenses": [
+    \\    "https://www.googleapis.com/compute/v1/projects/debian-cloud/global/licenses/debian-12-bookworm"
+    \\   ],
+    \\   "interface": "SCSI",
+    \\   "guestOsFeatures": [
+    \\    {
+    \\     "type": "UEFI_COMPATIBLE"
+    \\    },
+    \\    {
+    \\     "type": "VIRTIO_SCSI_MULTIQUEUE"
+    \\    },
+    \\    {
+    \\     "type": "GVNIC"
+    \\    },
+    \\    {
+    \\     "type": "SEV_CAPABLE"
+    \\    },
+    \\    {
+    \\     "type": "SEV_LIVE_MIGRATABLE_V2"
+    \\    },
+    \\    {
+    \\     "type": "SUSPEND_SAFE_FPR"
+    \\    }
+    \\   ],
+    \\   "diskSizeGb": "10",
+    \\   "architecture": "X86_64"
+    \\  }
+    \\ ],
+    \\ "metadata": {
+    \\  "kind": "compute#metadata",
+    \\  "fingerprint": "ZoWzZgwsD-M=",
+    \\  "items": [
+    \\   {
+    \\    "key": "startup-script",
+    \\    "value": "#!/bin/bash\n# zigps m0: a guest attribute, then enough serial output for more than one page.\ncurl -s -X PUT --data \"ready\" -H \"Metadata-Flavor: Google\" \\\n  \"http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/zigps/probe\"\nfor i in $(seq 1 30000); do printf 'zigps-m0 serial line %05d %060d\\n' \"$i\" 0; done > /dev/ttyS0\necho \"zigps-m0 serial done\" > /dev/ttyS0\n"
+    \\   },
+    \\   {
+    \\    "key": "enable-guest-attributes",
+    \\    "value": "TRUE"
+    \\   },
+    \\   {
+    \\    "key": "zigps",
+    \\    "value": "one"
+    \\   }
+    \\  ]
+    \\ },
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m0-11031830-a",
+    \\ "scheduling": {
+    \\  "maxRunDuration": {
+    \\   "seconds": "3600",
+    \\   "nanos": 0
+    \\  },
+    \\  "onHostMaintenance": "TERMINATE",
+    \\  "automaticRestart": false,
+    \\  "preemptible": true,
+    \\  "provisioningModel": "SPOT",
+    \\  "instanceTerminationAction": "DELETE"
+    \\ },
+    \\ "cpuPlatform": "Unknown CPU Platform",
+    \\ "labels": {
+    \\  "purpose": "gcp-zig-test",
+    \\  "tool": "compute-m0",
+    \\  "probe": "one"
+    \\ },
+    \\ "labelFingerprint": "ZjVmAPZeL3k=",
+    \\ "startRestricted": false,
+    \\ "deletionProtection": false,
+    \\ "shieldedInstanceConfig": {
+    \\  "enableSecureBoot": false,
+    \\  "enableVtpm": true,
+    \\  "enableIntegrityMonitoring": true
+    \\ },
+    \\ "shieldedInstanceIntegrityPolicy": {
+    \\  "updateAutoLearnPolicy": true
+    \\ },
+    \\ "fingerprint": "WKe5MjJKF2M=",
+    \\ "lastStartTimestamp": "2026-11-03T10:31:20.073-08:00",
+    \\ "lastStopTimestamp": "2026-11-03T10:36:38.877-08:00",
+    \\ "satisfiesPzi": true,
+    \\ "resourceStatus": {
+    \\  "effectiveInstanceMetadata": {
+    \\   "vmDnsSettingMetadataValue": "ZonalOnly",
+    \\   "enableGuestAttributesMetadataValue": true
+    \\  }
+    \\ }
+    \\}
+;
+
+/// A start's operation as the start answered it: RUNNING. HTTP 200.
+pub const operation_start_status = 200;
+pub const operation_start =
+    \\{
+    \\ "kind": "compute#operation",
+    \\ "id": "3520140527217907539",
+    \\ "name": "operation-1793731004331-65f638b55f720-46f8d765-55fb272b",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "clientOperationId": "adbe7c42-2ef2-49c9-b7ee-be0c45acb062",
+    \\ "operationType": "start",
+    \\ "targetLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m0-11031830-a",
+    \\ "targetId": "6231655708778534534",
+    \\ "status": "RUNNING",
+    \\ "user": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\ "progress": 0,
+    \\ "insertTime": "2026-11-03T10:36:44.690-08:00",
+    \\ "startTime": "2026-11-03T10:36:44.726-08:00",
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/operations/operation-1793731004331-65f638b55f720-46f8d765-55fb272b"
+    \\}
+;
+
+/// Starting a VM already running: an operation DONE at once, no refusal. HTTP 200.
+pub const operation_start_running_status = 200;
+pub const operation_start_running =
+    \\{
+    \\ "kind": "compute#operation",
+    \\ "id": "4273876527110133563",
+    \\ "name": "operation-1793731027975-65f638cbebcb3-202be241-88ef1d80",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "clientOperationId": "18ceb857-3a11-4a57-9e53-e1cbc92ea6e6",
+    \\ "operationType": "start",
+    \\ "targetLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m0-11031830-a",
+    \\ "targetId": "6231655708778534534",
+    \\ "status": "DONE",
+    \\ "user": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\ "progress": 100,
+    \\ "insertTime": "2026-11-03T10:37:08.353-08:00",
+    \\ "startTime": "2026-11-03T10:37:08.385-08:00",
+    \\ "endTime": "2026-11-03T10:37:08.385-08:00",
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/operations/operation-1793731027975-65f638cbebcb3-202be241-88ef1d80"
+    \\}
+;
+
+/// A reset's operation as the reset answered it: RUNNING. HTTP 200.
+pub const operation_reset_status = 200;
+pub const operation_reset =
+    \\{
+    \\ "kind": "compute#operation",
+    \\ "id": "1102672185564567354",
+    \\ "name": "operation-1793731028920-65f638ccd26cd-95918555-99923cf2",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "clientOperationId": "f7fe6766-d3be-4644-b9e4-39d83888449b",
+    \\ "operationType": "reset",
+    \\ "targetLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m0-11031830-a",
+    \\ "targetId": "6231655708778534534",
+    \\ "status": "RUNNING",
+    \\ "user": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\ "progress": 0,
+    \\ "insertTime": "2026-11-03T10:37:09.231-08:00",
+    \\ "startTime": "2026-11-03T10:37:09.248-08:00",
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/operations/operation-1793731028920-65f638ccd26cd-95918555-99923cf2"
+    \\}
+;
+
+/// A suspend's operation as the suspend answered it: RUNNING. HTTP 200.
+pub const operation_suspend_status = 200;
+pub const operation_suspend =
+    \\{
+    \\ "kind": "compute#operation",
+    \\ "id": "3638997334748534584",
+    \\ "name": "operation-1793731031246-65f638cf0a81b-79f0a9fe-430e264e",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "clientOperationId": "39441b28-8485-4937-8bcb-765b0627c842",
+    \\ "operationType": "suspend",
+    \\ "targetLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m0-11031830-a",
+    \\ "targetId": "6231655708778534534",
+    \\ "status": "RUNNING",
+    \\ "user": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\ "progress": 0,
+    \\ "insertTime": "2026-11-03T10:37:11.433-08:00",
+    \\ "startTime": "2026-11-03T10:37:11.452-08:00",
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/operations/operation-1793731031246-65f638cf0a81b-79f0a9fe-430e264e"
+    \\}
+;
+
+/// A resume's operation as the resume answered it: RUNNING. HTTP 200.
+pub const operation_resume_status = 200;
+pub const operation_resume =
+    \\{
+    \\ "kind": "compute#operation",
+    \\ "id": "8006124410648368159",
+    \\ "name": "operation-1793731312436-65f639db3434e-96912a38-54edd6b1",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "clientOperationId": "4d17ff6b-04a2-40e1-97d9-ac339e160d22",
+    \\ "operationType": "resume",
+    \\ "targetLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m0-11031830-a",
+    \\ "targetId": "6231655708778534534",
+    \\ "status": "RUNNING",
+    \\ "user": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\ "progress": 0,
+    \\ "insertTime": "2026-11-03T10:41:52.810-08:00",
+    \\ "startTime": "2026-11-03T10:41:52.825-08:00",
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/operations/operation-1793731312436-65f639db3434e-96912a38-54edd6b1"
+    \\}
+;
+
+/// A delete's operation as the delete answered it: RUNNING (milestone 2's live suite). HTTP 200.
+pub const operation_delete_status = 200;
+pub const operation_delete =
+    \\{
+    \\ "kind": "compute#operation",
+    \\ "id": "4970243858555726347",
+    \\ "name": "operation-1793742052617-65f661ddd6cb8-6aef07f8-2594daff",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "clientOperationId": "8fa5499d-237c-454f-875a-ebddec484448",
+    \\ "operationType": "delete",
+    \\ "targetLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-9e4cc1-a",
+    \\ "targetId": "3177492060727405285",
+    \\ "status": "RUNNING",
+    \\ "user": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\ "progress": 0,
+    \\ "insertTime": "2026-11-03T13:40:52.822-08:00",
+    \\ "startTime": "2026-11-03T13:40:52.845-08:00",
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/operations/operation-1793742052617-65f661ddd6cb8-6aef07f8-2594daff"
+    \\}
+;
+
+/// A start's operation answered PENDING, where milestone 0's had answered RUNNING (milestone 2's live suite). HTTP 200.
+pub const operation_start_pending_status = 200;
+pub const operation_start_pending =
+    \\{
+    \\ "kind": "compute#operation",
+    \\ "id": "5576679861927799464",
+    \\ "name": "operation-1793741895310-65f66147d1abd-28fa53bc-798fc6e2",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "clientOperationId": "968ed054-ed23-4e46-a7d9-0b8b2d0712e6",
+    \\ "operationType": "start",
+    \\ "targetLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-9e4cc1-a",
+    \\ "targetId": "3177492060727405285",
+    \\ "status": "PENDING",
+    \\ "user": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\ "progress": 0,
+    \\ "insertTime": "2026-11-03T13:38:15.669-08:00",
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/operations/operation-1793741895310-65f66147d1abd-28fa53bc-798fc6e2"
+    \\}
+;
+
+/// A standard VM created with automaticRestart false and a run limit: both kept, provisioningModel STANDARD (milestone 2's live suite). GET instance. HTTP 200.
+pub const instance_standard_restartless_status = 200;
+pub const instance_standard_restartless =
+    \\{
+    \\ "kind": "compute#instance",
+    \\ "id": "3728152248699054779",
+    \\ "creationTimestamp": "2026-11-03T13:38:28.407-08:00",
+    \\ "name": "zigps-9e4cc1-b",
+    \\ "tags": {
+    \\  "fingerprint": "42WmSpB8rSM="
+    \\ },
+    \\ "machineType": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/machineTypes/e2-micro",
+    \\ "status": "RUNNING",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "networkInterfaces": [
+    \\  {
+    \\   "kind": "compute#networkInterface",
+    \\   "network": "https://www.googleapis.com/compute/v1/projects/extractctl/global/networks/default",
+    \\   "subnetwork": "https://www.googleapis.com/compute/v1/projects/extractctl/regions/us-central1/subnetworks/default",
+    \\   "networkIP": "10.128.0.21",
+    \\   "name": "nic0",
+    \\   "fingerprint": "ft1VD-PdsPs=",
+    \\   "stackType": "IPV4_ONLY"
+    \\  }
+    \\ ],
+    \\ "disks": [
+    \\  {
+    \\   "kind": "compute#attachedDisk",
+    \\   "type": "PERSISTENT",
+    \\   "mode": "READ_WRITE",
+    \\   "source": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/disks/zigps-9e4cc1-b",
+    \\   "deviceName": "persistent-disk-0",
+    \\   "index": 0,
+    \\   "boot": true,
+    \\   "autoDelete": true,
+    \\   "licenses": [
+    \\    "https://www.googleapis.com/compute/v1/projects/debian-cloud/global/licenses/debian-12-bookworm"
+    \\   ],
+    \\   "interface": "SCSI",
+    \\   "guestOsFeatures": [
+    \\    {
+    \\     "type": "UEFI_COMPATIBLE"
+    \\    },
+    \\    {
+    \\     "type": "VIRTIO_SCSI_MULTIQUEUE"
+    \\    },
+    \\    {
+    \\     "type": "GVNIC"
+    \\    },
+    \\    {
+    \\     "type": "SEV_CAPABLE"
+    \\    },
+    \\    {
+    \\     "type": "SEV_LIVE_MIGRATABLE_V2"
+    \\    },
+    \\    {
+    \\     "type": "SUSPEND_SAFE_FPR"
+    \\    }
+    \\   ],
+    \\   "diskSizeGb": "10",
+    \\   "architecture": "X86_64"
+    \\  }
+    \\ ],
+    \\ "metadata": {
+    \\  "kind": "compute#metadata",
+    \\  "fingerprint": "azQvSjDzm8c=",
+    \\  "items": [
+    \\   {
+    \\    "key": "startup-script",
+    \\    "value": "#!/bin/bash\necho zigps-compute-it up > /dev/ttyS0\n"
+    \\   }
+    \\  ]
+    \\ },
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-9e4cc1-b",
+    \\ "scheduling": {
+    \\  "maxRunDuration": {
+    \\   "seconds": "1800",
+    \\   "nanos": 0
+    \\  },
+    \\  "onHostMaintenance": "MIGRATE",
+    \\  "automaticRestart": false,
+    \\  "preemptible": false,
+    \\  "provisioningModel": "STANDARD",
+    \\  "instanceTerminationAction": "DELETE"
+    \\ },
+    \\ "cpuPlatform": "Intel Broadwell",
+    \\ "labels": {
+    \\  "purpose": "gcp-zig-test",
+    \\  "tool": "compute-it",
+    \\  "run": "9e4cc1"
+    \\ },
+    \\ "labelFingerprint": "FQBtsIpaH9k=",
+    \\ "startRestricted": false,
+    \\ "deletionProtection": true,
+    \\ "shieldedInstanceConfig": {
+    \\  "enableSecureBoot": false,
+    \\  "enableVtpm": true,
+    \\  "enableIntegrityMonitoring": true
+    \\ },
+    \\ "shieldedInstanceIntegrityPolicy": {
+    \\  "updateAutoLearnPolicy": true
+    \\ },
+    \\ "fingerprint": "j1HLD52-yps=",
+    \\ "lastStartTimestamp": "2026-11-03T13:38:38.633-08:00",
+    \\ "satisfiesPzi": true,
+    \\ "resourceStatus": {
+    \\  "effectiveInstanceMetadata": {
+    \\   "vmDnsSettingMetadataValue": "ZonalOnly"
+    \\  },
+    \\  "scheduling": {
+    \\   "terminationTimestamp": "2026-11-03T22:08:29.631334Z"
+    \\  }
+    \\ }
+    \\}
+;
+
+/// An insert from a template nobody has (milestone 2's live suite). HTTP 404.
+pub const template_not_found_status = 404;
+pub const template_not_found =
+    \\{
+    \\ "error": {
+    \\  "code": 404,
+    \\  "message": "The resource 'projects/extractctl/global/instanceTemplates/zigps-nonesuch' was not found",
+    \\  "errors": [
+    \\   {
+    \\    "message": "The resource 'projects/extractctl/global/instanceTemplates/zigps-nonesuch' was not found",
+    \\    "domain": "global",
+    \\    "reason": "notFound"
     \\   }
     \\  ]
     \\ }

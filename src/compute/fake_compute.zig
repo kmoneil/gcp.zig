@@ -1,16 +1,42 @@
-//! Compute Engine in memory, for tests of code that reads VMs and waits on
-//! operations: behind `Client.Options.transport`, it answers the module's
-//! calls as production answered them when measured on 2026-11-03 (issue
-//! #346, milestone 0).
+//! Compute Engine in memory, for tests of code that reads, creates, starts,
+//! stops and deletes VMs and waits on operations: behind
+//! `Client.Options.transport`, it answers the module's calls as production
+//! answered them when measured on 2026-11-03 (issue #346, milestone 0).
 //!
 //! - Zones are the fake's options' (us-central1-a, -b and -c by default)
 //!   and `putZone`'s. A path under any other zone is 400 "Invalid value
 //!   for field 'zone': '<z>'. Unknown zone."
+//! - Every zone has the machine types `Options.machine_types` names
+//!   (e2-micro, e2-small, e2-medium and e2-standard-2, as production
+//!   described them), and the images `Options.images` holds (debian-12's
+//!   newest when measured) are there from the start.
 //! - VMs, machine types, images, guest attributes, serial output and
-//!   operations are put in by the test: `putInstance`, `setStatus`,
+//!   operations a test puts in: `putInstance`, `setStatus`,
 //!   `putMachineType`, `putImage`, `putGuestAttribute`, `appendSerial`
 //!   and `putOperation` stand in for whoever created them and for the
-//!   VMs themselves. Nothing moves on its own.
+//!   VMs themselves.
+//! - Writes, as production took them. An insert makes the VM
+//!   PROVISIONING, and its operation RUNNING; the operation finishes
+//!   after `Options.write_waits` waits (one, as production's inserts,
+//!   stops, starts and resumes each did), and then the VM is RUNNING.
+//!   Start, stop, suspend, resume, reset and delete move a VM the same
+//!   way, through STAGING, STOPPING or SUSPENDING to RUNNING, TERMINATED,
+//!   SUSPENDED or gone, in the states production took each from:
+//!   starting a running VM is an operation DONE at once, stopping a
+//!   stopped one an operation like any other (measured). A write from a
+//!   state production was not measured in (suspending a stopped VM, say)
+//!   is 501. `finishOperations` finishes everything still running.
+//! - A write with a `requestId` already seen answers that write's
+//!   operation as it stands, and changes nothing (measured). An insert of
+//!   a name taken is 409, of a name that is not RFC 1035 or a machine type
+//!   the zone lacks 400, of an image nobody has 404, of a standard e2
+//!   with onHostMaintenance TERMINATE 400; a delete under deletion
+//!   protection is 400; each in production's words.
+//! - `setStockout` puts a zone out of room: an insert or a start there is
+//!   taken, and its operation ends DONE with ZONE_RESOURCE_POOL_EXHAUSTED
+//!   (not measured: Google's documented words), the VM gone or still
+//!   TERMINATED. `putTemplate` puts in an instance template for an insert
+//!   from one.
 //! - Lists sort by name and page by `maxResults` (500 by default, as
 //!   production's); `orderBy=creationTimestamp desc` puts the newest
 //!   first. A filter and an order together are refused, as production
@@ -46,10 +72,11 @@
 //! - Faults a test asks for: refusals, dropped connections, and a lost
 //!   answer.
 //!
-//! Not modelled, answered 501 with the reason: every write (creating,
-//! changing, starting, stopping or deleting a VM, in the module's next
-//! milestones), a filter on another field, a page token the fake did not
-//! make, serial port 0, and another project's paths but for images.
+//! Not modelled, answered 501 with the reason: changing a live VM
+//! (labels, metadata, tags, machine type and the rest, in the module's
+//! next milestone), templates and groups beyond an insert from one, a
+//! filter on another field, a page token the fake did not make, serial
+//! port 0, and another project's paths but for images.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -57,6 +84,7 @@ const Stringify = std.json.Stringify;
 const core = @import("core");
 const tp = core.transport;
 const types = @import("types.zig");
+const validate = @import("validate.zig");
 
 /// What every link the fake writes starts with: production's links name
 /// this host, not the one a client calls (measured 2026-11-03).
@@ -79,6 +107,14 @@ pub const FakeCompute = struct {
     /// By "<scope path>/<name>", the scope path `zones/<z>`,
     /// `regions/<r>` or `global`.
     operations: std.StringArrayHashMapUnmanaged(*FakeOperation) = .empty,
+    /// Every write's operation by the `requestId` it came with, to answer
+    /// a resend.
+    request_ids: std.StringHashMapUnmanaged(*FakeOperation) = .empty,
+    /// Zones out of room.
+    stockouts: std.StringHashMapUnmanaged(void) = .empty,
+    /// By "global/<name>" or "regions/<region>/<name>"; a template's zone
+    /// and status are unused.
+    templates: std.StringHashMapUnmanaged(PutInstance) = .empty,
     counter: u64 = 0,
     calls: usize = 0,
     faults: [3]Fault = .{ .{}, .{}, .{} },
@@ -94,6 +130,28 @@ pub const FakeCompute = struct {
         zones: []const []const u8 = &.{ "us-central1-a", "us-central1-b", "us-central1-c" },
         /// How much of a serial port is kept.
         serial_window: usize = 1 << 20,
+        /// The machine types every zone has from the start, `putZone`'s
+        /// too. An insert must name one its zone has.
+        machine_types: []const PutMachineType = &default_machine_types,
+        /// The images there from the start. An insert's image must be one
+        /// put in, or the newest in one's family.
+        images: []const PutImage = &default_images,
+        /// How many `wait` calls a write's operation takes to finish, as
+        /// `PutOperation.waits_to_finish` counts them.
+        write_waits: u32 = 1,
+    };
+
+    /// As production listed them on 2026-11-03.
+    pub const default_machine_types = [_]PutMachineType{
+        .{ .name = "e2-micro", .guest_cpus = 2, .memory_mb = 1024, .shared_cpu = true, .description = "Efficient Instance, 2 vCPU (1/8 shared physical core) and 1 GB RAM" },
+        .{ .name = "e2-small", .guest_cpus = 2, .memory_mb = 2048, .shared_cpu = true, .description = "Efficient Instance, 2 vCPU (1/4 shared physical core) and 2 GB RAM" },
+        .{ .name = "e2-medium", .guest_cpus = 2, .memory_mb = 4096, .shared_cpu = true, .description = "Efficient Instance, 2 vCPU (1/2 shared physical core) and 4 GB RAM" },
+        .{ .name = "e2-standard-2", .guest_cpus = 2, .memory_mb = 8192, .description = "Efficient Instance, 2 vCPUs, 8 GB RAM" },
+    };
+
+    /// debian-12's newest when measured.
+    pub const default_images = [_]PutImage{
+        .{ .project = "debian-cloud", .name = "debian-12-bookworm-v20261027", .family = "debian-12" },
     };
 
     pub const PutInstance = struct {
@@ -105,6 +163,8 @@ pub const FakeCompute = struct {
         metadata: []const types.MetadataItem = &.{},
         tags: []const []const u8 = &.{},
         spot: bool = false,
+        /// Null: what Compute gives, false for a spot VM, true otherwise.
+        automatic_restart: ?bool = null,
         max_run_duration_s: ?u64 = null,
         termination_action: ?types.TerminationAction = null,
         deletion_protection: bool = false,
@@ -133,7 +193,9 @@ pub const FakeCompute = struct {
         operation_type: []const u8 = "insert",
         /// The instance it acts on, in the scope's zone; null for none.
         target_instance: ?[]const u8 = null,
-        /// How many `wait` calls answer it still RUNNING before it is DONE.
+        /// How many `wait` calls it takes to finish: the last of them
+        /// answers DONE, a read before it RUNNING. 0 is DONE from the
+        /// start.
         waits_to_finish: u32 = 0,
         /// Set to make it end failed.
         failure: ?Failure = null,
@@ -162,6 +224,21 @@ pub const FakeCompute = struct {
         guest: std.ArrayList(types.GuestAttribute) = .empty,
     };
 
+    /// An instance template, global or in a region, for an insert from
+    /// one; what it gives a VM.
+    pub const PutTemplate = struct {
+        name: []const u8,
+        /// Null for a global template.
+        region: ?[]const u8 = null,
+        machine_type: []const u8 = "e2-micro",
+        labels: []const types.Label = &.{},
+        metadata: []const types.MetadataItem = &.{},
+        tags: []const []const u8 = &.{},
+        spot: bool = false,
+        max_run_duration_s: ?u64 = null,
+        termination_action: ?types.TerminationAction = null,
+    };
+
     const FakeImage = struct { put: PutImage, created: std.Io.Timestamp };
 
     const FakeOperation = struct {
@@ -170,13 +247,19 @@ pub const FakeCompute = struct {
         id: u64,
         inserted: std.Io.Timestamp,
         waits_left: u32,
+        /// What finishing does to its VM, once.
+        effect: Effect = .none,
     };
+
+    /// What a write's operation does to its VM when it finishes.
+    const Effect = enum { none, run, terminate, suspend_vm, remove };
 
     pub const PutError = Allocator.Error || error{ UnknownZone, AlreadyExists, NotFound };
 
     pub fn init(gpa: Allocator, io: std.Io, options: Options) FakeCompute {
         var f: FakeCompute = .{ .gpa = gpa, .io = io, .options = options, .store = .init(gpa) };
-        for (options.zones) |z| f.zones.put(gpa, z, {}) catch @panic("OOM");
+        for (options.zones) |z| f.addZone(z) catch @panic("OOM");
+        for (options.images) |img| f.addImage(img) catch @panic("OOM");
         return f;
     }
 
@@ -190,6 +273,9 @@ pub const FakeCompute = struct {
         f.machine_types.deinit(f.gpa);
         f.images.deinit(f.gpa);
         f.operations.deinit(f.gpa);
+        f.request_ids.deinit(f.gpa);
+        f.stockouts.deinit(f.gpa);
+        f.templates.deinit(f.gpa);
         f.store.deinit();
         f.* = undefined;
     }
@@ -238,16 +324,26 @@ pub const FakeCompute = struct {
 
     // What a test puts in.
 
+    /// A zone, with `Options.machine_types`.
     pub fn putZone(f: *FakeCompute, id: []const u8) PutError!void {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
-        try f.zones.put(f.gpa, try f.store.allocator().dupe(u8, id), {});
+        try f.addZone(try f.store.allocator().dupe(u8, id));
+    }
+
+    fn addZone(f: *FakeCompute, id: []const u8) Allocator.Error!void {
+        try f.zones.put(f.gpa, id, {});
+        for (f.options.machine_types) |m| try f.addMachineType(id, m);
     }
 
     /// A VM, as if it had been created and had come up as `put.status`.
     pub fn putInstance(f: *FakeCompute, put: PutInstance) PutError!void {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
+        try f.addInstance(put);
+    }
+
+    fn addInstance(f: *FakeCompute, put: PutInstance) PutError!void {
         if (!f.zones.contains(put.zone)) return error.UnknownZone;
         const s = f.store.allocator();
         const key = try std.fmt.allocPrint(s, "{s}/{s}", .{ put.zone, put.name });
@@ -304,6 +400,10 @@ pub const FakeCompute = struct {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         if (!f.zones.contains(zone)) return error.UnknownZone;
+        try f.addMachineType(zone, put);
+    }
+
+    fn addMachineType(f: *FakeCompute, zone: []const u8, put: PutMachineType) Allocator.Error!void {
         const s = f.store.allocator();
         const key = try std.fmt.allocPrint(s, "{s}/{s}", .{ zone, put.name });
         try f.machine_types.put(f.gpa, key, .{
@@ -319,6 +419,10 @@ pub const FakeCompute = struct {
     pub fn putImage(f: *FakeCompute, put: PutImage) PutError!void {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
+        try f.addImage(put);
+    }
+
+    fn addImage(f: *FakeCompute, put: PutImage) Allocator.Error!void {
         const s = f.store.allocator();
         try f.images.append(f.gpa, .{ .put = .{
             .project = try s.dupe(u8, put.project),
@@ -346,6 +450,48 @@ pub const FakeCompute = struct {
         };
         try f.operations.put(f.gpa, try std.fmt.allocPrint(s, "{s}/{s}", .{ try scopeKey(s, op.put.scope), name }), op);
         return name;
+    }
+
+    /// Puts `zone` out of room, or gives it room again: an insert or a
+    /// start there is taken, and its operation ends DONE with
+    /// ZONE_RESOURCE_POOL_EXHAUSTED.
+    pub fn setStockout(f: *FakeCompute, zone: []const u8, out_of_room: bool) PutError!void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        if (!f.zones.contains(zone)) return error.UnknownZone;
+        if (out_of_room) {
+            try f.stockouts.put(f.gpa, try f.store.allocator().dupe(u8, zone), {});
+        } else _ = f.stockouts.remove(zone);
+    }
+
+    /// An instance template, for an insert from one.
+    pub fn putTemplate(f: *FakeCompute, put: PutTemplate) PutError!void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        const s = f.store.allocator();
+        const key = if (put.region) |r| try std.fmt.allocPrint(s, "regions/{s}/{s}", .{ r, put.name }) else try std.fmt.allocPrint(s, "global/{s}", .{put.name});
+        if (f.templates.contains(key)) return error.AlreadyExists;
+        try f.templates.put(f.gpa, key, try dupeInstance(s, .{
+            .zone = "",
+            .name = put.name,
+            .machine_type = put.machine_type,
+            .labels = put.labels,
+            .metadata = put.metadata,
+            .tags = put.tags,
+            .spot = put.spot,
+            .max_run_duration_s = put.max_run_duration_s,
+            .termination_action = put.termination_action,
+        }));
+    }
+
+    /// Finishes every operation still running, as waits until DONE would.
+    pub fn finishOperations(f: *FakeCompute) void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        for (f.operations.values()) |op| if (op.waits_left > 0) {
+            op.waits_left = 0;
+            f.finish(op);
+        };
     }
 
     fn instanceFor(f: *FakeCompute, zone: []const u8, name: []const u8) PutError!*FakeInstance {
@@ -452,7 +598,7 @@ pub const FakeCompute = struct {
         }
         if (!std.mem.eql(u8, project, f.options.project_id)) return notModelled(arena, "a project other than the fake's own");
         const wait = req.method == .POST and std.mem.endsWith(u8, tail, "/wait");
-        if (req.method != .GET and !wait) return notModelled(arena, "a write (the module's next milestones)");
+        if (req.method != .GET and !wait) return f.write(req, arena, tail, params);
         if (std.mem.eql(u8, tail, "zones")) return f.listZones(arena, params);
         if (std.mem.eql(u8, tail, "aggregated/instances")) return f.aggregated(arena, params);
         if (std.mem.startsWith(u8, tail, "global/operations")) return f.operation(arena, "global", tail["global/operations".len..], params, wait);
@@ -473,13 +619,13 @@ pub const FakeCompute = struct {
         const slash = std.mem.indexOfScalar(u8, tail, '/');
         const zone = tail[0 .. slash orelse tail.len];
         if (slash == null) return f.getZone(arena, zone);
-        if (!f.zones.contains(zone)) return fail(arena, 400, "invalid", try std.fmt.allocPrint(arena, "Invalid value for field 'zone': '{s}'. Unknown zone.", .{zone}));
+        if (!f.zones.contains(zone)) return unknownZone(arena, zone);
         const rest = tail[slash.? + 1 ..];
         if (std.mem.startsWith(u8, rest, "operations")) {
             const key = try std.fmt.allocPrint(arena, "zones/{s}", .{zone});
             return f.operation(arena, key, rest["operations".len..], params, wait);
         }
-        if (wait) return notModelled(arena, "a write (the module's next milestones)");
+        if (wait) return notModelled(arena, "a wait on this path");
         if (std.mem.eql(u8, rest, "instances")) return f.listInstances(arena, zone, params);
         if (std.mem.cutPrefix(u8, rest, "instances/")) |inst| return f.instancePath(arena, zone, inst, params);
         if (std.mem.eql(u8, rest, "machineTypes")) return f.listMachineTypes(arena, zone, params);
@@ -690,7 +836,9 @@ pub const FakeCompute = struct {
         return .{ .status = 200, .body = out.written() };
     }
 
-    fn image(f: *FakeCompute, arena: Allocator, project: []const u8, tail: []const u8) Allocator.Error!Reply {
+    /// An image by name, or a family's newest not deprecated: `tail` is
+    /// `<name>` or `family/<family>`.
+    fn findImage(f: *FakeCompute, project: []const u8, tail: []const u8) ?FakeImage {
         const family = std.mem.cutPrefix(u8, tail, "family/");
         var found: ?FakeImage = null;
         for (f.images.items) |img| {
@@ -699,7 +847,15 @@ pub const FakeCompute = struct {
                 if (std.mem.eql(u8, img.put.family, fam) and img.put.deprecated.len == 0) found = img;
             } else if (std.mem.eql(u8, img.put.name, tail)) found = img;
         }
-        const img = found orelse return fail(arena, 404, "notFound", try std.fmt.allocPrint(arena, "The resource 'projects/{s}/global/images/{s}' was not found", .{ project, tail }));
+        return found;
+    }
+
+    fn imageNotFound(arena: Allocator, project: []const u8, tail: []const u8) Allocator.Error!Reply {
+        return fail(arena, 404, "notFound", try std.fmt.allocPrint(arena, "The resource 'projects/{s}/global/images/{s}' was not found", .{ project, tail }));
+    }
+
+    fn image(f: *FakeCompute, arena: Allocator, project: []const u8, tail: []const u8) Allocator.Error!Reply {
+        const img = f.findImage(project, tail) orelse return imageNotFound(arena, project, tail);
         var out: std.Io.Writer.Allocating = .init(arena);
         var jw: Stringify = .{ .writer = &out.writer };
         writeImage(&jw, project, img) catch return error.OutOfMemory;
@@ -819,7 +975,8 @@ pub const FakeCompute = struct {
     }
 
     /// As production wrote a spot VM's: TERMINATE and preemptible filled
-    /// in; a standard VM's MIGRATE and automatic restart.
+    /// in; a standard VM's MIGRATE, and automatic restart unless it was
+    /// asked for none; the provisioning model for both.
     fn writeScheduling(jw: *Stringify, i: *FakeInstance) !void {
         const spot = i.put.spot;
         try jw.objectField("scheduling");
@@ -831,13 +988,11 @@ pub const FakeCompute = struct {
         try jw.objectField("onHostMaintenance");
         try jw.write(if (spot) "TERMINATE" else "MIGRATE");
         try jw.objectField("automaticRestart");
-        try jw.write(!spot);
+        try jw.write(i.put.automatic_restart orelse !spot);
         try jw.objectField("preemptible");
         try jw.write(spot);
-        if (spot) {
-            try jw.objectField("provisioningModel");
-            try jw.write("SPOT");
-        }
+        try jw.objectField("provisioningModel");
+        try jw.write(if (spot) "SPOT" else "STANDARD");
         if (i.put.termination_action) |action| {
             try jw.objectField("instanceTerminationAction");
             try jw.write(if (action == .delete) "DELETE" else "STOP");
@@ -911,11 +1066,312 @@ pub const FakeCompute = struct {
         const name = std.mem.cutSuffix(u8, rest, "/wait") orelse rest;
         const key = try std.fmt.allocPrint(arena, "{s}/{s}", .{ scope_key, name });
         const op = f.operations.get(key) orelse return f.notFound(arena, try std.fmt.allocPrint(arena, "{s}/operations/{s}", .{ scope_key, name }));
-        if (wait and op.waits_left > 0) op.waits_left -= 1;
+        if (wait and op.waits_left > 0) {
+            op.waits_left -= 1;
+            if (op.waits_left == 0) f.finish(op);
+        }
+        return f.operationReply(arena, op);
+    }
+
+    fn operationReply(f: *FakeCompute, arena: Allocator, op: *FakeOperation) Allocator.Error!Reply {
         var out: std.Io.Writer.Allocating = .init(arena);
         var jw: Stringify = .{ .writer = &out.writer };
         f.writeOperation(&jw, arena, op) catch return error.OutOfMemory;
         return .{ .status = 200, .body = out.written() };
+    }
+
+    // Writes.
+
+    /// A write under `zones/<z>/instances`: an insert, a delete, or a
+    /// verb on a VM. A `requestId` already seen answers its operation.
+    fn write(f: *FakeCompute, req: tp.Request, arena: Allocator, tail: []const u8, params: Params) Allocator.Error!Reply {
+        const rest = std.mem.cutPrefix(u8, tail, "zones/") orelse return notModelled(arena, "a write outside a zone (templates are the module's next milestones)");
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return notModelled(arena, "a write to a zone itself");
+        const zone = rest[0..slash];
+        if (!f.zones.contains(zone)) return unknownZone(arena, zone);
+        const target = std.mem.cutPrefix(u8, rest[slash + 1 ..], "instances") orelse return notModelled(arena, "a write to this zone path (groups are the module's next milestones)");
+        const request_id = params.get("requestId");
+        if (request_id) |id| if (f.request_ids.get(id)) |op| return f.operationReply(arena, op);
+        if (target.len == 0) {
+            if (req.method != .POST) return notModelled(arena, "this method on a zone's instances");
+            return f.insert(arena, zone, req.body orelse "", params, request_id);
+        }
+        const path = std.mem.cutPrefix(u8, target, "/") orelse return notModelled(arena, "this zone path");
+        const at = std.mem.indexOfScalar(u8, path, '/');
+        const name = path[0 .. at orelse path.len];
+        const i = f.instanceFor(zone, name) catch return f.notFound(arena, try std.fmt.allocPrint(arena, "zones/{s}/instances/{s}", .{ zone, name }));
+        if (at) |a| {
+            if (req.method != .POST) return notModelled(arena, "this method on an instance's verb");
+            return f.lifecycle(arena, i, path[a + 1 ..], request_id);
+        }
+        if (req.method != .DELETE) return notModelled(arena, "this method on an instance");
+        return f.delete(arena, i, request_id);
+    }
+
+    /// What an insert's body or template gives the VM, or production's
+    /// refusal.
+    const Parsed = union(enum) { ok: PutInstance, refused: Reply };
+
+    fn insert(f: *FakeCompute, arena: Allocator, zone: []const u8, text: []const u8, params: Params, request_id: ?[]const u8) Allocator.Error!Reply {
+        const parsed = if (params.get("sourceInstanceTemplate")) |source| try f.fromTemplate(arena, source, text) else try f.fromBody(arena, zone, text);
+        var put = switch (parsed) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        put.zone = zone;
+        put.status = .provisioning;
+        f.addInstance(put) catch |err| switch (err) {
+            error.AlreadyExists => return fail(arena, 409, "alreadyExists", try std.fmt.allocPrint(arena, "The resource 'projects/{s}/zones/{s}/instances/{s}' already exists", .{ f.options.project_id, zone, put.name })),
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnknownZone, error.NotFound => unreachable, // The zone was checked.
+        };
+        const out_of_room = f.stockouts.contains(zone);
+        const op = try f.addWriteOperation(zone, put.name, "insert", if (out_of_room) .remove else .run, out_of_room, f.options.write_waits, request_id);
+        return f.operationReply(arena, op);
+    }
+
+    /// The VM an insert's body describes, read as production reads the
+    /// fields the fake keeps.
+    fn fromBody(f: *FakeCompute, arena: Allocator, zone: []const u8, text: []const u8) Allocator.Error!Parsed {
+        const value = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .refused = try notModelled(arena, "an insert body that is not JSON") },
+        };
+        if (value != .object) return .{ .refused = try notModelled(arena, "an insert body that is not an object") };
+        const obj = value.object;
+        const name = jsonString(obj, "name") orelse return .{ .refused = try notModelled(arena, "an insert with no name") };
+        if (!validate.isName(name)) return .{ .refused = try fail(arena, 400, "invalid", try std.fmt.allocPrint(arena, "Invalid value for field 'resource.name': '{s}'. Must be a match of regex '(?:[a-z](?:[-a-z0-9]{{0,61}}[a-z0-9])?)'", .{name})) };
+        const machine_path = jsonString(obj, "machineType") orelse return .{ .refused = try notModelled(arena, "an insert with no machine type") };
+        const type_at = if (std.mem.lastIndexOfScalar(u8, machine_path, '/')) |s| s + 1 else 0;
+        const machine_type = machine_path[type_at..];
+        if (!f.machine_types.contains(try std.fmt.allocPrint(arena, "{s}/{s}", .{ zone, machine_type }))) {
+            return .{ .refused = try fail(arena, 400, "invalid", try std.fmt.allocPrint(arena, "Invalid value for field 'resource.machineType': '{s}'. Machine type with name '{s}' does not exist in zone '{s}'.", .{ machine_path, machine_type, zone })) };
+        }
+        if (try f.bootImageRefusal(arena, obj)) |refused| return .{ .refused = refused };
+        var put: PutInstance = .{ .zone = zone, .name = name, .machine_type = machine_type };
+        if (try schedulingOf(arena, obj, machine_type, &put)) |refused| return .{ .refused = refused };
+        put.labels = try labelsOf(arena, obj);
+        put.metadata = try metadataOf(arena, obj);
+        put.tags = try tagsOf(arena, obj);
+        put.deletion_protection = if (obj.get("deletionProtection")) |v| v == .bool and v.bool else false;
+        return .{ .ok = put };
+    }
+
+    /// Null when the boot disk's image is one the fake has.
+    fn bootImageRefusal(f: *FakeCompute, arena: Allocator, obj: std.json.ObjectMap) Allocator.Error!?Reply {
+        const source = bootImage(obj) orelse return try notModelled(arena, "an insert with no boot disk from an image");
+        const path = trimHost(source);
+        const project_path = if (std.mem.startsWith(u8, path, "global/")) try std.fmt.allocPrint(arena, "projects/{s}/{s}", .{ f.options.project_id, path }) else path;
+        const rest = std.mem.cutPrefix(u8, project_path, "projects/") orelse return try notModelled(arena, "an image path the fake does not read");
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return try notModelled(arena, "an image path the fake does not read");
+        const tail = std.mem.cutPrefix(u8, rest[slash..], "/global/images/") orelse return try notModelled(arena, "an image path the fake does not read");
+        if (f.findImage(rest[0..slash], tail) != null) return null;
+        return try imageNotFound(arena, rest[0..slash], tail);
+    }
+
+    fn bootImage(obj: std.json.ObjectMap) ?[]const u8 {
+        const disks = obj.get("disks") orelse return null;
+        if (disks != .array or disks.array.items.len == 0 or disks.array.items[0] != .object) return null;
+        const params = disks.array.items[0].object.get("initializeParams") orelse return null;
+        if (params != .object) return null;
+        return jsonString(params.object, "sourceImage");
+    }
+
+    /// Spot or not, the run limit and its action into `put`; production's
+    /// refusal of a standard e2 that asks for TERMINATE.
+    fn schedulingOf(arena: Allocator, obj: std.json.ObjectMap, machine_type: []const u8, put: *PutInstance) Allocator.Error!?Reply {
+        const v = obj.get("scheduling") orelse return null;
+        if (v != .object) return null;
+        const s = v.object;
+        const preemptible = if (s.get("preemptible")) |p| p == .bool and p.bool else false;
+        put.spot = preemptible or std.mem.eql(u8, jsonString(s, "provisioningModel") orelse "", "SPOT");
+        if (s.get("maxRunDuration")) |d| if (d == .object) {
+            if (d.object.get("seconds")) |secs| put.max_run_duration_s = switch (secs) {
+                .string => |t| std.fmt.parseInt(u64, t, 10) catch null,
+                .integer => |n| std.math.cast(u64, n),
+                else => null,
+            };
+        };
+        if (jsonString(s, "instanceTerminationAction")) |t| put.termination_action = types.TerminationAction.parse(t);
+        if (s.get("automaticRestart")) |r| if (r == .bool) {
+            put.automatic_restart = r.bool;
+        };
+        const terminate = std.mem.eql(u8, jsonString(s, "onHostMaintenance") orelse "", "TERMINATE");
+        if (terminate and !put.spot and std.mem.startsWith(u8, machine_type, "e2-")) {
+            return try fail(arena, 400, "badRequest", "e2 instances do not support onHostMaintenance=TERMINATE unless they are preemptible.");
+        }
+        return null;
+    }
+
+    fn labelsOf(arena: Allocator, obj: std.json.ObjectMap) Allocator.Error![]const types.Label {
+        const v = obj.get("labels") orelse return &.{};
+        if (v != .object) return &.{};
+        var out: std.ArrayList(types.Label) = .empty;
+        var it = v.object.iterator();
+        while (it.next()) |e| if (e.value_ptr.* == .string) try out.append(arena, .{ .key = e.key_ptr.*, .value = e.value_ptr.string });
+        return out.items;
+    }
+
+    fn metadataOf(arena: Allocator, obj: std.json.ObjectMap) Allocator.Error![]const types.MetadataItem {
+        const items = itemsOf(obj, "metadata") orelse return &.{};
+        var out: std.ArrayList(types.MetadataItem) = .empty;
+        for (items) |item| if (item == .object) {
+            const key = jsonString(item.object, "key") orelse continue;
+            try out.append(arena, .{ .key = key, .value = jsonString(item.object, "value") });
+        };
+        return out.items;
+    }
+
+    fn tagsOf(arena: Allocator, obj: std.json.ObjectMap) Allocator.Error![]const []const u8 {
+        const items = itemsOf(obj, "tags") orelse return &.{};
+        var out: std.ArrayList([]const u8) = .empty;
+        for (items) |item| if (item == .string) try out.append(arena, item.string);
+        return out.items;
+    }
+
+    /// `obj.<name>.items`, an array.
+    fn itemsOf(obj: std.json.ObjectMap, name: []const u8) ?[]const std.json.Value {
+        const v = obj.get(name) orelse return null;
+        if (v != .object) return null;
+        const items = v.object.get("items") orelse return null;
+        return if (items == .array) items.array.items else null;
+    }
+
+    fn jsonString(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
+        const v = obj.get(name) orelse return null;
+        return if (v == .string) v.string else null;
+    }
+
+    /// A path as the fake reads one: a URL's host and `/compute/v1/` cut.
+    fn trimHost(path: []const u8) []const u8 {
+        const at = std.mem.indexOf(u8, path, "/compute/v1/") orelse return path;
+        return path[at + "/compute/v1/".len ..];
+    }
+
+    /// The VM a template gives, named as the insert's body says.
+    fn fromTemplate(f: *FakeCompute, arena: Allocator, source: []const u8, text: []const u8) Allocator.Error!Parsed {
+        const value = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .refused = try notModelled(arena, "an insert body that is not JSON") },
+        };
+        const name = if (value == .object) jsonString(value.object, "name") else null;
+        const n = name orelse return .{ .refused = try notModelled(arena, "an insert from a template with no name") };
+        if (!validate.isName(n)) return .{ .refused = try fail(arena, 400, "invalid", try std.fmt.allocPrint(arena, "Invalid value for field 'resource.name': '{s}'. Must be a match of regex '(?:[a-z](?:[-a-z0-9]{{0,61}}[a-z0-9])?)'", .{n})) };
+        const path = trimHost(source);
+        const own = try std.fmt.allocPrint(arena, "projects/{s}/", .{f.options.project_id});
+        const local = std.mem.cutPrefix(u8, path, own) orelse path;
+        // `global/instanceTemplates/T` is kept as `global/T`, and
+        // `regions/R/instanceTemplates/T` as `regions/R/T`.
+        const key = if (std.mem.cutPrefix(u8, local, "global/instanceTemplates/")) |t|
+            try std.fmt.allocPrint(arena, "global/{s}", .{t})
+        else if (std.mem.startsWith(u8, local, "regions/"))
+            try std.mem.replaceOwned(u8, arena, local, "/instanceTemplates/", "/")
+        else
+            return .{ .refused = try notModelled(arena, "a template path the fake does not read") };
+        const t = f.templates.get(key) orelse return .{ .refused = try f.notFound(arena, local) };
+        var put = t;
+        put.name = n;
+        return .{ .ok = put };
+    }
+
+    /// How each verb moves a VM: from the states production took it in,
+    /// through `during`, to the effect when its operation finishes.
+    const Transition = struct {
+        verb: []const u8,
+        from: []const types.Status,
+        /// Null leaves the status as it is.
+        during: ?types.Status,
+        effect: Effect,
+        /// DONE from the start, as a start of a running VM answered.
+        at_once: bool = false,
+    };
+
+    const transitions = [_]Transition{
+        .{ .verb = "start", .from = &.{ .terminated, .stopped }, .during = .staging, .effect = .run },
+        .{ .verb = "start", .from = &.{.running}, .during = null, .effect = .none, .at_once = true },
+        .{ .verb = "stop", .from = &.{ .running, .staging, .provisioning }, .during = .stopping, .effect = .terminate },
+        .{ .verb = "stop", .from = &.{ .terminated, .stopped }, .during = null, .effect = .none },
+        .{ .verb = "suspend", .from = &.{.running}, .during = .suspending, .effect = .suspend_vm },
+        .{ .verb = "resume", .from = &.{.suspended}, .during = .staging, .effect = .run },
+        .{ .verb = "reset", .from = &.{.running}, .during = null, .effect = .none },
+    };
+
+    fn lifecycle(f: *FakeCompute, arena: Allocator, i: *FakeInstance, verb: []const u8, request_id: ?[]const u8) Allocator.Error!Reply {
+        var known = false;
+        const step: Transition = for (transitions) |t| {
+            if (!std.mem.eql(u8, t.verb, verb)) continue;
+            known = true;
+            if (std.mem.indexOfScalar(types.Status, t.from, i.put.status) != null) break t;
+        } else {
+            if (!known) return notModelled(arena, "this instance verb (the changes to a live VM are the module's next milestone)");
+            return notModelled(arena, try std.fmt.allocPrint(arena, "{s} on a VM that is {s}", .{ verb, statusName(i.put.status) }));
+        };
+        const out_of_room = step.effect == .run and std.mem.eql(u8, verb, "start") and f.stockouts.contains(i.put.zone);
+        if (step.during) |s| i.put.status = s;
+        const waits: u32 = if (step.at_once) 0 else f.options.write_waits;
+        const op = try f.addWriteOperation(i.put.zone, i.put.name, verb, if (out_of_room) .terminate else step.effect, out_of_room, waits, request_id);
+        return f.operationReply(arena, op);
+    }
+
+    fn delete(f: *FakeCompute, arena: Allocator, i: *FakeInstance, request_id: ?[]const u8) Allocator.Error!Reply {
+        if (i.put.deletion_protection) return fail(arena, 400, "invalidResourceUsage", "Invalid resource usage: 'Resource cannot be deleted if it's protected against deletion.'.");
+        i.put.status = .stopping;
+        const op = try f.addWriteOperation(i.put.zone, i.put.name, "delete", .remove, false, f.options.write_waits, request_id);
+        return f.operationReply(arena, op);
+    }
+
+    /// A write's operation on the VM `name`, kept under its `requestId`;
+    /// finished at once when `waits` is 0.
+    fn addWriteOperation(f: *FakeCompute, zone: []const u8, name: []const u8, operation_type: []const u8, effect: Effect, out_of_room: bool, waits: u32, request_id: ?[]const u8) Allocator.Error!*FakeOperation {
+        const s = f.store.allocator();
+        const op_name = try std.fmt.allocPrint(s, "operation-{d}", .{f.next()});
+        const op = try s.create(FakeOperation);
+        op.* = .{
+            .name = op_name,
+            .put = .{
+                .scope = .{ .zone = try s.dupe(u8, zone) },
+                .operation_type = try s.dupe(u8, operation_type),
+                .target_instance = try s.dupe(u8, name),
+                .waits_to_finish = waits,
+                .failure = if (out_of_room) .{
+                    .code = "ZONE_RESOURCE_POOL_EXHAUSTED",
+                    .message = try std.fmt.allocPrint(s, "The zone 'projects/{s}/zones/{s}' does not have enough resources available to fulfill the request.  Try a different zone, or try again later.", .{ f.options.project_id, zone }),
+                    .http_status = 503,
+                } else null,
+                .client_operation_id = try s.dupe(u8, request_id orelse ""),
+            },
+            .id = f.next(),
+            .inserted = std.Io.Clock.real.now(f.io),
+            .waits_left = waits,
+            .effect = effect,
+        };
+        try f.operations.put(f.gpa, try std.fmt.allocPrint(s, "zones/{s}/{s}", .{ zone, op_name }), op);
+        if (request_id) |id| try f.request_ids.put(f.gpa, try s.dupe(u8, id), op);
+        if (waits == 0) f.finish(op);
+        return op;
+    }
+
+    /// Does what a finished operation does to its VM, once.
+    fn finish(f: *FakeCompute, op: *FakeOperation) void {
+        const effect = op.effect;
+        op.effect = .none;
+        const name = op.put.target_instance orelse return;
+        if (effect == .none or op.put.scope != .zone) return;
+        const zone = op.put.scope.zone;
+        const i = f.instanceFor(zone, name) catch return;
+        switch (effect) {
+            .none => {},
+            .run => i.put.status = .running,
+            .terminate => i.put.status = .terminated,
+            .suspend_vm => i.put.status = .suspended,
+            .remove => {
+                i.serial.deinit(f.gpa);
+                i.guest.deinit(f.gpa);
+                var buf: [256]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "{s}/{s}", .{ zone, name }) catch return;
+                _ = f.instances.orderedRemove(key);
+            },
+        }
     }
 
     fn listOperations(f: *FakeCompute, arena: Allocator, scope_key: []const u8, params: Params) Allocator.Error!Reply {
@@ -1011,7 +1467,11 @@ pub const FakeCompute = struct {
         try jw.objectField("httpErrorStatusCode");
         try jw.write(failure.http_status);
         try jw.objectField("httpErrorMessage");
-        try jw.write(if (failure.http_status == 400) "BAD REQUEST" else "ERROR");
+        try jw.write(switch (failure.http_status) {
+            400 => "BAD REQUEST",
+            503 => "SERVICE UNAVAILABLE",
+            else => "ERROR",
+        });
     }
 
     // Filters, orders and pages.
@@ -1226,6 +1686,10 @@ pub const FakeCompute = struct {
         const after = url[scheme + 3 ..];
         const slash = std.mem.indexOfScalar(u8, after, '/') orelse return "/";
         return after[slash..];
+    }
+
+    fn unknownZone(arena: Allocator, zone: []const u8) Allocator.Error!Reply {
+        return fail(arena, 400, "invalid", try std.fmt.allocPrint(arena, "Invalid value for field 'zone': '{s}'. Unknown zone.", .{zone}));
     }
 
     fn notFound(f: *FakeCompute, arena: Allocator, tail: []const u8) Allocator.Error!Reply {
