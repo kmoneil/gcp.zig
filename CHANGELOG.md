@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.64.0 (unreleased)
+## 0.64.0 (2026-11-04)
 
 - Zig 0.17.1, a release of bug fixes on 0.17.0, is the version
   `minimum_zig_version` names and the only one CI tests. No call
