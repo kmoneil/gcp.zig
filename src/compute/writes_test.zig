@@ -457,10 +457,14 @@ test "FakeCompute: the lifecycle, through each state production showed" {
         try testing.expect(done.value.succeeded());
         try testing.expectEqual(s[2], try f.status(zone, "web-1"));
     }
-    // Starting a running VM: DONE at once, as production answered.
+    // Starting or resuming a running VM: DONE at once, as production
+    // answered.
     var again = try c.startInstance(zone, "web-1", .{});
     defer again.deinit();
     try testing.expect(again.value.succeeded());
+    var resumed = try c.resumeInstance(zone, "web-1", .{});
+    defer resumed.deinit();
+    try testing.expect(resumed.value.succeeded());
     // A delete: STOPPING, then gone.
     var del = try c.deleteInstance(zone, "web-1", .{});
     defer del.deinit();
@@ -780,7 +784,7 @@ const moves = [_]struct { Verb, []const types.Status, types.Status }{
     .{ .start, &.{ .terminated, .running }, .running },
     .{ .stop, &.{ .running, .terminated }, .terminated },
     .{ .suspend_, &.{.running}, .suspended },
-    .{ .resume_, &.{.suspended}, .running },
+    .{ .resume_, &.{ .suspended, .running }, .running },
     .{ .reset, &.{.running}, .running },
 };
 

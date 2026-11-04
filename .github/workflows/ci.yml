@@ -636,11 +636,12 @@ jobs:
         # slow-compute (0.63.0) holds FakeCompute's writes to a model of
         # what production showed, through lost answers, dropped
         # connections and request ids sent again, up to 24 writes a run,
-        # each waited on and read back, and its changes under fresh and
-        # stale fingerprints, up to 16 a run: the two together about 3.7
-        # ms a run on the Mac (20K in 74 s with the build cached, clean),
-        # so 350K, about 86 minutes at four times the Mac, to be priced by
-        # its first nights.
+        # each waited on and read back, its changes under fresh and stale
+        # fingerprints, up to 16 a run, and its groups through resizes and
+        # VMs made and deleted by name, each waited stable: the three
+        # together about 5.2 ms a run on the Mac (20K in 106 s with the
+        # build cached, clean), so 250K, about 88 minutes at four times the
+        # Mac, to be priced by its first nights.
         # heavy-pubsub took 103, 102, 98 and 113 minutes at 9M on the
         # nightlies of 10-20 to 10-23 (runs 39393583152, 39569725428,
         # 39748528927 and 39924930962) and drops to 7M, about 88 minutes
@@ -684,7 +685,7 @@ jobs:
           - { job: slow-bigquery, module: bigquery, filter: slow property, iterations: 1400K }
           - { job: datatransfer, module: datatransfer, filter: fuzz, iterations: 8M }
           - { job: compute, module: compute, filter: fuzz, iterations: 700K }
-          - { job: slow-compute, module: compute, filter: slow property, iterations: 350K }
+          - { job: slow-compute, module: compute, filter: slow property, iterations: 250K }
           - { job: slow-datatransfer, module: datatransfer, filter: slow property, iterations: 1400K }
     runs-on: ubuntu-latest
     timeout-minutes: 180

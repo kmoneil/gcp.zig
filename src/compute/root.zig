@@ -87,6 +87,17 @@ pub const SchedulingChange = @import("types.zig").SchedulingChange;
 pub const AttachSpec = @import("types.zig").AttachSpec;
 pub const LabelChange = @import("types.zig").LabelChange;
 pub const MetadataChange = @import("types.zig").MetadataChange;
+pub const Template = @import("types.zig").Template;
+pub const TemplatePage = @import("types.zig").TemplatePage;
+pub const GroupActions = @import("types.zig").GroupActions;
+pub const Group = @import("types.zig").Group;
+pub const GroupPage = @import("types.zig").GroupPage;
+pub const ManagedAction = @import("types.zig").ManagedAction;
+pub const ManagedInstance = @import("types.zig").ManagedInstance;
+pub const ManagedInstancePage = @import("types.zig").ManagedInstancePage;
+pub const GroupSpec = @import("types.zig").GroupSpec;
+pub const GroupWaitOptions = @import("types.zig").GroupWaitOptions;
+pub const GroupDeleteOptions = @import("types.zig").GroupDeleteOptions;
 /// A request as a write would send it, built by its `*Request` twin.
 pub const PreparedRequest = core.PreparedRequest;
 
@@ -118,6 +129,7 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("body.zig");
     _ = @import("changes_test.zig");
+    _ = @import("fleet_test.zig");
     _ = @import("Client.zig");
     _ = @import("Client_test.zig");
     _ = @import("codec.zig");

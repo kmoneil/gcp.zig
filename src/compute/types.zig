@@ -677,6 +677,165 @@ pub const MetadataChange = struct {
     remove: []const []const u8 = &.{},
 };
 
+// Fleets: instance templates and zonal managed instance groups.
+
+/// An instance template: what each VM made from it is.
+pub const Template = struct {
+    name: []const u8,
+    id: []const u8 = "",
+    /// Null for a global template.
+    region: ?[]const u8 = null,
+    description: []const u8 = "",
+    creation_time: ?Timestamp = null,
+    /// The machine type's name, `e2-micro`.
+    machine_type: []const u8 = "",
+    labels: []const Label = &.{},
+    metadata: Metadata = .{},
+    tags: Tags = .{},
+    disks: []const AttachedDisk = &.{},
+    /// The boot disk's image, as the template names it.
+    source_image: []const u8 = "",
+    network_interfaces: []const NetworkInterface = &.{},
+    service_accounts: []const ServiceAccount = &.{},
+    scheduling: Scheduling = .{},
+
+    /// What `Client.getTemplate` and the group calls take to name it.
+    pub fn ref(self: Template) TemplateRef {
+        if (self.region) |r| return .{ .regional = .{ .region = r, .name = self.name } };
+        return .{ .global = self.name };
+    }
+
+    pub fn label(self: Template, key: []const u8) ?[]const u8 {
+        for (self.labels) |l| if (std.mem.eql(u8, l.key, key)) return l.value;
+        return null;
+    }
+};
+
+/// One page of templates.
+pub const TemplatePage = struct {
+    templates: []const Template,
+    /// Null on the last page.
+    next_page_token: ?[]const u8 = null,
+};
+
+/// How many of a group's VMs are doing each thing now.
+pub const GroupActions = struct {
+    none: u32 = 0,
+    creating: u32 = 0,
+    creating_without_retries: u32 = 0,
+    verifying: u32 = 0,
+    recreating: u32 = 0,
+    deleting: u32 = 0,
+    abandoning: u32 = 0,
+    restarting: u32 = 0,
+    refreshing: u32 = 0,
+    suspending: u32 = 0,
+    resuming: u32 = 0,
+    stopping: u32 = 0,
+    starting: u32 = 0,
+};
+
+/// A zonal managed instance group: VMs made from one template, kept at a
+/// target size.
+pub const Group = struct {
+    name: []const u8,
+    id: []const u8 = "",
+    /// The zone's id.
+    zone: []const u8 = "",
+    description: []const u8 = "",
+    creation_time: ?Timestamp = null,
+    /// What each VM's name starts with, a dash and four characters after.
+    base_instance_name: []const u8 = "",
+    /// The template's path, `projects/P/global/instanceTemplates/T`.
+    template: []const u8 = "",
+    target_size: u32 = 0,
+    current_actions: GroupActions = .{},
+    /// Every VM there and doing nothing, as many as the target. A group's
+    /// operation is DONE well before this (measured): `Client.waitGroupStable`
+    /// waits for it.
+    is_stable: bool = false,
+    fingerprint: []const u8 = "",
+    self_link: []const u8 = "",
+};
+
+/// One page of groups.
+pub const GroupPage = struct {
+    groups: []const Group,
+    next_page_token: ?[]const u8 = null,
+};
+
+/// What a group is doing to one of its VMs.
+pub const ManagedAction = enum {
+    none,
+    creating,
+    creating_without_retries,
+    verifying,
+    recreating,
+    deleting,
+    abandoning,
+    restarting,
+    refreshing,
+    suspending,
+    resuming,
+    stopping,
+    starting,
+    unknown,
+
+    pub fn parse(text: []const u8) ManagedAction {
+        inline for (@typeInfo(ManagedAction).@"enum".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "unknown")) continue;
+            if (std.ascii.eqlIgnoreCase(text, name)) return @field(ManagedAction, name);
+        }
+        return .unknown;
+    }
+};
+
+/// One VM of a group, as the group sees it.
+pub const ManagedInstance = struct {
+    /// The VM's name, which `Client.getInstance` takes.
+    name: []const u8,
+    id: []const u8 = "",
+    /// Null while it is still being made: production answered none then
+    /// (measured).
+    status: ?Status = null,
+    target_status: ?Status = null,
+    current_action: ManagedAction = .unknown,
+    /// The template it was made from, as a path.
+    template: []const u8 = "",
+};
+
+/// One page of a group's VMs.
+pub const ManagedInstancePage = struct {
+    instances: []const ManagedInstance,
+    next_page_token: ?[]const u8 = null,
+};
+
+/// A group to make, in a zone.
+pub const GroupSpec = struct {
+    /// RFC 1035, as an instance's.
+    name: []const u8,
+    template: TemplateRef,
+    /// What its VMs' names start with; null takes the group's name.
+    base_instance_name: ?[]const u8 = null,
+    target_size: u32,
+    description: ?[]const u8 = null,
+};
+
+/// How long `Client.waitGroupStable` waits, and how often it reads.
+pub const GroupWaitOptions = struct {
+    timeout_ms: u32 = 600_000,
+    /// Between reads of the group. Production's groups took 30 to 40 s
+    /// to come up or empty (measured).
+    poll_ms: u32 = 5_000,
+};
+
+/// What `Client.deleteGroupInstances` and `Client.deleteGroup` take.
+pub const GroupDeleteOptions = struct {
+    request_id: ?[]const u8 = null,
+    /// Skips the VMs' graceful shutdown.
+    no_graceful_shutdown: bool = false,
+};
+
 const testing = std.testing;
 
 test "Status.parse: every state, and one this library does not know" {

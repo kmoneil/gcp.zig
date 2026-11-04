@@ -51,7 +51,19 @@ including the ones that did not change.
   disks that exist already. Each has its `*Request` twin and its request
   id, as the other writes do. `FakeCompute` takes them all as production
   did when measured, its refusals and failed operations in production's
-  words, with `putDisk` for disks to attach. Managed groups come next.
+  words, with `putDisk` for disks to attach.
+- compute: fleets. `listTemplates`, `getTemplate`, `insertTemplate` (from
+  an `InstanceSpec`) and `deleteTemplate`, global or regional; zonal
+  managed instance groups: `listGroups`, `getGroup`,
+  `listManagedInstances`, `insertGroup`, `resizeGroup`,
+  `createGroupInstances`, `deleteGroupInstances` and `deleteGroup`; and
+  `waitGroupStable`, which reads a group until its VMs are all there and
+  doing nothing, since a group's operations are DONE well before its VMs
+  (measured). Each write has its `*Request` twin and request id.
+  `FakeCompute` takes them, its groups making real VMs of the zone from
+  their templates that come up over reads of the group
+  (`Options.group_steps`), and refusing what production refused in its
+  words. Regional groups, autoscaling and update policies are not in it.
 - auth, bigquery, core, dataflow, datatransfer, error_reporting,
   firestore, kms, logging, monitoring, pubsub, resource_manager, run,
   scheduler, secret_manager and storage: unchanged.
