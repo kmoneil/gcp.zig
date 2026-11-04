@@ -1,9 +1,9 @@
 //! The Cloud Billing Catalog API, v1, read only: the services Google bills
 //! for, and a service's SKUs with their list prices, the latest or every
 //! one in force over a range of time within a month, in USD or another
-//! currency. Compute Engine's SKUs price a machine's vCPUs and memory
-//! apart, on demand and spot (the wire's `Preemptible`); a price list for
-//! machine types comes in the module's next milestone. **Experimental.**
+//! currency; and what a Compute Engine machine type costs an hour, on
+//! demand and spot, from the SKUs that price its vCPUs and memory apart
+//! (`Client.computePrices`, `compute.PriceList`). **Experimental.**
 //!
 //! Nothing here touches a billing account: the catalog's prices are the
 //! public list prices. The Cloud Billing API must be enabled in the
@@ -44,7 +44,12 @@ pub const ListSkusOptions = @import("types.zig").ListSkusOptions;
 pub const SkuPage = @import("types.zig").SkuPage;
 
 /// Compute Engine's service id.
-pub const compute_engine_service_id = "6F81-5844-456A";
+pub const compute_engine_service_id = Client.compute_engine_service_id;
+
+/// What a Compute Engine machine type costs an hour, on demand and spot:
+/// `compute.PriceList`, built by `Client.computePrices`.
+pub const compute = @import("compute.zig");
+pub const ComputePricesOptions = Client.ComputePricesOptions;
 
 /// The fixed limits and naming rules the client checks before sending,
 /// and the Los Angeles calendar a time range is held to.
@@ -73,6 +78,7 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("Client.zig");
     _ = @import("codec.zig");
+    _ = @import("compute.zig");
     _ = @import("errors.zig");
     _ = @import("fake_billing.zig");
     _ = @import("logging.zig");

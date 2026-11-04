@@ -258,6 +258,47 @@ pub fn listSkus(self: *Client, service_id: []const u8, options: types.ListSkusOp
     return result;
 }
 
+pub const ComputePricesOptions = struct {
+    /// 0 is the server's 5000: Compute Engine's SKUs are then 7 pages.
+    page_size: u32 = 0,
+};
+
+/// Every Compute Engine SKU, read a page at a time, as a `PriceList` of
+/// machine prices in the client's currency. Each page is let go once
+/// taken in, so this holds one page (about 7.6 MB) and the list (a few
+/// hundred kilobytes) at once, never all 46 MB.
+pub fn computePrices(self: *Client, options: ComputePricesOptions) Error!machine_prices.PriceList {
+    var list: machine_prices.PriceList = try .init(self.gpa);
+    errdefer list.deinit();
+    var token_buf: std.ArrayList(u8) = .empty;
+    defer token_buf.deinit(self.gpa);
+    var token: ?[]const u8 = null;
+    while (true) {
+        var page = try self.listSkus(compute_engine_service_id, .{ .page_size = options.page_size, .page_token = token });
+        defer page.deinit();
+        list.add(page.value.skus) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.MixedCurrencies => {
+                if (self.diagnostics) |d| d.print("the SKU list priced machines in more than one currency", .{});
+                return error.InvalidResponse;
+            },
+        };
+        const next = page.value.next_page_token orelse return list;
+        if (token) |t| if (std.mem.eql(u8, t, next)) {
+            if (self.diagnostics) |d| d.print("the SKU list answered the same page token twice", .{});
+            return error.InvalidResponse;
+        };
+        token_buf.clearRetainingCapacity();
+        try token_buf.appendSlice(self.gpa, next);
+        token = token_buf.items;
+    }
+}
+
+/// Compute Engine's service id.
+pub const compute_engine_service_id = "6F81-5844-456A";
+
+const machine_prices = @import("compute.zig");
+
 fn addTime(params: *core.query.Params, name: []const u8, at: ?std.Io.Timestamp) std.Io.Writer.Error!void {
     var buf: [core.timestamp.max_len]u8 = undefined;
     try params.addOptional(name, if (at) |t| core.timestamp.format(&buf, t) else null);
@@ -384,6 +425,24 @@ test "findService: reads page after page until the name, or the end" {
     try testing.expectError(error.InvalidResponse, h.client.findService("Nothing"));
     try testing.expectEqualStrings("the service list answered the same page token twice", h.diag.message());
     try testing.expectEqual(null, try h.client.findService("Nothing"));
+}
+
+test "computePrices: one currency, and a page token that does not repeat" {
+    const usd = "{\"skus\":[{\"name\":\"services/6F81-5844-456A/skus/CF4E-A0C7-E3BF\",\"skuId\":\"CF4E-A0C7-E3BF\",\"description\":\"E2 Instance Core running in Americas\",\"category\":{\"resourceFamily\":\"Compute\",\"resourceGroup\":\"CPU\",\"usageType\":\"OnDemand\"},\"serviceRegions\":[\"us-central1\"],\"pricingInfo\":[{\"effectiveTime\":\"2026-11-04T08:00:00Z\",\"pricingExpression\":{\"usageUnit\":\"h\",\"baseUnitConversionFactor\":3600,\"tieredRates\":[{\"startUsageAmount\":0,\"unitPrice\":{\"currencyCode\":\"USD\",\"units\":\"0\",\"nanos\":21811590}}]}}]}],\"nextPageToken\":\"MQ==\"}";
+    const eur = "{\"skus\":[{\"name\":\"services/6F81-5844-456A/skus/F449-33EC-A5EF\",\"skuId\":\"F449-33EC-A5EF\",\"description\":\"E2 Instance Ram running in Americas\",\"category\":{\"resourceFamily\":\"Compute\",\"resourceGroup\":\"RAM\",\"usageType\":\"OnDemand\"},\"serviceRegions\":[\"us-central1\"],\"pricingInfo\":[{\"effectiveTime\":\"2026-11-04T08:00:00Z\",\"pricingExpression\":{\"usageUnit\":\"GiBy.h\",\"baseUnitConversionFactor\":3865470566400,\"tieredRates\":[{\"startUsageAmount\":0,\"unitPrice\":{\"currencyCode\":\"EUR\",\"units\":\"0\",\"nanos\":2600000}}]}}]}],\"nextPageToken\":\"\"}";
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = usd } },
+        .{ .respond = .{ .body = eur } },
+        .{ .respond = .{ .body = usd } },
+        .{ .respond = .{ .body = usd } },
+    });
+    defer h.deinit();
+    try testing.expectError(error.InvalidResponse, h.client.computePrices(.{}));
+    try testing.expectEqualStrings("the SKU list priced machines in more than one currency", h.diag.message());
+    try h.expectRequest(1, .GET, "https://cloudbilling.googleapis.com/v1/services/6F81-5844-456A/skus?pageToken=MQ%3D%3D");
+    try testing.expectError(error.InvalidResponse, h.client.computePrices(.{}));
+    try testing.expectEqualStrings("the SKU list answered the same page token twice", h.diag.message());
 }
 
 test "init refuses options no call could use" {

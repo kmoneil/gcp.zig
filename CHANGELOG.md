@@ -27,8 +27,18 @@ including the ones that did not change.
   exact units and nanos with `toNanos()`; `Options.currency_code` reads
   them converted. `billing.testing.FakeBilling` answers them as
   production did when measured on 2026-11-04, refusals in its words.
-  The price of a machine type from its vCPU and memory SKUs comes in
-  the module's next part.
+- billing: what a Compute Engine machine type costs an hour, on demand
+  and spot. `Client.computePrices` reads every Compute Engine SKU a page
+  at a time into a `compute.PriceList`, whose `hourly(machine, region,
+  model)` prices a machine type from its vCPU and memory SKUs, exactly,
+  converting memory priced per GB-hour (C4D, M4's ultramem types) and
+  per GiB-hour alike; e2's shared-core types are billed as fractions of
+  a vCPU, f1-micro and g1-small by their own SKUs. Families whose price
+  the two SKUs do not hold (M1, M2, M4, the GPU families, H4D, Z4D,
+  Z4M) and custom types answer null, and `PriceList.skipped` counts
+  what was left out and why. `PriceList.write` and `read` keep the list
+  alone, about 410 KB, for a cache. `examples/billing_prices.zig` prints
+  a machine type's prices, offline with `--fake`.
 - auth, bigquery, compute, dataflow, datatransfer, error_reporting,
   firestore, kms, logging, monitoring, pubsub, resource_manager, run,
   scheduler, secret_manager and storage: unchanged.

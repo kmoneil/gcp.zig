@@ -87,6 +87,9 @@ test "an hourly price, read from the in-memory catalog" {
   400); a timestamp that is not one (400, naming the field); a service
   nobody put (404 "Requested entity was not found."); a call with no
   credentials (403).
+- `Client.computePrices` reads the fake as it reads production, page by
+  page, so a test can give a scheduler a price list built from the SKUs
+  it put in.
 - `refuseNext(n, status)` and `dropNext(n)` fail the next calls, for a
   test of what a caller does when a read is refused or its connection
   drops.

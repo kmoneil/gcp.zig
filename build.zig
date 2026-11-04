@@ -672,6 +672,25 @@ pub fn build(b: *std.Build) void {
     });
     gcp_step.dependOn(&streamed(b, compute_gcp_tests).step);
     test_step.dependOn(&compute_gcp_tests.step);
+    // The Cloud Billing Catalog against production: BILLING_TEST=1 beside
+    // GCP_TEST_TOKEN. Reads only: services, every Compute Engine SKU and
+    // this month's changes, and holds FakeBilling to a page of them.
+    const billing_gcp_tests = b.addTest(.{
+        .name = "billing-gcp-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/billing_gcp_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "billing", .module = billing },
+                .{ .name = "core", .module = core },
+            },
+        }),
+        .filters = test_filters,
+        .test_runner = test_runner,
+    });
+    gcp_step.dependOn(&streamed(b, billing_gcp_tests).step);
+    test_step.dependOn(&billing_gcp_tests.step);
     // The IAM reads against a real project: IAM_READS_TEST=1 beside the
     // usual two variables, a cloud-platform token. The suite reads the
     // project's policy, deploys a zigps- service and job raw and makes two
@@ -790,6 +809,7 @@ pub fn build(b: *std.Build) void {
         .{ &.{ "monitoring", "monitoring_alerts", "monitoring_policies" }, &.{ .{ .name = "monitoring", .module = monitoring }, .{ .name = "auth", .module = auth } } },
         .{ &.{"pubsub_metrics"}, &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "monitoring", .module = monitoring }, .{ .name = "auth", .module = auth } } },
         .{ &.{"kms"}, &.{ .{ .name = "kms", .module = kms }, .{ .name = "auth", .module = auth } } },
+        .{ &.{"billing_prices"}, &.{ .{ .name = "billing", .module = billing }, .{ .name = "auth", .module = auth } } },
         .{ &.{ "scheduler_jobs", "scheduler_run" }, &.{ .{ .name = "scheduler", .module = scheduler }, .{ .name = "auth", .module = auth } } },
         .{ &.{ "run_revisions", "run_actions", "run_service" }, &.{ .{ .name = "run", .module = cloud_run }, .{ .name = "auth", .module = auth } } },
         .{ &.{ "dataflow_jobs", "dataflow_stop" }, &.{ .{ .name = "dataflow", .module = dataflow }, .{ .name = "auth", .module = auth } } },
@@ -799,14 +819,14 @@ pub fn build(b: *std.Build) void {
         .{ &.{"permissions"}, &.{ .{ .name = "resource_manager", .module = resource_manager }, .{ .name = "run", .module = cloud_run }, .{ .name = "storage", .module = storage }, .{ .name = "auth", .module = auth } } },
         .{ &.{ "gcs_notify", "quickstart" }, &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } } },
     };
-    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "gcs_mv", "gcs_bucket", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "monitoring_policies", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "run_actions", "dataflow_jobs", "dataflow_stop", "bigquery_query", "datatransfer_runs", "permissions", "run_service", "compute" }) |name| {
+    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "gcs_mv", "gcs_bucket", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "monitoring_policies", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "run_actions", "dataflow_jobs", "dataflow_stop", "bigquery_query", "datatransfer_runs", "permissions", "run_service", "compute", "billing_prices" }) |name| {
         // whoami, secret, gcs_cp, gcs_sign, gcs_notify, gcs_mv, gcs_bucket, quickstart, iam,
         // secret_rotation, firestore, logs_read, logs_tail, projects_list,
         // error_dashboard, monitoring, monitoring_alerts,
         // monitoring_policies, pubsub_metrics,
         // kms, scheduler_jobs, scheduler_run, run_revisions, run_actions, run_service,
         // dataflow_jobs, dataflow_stop, bigquery_query, datatransfer_runs,
-        // permissions and compute pick their own credentials.
+        // permissions, compute and billing_prices pick their own credentials.
         const pubsub_only: []const std.Build.Module.Import = &.{.{ .name = "pubsub", .module = mod }};
         const imports = importsOf(&example_imports, name) orelse pubsub_only;
         const exe = b.addExecutable(.{

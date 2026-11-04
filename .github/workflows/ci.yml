@@ -642,12 +642,13 @@ jobs:
         # together about 5.2 ms a run on the Mac (20K in 106 s with the
         # build cached, clean), so 250K, about 88 minutes at four times the
         # Mac, to be priced by its first nights.
-        # billing (0.64.0) starts at estimates from a local run: its four
+        # billing (0.64.0) starts at estimates from a local run: its five
         # fuzz properties (the decoders, Money against a decimal model,
-        # Los Angeles time, and the fake's catalog read through random
-        # pages and ranges) took about 0.12 ms a run together on the Mac
-        # (200K in 101 s with the build cached, clean), so 2500K, about 85
-        # minutes at four times the Mac, to be priced by its first nights.
+        # Los Angeles time, the fake's catalog read through random pages
+        # and ranges, and the machine price list's cache form) took about
+        # 0.6 ms a run together on the Mac (200K in 122 s with the build
+        # cached, clean), so 2000K, about 81 minutes at four times the
+        # Mac, to be priced by its first nights.
         # heavy-pubsub took 103, 102, 98 and 113 minutes at 9M on the
         # nightlies of 10-20 to 10-23 (runs 39393583152, 39569725428,
         # 39748528927 and 39924930962) and drops to 7M, about 88 minutes
@@ -692,7 +693,7 @@ jobs:
           - { job: datatransfer, module: datatransfer, filter: fuzz, iterations: 8M }
           - { job: compute, module: compute, filter: fuzz, iterations: 700K }
           - { job: slow-compute, module: compute, filter: slow property, iterations: 250K }
-          - { job: billing, module: billing, filter: fuzz, iterations: 2500K }
+          - { job: billing, module: billing, filter: fuzz, iterations: 2000K }
           - { job: slow-datatransfer, module: datatransfer, filter: slow property, iterations: 1400K }
     runs-on: ubuntu-latest
     timeout-minutes: 180
