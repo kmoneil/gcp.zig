@@ -2861,3 +2861,38 @@ test "an hourly price, read from the in-memory catalog" {
     try std.testing.expectEqual(67_011_420, nanos); // $0.06701142 an hour
 }
 // end snippet
+
+// snippet: storage-fake
+test "a bucket browsed as a console shows it, from the in-memory Cloud Storage" {
+    var fake: storage.testing.FakeStorage = .init(std.testing.allocator, std.testing.io, .{ .project_id = "my-project" });
+    defer fake.deinit();
+    // Standing in for whoever made the bucket and wrote its objects.
+    try fake.putBucket(.{ .name = "my-reports" });
+    try fake.putObject(.{ .bucket = "my-reports", .name = "2026/11/summary.csv", .bytes = "day,total\n1,42\n", .content_type = "text/csv" });
+    try fake.putObject(.{ .bucket = "my-reports", .name = "2026/12/summary.csv", .bytes = "day,total\n", .content_type = "text/csv" });
+    try fake.putObject(.{ .bucket = "my-reports", .name = "README.txt", .bytes = "Monthly reports.\n", .content_type = "text/plain" });
+
+    var token: storage.StaticToken = .{ .token = "none" };
+    var client = try storage.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+
+    // The top level: one folder and one object.
+    const bucket = client.bucket("my-reports");
+    var top = try bucket.listObjects(.{ .delimiter = "/" });
+    defer top.deinit();
+    try std.testing.expectEqualStrings("2026/", top.value.prefixes[0]);
+    try std.testing.expectEqualStrings("README.txt", top.value.objects[0].name);
+
+    // Inside the folder, then a preview of one file's first bytes.
+    var months = try bucket.listObjects(.{ .prefix = "2026/", .delimiter = "/" });
+    defer months.deinit();
+    try std.testing.expectEqual(2, months.value.prefixes.len);
+    var preview = try bucket.object("2026/11/summary.csv").downloadAlloc(1024, .{ .range = .{ .offset = 0, .length = 9 } });
+    defer preview.deinit();
+    try std.testing.expectEqualStrings("day,total", preview.value.data);
+}
+// end snippet

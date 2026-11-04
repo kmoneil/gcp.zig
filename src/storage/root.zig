@@ -155,6 +155,15 @@ pub const limits = @import("validate.zig");
 /// way, or to fake the server in your own tests.
 pub const transport = core.transport;
 
+/// What a test of code that browses buckets and reads objects can stand
+/// on, with no network.
+pub const testing = struct {
+    /// Cloud Storage in memory, behind `Client.Options.transport`: buckets
+    /// and objects a test puts in, listed and read back as production
+    /// answered when measured, refusals in its words.
+    pub const FakeStorage = @import("fake_storage.zig").FakeStorage;
+};
+
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("acl.zig");
@@ -188,6 +197,7 @@ test {
     _ = @import("errors.zig");
     _ = @import("fake_buckets.zig");
     _ = @import("fake_multipart.zig");
+    _ = @import("fake_storage.zig");
     _ = @import("multipart.zig");
     _ = @import("logging.zig");
     _ = @import("metadata.zig");

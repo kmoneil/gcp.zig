@@ -649,6 +649,11 @@ jobs:
         # 0.6 ms a run together on the Mac (200K in 122 s with the build
         # cached, clean), so 2000K, about 81 minutes at four times the
         # Mac, to be priced by its first nights.
+        # fake-storage (0.65.0) holds FakeStorage's page walks to a model:
+        # up to 24 objects under a random prefix and delimiter, read a page
+        # at a time, about 1 ms a run on the Mac (20K in 20 s with the
+        # build cached, clean), so 1200K, about 80 minutes at four times the
+        # Mac, to be priced by its first nights.
         # heavy-pubsub took 103, 102, 98 and 113 minutes at 9M on the
         # nightlies of 10-20 to 10-23 (runs 39393583152, 39569725428,
         # 39748528927 and 39924930962) and drops to 7M, about 88 minutes
@@ -668,6 +673,7 @@ jobs:
           - { job: heavy-secret_manager, module: secret_manager, filter: heavy property, iterations: 110K }
           - { job: storage, module: storage, filter: fuzz, iterations: 1100K }
           - { job: slow-storage, module: storage, filter: slow property, iterations: 4200K }
+          - { job: fake-storage, module: storage, filter: fake property, iterations: 1200K }
           - { job: heavy-storage, module: storage, filter: heavy property, iterations: 20K }
           - { job: fault-storage, module: storage, filter: fault property parallel|fault property uploadFile resume, iterations: 55K }
           - { job: fault-gzip, module: storage, filter: fault property gzip|fault property compressed, iterations: 150 }

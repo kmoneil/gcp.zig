@@ -384,6 +384,10 @@ pub const FakeMultipart = struct {
         /// When its retention period started, on the fake's clock: its
         /// creation, or its event-based hold's latest release.
         retained_from_ns: i96 = 0,
+        /// When it was written, and last changed, on the fake's clock:
+        /// every write makes a new generation, and a patch moves `updated`.
+        created_ns: i96 = 0,
+        updated_ns: i96 = 0,
     };
 
     pub fn init(gpa: Allocator, io: std.Io) FakeMultipart {
@@ -460,6 +464,8 @@ pub const FakeMultipart = struct {
             .content_type = content_type,
             .metadata = metadata,
             .retained_from_ns = self.now(),
+            .created_ns = self.now(),
+            .updated_ns = self.now(),
             .owner = made.owner,
             .acl = made.acl,
         });
@@ -827,7 +833,7 @@ pub const FakeMultipart = struct {
     }
 
     fn json(self: *FakeMultipart, kind: Kind, target: JsonTarget, headers: []const Header, body: []const u8, accept_gzip: bool, fault: Fault, arena: Allocator) Allocator.Error!Reply {
-        const not_found: Reply = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"No such object\",\"errors\":[{\"reason\":\"notFound\"}]}}" };
+        const not_found = try notFound(arena, kind, target);
         const index = for (self.objects.items, 0..) |o, i| {
             if (std.mem.eql(u8, o.name, target.name) and (target.generation == null or target.generation.? == o.generation)) break i;
         } else null;
@@ -974,6 +980,7 @@ pub const FakeMultipart = struct {
         o.acl = list;
         o.custom_time = custom_time;
         o.metageneration += 1;
+        o.updated_ns = self.now();
         return .{ .status = 200, .body = try objectJsonFull(self, arena, o, o.name, o.generation, target.bucket, false, false, target.full) };
     }
 
@@ -1260,6 +1267,8 @@ pub const FakeMultipart = struct {
         errdefer freeStored(self.gpa, &copy);
         copy.metageneration = 1;
         copy.retained_from_ns = self.now();
+        copy.created_ns = self.now();
+        copy.updated_ns = copy.created_ns;
         // A restore needs no key, and answers without the checksums of an
         // object under one.
         const reply_body = try objectJson(self, arena, &copy, copy.name, copy.generation, target.bucket, false, false);
@@ -1320,6 +1329,8 @@ pub const FakeMultipart = struct {
         moved.generation = generation;
         moved.metageneration = 1;
         moved.retained_from_ns = self.now();
+        moved.created_ns = self.now();
+        moved.updated_ns = moved.created_ns;
         return .{ .status = 200, .body = reply_body };
     }
 
@@ -1340,11 +1351,13 @@ pub const FakeMultipart = struct {
     fn media(o: *const Stored, headers: []const Header, accept_gzip: bool, fault: Fault, arena: Allocator) Allocator.Error!Reply {
         const hash = core.crc32c.toBase64(core.crc32c.hash(o.bytes));
         var reply_headers: std.ArrayList(Header) = .empty;
+        try reply_headers.append(arena, .{ .name = "Content-Type", .value = o.content_type });
         try reply_headers.append(arena, .{ .name = "x-goog-generation", .value = try arena.print("{d}", .{o.generation}) });
+        try reply_headers.append(arena, .{ .name = "x-goog-metageneration", .value = try arena.print("{d}", .{o.metageneration}) });
         try reply_headers.append(arena, .{ .name = "x-goog-hash", .value = try arena.print("crc32c={s}", .{&hash}) });
         try reply_headers.append(arena, .{ .name = "x-goog-stored-content-length", .value = try arena.print("{d}", .{o.bytes.len}) });
+        try reply_headers.append(arena, .{ .name = "x-goog-stored-content-encoding", .value = if (o.served != null) "gzip" else "identity" });
         if (o.served) |served| {
-            try reply_headers.append(arena, .{ .name = "x-goog-stored-content-encoding", .value = "gzip" });
             if (!accept_gzip) return .{ .status = 200, .headers = reply_headers.items, .body = served, .cut = fault == .cut };
             try reply_headers.append(arena, .{ .name = "Content-Encoding", .value = "gzip" });
         }
@@ -1353,12 +1366,18 @@ pub const FakeMultipart = struct {
         var end: usize = size;
         var partial = false;
         if (requestedRange(headers)) |range| {
-            if (range.start >= size) {
+            // `bytes=-N`: the last N bytes, all of them when N is more.
+            const first: u64 = if (range.suffix) size -| range.start else range.start;
+            if (first >= size or (range.suffix and range.start == 0)) {
+                // Production's words and headers, measured 2026-11-04.
+                reply_headers.items[0] = .{ .name = "Content-Type", .value = "text/html; charset=UTF-8" };
                 try reply_headers.append(arena, .{ .name = "Content-Range", .value = try arena.print("bytes */{d}", .{size}) });
-                return .{ .status = 416, .headers = reply_headers.items, .body = "<Error><Code>InvalidRange</Code></Error>" };
+                return .{ .status = 416, .headers = reply_headers.items, .body = "Request range not satisfiable" };
             }
-            start = @intCast(range.start);
-            if (range.last) |last| end = @intCast(@min(last + 1, size));
+            start = @intCast(first);
+            if (!range.suffix) if (range.last) |last| {
+                end = @intCast(@min(last + 1, size));
+            };
             partial = true;
         }
         switch (fault) {
@@ -1579,6 +1598,8 @@ pub const FakeMultipart = struct {
             // The XML API sets no hold; the bucket's default applies.
             .holds = self.newHolds(bucket, .{}),
             .retained_from_ns = self.now(),
+            .created_ns = self.now(),
+            .updated_ns = self.now(),
         });
         u.name = u.name[0..0];
         u.content_type = u.content_type[0..0];
@@ -1823,6 +1844,8 @@ pub const FakeMultipart = struct {
             .kms_key_name = kms,
             .holds = self.newHolds(bucket, holds),
             .retained_from_ns = self.now(),
+            .created_ns = self.now(),
+            .updated_ns = self.now(),
         });
         return &self.objects.items[self.objects.items.len - 1];
     }
@@ -2882,6 +2905,55 @@ fn offsetTime(arena: Allocator, time: std.Io.Timestamp) Allocator.Error![]const 
 
 /// An object's `mediaLink`, as production writes it: the download host,
 /// both names strictly encoded, and the generation.
+/// `https://www.googleapis.com/storage/v1/b/{bucket}/o/{name}`, each
+/// escaped as production escapes them.
+fn selfLink(arena: Allocator, bucket: []const u8, name: []const u8) Allocator.Error![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    w.writeAll("https://www.googleapis.com/storage/v1/b/") catch return error.OutOfMemory;
+    core.query.writeStrictSegment(w, bucket) catch return error.OutOfMemory;
+    w.writeAll("/o/") catch return error.OutOfMemory;
+    core.query.writeStrictSegment(w, name) catch return error.OutOfMemory;
+    return out.written();
+}
+
+/// An object's ETag as production writes it: a protobuf of its generation
+/// (field 1) and metageneration (field 2), in base64. `CNu727Cq75cDEAE=`
+/// is generation 1793830237429211, metageneration 1.
+fn objectEtag(arena: Allocator, generation: u64, metageneration: u64) Allocator.Error![]const u8 {
+    var raw: [24]u8 = undefined;
+    var n: usize = 0;
+    inline for (.{ .{ @as(u8, 0x08), generation }, .{ @as(u8, 0x10), metageneration } }) |field| {
+        raw[n] = field[0];
+        n += 1;
+        var v: u64 = field[1];
+        while (true) {
+            const low: u8 = @truncate(v & 0x7f);
+            v >>= 7;
+            raw[n] = if (v == 0) low else low | 0x80;
+            n += 1;
+            if (v == 0) break;
+        }
+    }
+    const out = try arena.alloc(u8, std.base64.standard.Encoder.calcSize(n));
+    return std.base64.standard.Encoder.encode(out, raw[0..n]);
+}
+
+/// An object's custom metadata as the JSON API writes it: one field per
+/// `x-goog-meta-` header, by its lowercased name.
+const Metadata = struct {
+    headers: []const Header,
+
+    pub fn jsonStringify(self: Metadata, jw: anytype) !void {
+        try jw.beginObject();
+        for (self.headers) |h| {
+            try jw.objectField(h.name);
+            try jw.write(h.value);
+        }
+        try jw.endObject();
+    }
+};
+
 fn mediaLink(arena: Allocator, bucket: []const u8, name: []const u8, generation: u64) Allocator.Error![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
@@ -2936,17 +3008,33 @@ fn objectJsonFull(
     var sha_text: [44]u8 = undefined;
     var custom_text: [core.timestamp.max_len]u8 = undefined;
     const expiration: ?[]const u8 = if (self.retainedUntil(bucket, o)) |until| try rfc3339(arena, until) else null;
+    var md5: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash(o.bytes, &md5, .{});
+    var md5_text: [24]u8 = undefined;
+    const created = try rfc3339(arena, o.created_ns);
+    // The fields production answered on 2026-11-04 (the FakeStorage spec's
+    // milestone 0), in its order.
     jw.write(.{
+        .kind = "storage#object",
+        .id = try arena.print("{s}/{s}/{d}", .{ bucket, name, generation }),
+        .selfLink = try selfLink(arena, bucket, name),
         .mediaLink = try mediaLink(arena, bucket, name, generation),
         .name = name,
         .bucket = bucket,
-        .size = try arena.print("{d}", .{o.bytes.len}),
         .generation = try arena.print("{d}", .{generation}),
         .metageneration = try arena.print("{d}", .{o.metageneration}),
         .contentType = o.content_type,
         .contentEncoding = @as(?[]const u8, if (o.served != null) "gzip" else null),
-        .crc32c = @as(?[]const u8, if (hashes) &crc else null),
         .storageClass = "STANDARD",
+        .size = try arena.print("{d}", .{o.bytes.len}),
+        .md5Hash = @as(?[]const u8, if (hashes) std.base64.standard.Encoder.encode(&md5_text, &md5) else null),
+        .crc32c = @as(?[]const u8, if (hashes) &crc else null),
+        .etag = try objectEtag(arena, generation, o.metageneration),
+        .timeCreated = created,
+        .updated = try rfc3339(arena, o.updated_ns),
+        .timeStorageClassUpdated = created,
+        .timeFinalized = created,
+        .metadata = if (o.metadata.len > 0) @as(?Metadata, .{ .headers = o.metadata }) else null,
         .customTime = if (o.custom_time) |t| @as(?[]const u8, core.timestamp.format(&custom_text, t)) else null,
         .kmsKeyName = @as(?[]const u8, if (o.kms_key_name) |k| try arena.print("{s}/cryptoKeyVersions/1", .{k}) else null),
         .customerEncryption = if (o.key_sha256) |digest| @as(?struct { encryptionAlgorithm: []const u8, keySha256: []const u8 }, .{
@@ -3010,6 +3098,14 @@ fn writeObjectPolicy(jw: *std.json.Stringify, bucket: []const u8, name: []const 
     try jw.endObject();
 }
 
+/// An object nobody has, in production's words (2026-11-04): JSON for its
+/// metadata, plain text for a media read.
+fn notFound(arena: Allocator, kind: FakeMultipart.Kind, target: JsonTarget) Allocator.Error!FakeMultipart.Reply {
+    const missing = try arena.print("No such object: {s}/{s}", .{ target.bucket, target.name });
+    if (kind == .media) return .{ .status = 404, .headers = &.{.{ .name = "Content-Type", .value = "text/html; charset=UTF-8" }}, .body = missing };
+    return jsonRefusal(arena, 404, "notFound", missing);
+}
+
 fn jsonRefusal(arena: Allocator, status: u16, reason: []const u8, message: []const u8) Allocator.Error!FakeMultipart.Reply {
     const body = try std.json.Stringify.valueAlloc(arena, .{ .@"error" = .{
         .code = status,
@@ -3024,7 +3120,9 @@ fn jsonRefusal(arena: Allocator, status: u16, reason: []const u8, message: []con
 /// The fake's wall clock starts at midnight UTC on 2026-09-30.
 const wall_base_s: i96 = 1_790_726_400;
 
-fn rfc3339(arena: Allocator, ns: i96) Allocator.Error![]const u8 {
+/// A time on the fake's clock as Cloud Storage writes times, with
+/// milliseconds. `FakeStorage` stamps `timeDeleted` with it too.
+pub fn rfc3339(arena: Allocator, ns: i96) Allocator.Error![]const u8 {
     const base_s: i96 = wall_base_s;
     const total_ms: u64 = @intCast(@max(0, base_s * std.time.ms_per_s + @divFloor(ns, std.time.ns_per_ms)));
     const epoch: std.time.epoch.EpochSeconds = .{ .secs = total_ms / std.time.ms_per_s };
@@ -3200,6 +3298,8 @@ const RequestedRange = struct {
     start: u64,
     /// The last byte, inclusive, or null for everything from `start`.
     last: ?u64,
+    /// `bytes=-N`: `start` is then N, the count of last bytes asked for.
+    suffix: bool = false,
 };
 
 fn requestedRange(headers: []const Header) ?RequestedRange {
@@ -3208,6 +3308,10 @@ fn requestedRange(headers: []const Header) ?RequestedRange {
     } else return null;
     if (!std.mem.startsWith(u8, value, "bytes=")) return null;
     const spec = value["bytes=".len..];
+    if (spec.len > 1 and spec[0] == '-') {
+        const count = std.fmt.parseInt(u64, spec[1..], 10) catch return null;
+        return .{ .start = count, .last = null, .suffix = true };
+    }
     const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return null;
     const start = std.fmt.parseInt(u64, spec[0..dash], 10) catch return null;
     if (dash + 1 == spec.len) return .{ .start = start, .last = null };
