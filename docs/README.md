@@ -157,6 +157,13 @@ Google, not only what Google documents, and where the emulators differ.
 | --- | --- |
 | [Overview](compute/README.md) | VMs in one zone or every zone, with their status, scheduling, disks, network and fingerprints; serial consoles and guest attributes; zones, machine types and images; creating VMs and their life (start, stop, suspend, resume, reset, delete); changing a live VM under fingerprints, disks attached and detached; templates and managed groups; previews and request ids; operations waited on, the two ways a write is refused, and what ended a VM; an in-memory Compute Engine for tests; and what production showed when measured (experimental) |
 
+## 🧾 Billing
+
+| Guide | What's in it |
+| --- | --- |
+| [Overview](billing/README.md) | The Cloud Billing Catalog: the services Google bills for, and a service's SKUs with their list prices, the latest or over a range of time, in USD or another currency; how a machine's vCPU and memory are priced apart, on demand and spot; and what production showed when measured (experimental) |
+| [Testing](billing/testing.md) | An in-memory Cloud Billing Catalog for your own tests: services and SKUs with price timelines, pages, ranges and currencies held to production's answers (experimental) |
+
 ## 🛠️ Working on gcp.zig
 
 | Guide | What's in it |

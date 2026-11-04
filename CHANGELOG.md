@@ -15,6 +15,20 @@ including the ones that did not change.
   again: Zig 0.17.1's sweep refuses every resize itself, so the code it
   sweeps makes the same allocations on every run, which is what the
   allocator was for.
+- billing: a new module, **experimental**, for the Cloud Billing Catalog
+  API, v1, read only, for issue #350. `Client.listServices` and
+  `findService` (by display name) read the services Google bills for;
+  `listSkus` reads a service's SKUs, each with its description,
+  resource family and group, usage type (on demand, spot as
+  `.preemptible`, or a commitment), regions and price timeline: the
+  latest price, or every one in force over a range of time within a
+  month in Los Angeles, which the client checks before sending since
+  production refuses any other with a bare 400. Prices are `Money`,
+  exact units and nanos with `toNanos()`; `Options.currency_code` reads
+  them converted. `billing.testing.FakeBilling` answers them as
+  production did when measured on 2026-11-04, refusals in its words.
+  The price of a machine type from its vCPU and memory SKUs comes in
+  the module's next part.
 - auth, bigquery, compute, dataflow, datatransfer, error_reporting,
   firestore, kms, logging, monitoring, pubsub, resource_manager, run,
   scheduler, secret_manager and storage: unchanged.
