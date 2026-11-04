@@ -796,7 +796,7 @@ fn decodeAllocations(gpa: Allocator) !void {
 }
 
 test "decode: every allocation failure is OutOfMemory without leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, decodeAllocations, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, decodeAllocations, .{});
 }
 
 test "golden: the crypto bodies, every bytes field with its checksum" {

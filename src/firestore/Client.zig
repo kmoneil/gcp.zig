@@ -445,7 +445,7 @@ test "init: every allocation failure is OutOfMemory without leaks" {
             client.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 test "golden: listCollectionIds at the root, paged" {

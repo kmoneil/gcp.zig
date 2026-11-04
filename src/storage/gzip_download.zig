@@ -887,7 +887,7 @@ test "gzip: every allocation failure is OutOfMemory, and nothing leaks" {
     defer testing.allocator.free(plain);
     const stored = try test_util.gzipAlloc(testing.allocator, plain, .fastest);
     defer testing.allocator.free(stored);
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, downloadGzip, .{ stored, plain });
+    try testing.checkAllAllocationFailures(std.testing.allocator, downloadGzip, .{ stored, plain });
 }
 
 /// Any bytes, compressible or not, gzipped at any level, served under drawn

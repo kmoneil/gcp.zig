@@ -5,7 +5,7 @@ small fix, open an issue first so the approach can be agreed on.
 
 ## Setup
 
-You need Zig 0.17.0, and two programs on the PATH that `zig build test`
+You need Zig 0.17.1, and two programs on the PATH that `zig build test`
 runs: [zigvet](https://github.com/kmoneil/zigvet), which reports code
 the compiler accepts that is almost certainly wrong, and
 [gnarl](https://github.com/kmoneil/gnarl), which measures each

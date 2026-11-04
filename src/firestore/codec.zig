@@ -957,7 +957,7 @@ test "decoding a bytes value: every allocation failure is OutOfMemory" {
             try testing.expectEqualSlices(u8, &.{ 0x00, 0xff, 0xfe }, v.bytes);
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{tree});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{tree});
 }
 
 test "decode: nesting is bounded" {

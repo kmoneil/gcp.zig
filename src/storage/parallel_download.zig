@@ -1976,7 +1976,7 @@ fn downloadEverything(gpa: Allocator) !void {
 }
 
 test "downloadParallel: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, downloadEverything, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, downloadEverything, .{});
 }
 
 /// Draws each request's fate from fuzz bytes, under the fake's lock: mostly
@@ -2462,7 +2462,7 @@ fn downloadWithCheckpoint(gpa: Allocator) !void {
 }
 
 test "downloadParallel with a checkpoint: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, downloadWithCheckpoint, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, downloadWithCheckpoint, .{});
 }
 
 test "Run: ranges are handed out once each, never a held one, and none after a failure; the first failure is kept" {

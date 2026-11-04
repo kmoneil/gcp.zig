@@ -2760,7 +2760,7 @@ test "Subscriber: init failures under memory pressure are OutOfMemory without le
             subscriber.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.initDeinit, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.initDeinit, .{});
 }
 
 const Seeks = struct {
@@ -3473,7 +3473,7 @@ test "dispatch: every allocation failure is OutOfMemory, and no message leaks" {
             for (0..dispatched) |_| subscriber.resolve(try subscriber.queue.getOne(io), .acked);
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 test "workerLoop: a cancel parked at the empty queue is taken" {

@@ -790,7 +790,7 @@ fn decodeErrorInfosWith(gpa: Allocator, body: []const u8) !void {
 }
 
 test "decodeErrorInfos: every allocation failure is OutOfMemory without leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, decodeErrorInfosWith, .{
+    try testing.checkAllAllocationFailures(std.testing.allocator, decodeErrorInfosWith, .{
         \\{"error":{"code":400,"status":"INVALID_ARGUMENT","details":[
         \\{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"R\u00e9","domain":"d",
         \\"metadata":{"a\"1":"PERMANENT_FAILURE_INVALID_ACK_ID","b":"TRANSIENT_FAILURE_ACK_ID","c":5}},
@@ -885,7 +885,7 @@ fn decodePreconditionFailuresWith(gpa: Allocator, body: []const u8) !void {
 }
 
 test "decodePreconditionFailures: every allocation failure is OutOfMemory without leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, decodePreconditionFailuresWith, .{
+    try testing.checkAllAllocationFailures(std.testing.allocator, decodePreconditionFailuresWith, .{
         \\{"error":{"code":400,"status":"FAILED_PRECONDITION","details":[
         \\{"@type":"type.googleapis.com/google.rpc.PreconditionFailure","violations":[{"type":"KEY_DISABLED","subject":"s\u00e9"},{"type":"KEY_DESTROYED","description":"d"}]},
         \\{"@type":"type.googleapis.com/google.rpc.DebugInfo"}]}}

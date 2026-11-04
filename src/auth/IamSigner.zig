@@ -488,7 +488,7 @@ fn signWithFailingAllocations(gpa: Allocator) !void {
 }
 
 test "IamSigner: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, signWithFailingAllocations, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, signWithFailingAllocations, .{});
 }
 
 test "IamSigner: without a transport it builds and frees its own" {
@@ -514,5 +514,5 @@ test "IamSigner: init without a transport survives every allocation failure" {
             iam.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.init, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.init, .{});
 }

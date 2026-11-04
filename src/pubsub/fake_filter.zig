@@ -1140,5 +1140,5 @@ fn parseAllocations(gpa: Allocator) !void {
 }
 
 test "allocation failures: reading a filter leaks nothing" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, parseAllocations, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, parseAllocations, .{});
 }

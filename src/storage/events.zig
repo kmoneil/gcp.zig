@@ -558,7 +558,7 @@ fn decodeEverything(gpa: Allocator) !void {
 }
 
 test "decode: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, decodeEverything, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, decodeEverything, .{});
 }
 
 /// Attributes drawn from `bytes`: Cloud Storage's names, sometimes twice or

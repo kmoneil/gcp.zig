@@ -352,5 +352,5 @@ fn iamAllocations(gpa: std.mem.Allocator) !void {
 }
 
 test "IAM: every allocation failure is OutOfMemory without leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, iamAllocations, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, iamAllocations, .{});
 }

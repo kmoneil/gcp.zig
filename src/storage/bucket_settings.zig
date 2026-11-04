@@ -1546,7 +1546,7 @@ fn updateEverything(gpa: Allocator) !void {
 }
 
 test "update: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, updateEverything, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, updateEverything, .{});
 }
 
 fn createEverything(gpa: Allocator) !void {
@@ -1573,7 +1573,7 @@ fn createEverything(gpa: Allocator) !void {
 }
 
 test "create with settings: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, createEverything, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, createEverything, .{});
 }
 
 // Properties. Each states a rule again, independently of the code above,

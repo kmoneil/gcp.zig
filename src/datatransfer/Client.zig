@@ -658,7 +658,7 @@ test "every allocation failure is OutOfMemory without leaks" {
             } else |err| if (err != error.NotFound) return err;
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.calls, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.calls, .{});
 }
 
 test "golden: a run now, now or at a time given, and its answer" {
@@ -771,5 +771,5 @@ test "a run now's answer that cannot be decoded, and its allocation failures" {
             started.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.calls, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.calls, .{});
 }

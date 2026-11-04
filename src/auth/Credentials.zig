@@ -1145,10 +1145,10 @@ test "findDefault: every allocation failure is OutOfMemory without leaks" {
     defer with_file.deinit();
     var path_buf: [160]u8 = undefined;
     _ = try with_file.write(&path_buf, Lookup.adc_file_name, gcloud_json);
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.fromFile, .{with_file.dir});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.fromFile, .{with_file.dir});
     var named_buf: [160]u8 = undefined;
     const named = try std.fmt.bufPrint(&named_buf, "{s}/{s}", .{ with_file.dir, Lookup.adc_file_name });
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.fromNamedFile, .{named});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.fromNamedFile, .{named});
 
     // The other three file types walk their own cleanup arms when an
     // allocation after the provider's init fails.
@@ -1156,17 +1156,17 @@ test "findDefault: every allocation failure is OutOfMemory without leaks" {
     defer sa_arena.deinit();
     var sa_buf: [160]u8 = undefined;
     const sa_path = try with_file.write(&sa_buf, "sa.json", try serviceAccountJson(sa_arena.allocator()));
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.fromNamedFile, .{sa_path});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.fromNamedFile, .{sa_path});
     var ea_buf: [160]u8 = undefined;
     const ea_path = try with_file.write(&ea_buf, "external.json", "{\"type\":\"external_account\",\"audience\":\"a\",\"subject_token_type\":\"t\",\"credential_source\":{\"file\":\"/t\"}}");
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.fromNamedFile, .{ea_path});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.fromNamedFile, .{ea_path});
     var imp_buf: [160]u8 = undefined;
     const imp_path = try with_file.write(&imp_buf, "imp.json", "{\"type\":\"impersonated_service_account\",\"service_account_impersonation_url\":\"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:generateAccessToken\",\"source_credentials\":{\"type\":\"authorized_user\",\"client_id\":\"c\",\"client_secret\":\"s\",\"refresh_token\":\"r\"}}");
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.fromNamedFile, .{imp_path});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.fromNamedFile, .{imp_path});
 
     var empty: TmpConfig = undefined;
     try empty.init();
     defer empty.deinit();
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.fromMetadata, .{empty.dir});
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.nothing, .{empty.dir});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.fromMetadata, .{empty.dir});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.nothing, .{empty.dir});
 }

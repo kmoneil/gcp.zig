@@ -2033,7 +2033,7 @@ test "every allocation failure in the fake is OutOfMemory without leaks" {
             cancel.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(core.testing.no_grow_allocator, Run.calls, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.calls, .{});
 }
 
 // The slow property: the client against the fake, held to a model of

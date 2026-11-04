@@ -480,7 +480,7 @@ test "every allocation failure is reported as OutOfMemory without leaks" {
             sent.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.publish, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.publish, .{});
 }
 
 test "golden: create a topic with settings, and update it" {
@@ -667,7 +667,7 @@ test "publish: every allocation failure with compression is OutOfMemory without 
             try testing.expectEqualStrings("gzip", (try fake.request(1)).header("content-encoding").?);
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.publish, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.publish, .{});
 }
 
 /// Asserts that request `index` is the one `want` describes: its method
@@ -792,7 +792,7 @@ test "publishRequest: every allocation failure is OutOfMemory without leaks" {
             preview.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.build, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.build, .{});
 }
 
 /// Any topic id, messages and options: `publishRequest` fails exactly when
@@ -1098,7 +1098,7 @@ fn topicSchemaAllocations(gpa: std.mem.Allocator) !void {
 }
 
 test "allocation failures: a topic's schema on create and in an update" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, topicSchemaAllocations, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, topicSchemaAllocations, .{});
 }
 
 const redact: types.MessageTransform = .{ .kind = .{ .javascript_udf = .{
@@ -1235,7 +1235,7 @@ fn topicTransformsAllocations(gpa: std.mem.Allocator) !void {
 }
 
 test "allocation failures: a topic's transforms on create, as read, and in an update" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, topicTransformsAllocations, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, topicTransformsAllocations, .{});
 }
 
 const import_account = "importer@my-project.iam.gserviceaccount.com";
@@ -1377,5 +1377,5 @@ fn importTopicAllocations(gpa: std.mem.Allocator) !void {
 }
 
 test "allocation failures: an import topic on create, as read, and in an update" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, importTopicAllocations, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, importTopicAllocations, .{});
 }

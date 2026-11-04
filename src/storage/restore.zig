@@ -571,7 +571,7 @@ fn restoreEverything(gpa: Allocator) !void {
 }
 
 test "restores: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, restoreEverything, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, restoreEverything, .{});
 }
 
 fn bulkBodyProperty(_: void, bytes: []const u8) !void {

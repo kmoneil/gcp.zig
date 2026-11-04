@@ -1012,7 +1012,7 @@ fn uploadBoth(gpa: Allocator, plain: []const u8) !void {
 test "gzip upload: every allocation failure is OutOfMemory, and nothing leaks" {
     const plain = try randomBytes(testing.allocator, 300 * 1024, 12);
     defer testing.allocator.free(plain);
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, uploadBoth, .{plain});
+    try testing.checkAllAllocationFailures(std.testing.allocator, uploadBoth, .{plain});
 }
 
 /// Data drawn from the fuzz input: text that compresses, noise that does

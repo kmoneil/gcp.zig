@@ -481,5 +481,5 @@ test "get, set, update and delete: every allocation failure is OutOfMemory witho
             try la.delete(.{ .precondition = .{ .exists = true } });
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }

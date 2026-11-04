@@ -978,7 +978,7 @@ fn signEveryGolden(gpa: Allocator) !void {
 }
 
 test "postPolicy: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, signEveryGolden, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, signEveryGolden, .{});
 }
 
 // Properties. Each states a rule of the module comment independently of

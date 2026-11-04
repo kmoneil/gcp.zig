@@ -31,7 +31,7 @@ jobs:
 
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.17.0
+          version: 0.17.1
 
       - name: Format
         run: zig build fmt
@@ -313,7 +313,7 @@ jobs:
 
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.17.0
+          version: 0.17.1
           # One cache per mode: under one key the two legs raced to save it.
           cache-key: ${{ matrix.optimize }}
 
@@ -336,7 +336,7 @@ jobs:
 
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.17.0
+          version: 0.17.1
 
       - uses: ./.github/actions/vet-tools
 
@@ -364,7 +364,7 @@ jobs:
 
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.17.0
+          version: 0.17.1
 
       - name: Measure coverage
         run: zig build coverage
@@ -698,7 +698,7 @@ jobs:
 
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.17.0
+          version: 0.17.1
 
       # Each run starts from the corpus the earlier runs built up, kept as
       # an artifact rather than in the cache. On a busy day the build caches

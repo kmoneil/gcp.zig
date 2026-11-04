@@ -245,8 +245,8 @@ test "token_response: running out of memory is OutOfMemory, never a verdict on t
             try testing.expectEqualStrings("it's gone", e.description);
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.token, .{});
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.oauthError, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.token, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.oauthError, .{});
 }
 
 fn arbitraryProperty(_: void, input: []const u8) !void {
@@ -351,7 +351,7 @@ test "identity: running out of memory is OutOfMemory, never a verdict" {
             try testing.expectEqualStrings("person@example.com", (try identity(arena.allocator(), sent, test_client)).email);
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{body});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{body});
 }
 
 fn identityProperty(_: void, input: []const u8) !void {

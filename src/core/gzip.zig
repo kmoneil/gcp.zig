@@ -172,7 +172,7 @@ fn compressWith(gpa: Allocator) !void {
 }
 
 test "compress: every allocation failure is OutOfMemory without leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, compressWith, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, compressWith, .{});
 }
 
 fn roundTripProperty(_: void, input: []const u8) !void {

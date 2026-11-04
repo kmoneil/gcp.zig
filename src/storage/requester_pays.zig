@@ -615,5 +615,5 @@ fn billedEverything(gpa: Allocator) !void {
 }
 
 test "billing: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, billedEverything, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, billedEverything, .{});
 }

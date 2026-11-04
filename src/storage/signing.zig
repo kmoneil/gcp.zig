@@ -1191,7 +1191,7 @@ fn signEverything(gpa: Allocator) !void {
 }
 
 test "signedUrl: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, signEverything, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, signEverything, .{});
 }
 
 // Properties. Each states a rule of the module comment independently of

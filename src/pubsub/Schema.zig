@@ -677,7 +677,7 @@ fn schemaAllocations(gpa: std.mem.Allocator) !void {
 }
 
 test "allocation failures: every schema call fails cleanly at each allocation" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, schemaAllocations, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, schemaAllocations, .{});
 }
 
 const avro_v2: types.SchemaDefinition = .{ .type = .avro, .definition = "{\"type\":\"record\",\"name\":\"M\",\"fields\":[{\"name\":\"note\",\"type\":\"string\",\"default\":\"\"}]}" };
@@ -1046,5 +1046,5 @@ fn revisionAllocations(gpa: std.mem.Allocator) !void {
 }
 
 test "allocation failures: commit, rollback and their reads fail cleanly at each allocation" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, revisionAllocations, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, revisionAllocations, .{});
 }

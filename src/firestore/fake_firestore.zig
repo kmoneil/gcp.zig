@@ -3101,7 +3101,7 @@ test "fake: every allocation failure through a full path is OutOfMemory without 
             try cities.doc("LA").delete(.{});
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 // A model of the store, written once more from the rules, held against

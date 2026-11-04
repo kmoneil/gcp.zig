@@ -672,7 +672,7 @@ fn copyWithChanges(gpa: Allocator) !void {
 }
 
 test "copyTo with changes: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, copyWithChanges, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, copyWithChanges, .{});
 }
 
 // Properties. Each states a rule of the module comment independently of

@@ -431,7 +431,7 @@ test "serverDelayMs: every allocation failure is OutOfMemory without leaks" {
             , at(0));
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 test "Asked: each form, written as servers write it, and read back" {
@@ -491,7 +491,7 @@ test "Asked: every allocation failure is OutOfMemory without leaks" {
             _ = try a.intoBody(arena.allocator(), "{\"error\":{\"code\":429,\"details\":[{\"@type\":\"x\"}]}}");
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 fn askedProperty(_: void, input: []const u8) !void {

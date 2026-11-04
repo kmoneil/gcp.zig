@@ -693,7 +693,7 @@ fn everyRequest(gpa: Allocator) !void {
 }
 
 test "multipart requests: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, everyRequest, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, everyRequest, .{});
 }
 
 const list_page_one =

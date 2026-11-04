@@ -199,7 +199,7 @@ chmod +x "$W/bin/date" "$W/bin/sleep" "$W/bin/curl"
 # A repository of its own, so each run ships a few bytes, and a key.
 cat > "$W/repo/build.zig.zon" << 'EOF'
 .{
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
 }
 EOF
 cat > "$W/repo/jobs/test.sh" << 'EOF'

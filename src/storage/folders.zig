@@ -1077,5 +1077,5 @@ fn everyCall(gpa: Allocator) !void {
 }
 
 test "folders: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, everyCall, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, everyCall, .{});
 }

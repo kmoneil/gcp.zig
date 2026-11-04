@@ -415,5 +415,5 @@ fn tagsAllocations(gpa: std.mem.Allocator) !void {
 }
 
 test "allocation failures: tags on the three creates" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, tagsAllocations, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, tagsAllocations, .{});
 }

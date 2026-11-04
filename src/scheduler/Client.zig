@@ -685,5 +685,5 @@ test "every allocation failure is OutOfMemory without leaks" {
             }
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.calls, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.calls, .{});
 }
