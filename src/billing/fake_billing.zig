@@ -950,3 +950,43 @@ test "fuzz catalog: pages see every SKU once in order, ranges refused exactly as
         "\x0c\xff\xfe\xfd\xfc\xfb\xfa\xf9\xf8\xf7\xf6\xf5\xf4\xf3\xf2\xf1\xf0\xef\xee\xed\xec\xeb\xea\xe9\xe8",
     } });
 }
+
+test "computePrices reads every page into a price list, as production priced e2-standard-2" {
+    var b: Bench = undefined;
+    try b.init(null);
+    defer b.deinit();
+    try putProductionSkus(&b.fake);
+    const since = ts("2026-01-01T08:00:00Z");
+    const americas: []const []const u8 = &.{ "us-central1", "us-east1", "us-west1" };
+    inline for (.{
+        .{ "CF4E-A0C7-E3BF", "E2 Instance Core running in Americas", "CPU", "OnDemand", 21_811_590 },
+        .{ "F449-33EC-A5EF", "E2 Instance Ram running in Americas", "RAM", "OnDemand", 2_923_530 },
+        .{ "F179-E1EA-D97A", "Spot Preemptible E2 Instance Core running in Americas", "CPU", "Preemptible", 13_090_000 },
+        .{ "9B1F-1E62-4061", "Spot Preemptible E2 Instance Ram running in Americas", "RAM", "Preemptible", 1_754_000 },
+    }) |s| {
+        const ram = std.mem.eql(u8, s[2], "RAM");
+        try b.fake.putSku(.{
+            .id = s[0],
+            .service_id = "6F81-5844-456A",
+            .description = s[1],
+            .resource_group = s[2],
+            .usage_type = s[3],
+            .regions = americas,
+            .geo_type = "MULTI_REGIONAL",
+            .usage_unit = if (ram) "GiBy.h" else "h",
+            .base_unit = if (ram) "By.s" else "s",
+            .base_unit_conversion_factor = if (ram) 3_865_470_566_400 else 3600,
+            .prices = &.{.{ .from = since, .tiers = &.{.{ .usd_nanos = s[4] }} }},
+        });
+    }
+    // Six SKUs, two a page: three pages.
+    var list = try b.client.computePrices(.{ .page_size = 2 });
+    defer list.deinit();
+    try testing.expectEqual(3, b.fake.callCount());
+    try testing.expectEqual(4, list.kept);
+    try testing.expectEqual(2, list.skipped.get(.wording) + list.skipped.get(.unknown_family));
+    const std2: @import("compute.zig").Machine = .{ .name = "e2-standard-2", .vcpus = 2, .memory_mb = 8192 };
+    try testing.expectEqual(67_011_420, list.hourly(std2, "us-central1", .on_demand).?.nanos_per_hour);
+    try testing.expectEqual(40_212_000, list.hourly(std2, "us-east1", .spot).?.nanos_per_hour);
+    try testing.expectEqual(ts("2026-11-04T08:00:00Z"), list.hourly(std2, "us-west1", .spot).?.effective_time);
+}

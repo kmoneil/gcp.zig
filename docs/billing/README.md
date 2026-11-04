@@ -38,6 +38,7 @@ pub fn main(init: std.process.Init) !void {
 | `Client.listServices(options)` | One page of the services Google bills for, sorted by id; the default page, 5000, held all 1,781 when measured |
 | `Client.findService(display_name)` | The service named, such as "Compute Engine", read through every page; null when none has it |
 | `Client.listSkus(service_id, options)` | One page of a service's SKUs, sorted by id, each with its latest price or every one in force over `start_time` to `end_time` |
+| `Client.computePrices(options)` | Every Compute Engine SKU, a page at a time, as a `compute.PriceList` of [machine prices](#machine-prices) |
 
 `billing.compute_engine_service_id` is Compute Engine's, `6F81-5844-456A`.
 
@@ -48,6 +49,53 @@ Americas"), `resource_family` (Compute, Storage, Network, License),
 and `pricing`, oldest first. Each `Pricing` has its unit (`h` for a
 vCPU-hour, `GiBy.h` for a GiB-hour of memory) and its tiers, each a
 `Money`: whole `units` and `nanos`, exact, with `toNanos()` for sums.
+
+## Machine prices
+
+`Client.computePrices` reads Compute Engine's SKUs (7 pages, about 9 s)
+into a `compute.PriceList`, holding one page at a time, never all 46 MB.
+`PriceList.hourly(machine, region, model)` says what a machine type
+costs an hour there, on demand or as spot, in exact nanos, with the two
+SKUs it came from and when their prices took effect:
+
+```zig
+var list = try client.computePrices(.{});
+defer list.deinit();
+// The size compute.Client.getMachineType reports: guest_cpus, memory_mb.
+const machine: billing.compute.Machine = .{ .name = "e2-standard-2", .vcpus = 2, .memory_mb = 8192 };
+if (list.hourly(machine, "us-central1", .spot)) |price| {
+    // 40212000: $0.040212 an hour on 2026-11-04.
+    std.debug.print("{d} nanos an hour\n", .{price.nanos_per_hour});
+}
+```
+
+- **Priced**: e2 (with e2-micro, e2-small and e2-medium billed as a
+  quarter, a half and one vCPU), n1, n2, n2d, n4, n4a, n4d, c2, c2d, c3,
+  c3d, c4, c4a, c4d, c4n, t2a, t2d, h3, m3 and z3, from a vCPU SKU and a
+  memory SKU; f1-micro and g1-small from their one SKU each.
+- **Left out**, so `hourly` answers null: M1 and M2 (their SKUs cannot
+  be told apart in three regions), the M4 family, the GPU families (A2,
+  A3, G2, G4, whose GPUs are priced apart), H4D, Z4D and Z4M; custom
+  machine types; and any region without both SKUs.
+- **Memory is priced by the byte.** Most families price a GiB-hour, but
+  C4D and M4's ultramem types price a GB-hour (10^9 bytes), measured, so
+  the list converts each through its SKU's base-unit factor rather than
+  assume one. The sum is rounded once, to the nearest nano.
+- `PriceList.skipped` counts every SKU left out, by reason, so a family
+  Google adds shows as `unknown_family` instead of going missing.
+- `PriceList.write` gives the list alone, about 410 KB of JSON, and
+  `PriceList.read` takes it back: a cache for a day, where a reader of
+  spot prices should remember that they change about weekly.
+
+`examples/billing_prices.zig` prints a machine type's prices in a
+region, or with `--fake` reads E2's from `FakeBilling` offline:
+
+```
+$ zig build example-billing_prices -- e2-micro 2 1 us-central1
+e2-micro (2 vCPUs, 1024 MiB) in us-central1, list prices in USD:
+  on_demand 0.008376 an hour, 6.114792 for 730 hours (SKUs CF4E-A0C7-E3BF and F449-33EC-A5EF)
+  spot      0.005027 an hour, 3.669345 for 730 hours (SKUs F179-E1EA-D97A and 9B1F-1E62-4061)
+```
 
 ## Prices, as production showed them
 
