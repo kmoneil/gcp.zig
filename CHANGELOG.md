@@ -4,6 +4,24 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.65.0 (unreleased)
+
+- storage: `storage.testing.FakeStorage`, a public in-memory Cloud
+  Storage for your own tests, for issue #337. Buckets and objects a test
+  puts in (`putBucket`, `putObject`, `deleteObject`), read back as
+  production answered on 2026-11-04: `Client.listBuckets`; a bucket's
+  `get`; `Bucket.listObjects` with `prefix`, `delimiter`, `match_glob`,
+  `versions` and pages, objects and folders in one sorted order and one
+  count, production's page tokens, and its refusals of a malformed glob;
+  an object's metadata and media reads, whole, by range, and gzip
+  objects decompressed. Uploads and deletes land in their own bucket. A
+  bucket put with versioning keeps earlier generations. Making buckets,
+  writes to versioned buckets, cross-bucket copies, soft-deleted
+  listings and folders answer 501. No call changes.
+- auth, billing, bigquery, compute, core, dataflow, datatransfer,
+  error_reporting, firestore, kms, logging, monitoring, pubsub,
+  resource_manager, run, scheduler and secret_manager: unchanged.
+
 ## 0.64.0 (2026-11-04)
 
 - Zig 0.17.1, a release of bug fixes on 0.17.0, is the version

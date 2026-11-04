@@ -46,6 +46,7 @@ Google, not only what Google documents, and where the emulators differ.
 | [Notifications](storage/notifications.md) | A Pub/Sub message for every change to a bucket's objects, and what each change publishes |
 | [Folders](storage/folders.md) | Hierarchical buckets, atomic tree renames, and managed folders with policies of their own |
 | [The emulator](storage/emulator.md) | What fake-gcs-server does differently, and how the tests make up for it |
+| [Testing](storage/testing.md) | An in-memory Cloud Storage for your own tests: buckets and objects put in, listed, globbed and read, versions included, held to production's answers |
 
 ## 🔑 Secret Manager
 

@@ -58,6 +58,7 @@ it differs from Cloud Storage.
 | [HMAC keys](hmac.md) | A service account's second credential: making and retiring keys, and signing with one |
 | [Notifications](notifications.md) | A Pub/Sub message for every change to a bucket's objects, decoded |
 | [The emulator](emulator.md) | What fake-gcs-server does differently, and how the tests cover it |
+| [Testing](testing.md) | An in-memory Cloud Storage for your own tests: buckets and objects put in, listed and read as production answered |
 
 ## What it covers
 
