@@ -455,12 +455,16 @@ pub fn stopInstance(self: *Client, zone: []const u8, name: []const u8, options: 
 
 /// Suspends a running VM, its memory kept: DONE 87 to 93 s later for a
 /// standard VM and 281 s for a spot one, which can be suspended
-/// (measured).
+/// (measured). A suspend can fail in its operation when the guest does
+/// not answer: UNSUPPORTED_OPERATION "Instance suspend failed due to
+/// guest timeout." after four minutes, the VM still RUNNING (measured
+/// once in three runs).
 pub fn suspendInstance(self: *Client, zone: []const u8, name: []const u8, options: types.SuspendOptions) Error!types.Owned(types.Operation) {
     return self.write(suspendCall, .{ zone, name, options });
 }
 
-/// Resumes a suspended VM: DONE 12 to 19 s later (measured).
+/// Resumes a suspended VM: DONE 12 to 19 s later (measured). Resuming a
+/// running VM is no refusal: its operation answered DONE at once.
 pub fn resumeInstance(self: *Client, zone: []const u8, name: []const u8, options: types.WriteOptions) Error!types.Owned(types.Operation) {
     return self.write(resumeCall, .{ zone, name, options });
 }
@@ -912,14 +916,275 @@ const Flag = struct { name: []const u8, value: []const u8 };
 /// `/compute/v1/projects/P/zones/Z/instances[/<tail>]?<flags>&requestId=<id>`,
 /// the id `request_id` or a new one.
 fn writePath(self: *Client, a: Allocator, zone: []const u8, tail: ?[]const u8, flags: []const Flag, request_id: ?[]const u8) Error![]const u8 {
+    const rest = if (tail) |t| try self.print(a, "zones/{s}/instances/{s}", .{ zone, t }) else try self.print(a, "zones/{s}/instances", .{zone});
+    return self.requestPath(a, rest, flags, request_id);
+}
+
+/// `/compute/v1/projects/P/<rest>?<flags>&requestId=<id>`, the id
+/// `request_id` or a new one.
+fn requestPath(self: *Client, a: Allocator, rest: []const u8, flags: []const Flag, request_id: ?[]const u8) Error![]const u8 {
     const id = try self.requestIdFor(a, request_id);
     var w: std.Io.Writer.Allocating = .init(a);
-    w.writer.print("/compute/v1/projects/{s}/zones/{s}/instances", .{ self.project, zone }) catch return error.OutOfMemory;
-    if (tail) |t| w.writer.print("/{s}", .{t}) catch return error.OutOfMemory;
+    w.writer.print("/compute/v1/projects/{s}/{s}", .{ self.project, rest }) catch return error.OutOfMemory;
     var params: core.query.Params = .init(&w.writer);
     for (flags) |f| params.add(f.name, f.value) catch return error.OutOfMemory;
     params.add("requestId", id) catch return error.OutOfMemory;
     return w.written();
+}
+
+// Fleets: instance templates and zonal managed instance groups. A group's
+// operations are DONE well before its VMs are: an insert in 7 s while
+// they were made, RUNNING 30 s later; a resize in 1 s while the VM it
+// dropped took 37 s more to go (measured). `waitGroupStable` waits for
+// the VMs.
+
+/// One page of the project's global templates (`region` null), or a
+/// region's.
+pub fn listTemplates(self: *Client, region: ?[]const u8, options: types.ListOptions) Error!types.Owned(types.TemplatePage) {
+    rpc.begin(self);
+    if (region) |r| try self.checkScope(.{ .region = r });
+    try self.checkList(options);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const tail = if (region) |r| try self.print(a, "regions/{s}/instanceTemplates", .{r}) else "global/instanceTemplates";
+    return self.read(types.TemplatePage, try self.listPath(a, tail, options), codec.decodeTemplatePage, "template list");
+}
+
+/// One template. `error.NotFound` when there is none of that name.
+pub fn getTemplate(self: *Client, ref: types.TemplateRef) Error!types.Owned(types.Template) {
+    rpc.begin(self);
+    try self.checkTemplate(ref);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    return self.read(types.Template, try self.print(a, "/compute/v1/{s}", .{try body.templatePath(a, self.project, ref)}), codec.decodeTemplate, "template");
+}
+
+/// Makes the template `spec.name`, global (`region` null) or in a region,
+/// its VMs as `spec` describes. A name taken is `error.AlreadyExists`
+/// (measured). A group refuses a template whose spot VMs DELETE or have a
+/// run limit, in its insert's operation (measured): give a group's
+/// template `.termination_action = .stop` and no run limit.
+pub fn insertTemplate(self: *Client, region: ?[]const u8, spec: types.InstanceSpec, options: types.WriteOptions) Error!types.Owned(types.Operation) {
+    return self.write(insertTemplateCall, .{ region, spec, options });
+}
+
+/// Deletes a template. One a group uses is taken, and its operation ends
+/// DONE failed, RESOURCE_IN_USE_BY_ANOTHER_RESOURCE (measured).
+pub fn deleteTemplate(self: *Client, ref: types.TemplateRef, options: types.WriteOptions) Error!types.Owned(types.Operation) {
+    return self.write(deleteTemplateCall, .{ ref, options });
+}
+
+/// One page of a zone's managed instance groups.
+pub fn listGroups(self: *Client, zone: []const u8, options: types.ListOptions) Error!types.Owned(types.GroupPage) {
+    rpc.begin(self);
+    try self.checkZone(zone);
+    try self.checkList(options);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const path = try self.listPath(a, try self.print(a, "zones/{s}/instanceGroupManagers", .{zone}), options);
+    return self.read(types.GroupPage, path, codec.decodeGroupPage, "group list");
+}
+
+/// One group, with its target size, what its VMs are doing, and whether
+/// it is stable.
+pub fn getGroup(self: *Client, zone: []const u8, name: []const u8) Error!types.Owned(types.Group) {
+    rpc.begin(self);
+    try self.checkZone(zone);
+    try self.checkName(name, "group");
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const path = try self.print(scratch.allocator(), "/compute/v1/projects/{s}/zones/{s}/instanceGroupManagers/{s}", .{ self.project, zone, name });
+    return self.read(types.Group, path, codec.decodeGroup, "group");
+}
+
+/// One page of a group's VMs, each with its status and what the group is
+/// doing to it. A POST, as the API has it, retried as the reads are.
+pub fn listManagedInstances(self: *Client, zone: []const u8, name: []const u8, options: types.ListOptions) Error!types.Owned(types.ManagedInstancePage) {
+    rpc.begin(self);
+    try self.checkZone(zone);
+    try self.checkName(name, "group");
+    try self.checkList(options);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const path = try self.listPath(a, try self.print(a, "zones/{s}/instanceGroupManagers/{s}/listManagedInstances", .{ zone, name }), options);
+    var result: types.Owned(types.ManagedInstancePage) = try .init(self.gpa);
+    errdefer result.deinit();
+    const answer = try rpc.execute(self, result.arena, .{ .method = .POST, .path = path, .body = "" });
+    result.value = codec.decodeManagedInstancePage(result.arena.allocator(), a, answer) catch |err|
+        return rpc.decodeFailed(self, err, "managed instance list");
+    return result;
+}
+
+/// Makes a group of `spec.target_size` VMs from a template. Its operation
+/// was DONE in 7 s, its VMs RUNNING 30 s later (measured): wait with
+/// `waitGroupStable`. A template whose spot VMs DELETE, or have a run
+/// limit, is taken and the operation ends DONE failed,
+/// UNSUPPORTED_OPERATION "Spot virtual machines with termination action
+/// set to DELETE cannot be used with Managed Instance Groups." (measured).
+pub fn insertGroup(self: *Client, zone: []const u8, spec: types.GroupSpec, options: types.WriteOptions) Error!types.Owned(types.Operation) {
+    return self.write(insertGroupCall, .{ zone, spec, options });
+}
+
+/// Sets how many VMs the group keeps, making or deleting the difference.
+pub fn resizeGroup(self: *Client, zone: []const u8, name: []const u8, size: u32, options: types.WriteOptions) Error!types.Owned(types.Operation) {
+    return self.write(resizeGroupCall, .{ zone, name, size, options });
+}
+
+/// Makes VMs in the group by name, its target size growing with them
+/// (measured).
+pub fn createGroupInstances(self: *Client, zone: []const u8, name: []const u8, names: []const []const u8, options: types.WriteOptions) Error!types.Owned(types.Operation) {
+    return self.write(createInstancesCall, .{ zone, name, names, options });
+}
+
+/// Deletes VMs of the group by name, its target size shrinking with them
+/// (measured).
+pub fn deleteGroupInstances(self: *Client, zone: []const u8, name: []const u8, names: []const []const u8, options: types.GroupDeleteOptions) Error!types.Owned(types.Operation) {
+    return self.write(deleteInstancesCall, .{ zone, name, names, options });
+}
+
+/// Deletes the group and its VMs: DONE 80 s later (measured).
+pub fn deleteGroup(self: *Client, zone: []const u8, name: []const u8, options: types.GroupDeleteOptions) Error!types.Owned(types.Operation) {
+    return self.write(deleteGroupCall, .{ zone, name, options });
+}
+
+/// Reads the group every `options.poll_ms` until it is stable (every VM
+/// there and doing nothing, as many as its target) or `options.timeout_ms`
+/// has passed, and answers it as it stands then.
+pub fn waitGroupStable(self: *Client, zone: []const u8, name: []const u8, options: types.GroupWaitOptions) Error!types.Owned(types.Group) {
+    const clock: std.Io.Clock = .awake;
+    const deadline = clock.now(self.io).addDuration(.fromMilliseconds(options.timeout_ms));
+    var reads: u32 = 0;
+    while (true) {
+        var group = try self.getGroup(zone, name);
+        reads += 1;
+        const now = clock.now(self.io);
+        const left = now.durationTo(deadline).toMilliseconds();
+        if (group.value.is_stable or left <= 0) {
+            logging.debug("group {s}: stable {} after {d} read(s)", .{ name, group.value.is_stable, reads });
+            return group;
+        }
+        group.deinit();
+        self.io.sleep(.fromMilliseconds(@min(options.poll_ms, left)), .awake) catch return error.Canceled;
+    }
+}
+
+/// The request `insertTemplate` sends, as `insertInstanceRequest` says.
+pub fn insertTemplateRequest(self: *Client, region: ?[]const u8, spec: types.InstanceSpec, options: types.WriteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(insertTemplateCall, .{ region, spec, options });
+}
+
+/// The request `deleteTemplate` sends, as `insertInstanceRequest` says.
+pub fn deleteTemplateRequest(self: *Client, ref: types.TemplateRef, options: types.WriteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(deleteTemplateCall, .{ ref, options });
+}
+
+/// The request `insertGroup` sends, as `insertInstanceRequest` says.
+pub fn insertGroupRequest(self: *Client, zone: []const u8, spec: types.GroupSpec, options: types.WriteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(insertGroupCall, .{ zone, spec, options });
+}
+
+/// The request `resizeGroup` sends, as `insertInstanceRequest` says.
+pub fn resizeGroupRequest(self: *Client, zone: []const u8, name: []const u8, size: u32, options: types.WriteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(resizeGroupCall, .{ zone, name, size, options });
+}
+
+/// The request `createGroupInstances` sends, as `insertInstanceRequest`
+/// says.
+pub fn createGroupInstancesRequest(self: *Client, zone: []const u8, name: []const u8, names: []const []const u8, options: types.WriteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(createInstancesCall, .{ zone, name, names, options });
+}
+
+/// The request `deleteGroupInstances` sends, as `insertInstanceRequest`
+/// says.
+pub fn deleteGroupInstancesRequest(self: *Client, zone: []const u8, name: []const u8, names: []const []const u8, options: types.GroupDeleteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(deleteInstancesCall, .{ zone, name, names, options });
+}
+
+/// The request `deleteGroup` sends, as `insertInstanceRequest` says.
+pub fn deleteGroupRequest(self: *Client, zone: []const u8, name: []const u8, options: types.GroupDeleteOptions) Error!types.Owned(PreparedRequest) {
+    return self.preview(deleteGroupCall, .{ zone, name, options });
+}
+
+fn insertTemplateCall(self: *Client, a: Allocator, region: ?[]const u8, spec: types.InstanceSpec, options: types.WriteOptions) Error!rpc.Call {
+    try self.checkWrite();
+    if (region) |r| try self.checkScope(.{ .region = r });
+    try self.checkSpec(spec);
+    if (region == null) if (spec.subnetwork) |s| if (std.mem.indexOfScalar(u8, s, '/') == null) {
+        if (self.diagnostics) |d| d.print("invalid subnetwork: a global template names one by its path, regions/R/subnetworks/S", .{});
+        return error.InvalidOptions;
+    };
+    const tail = if (region) |r| try self.print(a, "regions/{s}/instanceTemplates", .{r}) else "global/instanceTemplates";
+    return .{ .method = .POST, .path = try self.requestPath(a, tail, &.{}, options.request_id), .body = try body.template(a, region, spec) };
+}
+
+fn deleteTemplateCall(self: *Client, a: Allocator, ref: types.TemplateRef, options: types.WriteOptions) Error!rpc.Call {
+    try self.checkWrite();
+    try self.checkTemplate(ref);
+    const full = try body.templatePath(a, self.project, ref);
+    const rest = full["projects/".len + self.project.len + 1 ..];
+    return .{ .method = .DELETE, .path = try self.requestPath(a, rest, &.{}, options.request_id) };
+}
+
+fn insertGroupCall(self: *Client, a: Allocator, zone: []const u8, spec: types.GroupSpec, options: types.WriteOptions) Error!rpc.Call {
+    try self.checkWrite();
+    try self.checkZone(zone);
+    try self.checkName(spec.name, "group");
+    if (spec.base_instance_name) |b| try self.checkName(b, "base instance");
+    try self.checkTemplate(spec.template);
+    if (spec.description) |d| if (!std.unicode.utf8ValidateSlice(d) or d.len > 2048) {
+        if (self.diagnostics) |x| x.print("invalid description: expected UTF-8, at most 2048 bytes", .{});
+        return error.InvalidOptions;
+    };
+    const path = try self.requestPath(a, try self.print(a, "zones/{s}/instanceGroupManagers", .{zone}), &.{}, options.request_id);
+    return .{ .method = .POST, .path = path, .body = try body.group(a, self.project, spec) };
+}
+
+fn resizeGroupCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, size: u32, options: types.WriteOptions) Error!rpc.Call {
+    const size_text = try self.print(a, "{d}", .{size});
+    return self.groupVerbCall(a, zone, name, "resize", &.{.{ .name = "size", .value = size_text }}, "", options.request_id);
+}
+
+fn createInstancesCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, names: []const []const u8, options: types.WriteOptions) Error!rpc.Call {
+    try self.checkInstanceNames(names);
+    return self.groupVerbCall(a, zone, name, "createInstances", &.{}, try body.createInstances(a, names), options.request_id);
+}
+
+fn deleteInstancesCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, names: []const []const u8, options: types.GroupDeleteOptions) Error!rpc.Call {
+    try self.checkInstanceNames(names);
+    const flags: []const Flag = if (options.no_graceful_shutdown) &.{.{ .name = "noGracefulShutdown", .value = "true" }} else &.{};
+    return self.groupVerbCall(a, zone, name, "deleteInstances", flags, try body.deleteInstances(a, zone, names), options.request_id);
+}
+
+fn deleteGroupCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, options: types.GroupDeleteOptions) Error!rpc.Call {
+    try self.checkWrite();
+    try self.checkZone(zone);
+    try self.checkName(name, "group");
+    const flags: []const Flag = if (options.no_graceful_shutdown) &.{.{ .name = "noGracefulShutdown", .value = "true" }} else &.{};
+    const path = try self.requestPath(a, try self.print(a, "zones/{s}/instanceGroupManagers/{s}", .{ zone, name }), flags, options.request_id);
+    return .{ .method = .DELETE, .path = path };
+}
+
+/// `POST .../zones/Z/instanceGroupManagers/G/<verb>?<flags>` with `text`.
+fn groupVerbCall(self: *Client, a: Allocator, zone: []const u8, name: []const u8, verb: []const u8, flags: []const Flag, text: []const u8, request_id: ?[]const u8) Error!rpc.Call {
+    try self.checkWrite();
+    try self.checkZone(zone);
+    try self.checkName(name, "group");
+    const path = try self.requestPath(a, try self.print(a, "zones/{s}/instanceGroupManagers/{s}/{s}", .{ zone, name, verb }), flags, request_id);
+    return .{ .method = .POST, .path = path, .body = text };
+}
+
+/// At least one VM, each by an instance name: production refused an
+/// empty one, "The URL is malformed." (measured).
+fn checkInstanceNames(self: *Client, names: []const []const u8) Error!void {
+    if (names.len == 0) {
+        if (self.diagnostics) |d| d.print("invalid instances: name at least one", .{});
+        return error.InvalidOptions;
+    }
+    for (names) |n| try self.checkName(n, "instance");
 }
 
 fn requestIdFor(self: *Client, a: Allocator, given: ?[]const u8) Error![]const u8 {

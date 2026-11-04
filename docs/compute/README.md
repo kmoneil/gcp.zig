@@ -9,9 +9,9 @@ change must send back; a VM's serial console and the guest attributes
 its guest wrote; the zones, machine types and images a create needs;
 Compute's own operations, read, listed and waited on; and the writes
 that create a VM and run it through its life, each shown before it is
-sent if the caller asks. Changing a live VM (labels, metadata, machine
-type, disks) and managed groups are the module's next milestones
-(issue #346).
+sent if the caller asks; changes to a live VM under fingerprints; and
+fleets: instance templates and zonal managed instance groups, waited on
+until their VMs are up (issue #346).
 
 ```zig
 const std = @import("std");
@@ -59,6 +59,10 @@ pub fn main(init: std.process.Init) !void {
 | `updateLabels`, `updateMetadata` | Some labels or items set or removed, the rest kept: read, change, send, again if the VM changed in between |
 | `setMachineType`, `setScheduling`, `setDeletionProtection` | A stopped VM's machine type; how a VM is scheduled; its protection from deletion |
 | `attachDisk`, `detachDisk` | A disk that exists already, attached by name, detached by device name |
+| `listTemplates`, `getTemplate`, `insertTemplate`, `deleteTemplate` | Instance templates, global or regional |
+| `listGroups`, `getGroup`, `listManagedInstances` | A zone's managed groups, one, and its VMs with what each is doing |
+| `insertGroup`, `resizeGroup`, `createGroupInstances`, `deleteGroupInstances`, `deleteGroup` | A group made, resized, its VMs made or deleted by name, deleted |
+| `waitGroupStable(zone, name, options)` | A group once its VMs are all there and doing nothing, or at a deadline |
 | `insertInstanceRequest` and the other `*Request` twins | The exact request a write would send, unsent |
 | `newRequestId(buf)` | A request id, a random UUID |
 
@@ -176,9 +180,12 @@ A write answers its operation before it is DONE as a rule: RUNNING, or
 PENDING (production answered a start each way on two days). Wait on
 either the same way.
 
-Stopping a stopped VM and starting a running one are no refusals: each
-answers an operation, the start DONE at once. A spot VM can be
-suspended. `stopInstance` and `deleteInstance` take
+Stopping a stopped VM, and starting or resuming a running one, are no
+refusals: each answers an operation, the start and the resume DONE at
+once. A spot VM can be suspended. A suspend can fail in its operation
+when the guest does not answer in time: production's once ended
+UNSUPPORTED_OPERATION, "Instance suspend failed due to guest timeout.",
+four minutes in, the VM still RUNNING. `stopInstance` and `deleteInstance` take
 `no_graceful_shutdown`, `stopInstance` and `suspendInstance`
 `discard_local_ssd`, which a VM with local SSDs must give.
 
@@ -236,6 +243,55 @@ use, by this VM or another, and a detach of a device the VM does not
 have, are taken, and their operations end failed
 (RESOURCE_IN_USE_BY_ANOTHER_RESOURCE, INVALID_USAGE).
 `setDeletionProtection` answered DONE at once, either way.
+
+## Fleets
+
+A managed instance group keeps a number of VMs made from one instance
+template, in a zone. `insertTemplate` makes the template from an
+`InstanceSpec`, its `name` the template's; `insertGroup` makes the
+group from it:
+
+```zig
+var op = try client.insertGroup("us-central1-a", .{
+    .name = "workers",
+    .template = .{ .global = "worker-tpl" },
+    .target_size = 3,
+}, .{});
+defer op.deinit();
+var done = try client.waitOperation(op.value.ref(), .{});
+defer done.deinit();
+var group = try client.waitGroupStable("us-central1-a", "workers", .{});
+defer group.deinit();
+```
+
+**A group's operation is not its VMs.** Production answered a group's
+insert DONE in 7 s while its two VMs were still being made; they were
+RUNNING and doing nothing 30 s later, when the group read stable. A
+resize was DONE in 1 s while the VM it dropped took 37 s more to go.
+`waitGroupStable` reads the group every few seconds until it is stable
+(every VM there, doing nothing, as many as its target) or a deadline,
+and answers it as it stands. `listManagedInstances` lists its VMs, each
+with its status and what the group is doing to it: a VM still being
+made has no status yet.
+
+A group's VMs are named `<base>-<four letters and digits>`;
+`createGroupInstances` makes VMs under names of your choosing, and
+`deleteGroupInstances` deletes VMs by name, the target size moving with
+each. `deleteGroup` deletes the group and its VMs: DONE 80 s later.
+
+What a group refuses, in its insert's operation, which ends failed
+UNSUPPORTED_OPERATION and makes no group: a template whose spot VMs
+DELETE ("Spot virtual machines with termination action set to DELETE
+cannot be used with Managed Instance Groups."), or have a run limit
+("...with set termination time..."). Give a group's template
+`.termination_action = .stop` and no run limit; such a template makes a
+single VM with `insertFromTemplate` all the same. A template a group
+uses is taken for deletion and its operation fails,
+RESOURCE_IN_USE_BY_ANOTHER_RESOURCE: delete the group first.
+
+Templates are global (`region` null) or regional; a global template
+names a subnetwork by its path. Regional groups are not in this module
+yet.
 
 ## Previews and request ids
 
@@ -373,6 +429,15 @@ one in use and a detach of a device the VM lacks fail in their
 operations as production's did, and a VM deleted frees its disks and
 deletes those that auto-delete. A scheduling change to a running VM
 with no run limit was not measured, and answers 501.
+
+Templates and groups work on it as on production: a group makes real
+VMs of the zone from its template, each CREATING until
+`Options.group_steps` reads of the group (two by default) have passed,
+then RUNNING; a VM it drops goes the same way; its operations finish on
+their waits, before its VMs, as production's did. A template of spot
+VMs that DELETE or have a run limit fails a group's insert in its
+operation, and a template a group uses fails its delete, each in
+production's words. `finishOperations` settles every group too.
 
 <!-- snippet: tests/docs_examples.zig#compute-fake -->
 ```zig

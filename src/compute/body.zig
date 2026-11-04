@@ -28,6 +28,86 @@ pub fn nameOnly(arena: Allocator, name: []const u8) Allocator.Error![]const u8 {
     return Stringify.valueAlloc(arena, .{ .name = name }, .{});
 }
 
+/// `instanceTemplates.insert`'s body: the template named `spec.name`, its
+/// properties the spec's fields, written as milestone 0's template was:
+/// the machine and disk types bare names, the subnetwork in `region` for
+/// a regional template.
+pub fn template(arena: Allocator, region: ?[]const u8, spec: types.InstanceSpec) Allocator.Error![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeTemplate(&jw, arena, region, spec) catch return error.OutOfMemory;
+    return out.written();
+}
+
+fn writeTemplate(jw: *Stringify, arena: Allocator, region: ?[]const u8, spec: types.InstanceSpec) !void {
+    try jw.beginObject();
+    try jw.objectField("name");
+    try jw.write(spec.name);
+    if (spec.description) |d| {
+        try jw.objectField("description");
+        try jw.write(d);
+    }
+    try jw.objectField("properties");
+    try jw.beginObject();
+    try writeFields(jw, arena, .{ .template = region }, spec);
+    try jw.endObject();
+    try jw.endObject();
+}
+
+/// `instanceGroupManagers.insert`'s body, in milestone 0's order.
+pub fn group(arena: Allocator, project: []const u8, spec: types.GroupSpec) Allocator.Error![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeGroup(&jw, try templatePath(arena, project, spec.template), spec) catch return error.OutOfMemory;
+    return out.written();
+}
+
+fn writeGroup(jw: *Stringify, template_path: []const u8, spec: types.GroupSpec) !void {
+    try jw.beginObject();
+    try jw.objectField("name");
+    try jw.write(spec.name);
+    if (spec.description) |d| {
+        try jw.objectField("description");
+        try jw.write(d);
+    }
+    try jw.objectField("baseInstanceName");
+    try jw.write(spec.base_instance_name orelse spec.name);
+    try jw.objectField("instanceTemplate");
+    try jw.write(template_path);
+    try jw.objectField("targetSize");
+    try jw.write(spec.target_size);
+    try jw.endObject();
+}
+
+/// `createInstances`' body: each VM by name.
+pub fn createInstances(arena: Allocator, names: []const []const u8) Allocator.Error![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeNamed(&jw, names) catch return error.OutOfMemory;
+    return out.written();
+}
+
+fn writeNamed(jw: *Stringify, names: []const []const u8) !void {
+    try jw.beginObject();
+    try jw.objectField("instances");
+    try jw.beginArray();
+    for (names) |n| try jw.write(.{ .name = n });
+    try jw.endArray();
+    try jw.endObject();
+}
+
+/// `deleteInstances`' body: each VM by its path in `zone`.
+pub fn deleteInstances(arena: Allocator, zone: []const u8, names: []const []const u8) Allocator.Error![]const u8 {
+    const paths = try arena.alloc([]const u8, names.len);
+    for (names, paths) |n, *p| p.* = try std.fmt.allocPrint(arena, "zones/{s}/instances/{s}", .{ zone, n });
+    return Stringify.valueAlloc(arena, .{ .instances = paths }, .{});
+}
+
+/// Where an instance's fields go: a VM in a zone, whose paths name the
+/// zone, or a template, whose machine and disk types are bare names and
+/// whose subnetwork names its region when it has one.
+const Place = union(enum) { zone: []const u8, template: ?[]const u8 };
+
 fn writeInstance(jw: *Stringify, arena: Allocator, zone: []const u8, spec: types.InstanceSpec) !void {
     try jw.beginObject();
     try jw.objectField("name");
@@ -36,8 +116,21 @@ fn writeInstance(jw: *Stringify, arena: Allocator, zone: []const u8, spec: types
         try jw.objectField("description");
         try jw.write(d);
     }
+    try writeFields(jw, arena, .{ .zone = zone }, spec);
+    if (spec.deletion_protection) {
+        try jw.objectField("deletionProtection");
+        try jw.write(true);
+    }
+    try jw.endObject();
+}
+
+/// Everything an instance and a template's properties share.
+fn writeFields(jw: *Stringify, arena: Allocator, place: Place, spec: types.InstanceSpec) !void {
     try jw.objectField("machineType");
-    try jw.print("\"zones/{s}/machineTypes/{s}\"", .{ zone, spec.machine_type });
+    switch (place) {
+        .zone => |zone| try jw.print("\"zones/{s}/machineTypes/{s}\"", .{ zone, spec.machine_type }),
+        .template => try jw.write(spec.machine_type),
+    }
     if (spec.labels.len > 0) {
         try jw.objectField("labels");
         try jw.beginObject();
@@ -51,8 +144,8 @@ fn writeInstance(jw: *Stringify, arena: Allocator, zone: []const u8, spec: types
         try jw.objectField("tags");
         try jw.write(.{ .items = spec.tags });
     }
-    try writeDisks(jw, arena, zone, spec);
-    try writeInterfaces(jw, arena, zone, spec);
+    try writeDisks(jw, arena, place, spec);
+    try writeInterfaces(jw, arena, place, spec);
     if (spec.metadata.len > 0) {
         try jw.objectField("metadata");
         try jw.beginObject();
@@ -77,14 +170,9 @@ fn writeInstance(jw: *Stringify, arena: Allocator, zone: []const u8, spec: types
         try jw.write(.{.{ .email = account.email, .scopes = scopes }});
     }
     try writeScheduling(jw, spec);
-    if (spec.deletion_protection) {
-        try jw.objectField("deletionProtection");
-        try jw.write(true);
-    }
-    try jw.endObject();
 }
 
-fn writeDisks(jw: *Stringify, arena: Allocator, zone: []const u8, spec: types.InstanceSpec) !void {
+fn writeDisks(jw: *Stringify, arena: Allocator, place: Place, spec: types.InstanceSpec) !void {
     try jw.objectField("disks");
     try jw.beginArray();
     try jw.beginObject();
@@ -102,14 +190,17 @@ fn writeDisks(jw: *Stringify, arena: Allocator, zone: []const u8, spec: types.In
     }
     if (spec.boot_disk.type) |t| {
         try jw.objectField("diskType");
-        try jw.write(try zonal(arena, zone, "diskTypes", t));
+        try jw.write(switch (place) {
+            .zone => |zone| try zonal(arena, zone, "diskTypes", t),
+            .template => t,
+        });
     }
     try jw.endObject();
     try jw.endObject();
     try jw.endArray();
 }
 
-fn writeInterfaces(jw: *Stringify, arena: Allocator, zone: []const u8, spec: types.InstanceSpec) !void {
+fn writeInterfaces(jw: *Stringify, arena: Allocator, place: Place, spec: types.InstanceSpec) !void {
     try jw.objectField("networkInterfaces");
     try jw.beginArray();
     try jw.beginObject();
@@ -117,7 +208,10 @@ fn writeInterfaces(jw: *Stringify, arena: Allocator, zone: []const u8, spec: typ
     try jw.write(try global(arena, "networks", spec.network));
     if (spec.subnetwork) |s| {
         try jw.objectField("subnetwork");
-        try jw.write(try regional(arena, zone, "subnetworks", s));
+        try jw.write(switch (place) {
+            .zone => |zone| try regional(arena, regionOf(zone), "subnetworks", s),
+            .template => |region| if (region) |r| try regional(arena, r, "subnetworks", s) else s,
+        });
     }
     if (spec.external_ip) {
         try jw.objectField("accessConfigs");
@@ -314,11 +408,10 @@ fn global(arena: Allocator, comptime kind: []const u8, name: []const u8) Allocat
     return std.fmt.allocPrint(arena, "global/" ++ kind ++ "/{s}", .{name});
 }
 
-/// A name becomes `regions/R/<kind>/<name>`, R the zone's region; a path
-/// or URL is kept.
-fn regional(arena: Allocator, zone: []const u8, comptime kind: []const u8, name: []const u8) Allocator.Error![]const u8 {
+/// A name becomes `regions/R/<kind>/<name>`; a path or URL is kept.
+fn regional(arena: Allocator, region: []const u8, comptime kind: []const u8, name: []const u8) Allocator.Error![]const u8 {
     if (std.mem.indexOfScalar(u8, name, '/') != null) return name;
-    return std.fmt.allocPrint(arena, "regions/{s}/" ++ kind ++ "/{s}", .{ regionOf(zone), name });
+    return std.fmt.allocPrint(arena, "regions/{s}/" ++ kind ++ "/{s}", .{ region, name });
 }
 
 /// `us-central1` from `us-central1-a`.
@@ -404,6 +497,49 @@ test "the changes' bodies, in milestone 0's order" {
     try testing.expectEqualStrings(
         \\{"source":"projects/p/regions/us-central1/disks/shared","mode":"READ_ONLY","autoDelete":true}
     , try attach(a, "us-central1-a", .{ .disk = "projects/p/regions/us-central1/disks/shared", .read_only = true, .auto_delete = true }));
+}
+
+test "template: milestone 0's, its properties as an instance's with bare types" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const spec: types.InstanceSpec = .{
+        .name = "zigps-m0d-11031901-tpl",
+        .machine_type = "e2-micro",
+        .image = .{ .family = .{ .project = "debian-cloud", .name = "debian-12" } },
+        .boot_disk = .{ .size_gb = 10, .type = "pd-standard" },
+        .spot = true,
+        .termination_action = .stop,
+        .labels = &.{ .{ .key = "purpose", .value = "gcp-zig-test" }, .{ .key = "tool", .value = "compute-m0" } },
+    };
+    try testing.expectEqualStrings(
+        \\{"name":"zigps-m0d-11031901-tpl","properties":{"machineType":"e2-micro","labels":{"purpose":"gcp-zig-test","tool":"compute-m0"},"disks":[{"boot":true,"autoDelete":true,"initializeParams":{"sourceImage":"projects/debian-cloud/global/images/family/debian-12","diskSizeGb":"10","diskType":"pd-standard"}}],"networkInterfaces":[{"network":"global/networks/default"}],"scheduling":{"automaticRestart":false,"instanceTerminationAction":"STOP","provisioningModel":"SPOT"}}}
+    , try template(a, null, spec));
+    var regional_spec = spec;
+    regional_spec.subnetwork = "apps";
+    regional_spec.deletion_protection = true;
+    const got = try template(a, "europe-west1", regional_spec);
+    try testing.expect(std.mem.indexOf(u8, got, "\"subnetwork\":\"regions/europe-west1/subnetworks/apps\"") != null);
+    // A template's properties take no deletion protection.
+    try testing.expect(std.mem.indexOf(u8, got, "deletionProtection") == null);
+}
+
+test "group bodies, in milestone 0's order" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        \\{"name":"zigps-m0d-11031901-g","baseInstanceName":"zigps-m0d-11031901-g-i","instanceTemplate":"projects/extractctl/global/instanceTemplates/zigps-m0d-11031901-tpl","targetSize":2}
+    , try group(a, "extractctl", .{ .name = "zigps-m0d-11031901-g", .base_instance_name = "zigps-m0d-11031901-g-i", .template = .{ .global = "zigps-m0d-11031901-tpl" }, .target_size = 2 }));
+    try testing.expectEqualStrings(
+        \\{"name":"web","description":"the web tier","baseInstanceName":"web","instanceTemplate":"projects/p/regions/us-east1/instanceTemplates/t","targetSize":0}
+    , try group(a, "p", .{ .name = "web", .description = "the web tier", .template = .{ .regional = .{ .region = "us-east1", .name = "t" } }, .target_size = 0 }));
+    try testing.expectEqualStrings(
+        \\{"instances":[{"name":"zigps-m0d-11031901-g-named"}]}
+    , try createInstances(a, &.{"zigps-m0d-11031901-g-named"}));
+    try testing.expectEqualStrings(
+        \\{"instances":["zones/us-central1-a/instances/web-abcd","zones/us-central1-a/instances/web-efgh"]}
+    , try deleteInstances(a, "us-central1-a", &.{ "web-abcd", "web-efgh" }));
 }
 
 test "paths: images, templates, regions" {

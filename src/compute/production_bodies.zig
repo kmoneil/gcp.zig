@@ -2857,3 +2857,429 @@ pub const scheduling_spot_not_preemptible =
     \\ }
     \\}
 ;
+
+/// A global template of spot e2-micro VMs that STOP, no run limit: what a group can use. GET template. HTTP 200.
+pub const template_status = 200;
+pub const template =
+    \\{
+    \\ "kind": "compute#instanceTemplate",
+    \\ "id": "2741556500840812922",
+    \\ "creationTimestamp": "2026-11-03T11:01:41.353-08:00",
+    \\ "name": "zigps-m0d-11031901-tpl",
+    \\ "description": "",
+    \\ "properties": {
+    \\  "machineType": "e2-micro",
+    \\  "networkInterfaces": [
+    \\   {
+    \\    "kind": "compute#networkInterface",
+    \\    "network": "https://www.googleapis.com/compute/v1/projects/extractctl/global/networks/default",
+    \\    "name": "nic0"
+    \\   }
+    \\  ],
+    \\  "disks": [
+    \\   {
+    \\    "kind": "compute#attachedDisk",
+    \\    "type": "PERSISTENT",
+    \\    "mode": "READ_WRITE",
+    \\    "deviceName": "persistent-disk-0",
+    \\    "index": 0,
+    \\    "boot": true,
+    \\    "initializeParams": {
+    \\     "sourceImage": "projects/debian-cloud/global/images/family/debian-12",
+    \\     "diskSizeGb": "10",
+    \\     "diskType": "pd-standard"
+    \\    },
+    \\    "autoDelete": true
+    \\   }
+    \\  ],
+    \\  "metadata": {
+    \\   "kind": "compute#metadata",
+    \\   "fingerprint": "inPgXPhJXaM=",
+    \\   "items": [
+    \\    {
+    \\     "key": "startup-script",
+    \\     "value": "#!/bin/bash\n# zigps m0: a guest attribute, then enough serial output for more than one page.\ncurl -s -X PUT --data \"ready\" -H \"Metadata-Flavor: Google\" \\\n  \"http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/zigps/probe\"\nfor i in $(seq 1 30000); do printf 'zigps-m0 serial line %05d %060d\\n' \"$i\" 0; done > /dev/ttyS0\necho \"zigps-m0 serial done\" > /dev/ttyS0\n"
+    \\    },
+    \\    {
+    \\     "key": "enable-guest-attributes",
+    \\     "value": "TRUE"
+    \\    }
+    \\   ]
+    \\  },
+    \\  "scheduling": {
+    \\   "onHostMaintenance": "TERMINATE",
+    \\   "automaticRestart": false,
+    \\   "preemptible": true,
+    \\   "provisioningModel": "SPOT",
+    \\   "instanceTerminationAction": "STOP"
+    \\  },
+    \\  "labels": {
+    \\   "purpose": "gcp-zig-test",
+    \\   "tool": "compute-m0"
+    \\  }
+    \\ },
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/global/instanceTemplates/zigps-m0d-11031901-tpl"
+    \\}
+;
+
+/// A template insert of a name taken. HTTP 409.
+pub const template_taken_status = 409;
+pub const template_taken =
+    \\{
+    \\ "error": {
+    \\  "code": 409,
+    \\  "message": "The resource 'projects/extractctl/global/instanceTemplates/zigps-m0d-11031901-tpl' already exists",
+    \\  "errors": [
+    \\   {
+    \\    "message": "The resource 'projects/extractctl/global/instanceTemplates/zigps-m0d-11031901-tpl' already exists",
+    \\    "domain": "global",
+    \\    "reason": "alreadyExists"
+    \\   }
+    \\  ]
+    \\ }
+    \\}
+;
+
+/// A group insert's operation as the call answered it: RUNNING. HTTP 200.
+pub const operation_group_insert_status = 200;
+pub const operation_group_insert =
+    \\{
+    \\ "kind": "compute#operation",
+    \\ "id": "2372726781297267063",
+    \\ "name": "operation-1793732503163-65f63e4ac5320-b135fe1f-4f32db4f",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "clientOperationId": "fe23b0c0-a091-40ad-9b39-f69e6e7d5ec1",
+    \\ "operationType": "compute.instanceGroupManagers.insert",
+    \\ "targetLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instanceGroupManagers/zigps-m0d-11031901-g",
+    \\ "targetId": "4679602103080423799",
+    \\ "status": "RUNNING",
+    \\ "user": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\ "progress": 0,
+    \\ "insertTime": "2026-11-03T11:01:44.656-08:00",
+    \\ "startTime": "2026-11-03T11:01:44.664-08:00",
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/operations/operation-1793732503163-65f63e4ac5320-b135fe1f-4f32db4f"
+    \\}
+;
+
+/// A new group's VMs at its first read: CREATING, no instanceStatus yet. HTTP 200.
+pub const group_instances_creating_status = 200;
+pub const group_instances_creating =
+    \\{
+    \\ "managedInstances": [
+    \\  {
+    \\   "name": "zigps-m0d-11031901-g-i-940j",
+    \\   "instance": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m0d-11031901-g-i-940j",
+    \\   "targetStatus": "RUNNING",
+    \\   "version": {
+    \\    "instanceTemplate": "https://www.googleapis.com/compute/v1/projects/extractctl/global/instanceTemplates/zigps-m0d-11031901-tpl"
+    \\   },
+    \\   "currentAction": "CREATING"
+    \\  },
+    \\  {
+    \\   "name": "zigps-m0d-11031901-g-i-vprl",
+    \\   "instance": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m0d-11031901-g-i-vprl",
+    \\   "targetStatus": "RUNNING",
+    \\   "version": {
+    \\    "instanceTemplate": "https://www.googleapis.com/compute/v1/projects/extractctl/global/instanceTemplates/zigps-m0d-11031901-tpl"
+    \\   },
+    \\   "currentAction": "CREATING"
+    \\  }
+    \\ ]
+    \\}
+;
+
+/// The group's VMs about 30 s later: RUNNING, doing nothing. HTTP 200.
+pub const group_instances_stable_status = 200;
+pub const group_instances_stable =
+    \\{
+    \\ "managedInstances": [
+    \\  {
+    \\   "name": "zigps-m0d-11031901-g-i-940j",
+    \\   "instance": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m0d-11031901-g-i-940j",
+    \\   "id": "8137573478175314255",
+    \\   "instanceStatus": "RUNNING",
+    \\   "targetStatus": "RUNNING",
+    \\   "version": {
+    \\    "instanceTemplate": "https://www.googleapis.com/compute/v1/projects/extractctl/global/instanceTemplates/zigps-m0d-11031901-tpl"
+    \\   },
+    \\   "currentAction": "NONE"
+    \\  },
+    \\  {
+    \\   "name": "zigps-m0d-11031901-g-i-vprl",
+    \\   "instance": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m0d-11031901-g-i-vprl",
+    \\   "id": "6932497786261180751",
+    \\   "instanceStatus": "RUNNING",
+    \\   "targetStatus": "RUNNING",
+    \\   "version": {
+    \\    "instanceTemplate": "https://www.googleapis.com/compute/v1/projects/extractctl/global/instanceTemplates/zigps-m0d-11031901-tpl"
+    \\   },
+    \\   "currentAction": "NONE"
+    \\  }
+    \\ ]
+    \\}
+;
+
+/// The group, stable: two VMs, none doing anything. GET group. HTTP 200.
+pub const group_stable_status = 200;
+pub const group_stable =
+    \\{
+    \\ "kind": "compute#instanceGroupManager",
+    \\ "id": "4679602103080423799",
+    \\ "creationTimestamp": "2026-11-03T11:01:44.622-08:00",
+    \\ "name": "zigps-m0d-11031901-g",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "instanceTemplate": "https://www.googleapis.com/compute/v1/projects/extractctl/global/instanceTemplates/zigps-m0d-11031901-tpl",
+    \\ "versions": [
+    \\  {
+    \\   "instanceTemplate": "https://www.googleapis.com/compute/v1/projects/extractctl/global/instanceTemplates/zigps-m0d-11031901-tpl",
+    \\   "targetSize": {
+    \\    "calculated": 2
+    \\   }
+    \\  }
+    \\ ],
+    \\ "instanceGroup": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instanceGroups/zigps-m0d-11031901-g",
+    \\ "baseInstanceName": "zigps-m0d-11031901-g-i",
+    \\ "fingerprint": "UTi0tLYL7w8=",
+    \\ "currentActions": {
+    \\  "none": 2,
+    \\  "creating": 0,
+    \\  "creatingWithoutRetries": 0,
+    \\  "verifying": 0,
+    \\  "recreating": 0,
+    \\  "deleting": 0,
+    \\  "abandoning": 0,
+    \\  "restarting": 0,
+    \\  "refreshing": 0,
+    \\  "suspending": 0,
+    \\  "resuming": 0,
+    \\  "stopping": 0,
+    \\  "starting": 0
+    \\ },
+    \\ "status": {
+    \\  "isStable": true,
+    \\  "allInstancesConfig": {
+    \\   "effective": true
+    \\  },
+    \\  "versionTarget": {
+    \\   "isReached": true
+    \\  },
+    \\  "stateful": {
+    \\   "hasStatefulConfig": false,
+    \\   "perInstanceConfigs": {
+    \\    "allEffective": true
+    \\   }
+    \\  }
+    \\ },
+    \\ "targetSize": 2,
+    \\ "targetSizePolicy": {
+    \\  "mode": "INDIVIDUAL"
+    \\ },
+    \\ "targetStoppedSize": 0,
+    \\ "targetSuspendedSize": 0,
+    \\ "listManagedInstancesResults": "PAGELESS",
+    \\ "standbyPolicy": {
+    \\  "mode": "MANUAL"
+    \\ },
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instanceGroupManagers/zigps-m0d-11031901-g",
+    \\ "updatePolicy": {
+    \\  "type": "OPPORTUNISTIC",
+    \\  "minimalAction": "REPLACE",
+    \\  "maxSurge": {
+    \\   "fixed": 1,
+    \\   "calculated": 1
+    \\  },
+    \\  "maxUnavailable": {
+    \\   "fixed": 1,
+    \\   "calculated": 1
+    \\  },
+    \\  "replacementMethod": "SUBSTITUTE"
+    \\ },
+    \\ "instanceLifecyclePolicy": {
+    \\  "forceUpdateOnRepair": "NO",
+    \\  "defaultActionOnFailure": "REPAIR",
+    \\  "onFailedHealthCheck": "DEFAULT_ACTION"
+    \\ },
+    \\ "satisfiesPzi": true,
+    \\ "satisfiesPzs": true
+    \\}
+;
+
+/// A resize's operation as the call answered it: RUNNING. HTTP 200.
+pub const operation_group_resize_status = 200;
+pub const operation_group_resize =
+    \\{
+    \\ "kind": "compute#operation",
+    \\ "id": "8679147246220448045",
+    \\ "name": "operation-1793732545924-65f63e738ce19-d4de9b82-6f8e7a9e",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "clientOperationId": "422b1bc9-7210-49d7-88d5-8a183431d976",
+    \\ "operationType": "compute.instanceGroupManagers.resize",
+    \\ "targetLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instanceGroupManagers/zigps-m0d-11031901-g",
+    \\ "targetId": "4679602103080423799",
+    \\ "status": "RUNNING",
+    \\ "user": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\ "progress": 0,
+    \\ "insertTime": "2026-11-03T11:02:26.059-08:00",
+    \\ "startTime": "2026-11-03T11:02:26.061-08:00",
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/operations/operation-1793732545924-65f63e738ce19-d4de9b82-6f8e7a9e"
+    \\}
+;
+
+/// After createInstances of one by name: it CREATING with no instanceStatus, the other RUNNING. HTTP 200.
+pub const group_instances_named_status = 200;
+pub const group_instances_named =
+    \\{
+    \\ "managedInstances": [
+    \\  {
+    \\   "name": "zigps-m0d-11031901-g-i-940j",
+    \\   "instance": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m0d-11031901-g-i-940j",
+    \\   "id": "8137573478175314255",
+    \\   "instanceStatus": "RUNNING",
+    \\   "targetStatus": "RUNNING",
+    \\   "version": {
+    \\    "instanceTemplate": "https://www.googleapis.com/compute/v1/projects/extractctl/global/instanceTemplates/zigps-m0d-11031901-tpl"
+    \\   },
+    \\   "currentAction": "NONE"
+    \\  },
+    \\  {
+    \\   "name": "zigps-m0d-11031901-g-named",
+    \\   "instance": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instances/zigps-m0d-11031901-g-named",
+    \\   "targetStatus": "RUNNING",
+    \\   "version": {
+    \\    "instanceTemplate": "https://www.googleapis.com/compute/v1/projects/extractctl/global/instanceTemplates/zigps-m0d-11031901-tpl"
+    \\   },
+    \\   "currentAction": "CREATING"
+    \\  }
+    \\ ]
+    \\}
+;
+
+/// A delete of a template a group uses: the call taken, its operation DONE with RESOURCE_IN_USE_BY_ANOTHER_RESOURCE. HTTP 200.
+pub const operation_template_in_use_status = 200;
+pub const operation_template_in_use =
+    \\{
+    \\ "kind": "compute#operation",
+    \\ "id": "7934919883014770991",
+    \\ "name": "operation-1793732543958-65f63e71accc7-454a6749-ac1a1340",
+    \\ "clientOperationId": "d7b9bf22-d430-4f9c-9a98-20878866cb28",
+    \\ "operationType": "delete",
+    \\ "targetLink": "https://www.googleapis.com/compute/v1/projects/extractctl/global/instanceTemplates/zigps-m0d-11031901-tpl",
+    \\ "targetId": "2741556500840812922",
+    \\ "status": "DONE",
+    \\ "user": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\ "progress": 100,
+    \\ "insertTime": "2026-11-03T11:02:24.070-08:00",
+    \\ "startTime": "2026-11-03T11:02:24.085-08:00",
+    \\ "endTime": "2026-11-03T11:02:25.458-08:00",
+    \\ "error": {
+    \\  "errors": [
+    \\   {
+    \\    "code": "RESOURCE_IN_USE_BY_ANOTHER_RESOURCE",
+    \\    "message": "The instance_template resource 'projects/extractctl/global/instanceTemplates/zigps-m0d-11031901-tpl' is already being used by 'projects/extractctl/zones/us-central1-a/instanceGroupManagers/zigps-m0d-11031901-g@4679602103080423799'"
+    \\   }
+    \\  ]
+    \\ },
+    \\ "httpErrorStatusCode": 400,
+    \\ "httpErrorMessage": "BAD REQUEST",
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/global/operations/operation-1793732543958-65f63e71accc7-454a6749-ac1a1340"
+    \\}
+;
+
+/// A group insert from a template of spot VMs that DELETE: its operation DONE with UNSUPPORTED_OPERATION. HTTP 200.
+pub const operation_group_spot_delete_status = 200;
+pub const operation_group_spot_delete =
+    \\{
+    \\ "kind": "compute#operation",
+    \\ "id": "4634665960501384117",
+    \\ "name": "operation-1793731929893-65f63c280ea49-f9954f42-0dd0512a",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "clientOperationId": "ddcd3504-cb8a-4649-bc59-419f062300b7",
+    \\ "operationType": "compute.instanceGroupManagers.insert",
+    \\ "targetLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instanceGroupManagers/zigps-m0-11031830-g",
+    \\ "targetId": "4085587896747660213",
+    \\ "status": "DONE",
+    \\ "user": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\ "progress": 100,
+    \\ "insertTime": "2026-11-03T10:52:10.855-08:00",
+    \\ "startTime": "2026-11-03T10:52:10.865-08:00",
+    \\ "endTime": "2026-11-03T10:52:12.257-08:00",
+    \\ "error": {
+    \\  "errors": [
+    \\   {
+    \\    "code": "UNSUPPORTED_OPERATION",
+    \\    "message": "Spot virtual machines with termination action set to DELETE cannot be used with Managed Instance Groups."
+    \\   }
+    \\  ]
+    \\ },
+    \\ "httpErrorStatusCode": 400,
+    \\ "httpErrorMessage": "BAD REQUEST",
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/operations/operation-1793731929893-65f63c280ea49-f9954f42-0dd0512a"
+    \\}
+;
+
+/// A group insert from a template of spot VMs with a run limit: its operation DONE with UNSUPPORTED_OPERATION. HTTP 200.
+pub const operation_group_spot_limit_status = 200;
+pub const operation_group_spot_limit =
+    \\{
+    \\ "kind": "compute#operation",
+    \\ "id": "3469411684937339261",
+    \\ "name": "operation-1793732497287-65f63e452aa8d-6459e964-401a437f",
+    \\ "zone": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a",
+    \\ "clientOperationId": "c64c8760-fb53-419a-8b82-3d1b0ef09a36",
+    \\ "operationType": "compute.instanceGroupManagers.insert",
+    \\ "targetLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/instanceGroupManagers/zigps-m0d-11031901-g-limit",
+    \\ "targetId": "264025171856691581",
+    \\ "status": "DONE",
+    \\ "user": "zig-gcp@extractctl.iam.gserviceaccount.com",
+    \\ "progress": 100,
+    \\ "insertTime": "2026-11-03T11:01:38.877-08:00",
+    \\ "startTime": "2026-11-03T11:01:38.885-08:00",
+    \\ "endTime": "2026-11-03T11:01:40.905-08:00",
+    \\ "error": {
+    \\  "errors": [
+    \\   {
+    \\    "code": "UNSUPPORTED_OPERATION",
+    \\    "message": "Spot virtual machines with set termination time cannot be used with Managed Instance Groups."
+    \\   }
+    \\  ]
+    \\ },
+    \\ "httpErrorStatusCode": 400,
+    \\ "httpErrorMessage": "BAD REQUEST",
+    \\ "selfLink": "https://www.googleapis.com/compute/v1/projects/extractctl/zones/us-central1-a/operations/operation-1793732497287-65f63e452aa8d-6459e964-401a437f"
+    \\}
+;
+
+/// deleteInstances with an empty instance URL. HTTP 400.
+pub const delete_instances_malformed_status = 400;
+pub const delete_instances_malformed =
+    \\{
+    \\ "error": {
+    \\  "code": 400,
+    \\  "message": "Invalid value for field 'instances[0]': ''. The URL is malformed.",
+    \\  "errors": [
+    \\   {
+    \\    "message": "Invalid value for field 'instances[0]': ''. The URL is malformed.",
+    \\    "domain": "global",
+    \\    "reason": "invalid"
+    \\   }
+    \\  ],
+    \\  "details": [
+    \\   {
+    \\    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+    \\    "reason": "INVALID_FIELD_VALUE",
+    \\    "domain": "compute.googleapis.com",
+    \\    "metadata": {
+    \\     "field": "instances[0]",
+    \\     "value": "",
+    \\     "reason": "The URL is malformed."
+    \\    }
+    \\   },
+    \\   {
+    \\    "@type": "type.googleapis.com/google.rpc.LocalizedMessage",
+    \\    "locale": "en-US",
+    \\    "message": "Invalid value for field 'instances[0]': ''. The URL is malformed."
+    \\   }
+    \\  ]
+    \\ }
+    \\}
+;

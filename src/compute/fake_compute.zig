@@ -22,8 +22,8 @@
 //!   Start, stop, suspend, resume, reset and delete move a VM the same
 //!   way, through STAGING, STOPPING or SUSPENDING to RUNNING, TERMINATED,
 //!   SUSPENDED or gone, in the states production took each from:
-//!   starting a running VM is an operation DONE at once, stopping a
-//!   stopped one an operation like any other (measured). A write from a
+//!   starting or resuming a running VM is an operation DONE at once,
+//!   stopping a stopped one an operation like any other (measured). A write from a
 //!   state production was not measured in (suspending a stopped VM, say)
 //!   is 501. `finishOperations` finishes everything still running.
 //! - A write with a `requestId` already seen answers that write's
@@ -89,10 +89,24 @@
 //! - Faults a test asks for: refusals, dropped connections, and a lost
 //!   answer.
 //!
-//! Not modelled, answered 501 with the reason: templates and groups
-//! beyond an insert from one (the module's next milestone), detaching a
-//! boot disk, a filter on another field, a page token the fake did not
-//! make, serial port 0, and another project's paths but for images.
+//! - Templates and zonal managed groups (measured 2026-11-03). Templates,
+//!   global or regional, listed, read, made and deleted; one a group uses
+//!   is taken for deletion and its operation fails,
+//!   RESOURCE_IN_USE_BY_ANOTHER_RESOURCE. A group makes its VMs from its
+//!   template, real VMs of the zone, each CREATING until `Options.group_steps`
+//!   reads of the group (a get, or a list of its VMs) have passed, then
+//!   RUNNING and doing nothing; a VM it deletes goes the same way. Its
+//!   operations finish on their waits as any write's, well before its VMs,
+//!   as production's did. A template whose spot VMs DELETE, or have a run
+//!   limit, fails a group's insert in its operation, in production's
+//!   words, and no group is made. Resizing, and making or deleting VMs by
+//!   name, move the target size; deleting the group takes its VMs when its
+//!   operation finishes. `finishOperations` settles every group too.
+//!
+//! Not modelled, answered 501 with the reason: detaching a boot disk, a
+//! filter on another field, a page token the fake did not make, serial
+//! port 0, a group's VM made under a name taken or deleted when the group
+//! lacks it, and another project's paths but for images.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -128,9 +142,10 @@ pub const FakeCompute = struct {
     request_ids: std.StringHashMapUnmanaged(*FakeOperation) = .empty,
     /// Zones out of room.
     stockouts: std.StringHashMapUnmanaged(void) = .empty,
-    /// By "global/<name>" or "regions/<region>/<name>"; a template's zone
-    /// and status are unused.
-    templates: std.StringHashMapUnmanaged(PutInstance) = .empty,
+    /// By "global/<name>" or "regions/<region>/<name>".
+    templates: std.StringArrayHashMapUnmanaged(*FakeTemplate) = .empty,
+    /// By "<zone>/<name>".
+    groups: std.StringArrayHashMapUnmanaged(*FakeGroup) = .empty,
     /// By "<zone>/<name>", the VMs' boot disks among them.
     disks: std.StringArrayHashMapUnmanaged(FakeDisk) = .empty,
     counter: u64 = 0,
@@ -157,6 +172,10 @@ pub const FakeCompute = struct {
         /// How many `wait` calls a write's operation takes to finish, as
         /// `PutOperation.waits_to_finish` counts them.
         write_waits: u32 = 1,
+        /// How many reads of a group (get, or a list of its VMs) a VM it
+        /// makes takes to be RUNNING, or one it deletes to go: production's
+        /// took 30 to 40 s (measured).
+        group_steps: u32 = 2,
     };
 
     /// As production listed them on 2026-11-03.
@@ -260,6 +279,8 @@ pub const FakeCompute = struct {
         spot: bool = false,
         max_run_duration_s: ?u64 = null,
         termination_action: ?types.TerminationAction = null,
+        description: []const u8 = "",
+        source_image: []const u8 = "projects/debian-cloud/global/images/family/debian-12",
     };
 
     /// A disk a VM can attach.
@@ -283,6 +304,53 @@ pub const FakeCompute = struct {
         auto_delete: bool,
     };
 
+    /// A template as the fake keeps it: what it gives a VM as a
+    /// `PutInstance` (its zone and status unused), and its own fields.
+    const FakeTemplate = struct {
+        put: PutInstance,
+        region: ?[]const u8,
+        id: u64,
+        created: std.Io.Timestamp,
+        description: []const u8,
+        source_image: []const u8,
+        metadata_fingerprint: []const u8,
+
+        /// `projects/<p>/global/instanceTemplates/<n>`, or the region's.
+        fn path(t: *const FakeTemplate, a: Allocator, project: []const u8) Allocator.Error![]const u8 {
+            if (t.region) |r| return std.fmt.allocPrint(a, "projects/{s}/regions/{s}/instanceTemplates/{s}", .{ project, r, t.put.name });
+            return std.fmt.allocPrint(a, "projects/{s}/global/instanceTemplates/{s}", .{ project, t.put.name });
+        }
+    };
+
+    /// A zonal managed group, and the VMs it keeps.
+    const FakeGroup = struct {
+        name: []const u8,
+        zone: []const u8,
+        base: []const u8,
+        /// The template's key in `templates`, and its path.
+        template_key: []const u8,
+        template_path: []const u8,
+        target_size: u32,
+        id: u64,
+        created: std.Io.Timestamp,
+        description: []const u8,
+        fingerprint: []const u8,
+        members: std.ArrayList(Member) = .empty,
+
+        const Member = struct {
+            name: []const u8,
+            action: types.ManagedAction,
+            /// Reads of the group left before what `action` does is done.
+            steps_left: u32,
+        };
+
+        fn stable(g: *const FakeGroup) bool {
+            if (g.members.items.len != g.target_size) return false;
+            for (g.members.items) |m| if (m.action != .none) return false;
+            return true;
+        }
+    };
+
     const FakeImage = struct { put: PutImage, created: std.Io.Timestamp };
 
     const FakeOperation = struct {
@@ -293,10 +361,16 @@ pub const FakeCompute = struct {
         waits_left: u32,
         /// What finishing does to its VM, once.
         effect: Effect = .none,
+        /// What it acts on when that is no VM: `global/instanceTemplates/T`
+        /// or `zones/Z/instanceGroupManagers/G`.
+        target_path: ?[]const u8 = null,
+        /// A group's key, for `.remove_group`.
+        subject: ?[]const u8 = null,
     };
 
-    /// What a write's operation does to its VM when it finishes.
-    const Effect = enum { none, run, terminate, suspend_vm, remove };
+    /// What a write's operation does to its VM, or group, when it
+    /// finishes.
+    const Effect = enum { none, run, terminate, suspend_vm, remove, remove_group };
 
     pub const PutError = Allocator.Error || error{ UnknownZone, AlreadyExists, NotFound };
 
@@ -314,6 +388,8 @@ pub const FakeCompute = struct {
             i.attached.deinit(f.gpa);
         }
         f.disks.deinit(f.gpa);
+        for (f.groups.values()) |g| g.members.deinit(f.gpa);
+        f.groups.deinit(f.gpa);
         f.zones.deinit(f.gpa);
         f.instances.deinit(f.gpa);
         f.machine_types.deinit(f.gpa);
@@ -520,7 +596,7 @@ pub const FakeCompute = struct {
         const s = f.store.allocator();
         const key = if (put.region) |r| try std.fmt.allocPrint(s, "regions/{s}/{s}", .{ r, put.name }) else try std.fmt.allocPrint(s, "global/{s}", .{put.name});
         if (f.templates.contains(key)) return error.AlreadyExists;
-        try f.templates.put(f.gpa, key, try dupeInstance(s, .{
+        try f.addTemplate(key, put.region, put.description, put.source_image, .{
             .zone = "",
             .name = put.name,
             .machine_type = put.machine_type,
@@ -530,7 +606,22 @@ pub const FakeCompute = struct {
             .spot = put.spot,
             .max_run_duration_s = put.max_run_duration_s,
             .termination_action = put.termination_action,
-        }));
+        });
+    }
+
+    fn addTemplate(f: *FakeCompute, key: []const u8, region: ?[]const u8, description: []const u8, source_image: []const u8, put: PutInstance) Allocator.Error!void {
+        const s = f.store.allocator();
+        const t = try s.create(FakeTemplate);
+        t.* = .{
+            .put = try dupeInstance(s, put),
+            .region = if (region) |r| try s.dupe(u8, r) else null,
+            .id = f.next(),
+            .created = std.Io.Clock.real.now(f.io),
+            .description = try s.dupe(u8, description),
+            .source_image = try s.dupe(u8, source_image),
+            .metadata_fingerprint = try f.fingerprint(),
+        };
+        try f.templates.put(f.gpa, try s.dupe(u8, key), t);
     }
 
     /// A disk a VM can attach, in a zone the fake has.
@@ -551,6 +642,10 @@ pub const FakeCompute = struct {
             op.waits_left = 0;
             f.finish(op);
         };
+        for (f.groups.values()) |g| {
+            for (g.members.items) |*m| m.steps_left = @min(m.steps_left, 1);
+            f.advance(g);
+        }
     }
 
     fn instanceFor(f: *FakeCompute, zone: []const u8, name: []const u8) PutError!*FakeInstance {
@@ -656,6 +751,7 @@ pub const FakeCompute = struct {
             return f.image(arena, project, tail["global/images/".len..]);
         }
         if (!std.mem.eql(u8, project, f.options.project_id)) return notModelled(arena, "a project other than the fake's own");
+        if (try f.fleet(req, arena, tail, params)) |reply| return reply;
         const wait = req.method == .POST and std.mem.endsWith(u8, tail, "/wait");
         if (req.method != .GET and !wait) return f.write(req, arena, tail, params);
         if (std.mem.eql(u8, tail, "zones")) return f.listZones(arena, params);
@@ -1040,16 +1136,21 @@ pub const FakeCompute = struct {
     }
 
     fn writeMetadata(jw: *Stringify, i: *FakeInstance) !void {
+        try writeItems(jw, i.put.metadata, i.metadata_fingerprint);
+    }
+
+    /// `metadata`, a VM's or a template's.
+    fn writeItems(jw: *Stringify, items: []const types.MetadataItem, fingerprint_: []const u8) !void {
         try jw.objectField("metadata");
         try jw.beginObject();
         try jw.objectField("kind");
         try jw.write("compute#metadata");
         try jw.objectField("fingerprint");
-        try jw.write(i.metadata_fingerprint);
-        if (i.put.metadata.len > 0) {
+        try jw.write(fingerprint_);
+        if (items.len > 0) {
             try jw.objectField("items");
             try jw.beginArray();
-            for (i.put.metadata) |m| {
+            for (items) |m| {
                 try jw.beginObject();
                 try jw.objectField("key");
                 try jw.write(m.key);
@@ -1068,22 +1169,27 @@ pub const FakeCompute = struct {
     /// in; a standard VM's MIGRATE, and automatic restart unless it was
     /// asked for none; the provisioning model for both.
     fn writeScheduling(jw: *Stringify, i: *FakeInstance) !void {
-        const spot = i.put.spot;
+        try writeSchedulingOf(jw, i.put);
+    }
+
+    /// `scheduling`, a VM's or a template's.
+    fn writeSchedulingOf(jw: *Stringify, put: PutInstance) !void {
+        const spot = put.spot;
         try jw.objectField("scheduling");
         try jw.beginObject();
-        if (i.put.max_run_duration_s) |secs| {
+        if (put.max_run_duration_s) |secs| {
             try jw.objectField("maxRunDuration");
             try jw.print("{{\"seconds\":\"{d}\",\"nanos\":0}}", .{secs});
         }
         try jw.objectField("onHostMaintenance");
-        try jw.write(if (i.put.on_host_maintenance) |m| (if (m == .migrate) "MIGRATE" else "TERMINATE") else if (spot) "TERMINATE" else "MIGRATE");
+        try jw.write(if (put.on_host_maintenance) |m| (if (m == .migrate) "MIGRATE" else "TERMINATE") else if (spot) "TERMINATE" else "MIGRATE");
         try jw.objectField("automaticRestart");
-        try jw.write(i.put.automatic_restart orelse !spot);
+        try jw.write(put.automatic_restart orelse !spot);
         try jw.objectField("preemptible");
         try jw.write(spot);
         try jw.objectField("provisioningModel");
         try jw.write(if (spot) "SPOT" else "STANDARD");
-        if (i.put.termination_action) |action| {
+        if (put.termination_action) |action| {
             try jw.objectField("instanceTerminationAction");
             try jw.write(if (action == .delete) "DELETE" else "STOP");
         }
@@ -1091,17 +1197,21 @@ pub const FakeCompute = struct {
     }
 
     fn writeLabels(jw: *Stringify, i: *FakeInstance) !void {
-        if (i.put.labels.len > 0) {
-            try jw.objectField("labels");
-            try jw.beginObject();
-            for (i.put.labels) |l| {
-                try jw.objectField(l.key);
-                try jw.write(l.value);
-            }
-            try jw.endObject();
-        }
+        try writeLabelMap(jw, i.put.labels);
         try jw.objectField("labelFingerprint");
         try jw.write(i.label_fingerprint);
+    }
+
+    /// `labels`, when there are any.
+    fn writeLabelMap(jw: *Stringify, labels: []const types.Label) !void {
+        if (labels.len == 0) return;
+        try jw.objectField("labels");
+        try jw.beginObject();
+        for (labels) |l| {
+            try jw.objectField(l.key);
+            try jw.write(l.value);
+        }
+        try jw.endObject();
     }
 
     fn serialPort(f: *FakeCompute, arena: Allocator, i: *FakeInstance, params: Params) Allocator.Error!Reply {
@@ -1362,7 +1472,7 @@ pub const FakeCompute = struct {
         else
             return .{ .refused = try notModelled(arena, "a template path the fake does not read") };
         const t = f.templates.get(key) orelse return .{ .refused = try f.notFound(arena, local) };
-        var put = t;
+        var put = t.put;
         put.name = n;
         return .{ .ok = put };
     }
@@ -1386,6 +1496,7 @@ pub const FakeCompute = struct {
         .{ .verb = "stop", .from = &.{ .terminated, .stopped }, .during = null, .effect = .none },
         .{ .verb = "suspend", .from = &.{.running}, .during = .suspending, .effect = .suspend_vm },
         .{ .verb = "resume", .from = &.{.suspended}, .during = .staging, .effect = .run },
+        .{ .verb = "resume", .from = &.{.running}, .during = null, .effect = .none, .at_once = true },
         .{ .verb = "reset", .from = &.{.running}, .during = null, .effect = .none },
     };
 
@@ -1635,34 +1746,72 @@ pub const FakeCompute = struct {
     /// A write's operation on the VM `name`, kept under its `requestId`;
     /// finished at once when `waits` is 0.
     fn addWriteOperation(f: *FakeCompute, zone: []const u8, name: []const u8, operation_type: []const u8, effect: Effect, failure: ?PutOperation.Failure, waits: u32, request_id: ?[]const u8) Allocator.Error!*FakeOperation {
+        return f.addOperation(.{
+            .scope = .{ .zone = zone },
+            .target_instance = name,
+            .operation_type = operation_type,
+            .effect = effect,
+            .failure = failure,
+            .waits = waits,
+            .request_id = request_id,
+        });
+    }
+
+    /// An operation a write starts, in any scope.
+    const NewOperation = struct {
+        scope: types.OperationScope,
+        target_instance: ?[]const u8 = null,
+        target_path: ?[]const u8 = null,
+        operation_type: []const u8,
+        effect: Effect = .none,
+        failure: ?PutOperation.Failure = null,
+        waits: u32,
+        request_id: ?[]const u8,
+        subject: ?[]const u8 = null,
+    };
+
+    /// A write's operation, kept under its `requestId`; finished at once
+    /// when `waits` is 0.
+    fn addOperation(f: *FakeCompute, new: NewOperation) Allocator.Error!*FakeOperation {
         const s = f.store.allocator();
         const op_name = try std.fmt.allocPrint(s, "operation-{d}", .{f.next()});
         const op = try s.create(FakeOperation);
+        const scope: types.OperationScope = switch (new.scope) {
+            .zone => |z| .{ .zone = try s.dupe(u8, z) },
+            .region => |r| .{ .region = try s.dupe(u8, r) },
+            .global => .global,
+        };
         op.* = .{
             .name = op_name,
             .put = .{
-                .scope = .{ .zone = try s.dupe(u8, zone) },
-                .operation_type = try s.dupe(u8, operation_type),
-                .target_instance = try s.dupe(u8, name),
-                .waits_to_finish = waits,
-                .failure = failure,
-                .client_operation_id = try s.dupe(u8, request_id orelse ""),
+                .scope = scope,
+                .operation_type = try s.dupe(u8, new.operation_type),
+                .target_instance = if (new.target_instance) |t| try s.dupe(u8, t) else null,
+                .waits_to_finish = new.waits,
+                .failure = new.failure,
+                .client_operation_id = try s.dupe(u8, new.request_id orelse ""),
             },
             .id = f.next(),
             .inserted = std.Io.Clock.real.now(f.io),
-            .waits_left = waits,
-            .effect = effect,
+            .waits_left = new.waits,
+            .effect = new.effect,
+            .target_path = if (new.target_path) |p| try s.dupe(u8, p) else null,
+            .subject = if (new.subject) |k| try s.dupe(u8, k) else null,
         };
-        try f.operations.put(f.gpa, try std.fmt.allocPrint(s, "zones/{s}/{s}", .{ zone, op_name }), op);
-        if (request_id) |id| try f.request_ids.put(f.gpa, try s.dupe(u8, id), op);
-        if (waits == 0) f.finish(op);
+        try f.operations.put(f.gpa, try std.fmt.allocPrint(s, "{s}/{s}", .{ try scopeKey(s, scope), op_name }), op);
+        if (new.request_id) |id| try f.request_ids.put(f.gpa, try s.dupe(u8, id), op);
+        if (new.waits == 0) f.finish(op);
         return op;
     }
 
-    /// Does what a finished operation does to its VM, once.
+    /// Does what a finished operation does to its VM or group, once.
     fn finish(f: *FakeCompute, op: *FakeOperation) void {
         const effect = op.effect;
         op.effect = .none;
+        if (effect == .remove_group) {
+            if (op.subject) |key| f.removeGroup(key);
+            return;
+        }
         const name = op.put.target_instance orelse return;
         if (effect == .none or op.put.scope != .zone) return;
         const zone = op.put.scope.zone;
@@ -1673,7 +1822,633 @@ pub const FakeCompute = struct {
             .terminate => i.put.status = .terminated,
             .suspend_vm => i.put.status = .suspended,
             .remove => f.removeInstance(i),
+            .remove_group => {},
         }
+    }
+
+    // Fleets.
+
+    /// A template or group path, or null for another: templates under
+    /// `global/` or `regions/<r>/`, groups under `zones/<z>/`.
+    fn fleet(f: *FakeCompute, req: tp.Request, arena: Allocator, tail: []const u8, params: Params) Allocator.Error!?Reply {
+        if (std.mem.cutPrefix(u8, tail, "global/instanceTemplates")) |rest| return try f.templateCall(req, arena, null, rest, params);
+        if (std.mem.cutPrefix(u8, tail, "regions/")) |after| {
+            const slash = std.mem.indexOfScalar(u8, after, '/') orelse return null;
+            const rest = std.mem.cutPrefix(u8, after[slash + 1 ..], "instanceTemplates") orelse return null;
+            return try f.templateCall(req, arena, after[0..slash], rest, params);
+        }
+        const after = std.mem.cutPrefix(u8, tail, "zones/") orelse return null;
+        const slash = std.mem.indexOfScalar(u8, after, '/') orelse return null;
+        const rest = std.mem.cutPrefix(u8, after[slash + 1 ..], "instanceGroupManagers") orelse return null;
+        const zone = after[0..slash];
+        if (!f.zones.contains(zone)) return try unknownZone(arena, zone);
+        return try f.groupCall(req, arena, zone, rest, params);
+    }
+
+    /// A seen `requestId`'s operation, for a write sent again.
+    fn replayed(f: *FakeCompute, arena: Allocator, req: tp.Request, params: Params) Allocator.Error!?Reply {
+        if (req.method == .GET) return null;
+        const id = params.get("requestId") orelse return null;
+        const op = f.request_ids.get(id) orelse return null;
+        return try f.operationReply(arena, op);
+    }
+
+    fn templateCall(f: *FakeCompute, req: tp.Request, arena: Allocator, region: ?[]const u8, rest: []const u8, params: Params) Allocator.Error!Reply {
+        if (try f.replayed(arena, req, params)) |r| return r;
+        const prefix = if (region) |r| try std.fmt.allocPrint(arena, "regions/{s}/", .{r}) else "global/";
+        if (rest.len == 0) return switch (req.method) {
+            .GET => f.listTemplates(arena, prefix, params),
+            .POST => f.insertTemplate(arena, region, prefix, req.body orelse "", params.get("requestId")),
+            else => notModelled(arena, "this method on templates"),
+        };
+        const name = std.mem.cutPrefix(u8, rest, "/") orelse return notModelled(arena, "this template path");
+        const key = try std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, name });
+        const path = try std.fmt.allocPrint(arena, "{s}instanceTemplates/{s}", .{ prefix, name });
+        const t = f.templates.get(key) orelse return f.notFound(arena, path);
+        return switch (req.method) {
+            .GET => f.templateReply(arena, t),
+            .DELETE => f.deleteTemplate(arena, key, path, t, params.get("requestId")),
+            else => notModelled(arena, "this method on a template"),
+        };
+    }
+
+    fn listTemplates(f: *FakeCompute, arena: Allocator, prefix: []const u8, params: Params) Allocator.Error!Reply {
+        const plan = listPlan(params) orelse return listRefusal(arena, params);
+        var matched: std.ArrayList(*FakeTemplate) = .empty;
+        for (f.templates.keys(), f.templates.values()) |k, t| {
+            const name = std.mem.cutPrefix(u8, k, prefix) orelse continue;
+            if (std.mem.indexOfScalar(u8, name, '/') != null) continue;
+            if (plan.filter) |flt| {
+                if (!std.mem.eql(u8, flt.field, "name")) return notModelled(arena, "a filter on this field");
+                if (!nameMatches(name, flt.value)) continue;
+            }
+            try matched.append(arena, t);
+        }
+        std.mem.sort(*FakeTemplate, matched.items, {}, struct {
+            fn less(_: void, a: *FakeTemplate, b: *FakeTemplate) bool {
+                return std.mem.lessThan(u8, a.put.name, b.put.name);
+            }
+        }.less);
+        const page = try pageOf(arena, matched.items.len, plan) orelse return notModelled(arena, "a page token the fake did not make");
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        f.writeTemplateList(&jw, arena, matched.items[page.start..page.end], page.next) catch return error.OutOfMemory;
+        return .{ .status = 200, .body = out.written() };
+    }
+
+    fn writeTemplateList(f: *FakeCompute, jw: *Stringify, arena: Allocator, list: []const *FakeTemplate, next_token: ?[]const u8) !void {
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write("compute#instanceTemplateList");
+        if (list.len > 0) {
+            try jw.objectField("items");
+            try jw.beginArray();
+            for (list) |t| try f.writeTemplate(jw, arena, t);
+            try jw.endArray();
+        }
+        if (next_token) |t| {
+            try jw.objectField("nextPageToken");
+            try jw.write(t);
+        }
+        try jw.endObject();
+    }
+
+    fn templateReply(f: *FakeCompute, arena: Allocator, t: *FakeTemplate) Allocator.Error!Reply {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        f.writeTemplate(&jw, arena, t) catch return error.OutOfMemory;
+        return .{ .status = 200, .body = out.written() };
+    }
+
+    /// As production wrote milestone 0's: the properties' machine and disk
+    /// types bare names.
+    fn writeTemplate(f: *FakeCompute, jw: *Stringify, arena: Allocator, t: *FakeTemplate) !void {
+        const p = f.options.project_id;
+        var buf: [core.timestamp.max_len]u8 = undefined;
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write("compute#instanceTemplate");
+        try jw.objectField("id");
+        try jw.print("\"{d}\"", .{t.id});
+        try jw.objectField("creationTimestamp");
+        try jw.write(core.timestamp.format(&buf, t.created));
+        try jw.objectField("name");
+        try jw.write(t.put.name);
+        if (t.description.len > 0) {
+            try jw.objectField("description");
+            try jw.write(t.description);
+        }
+        if (t.region) |r| {
+            try jw.objectField("region");
+            try jw.print("\"{s}projects/{s}/regions/{s}\"", .{ link_base, p, r });
+        }
+        try jw.objectField("properties");
+        try jw.beginObject();
+        try jw.objectField("machineType");
+        try jw.write(t.put.machine_type);
+        try writeLabelMap(jw, t.put.labels);
+        try jw.objectField("disks");
+        try jw.write(.{.{ .type = "PERSISTENT", .mode = "READ_WRITE", .deviceName = "persistent-disk-0", .boot = true, .autoDelete = true, .initializeParams = .{ .sourceImage = t.source_image } }});
+        try jw.objectField("networkInterfaces");
+        try jw.write(.{.{ .network = try std.fmt.allocPrint(arena, "{s}projects/{s}/global/networks/default", .{ link_base, p }) }});
+        try writeItems(jw, t.put.metadata, t.metadata_fingerprint);
+        try writeSchedulingOf(jw, t.put);
+        try jw.endObject();
+        try jw.objectField("selfLink");
+        try jw.print("\"{s}{s}\"", .{ link_base, try t.path(arena, p) });
+        try jw.endObject();
+    }
+
+    fn insertTemplate(f: *FakeCompute, arena: Allocator, region: ?[]const u8, prefix: []const u8, text: []const u8, request_id: ?[]const u8) Allocator.Error!Reply {
+        const value = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return notModelled(arena, "a template body that is not JSON"),
+        };
+        if (value != .object) return notModelled(arena, "a template body that is not an object");
+        const name = jsonString(value.object, "name") orelse return notModelled(arena, "a template with no name");
+        const props_value = value.object.get("properties") orelse return notModelled(arena, "a template with no properties");
+        if (props_value != .object) return notModelled(arena, "a template whose properties are not an object");
+        const props = props_value.object;
+        const key = try std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, name });
+        const path = try std.fmt.allocPrint(arena, "{s}instanceTemplates/{s}", .{ prefix, name });
+        if (f.templates.contains(key)) return fail(arena, 409, "alreadyExists", try std.fmt.allocPrint(arena, "The resource 'projects/{s}/{s}' already exists", .{ f.options.project_id, path }));
+        const machine_path = jsonString(props, "machineType") orelse "e2-micro";
+        const type_at = if (std.mem.lastIndexOfScalar(u8, machine_path, '/')) |s| s + 1 else 0;
+        var put: PutInstance = .{ .zone = "", .name = name, .machine_type = machine_path[type_at..] };
+        if (try schedulingOf(arena, props, put.machine_type, &put)) |refused| return refused;
+        put.labels = try labelsOf(arena, props);
+        put.metadata = try metadataOf(arena, props);
+        put.tags = try tagsOf(arena, props);
+        try f.addTemplate(key, region, jsonString(value.object, "description") orelse "", bootImage(props) orelse "", put);
+        const op = try f.addOperation(.{
+            .scope = if (region) |r| .{ .region = r } else .global,
+            .target_path = path,
+            .operation_type = "compute.instanceTemplates.insert",
+            .waits = f.options.write_waits,
+            .request_id = request_id,
+        });
+        return f.operationReply(arena, op);
+    }
+
+    /// Gone at once, unless a group uses it: then the call is taken and
+    /// its operation fails, as production's did.
+    fn deleteTemplate(f: *FakeCompute, arena: Allocator, key: []const u8, path: []const u8, t: *FakeTemplate, request_id: ?[]const u8) Allocator.Error!Reply {
+        var failure: ?PutOperation.Failure = null;
+        for (f.groups.values()) |g| if (std.mem.eql(u8, g.template_key, key)) {
+            failure = .{
+                .code = "RESOURCE_IN_USE_BY_ANOTHER_RESOURCE",
+                .message = try std.fmt.allocPrint(f.store.allocator(), "The instance_template resource 'projects/{s}/{s}' is already being used by 'projects/{s}/zones/{s}/instanceGroupManagers/{s}@{d}'", .{ f.options.project_id, path, f.options.project_id, g.zone, g.name, g.id }),
+            };
+            break;
+        };
+        if (failure == null) _ = f.templates.orderedRemove(key);
+        const op = try f.addOperation(.{
+            .scope = if (t.region) |r| .{ .region = r } else .global,
+            .target_path = path,
+            .operation_type = "delete",
+            .failure = failure,
+            .waits = f.options.write_waits,
+            .request_id = request_id,
+        });
+        return f.operationReply(arena, op);
+    }
+
+    fn groupCall(f: *FakeCompute, req: tp.Request, arena: Allocator, zone: []const u8, rest: []const u8, params: Params) Allocator.Error!Reply {
+        const list_vms = std.mem.endsWith(u8, rest, "/listManagedInstances");
+        if (!list_vms) if (try f.replayed(arena, req, params)) |r| return r;
+        if (rest.len == 0) return switch (req.method) {
+            .GET => f.listGroups(arena, zone, params),
+            .POST => f.insertGroup(arena, zone, req.body orelse "", params.get("requestId")),
+            else => notModelled(arena, "this method on groups"),
+        };
+        const path = std.mem.cutPrefix(u8, rest, "/") orelse return notModelled(arena, "this group path");
+        const at = std.mem.indexOfScalar(u8, path, '/');
+        const name = path[0 .. at orelse path.len];
+        const key = try std.fmt.allocPrint(arena, "{s}/{s}", .{ zone, name });
+        const g = f.groups.get(key) orelse return f.notFound(arena, try std.fmt.allocPrint(arena, "zones/{s}/instanceGroupManagers/{s}", .{ zone, name }));
+        if (at) |a| {
+            if (req.method != .POST) return notModelled(arena, "this method on a group's verb");
+            return f.groupVerb(arena, g, path[a + 1 ..], req.body orelse "", params);
+        }
+        return switch (req.method) {
+            .GET => blk: {
+                f.advance(g);
+                break :blk f.groupReply(arena, g);
+            },
+            .DELETE => f.deleteGroup(arena, g, params.get("requestId")),
+            else => notModelled(arena, "this method on a group"),
+        };
+    }
+
+    fn groupVerb(f: *FakeCompute, arena: Allocator, g: *FakeGroup, verb: []const u8, text: []const u8, params: Params) Allocator.Error!Reply {
+        const request_id = params.get("requestId");
+        if (std.mem.eql(u8, verb, "listManagedInstances")) {
+            f.advance(g);
+            return f.listMembers(arena, g, params);
+        }
+        if (std.mem.eql(u8, verb, "resize")) {
+            const size = std.fmt.parseInt(u32, params.get("size") orelse "", 10) catch return notModelled(arena, "a resize with no size");
+            try f.resize(g, size);
+            return f.groupOperation(arena, g, "compute.instanceGroupManagers.resize", null, request_id);
+        }
+        if (std.mem.eql(u8, verb, "createInstances")) return f.createMembers(arena, g, text, request_id);
+        if (std.mem.eql(u8, verb, "deleteInstances")) return f.deleteMembers(arena, g, text, request_id);
+        return notModelled(arena, "this group verb");
+    }
+
+    fn listGroups(f: *FakeCompute, arena: Allocator, zone: []const u8, params: Params) Allocator.Error!Reply {
+        const plan = listPlan(params) orelse return listRefusal(arena, params);
+        var matched: std.ArrayList(*FakeGroup) = .empty;
+        for (f.groups.values()) |g| {
+            if (!std.mem.eql(u8, g.zone, zone)) continue;
+            if (plan.filter) |flt| {
+                if (!std.mem.eql(u8, flt.field, "name")) return notModelled(arena, "a filter on this field");
+                if (!nameMatches(g.name, flt.value)) continue;
+            }
+            f.advance(g);
+            try matched.append(arena, g);
+        }
+        std.mem.sort(*FakeGroup, matched.items, {}, struct {
+            fn less(_: void, a: *FakeGroup, b: *FakeGroup) bool {
+                return std.mem.lessThan(u8, a.name, b.name);
+            }
+        }.less);
+        const page = try pageOf(arena, matched.items.len, plan) orelse return notModelled(arena, "a page token the fake did not make");
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        f.writeGroupList(&jw, matched.items[page.start..page.end], page.next) catch return error.OutOfMemory;
+        return .{ .status = 200, .body = out.written() };
+    }
+
+    fn writeGroupList(f: *FakeCompute, jw: *Stringify, list: []const *FakeGroup, next_token: ?[]const u8) !void {
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write("compute#instanceGroupManagerList");
+        if (list.len > 0) {
+            try jw.objectField("items");
+            try jw.beginArray();
+            for (list) |g| try f.writeGroup(jw, g);
+            try jw.endArray();
+        }
+        if (next_token) |t| {
+            try jw.objectField("nextPageToken");
+            try jw.write(t);
+        }
+        try jw.endObject();
+    }
+
+    fn groupReply(f: *FakeCompute, arena: Allocator, g: *FakeGroup) Allocator.Error!Reply {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        f.writeGroup(&jw, g) catch return error.OutOfMemory;
+        return .{ .status = 200, .body = out.written() };
+    }
+
+    /// As production wrote milestone 0's: links on the www host, the
+    /// counts of what its VMs are doing, `status.isStable`.
+    fn writeGroup(f: *FakeCompute, jw: *Stringify, g: *FakeGroup) !void {
+        const p = f.options.project_id;
+        var buf: [core.timestamp.max_len]u8 = undefined;
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write("compute#instanceGroupManager");
+        try jw.objectField("id");
+        try jw.print("\"{d}\"", .{g.id});
+        try jw.objectField("creationTimestamp");
+        try jw.write(core.timestamp.format(&buf, g.created));
+        try jw.objectField("name");
+        try jw.write(g.name);
+        if (g.description.len > 0) {
+            try jw.objectField("description");
+            try jw.write(g.description);
+        }
+        try jw.objectField("zone");
+        try jw.print("\"{s}projects/{s}/zones/{s}\"", .{ link_base, p, g.zone });
+        try jw.objectField("instanceTemplate");
+        try jw.print("\"{s}{s}\"", .{ link_base, g.template_path });
+        try jw.objectField("instanceGroup");
+        try jw.print("\"{s}projects/{s}/zones/{s}/instanceGroups/{s}\"", .{ link_base, p, g.zone, g.name });
+        try jw.objectField("baseInstanceName");
+        try jw.write(g.base);
+        try jw.objectField("fingerprint");
+        try jw.write(g.fingerprint);
+        try writeActions(jw, g);
+        try jw.objectField("targetSize");
+        try jw.write(g.target_size);
+        try jw.objectField("selfLink");
+        try jw.print("\"{s}projects/{s}/zones/{s}/instanceGroupManagers/{s}\"", .{ link_base, p, g.zone, g.name });
+        try jw.objectField("status");
+        try jw.write(.{ .isStable = g.stable(), .versionTarget = .{ .isReached = true } });
+        try jw.endObject();
+    }
+
+    fn writeActions(jw: *Stringify, g: *FakeGroup) !void {
+        var counts: types.GroupActions = .{};
+        for (g.members.items) |m| switch (m.action) {
+            .creating => counts.creating += 1,
+            .deleting => counts.deleting += 1,
+            else => counts.none += 1,
+        };
+        try jw.objectField("currentActions");
+        try jw.write(.{
+            .none = counts.none,
+            .creating = counts.creating,
+            .creatingWithoutRetries = 0,
+            .verifying = 0,
+            .recreating = 0,
+            .deleting = counts.deleting,
+            .abandoning = 0,
+            .restarting = 0,
+            .refreshing = 0,
+            .suspending = 0,
+            .resuming = 0,
+            .stopping = 0,
+            .starting = 0,
+        });
+    }
+
+    fn listMembers(f: *FakeCompute, arena: Allocator, g: *FakeGroup, params: Params) Allocator.Error!Reply {
+        const plan = listPlan(params) orelse return listRefusal(arena, params);
+        if (plan.filter != null) return notModelled(arena, "a filter on a group's VMs");
+        const page = try pageOf(arena, g.members.items.len, plan) orelse return notModelled(arena, "a page token the fake did not make");
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        f.writeMembers(&jw, g, g.members.items[page.start..page.end], page.next) catch return error.OutOfMemory;
+        return .{ .status = 200, .body = out.written() };
+    }
+
+    /// As production listed milestone 0's: a VM still being made has no
+    /// `instanceStatus` until its first step.
+    fn writeMembers(f: *FakeCompute, jw: *Stringify, g: *FakeGroup, list: []const FakeGroup.Member, next_token: ?[]const u8) !void {
+        const p = f.options.project_id;
+        try jw.beginObject();
+        try jw.objectField("managedInstances");
+        try jw.beginArray();
+        for (list) |m| {
+            try jw.beginObject();
+            try jw.objectField("name");
+            try jw.write(m.name);
+            try jw.objectField("instance");
+            try jw.print("\"{s}projects/{s}/zones/{s}/instances/{s}\"", .{ link_base, p, g.zone, m.name });
+            if (f.instanceFor(g.zone, m.name)) |i| {
+                try jw.objectField("id");
+                try jw.print("\"{d}\"", .{i.id});
+                if (!(m.action == .creating and m.steps_left == f.options.group_steps)) {
+                    try jw.objectField("instanceStatus");
+                    try jw.write(statusName(i.put.status));
+                }
+            } else |_| {}
+            if (m.action != .deleting) {
+                try jw.objectField("targetStatus");
+                try jw.write("RUNNING");
+            }
+            try jw.objectField("currentAction");
+            try jw.write(managedActionName(m.action));
+            try jw.objectField("version");
+            try jw.print("{{\"instanceTemplate\":\"{s}{s}\"}}", .{ link_base, g.template_path });
+            try jw.endObject();
+        }
+        try jw.endArray();
+        if (next_token) |t| {
+            try jw.objectField("nextPageToken");
+            try jw.write(t);
+        }
+        try jw.endObject();
+    }
+
+    fn managedActionName(action: types.ManagedAction) []const u8 {
+        return switch (action) {
+            .creating => "CREATING",
+            .deleting => "DELETING",
+            else => "NONE",
+        };
+    }
+
+    fn insertGroup(f: *FakeCompute, arena: Allocator, zone: []const u8, text: []const u8, request_id: ?[]const u8) Allocator.Error!Reply {
+        const value = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return notModelled(arena, "a group body that is not JSON"),
+        };
+        if (value != .object) return notModelled(arena, "a group body that is not an object");
+        const obj = value.object;
+        const name = jsonString(obj, "name") orelse return notModelled(arena, "a group with no name");
+        const source = jsonString(obj, "instanceTemplate") orelse return notModelled(arena, "a group with no template");
+        const size: u32 = if (obj.get("targetSize")) |v| switch (v) {
+            .integer => |n| std.math.cast(u32, n) orelse 0,
+            else => 0,
+        } else 0;
+        const key = try std.fmt.allocPrint(arena, "{s}/{s}", .{ zone, name });
+        const path = try std.fmt.allocPrint(arena, "zones/{s}/instanceGroupManagers/{s}", .{ zone, name });
+        if (f.groups.contains(key)) return fail(arena, 409, "alreadyExists", try std.fmt.allocPrint(arena, "The resource 'projects/{s}/{s}' already exists", .{ f.options.project_id, path }));
+        const local = try f.localPath(arena, source);
+        const template_key = templateKey(arena, local) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.NotATemplate => return notModelled(arena, "a group template path the fake does not read"),
+        };
+        const t = f.templates.get(template_key) orelse return f.notFound(arena, local);
+        if (try unusable(t)) |failure| {
+            const op = try f.addOperation(.{ .scope = .{ .zone = zone }, .target_path = path, .operation_type = "compute.instanceGroupManagers.insert", .failure = failure, .waits = f.options.write_waits, .request_id = request_id });
+            return f.operationReply(arena, op);
+        }
+        const s = f.store.allocator();
+        const g = try s.create(FakeGroup);
+        g.* = .{
+            .name = try s.dupe(u8, name),
+            .zone = try s.dupe(u8, zone),
+            .base = try s.dupe(u8, jsonString(obj, "baseInstanceName") orelse name),
+            .template_key = try s.dupe(u8, template_key),
+            .template_path = try t.path(s, f.options.project_id),
+            .target_size = 0,
+            .id = f.next(),
+            .created = std.Io.Clock.real.now(f.io),
+            .description = try s.dupe(u8, jsonString(obj, "description") orelse ""),
+            .fingerprint = try f.fingerprint(),
+        };
+        try f.groups.put(f.gpa, try s.dupe(u8, key), g);
+        try f.resize(g, size);
+        return f.groupOperation(arena, g, "compute.instanceGroupManagers.insert", null, request_id);
+    }
+
+    /// A path as the fake reads one: the host cut, and the fake's own
+    /// project.
+    fn localPath(f: *FakeCompute, arena: Allocator, source: []const u8) Allocator.Error![]const u8 {
+        const path = trimHost(source);
+        const own = try std.fmt.allocPrint(arena, "projects/{s}/", .{f.options.project_id});
+        return std.mem.cutPrefix(u8, path, own) orelse path;
+    }
+
+    /// `global/instanceTemplates/T` as `global/T`; a region's as
+    /// `regions/R/T`.
+    fn templateKey(arena: Allocator, local: []const u8) error{ OutOfMemory, NotATemplate }![]const u8 {
+        if (std.mem.cutPrefix(u8, local, "global/instanceTemplates/")) |t| return std.fmt.allocPrint(arena, "global/{s}", .{t});
+        if (std.mem.startsWith(u8, local, "regions/")) return std.mem.replaceOwned(u8, arena, local, "/instanceTemplates/", "/");
+        return error.NotATemplate;
+    }
+
+    /// Why a group cannot keep VMs from `t`, in production's words, or
+    /// null: spot VMs that DELETE, or with a run limit.
+    fn unusable(t: *FakeTemplate) Allocator.Error!?PutOperation.Failure {
+        if (!t.put.spot) return null;
+        if (t.put.termination_action == .delete) return .{ .code = "UNSUPPORTED_OPERATION", .message = "Spot virtual machines with termination action set to DELETE cannot be used with Managed Instance Groups." };
+        if (t.put.max_run_duration_s != null) return .{ .code = "UNSUPPORTED_OPERATION", .message = "Spot virtual machines with set termination time cannot be used with Managed Instance Groups." };
+        return null;
+    }
+
+    fn groupOperation(f: *FakeCompute, arena: Allocator, g: *FakeGroup, operation_type: []const u8, effect: ?Effect, request_id: ?[]const u8) Allocator.Error!Reply {
+        g.fingerprint = try f.fingerprint();
+        const key = try std.fmt.allocPrint(arena, "{s}/{s}", .{ g.zone, g.name });
+        const op = try f.addOperation(.{
+            .scope = .{ .zone = g.zone },
+            .target_path = try std.fmt.allocPrint(arena, "zones/{s}/instanceGroupManagers/{s}", .{ g.zone, g.name }),
+            .operation_type = operation_type,
+            .effect = effect orelse .none,
+            .waits = f.options.write_waits,
+            .request_id = request_id,
+            .subject = key,
+        });
+        return f.operationReply(arena, op);
+    }
+
+    /// Makes VMs, or marks the newest for deletion, until as many are
+    /// kept as `size`.
+    fn resize(f: *FakeCompute, g: *FakeGroup, size: u32) Allocator.Error!void {
+        g.target_size = size;
+        var kept: u32 = 0;
+        for (g.members.items) |m| if (m.action != .deleting) {
+            kept += 1;
+        };
+        while (kept < size) : (kept += 1) try f.addMember(g, try f.memberName(g));
+        var n = g.members.items.len;
+        while (kept > size and n > 0) {
+            n -= 1;
+            const m = &g.members.items[n];
+            if (m.action == .deleting) continue;
+            f.markDeleting(m);
+            kept -= 1;
+        }
+    }
+
+    /// `<base>-<four letters and digits>`, as production named them.
+    fn memberName(f: *FakeCompute, g: *FakeGroup) Allocator.Error![]const u8 {
+        const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+        var n = f.next() *% 2654435761;
+        var suffix: [4]u8 = undefined;
+        for (&suffix) |*c| {
+            c.* = alphabet[n % alphabet.len];
+            n /= alphabet.len;
+        }
+        return std.fmt.allocPrint(f.store.allocator(), "{s}-{s}", .{ g.base, &suffix });
+    }
+
+    /// A VM of the group: a VM of the zone, from its template, CREATING.
+    fn addMember(f: *FakeCompute, g: *FakeGroup, name: []const u8) Allocator.Error!void {
+        const t = f.templates.get(g.template_key);
+        var put: PutInstance = if (t) |tt| tt.put else .{ .zone = "", .name = "" };
+        put.zone = g.zone;
+        put.name = name;
+        put.status = .staging;
+        f.addInstance(put) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {},
+        };
+        try g.members.append(f.gpa, .{ .name = try f.store.allocator().dupe(u8, name), .action = .creating, .steps_left = f.options.group_steps });
+        if (f.options.group_steps == 0) f.advance(g);
+    }
+
+    fn markDeleting(f: *FakeCompute, m: *FakeGroup.Member) void {
+        m.action = .deleting;
+        m.steps_left = f.options.group_steps;
+    }
+
+    /// One step for each VM coming or going: a read of the group.
+    fn advance(f: *FakeCompute, g: *FakeGroup) void {
+        var n: usize = 0;
+        while (n < g.members.items.len) {
+            const m = &g.members.items[n];
+            if (m.action == .none) {
+                n += 1;
+                continue;
+            }
+            if (m.steps_left > 0) m.steps_left -= 1;
+            if (m.steps_left > 0) {
+                n += 1;
+                continue;
+            }
+            const i = f.instanceFor(g.zone, m.name) catch null;
+            if (m.action == .creating) {
+                m.action = .none;
+                if (i) |vm| vm.put.status = .running;
+                n += 1;
+                continue;
+            }
+            if (i) |vm| f.removeInstance(vm);
+            _ = g.members.orderedRemove(n);
+        }
+    }
+
+    fn createMembers(f: *FakeCompute, arena: Allocator, g: *FakeGroup, text: []const u8, request_id: ?[]const u8) Allocator.Error!Reply {
+        const value = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return notModelled(arena, "a createInstances body that is not JSON"),
+        };
+        const list = itemsArray(value, "instances") orelse return notModelled(arena, "a createInstances body with no instances");
+        for (list) |item| {
+            const name = (if (item == .object) jsonString(item.object, "name") else null) orelse return notModelled(arena, "an instance to create with no name");
+            if (f.instanceFor(g.zone, name)) |_| return notModelled(arena, "a group's VM made under a name taken") else |_| {}
+        }
+        for (list) |item| {
+            try f.addMember(g, jsonString(item.object, "name").?);
+            g.target_size += 1;
+        }
+        return f.groupOperation(arena, g, "compute.instanceGroupManagers.createInstances", null, request_id);
+    }
+
+    fn deleteMembers(f: *FakeCompute, arena: Allocator, g: *FakeGroup, text: []const u8, request_id: ?[]const u8) Allocator.Error!Reply {
+        const value = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return notModelled(arena, "a deleteInstances body that is not JSON"),
+        };
+        const list = itemsArray(value, "instances") orelse return notModelled(arena, "a deleteInstances body with no instances");
+        var marked: std.ArrayList(*FakeGroup.Member) = .empty;
+        for (list, 0..) |item, n| {
+            const url = if (item == .string) item.string else "";
+            if (url.len == 0) return fail(arena, 400, "invalid", try std.fmt.allocPrint(arena, "Invalid value for field 'instances[{d}]': '{s}'. The URL is malformed.", .{ n, url }));
+            const name_at = if (std.mem.lastIndexOfScalar(u8, url, '/')) |s| s + 1 else 0;
+            const name = url[name_at..];
+            const m = memberNamed(g, name) orelse return notModelled(arena, "deleting a VM the group does not have");
+            try marked.append(arena, m);
+        }
+        for (marked.items) |m| {
+            f.markDeleting(m);
+            g.target_size -|= 1;
+        }
+        return f.groupOperation(arena, g, "compute.instanceGroupManagers.deleteInstances", null, request_id);
+    }
+
+    fn memberNamed(g: *FakeGroup, name: []const u8) ?*FakeGroup.Member {
+        for (g.members.items) |*m| if (std.mem.eql(u8, m.name, name) and m.action != .deleting) return m;
+        return null;
+    }
+
+    fn itemsArray(value: std.json.Value, name: []const u8) ?[]const std.json.Value {
+        if (value != .object) return null;
+        const v = value.object.get(name) orelse return null;
+        return if (v == .array) v.array.items else null;
+    }
+
+    /// Its VMs DELETING at once, the group gone with them when the
+    /// operation finishes.
+    fn deleteGroup(f: *FakeCompute, arena: Allocator, g: *FakeGroup, request_id: ?[]const u8) Allocator.Error!Reply {
+        for (g.members.items) |*m| if (m.action != .deleting) f.markDeleting(m);
+        g.target_size = 0;
+        return f.groupOperation(arena, g, "compute.instanceGroupManagers.delete", .remove_group, request_id);
+    }
+
+    fn removeGroup(f: *FakeCompute, key: []const u8) void {
+        const g = f.groups.get(key) orelse return;
+        for (g.members.items) |m| if (f.instanceFor(g.zone, m.name)) |vm| f.removeInstance(vm) else |_| {};
+        g.members.deinit(f.gpa);
+        _ = f.groups.orderedRemove(key);
     }
 
     /// A VM deleted: its boot disk with it, its other disks freed or, when
@@ -1729,6 +2504,7 @@ pub const FakeCompute = struct {
     }
 
     fn targetLink(f: *FakeCompute, arena: Allocator, op: *FakeOperation) Allocator.Error!?[]const u8 {
+        if (op.target_path) |p| return try std.fmt.allocPrint(arena, "{s}projects/{s}/{s}", .{ link_base, f.options.project_id, p });
         const name = op.put.target_instance orelse return null;
         return switch (op.put.scope) {
             .zone => |z| try std.fmt.allocPrint(arena, "{s}projects/{s}/zones/{s}/instances/{s}", .{ link_base, f.options.project_id, z, name }),

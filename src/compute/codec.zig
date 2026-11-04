@@ -157,6 +157,142 @@ pub fn decodeImage(out: Allocator, scratch: Allocator, body: []const u8) DecodeE
     };
 }
 
+/// An instance template, as get answers.
+pub fn decodeTemplate(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.Template {
+    return templateOf(out, try object(try parse(scratch, body)));
+}
+
+/// A page of templates: no `items` key is an empty page.
+pub fn decodeTemplatePage(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.TemplatePage {
+    const obj = try object(try parse(scratch, body));
+    const list = try field(obj, "items", .array);
+    const templates = try out.alloc(types.Template, if (list) |l| l.items.len else 0);
+    if (list) |l| for (l.items, templates) |v, *t| {
+        t.* = try templateOf(out, try object(v));
+    };
+    return .{ .templates = templates, .next_page_token = try token(out, obj) };
+}
+
+/// A managed instance group, as get answers.
+pub fn decodeGroup(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.Group {
+    return groupOf(out, try object(try parse(scratch, body)));
+}
+
+/// A page of a zone's groups.
+pub fn decodeGroupPage(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.GroupPage {
+    const obj = try object(try parse(scratch, body));
+    const list = try field(obj, "items", .array);
+    const groups = try out.alloc(types.Group, if (list) |l| l.items.len else 0);
+    if (list) |l| for (l.items, groups) |v, *g| {
+        g.* = try groupOf(out, try object(v));
+    };
+    return .{ .groups = groups, .next_page_token = try token(out, obj) };
+}
+
+/// A page of a group's VMs, under `managedInstances`.
+pub fn decodeManagedInstancePage(out: Allocator, scratch: Allocator, body: []const u8) DecodeError!types.ManagedInstancePage {
+    const obj = try object(try parse(scratch, body));
+    const list = try field(obj, "managedInstances", .array);
+    const instances = try out.alloc(types.ManagedInstance, if (list) |l| l.items.len else 0);
+    if (list) |l| for (l.items, instances) |v, *m| {
+        m.* = try managedOf(out, try object(v));
+    };
+    return .{ .instances = instances, .next_page_token = try token(out, obj) };
+}
+
+/// A template; what its VMs are is under `properties`, read as an
+/// instance's fields are.
+fn templateOf(out: Allocator, obj: ObjectMap) DecodeError!types.Template {
+    const props = try field(obj, "properties", .object) orelse return error.InvalidResponse;
+    const region = try text(out, obj, "region");
+    return .{
+        .name = try required(out, obj, "name"),
+        .id = try integerText(out, obj, "id"),
+        .region = if (region.len == 0) null else trailing(region),
+        .description = try text(out, obj, "description"),
+        .creation_time = try time(obj, "creationTimestamp"),
+        .machine_type = trailing(try text(out, props, "machineType")),
+        .labels = try labelMap(out, props, "labels"),
+        .metadata = try metadataOf(out, props),
+        .tags = try tagsOf(out, props),
+        .disks = try diskList(out, props),
+        .source_image = try bootImage(out, props),
+        .network_interfaces = try interfaceList(out, props),
+        .service_accounts = try accountList(out, props),
+        .scheduling = try schedulingOf(out, props),
+    };
+}
+
+/// The boot disk's `initializeParams.sourceImage`, or empty.
+fn bootImage(out: Allocator, props: ObjectMap) DecodeError![]const u8 {
+    const list = try field(props, "disks", .array) orelse return "";
+    for (list.items) |v| {
+        const d = try object(v);
+        if (try boolean(d, "boot") != true) continue;
+        const params = try field(d, "initializeParams", .object) orelse return "";
+        return text(out, params, "sourceImage");
+    }
+    return "";
+}
+
+fn groupOf(out: Allocator, obj: ObjectMap) DecodeError!types.Group {
+    const status = try field(obj, "status", .object);
+    const actions = try field(obj, "currentActions", .object);
+    return .{
+        .name = try required(out, obj, "name"),
+        .id = try integerText(out, obj, "id"),
+        .zone = trailing(try text(out, obj, "zone")),
+        .description = try text(out, obj, "description"),
+        .creation_time = try time(obj, "creationTimestamp"),
+        .base_instance_name = try text(out, obj, "baseInstanceName"),
+        .template = pathOf(try text(out, obj, "instanceTemplate")),
+        .target_size = try integer(u32, obj, "targetSize") orelse 0,
+        .current_actions = if (actions) |a| try actionsOf(a) else .{},
+        .is_stable = if (status) |s| try boolean(s, "isStable") orelse false else false,
+        .fingerprint = try text(out, obj, "fingerprint"),
+        .self_link = try text(out, obj, "selfLink"),
+    };
+}
+
+/// `currentActions`' counts, each field under its camelCase name.
+fn actionsOf(obj: ObjectMap) DecodeError!types.GroupActions {
+    var out: types.GroupActions = .{};
+    inline for (@typeInfo(types.GroupActions).@"struct".field_names) |name| {
+        @field(out, name) = try integer(u32, obj, comptime camelCase(name)) orelse 0;
+    }
+    return out;
+}
+
+fn camelCase(comptime snake: []const u8) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        var upper = false;
+        for (snake) |c| {
+            if (c == '_') {
+                upper = true;
+                continue;
+            }
+            out = out ++ [_]u8{if (upper) std.ascii.toUpper(c) else c};
+            upper = false;
+        }
+        return out;
+    }
+}
+
+fn managedOf(out: Allocator, obj: ObjectMap) DecodeError!types.ManagedInstance {
+    const status = try text(out, obj, "instanceStatus");
+    const target = try text(out, obj, "targetStatus");
+    const version = try field(obj, "version", .object);
+    return .{
+        .name = try required(out, obj, "name"),
+        .id = try integerText(out, obj, "id"),
+        .status = if (status.len == 0) null else types.Status.parse(status),
+        .target_status = if (target.len == 0) null else types.Status.parse(target),
+        .current_action = types.ManagedAction.parse(try text(out, obj, "currentAction")),
+        .template = if (version) |v| pathOf(try text(out, v, "instanceTemplate")) else "",
+    };
+}
+
 fn instanceOf(out: Allocator, obj: ObjectMap) DecodeError!types.Instance {
     return .{
         .id = try integerText(out, obj, "id"),

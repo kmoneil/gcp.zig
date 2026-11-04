@@ -157,6 +157,44 @@ const Side = struct {
         } else try s.say("{s} waited: {t}", .{ label, done.value.status });
     }
 
+    /// A template, as a line.
+    fn readTemplate(s: *Side, ref: compute.TemplateRef, label: []const u8) !void {
+        var got = s.client.getTemplate(ref) catch |err| {
+            try s.say("{s}: error.{t}", .{ label, err });
+            return;
+        };
+        defer got.deinit();
+        const t = got.value;
+        try s.say("{s}: {s} {t} {?t} region={s} image={s}", .{ label, t.machine_type, t.scheduling.provisioning_model, t.scheduling.termination_action, t.region orelse "-", t.source_image });
+    }
+
+    /// A group, as a line: its target and what its VMs are doing, or its
+    /// error.
+    fn readGroup(s: *Side, name: []const u8, label: []const u8) !void {
+        var got = s.client.getGroup(s.zone, name) catch |err| {
+            try s.say("{s}: error.{t}", .{ label, err });
+            return;
+        };
+        defer got.deinit();
+        try s.say("{s}: target {d}", .{ label, got.value.target_size });
+    }
+
+    /// Waits until the group is stable, then its target, actions and VMs,
+    /// as lines: their statuses and actions, not their names, which end
+    /// in letters production picks.
+    fn waitStable(s: *Side, name: []const u8, label: []const u8) !void {
+        var g = try s.client.waitGroupStable(s.zone, name, .{ .timeout_ms = 600_000 });
+        defer g.deinit();
+        const v = g.value;
+        try s.say("{s}: stable={} target {d}, none {d}, creating {d}, deleting {d}", .{ label, v.is_stable, v.target_size, v.current_actions.none, v.current_actions.creating, v.current_actions.deleting });
+        var vms = try s.client.listManagedInstances(s.zone, name, .{});
+        defer vms.deinit();
+        var parts: std.ArrayList([]const u8) = .empty;
+        for (vms.value.instances) |m| try parts.append(s.a, try s.a.print("{?t}/{t}", .{ m.status, m.current_action }));
+        std.mem.sort([]const u8, parts.items, {}, less);
+        try s.say("{s}, its VMs: {s}", .{ label, try std.mem.join(s.a, " ", parts.items) });
+    }
+
     /// A VM's labels, tags and metadata keys, as a line, each sorted.
     fn readChanges(s: *Side, name: []const u8, label: []const u8) !void {
         var got = try s.client.getInstance(s.zone, name);
@@ -272,6 +310,55 @@ fn stoppedChanges(s: *Side, a: []const u8) !void {
     try s.read(a, "a spot again");
 }
 
+/// Templates and a group, milestone 4's: the group made, waited on until
+/// stable, resized, a VM made and deleted by name, the template it uses
+/// refused deletion, a group from a template of spot VMs that DELETE
+/// refused, and all of it deleted. `delete_template` is milestone 2's,
+/// whose spot VMs DELETE at a run limit.
+fn fleets(s: *Side, delete_template: []const u8) !void {
+    const c = s.client;
+    const z = s.zone;
+    var buf: [36]u8 = undefined;
+    const region = z[0..std.mem.lastIndexOfScalar(u8, z, '-').?];
+    const global_name = s.vm("gtpl");
+    const regional_name = s.vm("rtpl");
+    var spec: compute.InstanceSpec = .{
+        .name = global_name,
+        .machine_type = "e2-micro",
+        .image = .{ .family = .{ .project = "debian-cloud", .name = "debian-12" } },
+        .spot = true,
+        .termination_action = .stop,
+        .labels = s.labels(),
+    };
+    try s.step("insert the group's template", c.insertTemplate(null, spec, .{ .request_id = c.newRequestId(&buf) }), c.insertTemplateRequest(null, spec, .{ .request_id = &buf }));
+    try s.waited("insert it again", try s.wrote("insert it again", c.insertTemplate(null, spec, .{})));
+    spec.name = regional_name;
+    try s.step("insert a regional template", c.insertTemplate(region, spec, .{ .request_id = c.newRequestId(&buf) }), c.insertTemplateRequest(region, spec, .{ .request_id = &buf }));
+    try s.readTemplate(.{ .global = global_name }, "the group's template");
+    try s.readTemplate(.{ .regional = .{ .region = region, .name = regional_name } }, "the regional template");
+
+    const g = s.vm("g");
+    const group: compute.GroupSpec = .{ .name = g, .template = .{ .global = global_name }, .target_size = 2 };
+    try s.step("insert the group", c.insertGroup(z, group, .{ .request_id = c.newRequestId(&buf) }), c.insertGroupRequest(z, group, .{ .request_id = &buf }));
+    try s.waitStable(g, "the group");
+    try s.step("resize it to 1", c.resizeGroup(z, g, 1, .{ .request_id = c.newRequestId(&buf) }), c.resizeGroupRequest(z, g, 1, .{ .request_id = &buf }));
+    try s.waitStable(g, "resized");
+    const named = s.vm("g-named");
+    try s.step("make a VM by name", c.createGroupInstances(z, g, &.{named}, .{ .request_id = c.newRequestId(&buf) }), c.createGroupInstancesRequest(z, g, &.{named}, .{ .request_id = &buf }));
+    try s.waitStable(g, "with the named VM");
+    try s.step("delete it by name", c.deleteGroupInstances(z, g, &.{named}, .{ .request_id = c.newRequestId(&buf) }), c.deleteGroupInstancesRequest(z, g, &.{named}, .{ .request_id = &buf }));
+    try s.waitStable(g, "without it");
+    try s.read(named, "the named VM");
+    try s.waited("delete the template it uses", try s.wrote("delete the template it uses", c.deleteTemplate(.{ .global = global_name }, .{})));
+    const refused = s.vm("gdel");
+    try s.waited("a group whose spot VMs DELETE", try s.wrote("a group whose spot VMs DELETE", c.insertGroup(z, .{ .name = refused, .template = .{ .global = delete_template }, .target_size = 1 }, .{})));
+    try s.readGroup(refused, "that group");
+    try s.step("delete the group", c.deleteGroup(z, g, .{ .request_id = c.newRequestId(&buf) }), c.deleteGroupRequest(z, g, .{ .request_id = &buf }));
+    try s.readGroup(g, "the group deleted");
+    try s.step("delete its template", c.deleteTemplate(.{ .global = global_name }, .{ .request_id = c.newRequestId(&buf) }), c.deleteTemplateRequest(.{ .global = global_name }, .{ .request_id = &buf }));
+    try s.waited("delete the regional template", try s.wrote("delete the regional template", c.deleteTemplate(.{ .regional = .{ .region = region, .name = regional_name } }, .{})));
+}
+
 /// The writes, read back after each: the same calls on either side.
 fn scenario(s: *Side, template: []const u8, disk: []const u8) !void {
     const c = s.client;
@@ -340,6 +427,7 @@ fn scenario(s: *Side, template: []const u8, disk: []const u8) !void {
         try s.read(name, label);
     }
     try s.waited("start a, gone", try s.wrote("start a, gone", c.startInstance(z, a, .{})));
+    try fleets(s, template);
 }
 
 /// One raw call beside the client, for what it has no verb for yet: the
@@ -366,9 +454,31 @@ fn sweep(f: *Fixture, client: *compute.Client, run: ?[]const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    try sweepGroups(f, client, a, run);
     try sweepVms(f, client, a, run);
     try sweepDisks(f, client, a, run);
     try sweepTemplates(f, client, a, run);
+}
+
+/// Groups first: a group's VMs deleted alone would be made again.
+fn sweepGroups(f: *Fixture, client: *compute.Client, a: Allocator, run: ?[]const u8) !void {
+    _ = a;
+    var page = client.listGroups(f.zone, .{ .filter = "name eq zigps-.*" }) catch |err| {
+        fact("sweep: listing groups failed: {t}", .{err});
+        return;
+    };
+    defer page.deinit();
+    for (page.value.groups) |g| {
+        if (run) |r| if (std.mem.indexOf(u8, g.name, r) == null) continue;
+        var op = client.deleteGroup(f.zone, g.name, .{ .no_graceful_shutdown = true }) catch |err| {
+            fact("sweep: deleting group {s} failed: {t}", .{ g.name, err });
+            continue;
+        };
+        defer op.deinit();
+        var done = client.waitOperation(op.value.ref(), .{}) catch continue;
+        done.deinit();
+        fact("sweep: deleted group {s}", .{g.name});
+    }
 }
 
 fn sweepVms(f: *Fixture, client: *compute.Client, a: Allocator, run: ?[]const u8) !void {
