@@ -862,7 +862,7 @@ test "every allocation failure is OutOfMemory without leaks" {
             } else |err| if (err != error.InvalidQuery) return err;
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.calls, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.calls, .{});
 }
 
 const hamlet = "SELECT word, word_count FROM `bigquery-public-data.samples.shakespeare` WHERE corpus = 'hamlet' ORDER BY word_count DESC LIMIT 5";
@@ -1316,5 +1316,5 @@ test "every allocation failure in the queries is OutOfMemory without leaks" {
             } else |err| if (err != error.InvalidQuery) return err;
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.calls, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.calls, .{});
 }

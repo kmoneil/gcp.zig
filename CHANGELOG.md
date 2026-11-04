@@ -4,6 +4,21 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.64.0 (unreleased)
+
+- Zig 0.17.1, a release of bug fixes on 0.17.0, is the version
+  `minimum_zig_version` names and the only one CI tests. No call
+  changes for it. Zig does not check that field, and the package's code
+  still builds with 0.17.0, but its own tests need 0.17.1 (below).
+- core: **Breaking:** `core.testing.no_grow_allocator` is gone. Back
+  `std.testing.checkAllAllocationFailures` onto `std.testing.allocator`
+  again: Zig 0.17.1's sweep refuses every resize itself, so the code it
+  sweeps makes the same allocations on every run, which is what the
+  allocator was for.
+- auth, bigquery, compute, dataflow, datatransfer, error_reporting,
+  firestore, kms, logging, monitoring, pubsub, resource_manager, run,
+  scheduler, secret_manager and storage: unchanged.
+
 ## 0.63.0 (2026-11-04)
 
 - compute: a new module, **experimental**, for Compute Engine's v1 API,

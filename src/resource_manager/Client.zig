@@ -419,7 +419,7 @@ test "init: every allocation failure is OutOfMemory without leaks" {
             client.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 test "searchProjects: a query it will not send is refused, unsent" {
@@ -592,7 +592,7 @@ test "getProject: every allocation failure is OutOfMemory without leaks" {
             p.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 test "getProjectIamPolicy: the version 3 request, production's policy, and its refusals" {
@@ -721,5 +721,5 @@ test "getProjectIamPolicy and testProjectIamPermissions: every allocation failur
             t.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }

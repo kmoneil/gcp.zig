@@ -517,7 +517,7 @@ fn patchEverything(gpa: Allocator) !void {
 }
 
 test "updateMetadata: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, patchEverything, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, patchEverything, .{});
 }
 
 // Properties. Each states a rule of the module comment independently of

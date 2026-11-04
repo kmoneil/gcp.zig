@@ -508,7 +508,7 @@ test "access: every allocation failure is OutOfMemory without leaks" {
             again.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 const destroyed_version: Reply = .{ .respond = .{ .body =
@@ -619,7 +619,7 @@ test "version administration: every allocation failure is OutOfMemory without le
             gone.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 test "access: a payload too big for the arena's spare room is OutOfMemory" {
@@ -654,7 +654,7 @@ test "access: a payload too big for the arena's spare room is OutOfMemory" {
         .{ encoded, core.crc32c.hash(big) },
     );
     defer testing.allocator.free(body);
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{body});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{body});
 }
 
 test "golden: enableIf, disableIf and destroyIf send the etag as read" {
@@ -750,5 +750,5 @@ test "conditional version changes: every allocation failure is OutOfMemory witho
             b.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }

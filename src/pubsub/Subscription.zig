@@ -1072,7 +1072,7 @@ test "ackWithResults: every allocation failure is OutOfMemory without leaks" {
             try testing.expectEqual(replies.len, fake.requests.items.len);
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{@as([]const Reply, &script)});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{@as([]const Reply, &script)});
 }
 
 /// Drawn answers to an ack call, and a model of what the loop must do with
@@ -1349,7 +1349,7 @@ test "create and update with settings: every allocation failure is OutOfMemory w
             try testing.expectEqual(replies.len, fake.requests.items.len);
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{@as([]const Reply, &script)});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{@as([]const Reply, &script)});
 }
 
 // Delivery: push, BigQuery and Cloud Storage subscriptions.
@@ -1533,7 +1533,7 @@ test "a delivery update: every allocation failure is OutOfMemory without leaks" 
             try testing.expectEqual(3, fake.requests.items.len);
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 test "create with each delivery kind: every allocation failure is OutOfMemory without leaks" {
@@ -1587,7 +1587,7 @@ test "create with each delivery kind: every allocation failure is OutOfMemory wi
             try testing.expectEqual(replies.len, fake.requests.items.len);
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{@as([]const Reply, &script)});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{@as([]const Reply, &script)});
 }
 
 // Seek and detach.
@@ -1831,7 +1831,7 @@ test "seek and detach: every allocation failure is OutOfMemory without leaks" {
             try testing.expectEqual(6, fake.requests.items.len);
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.all, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.all, .{});
 }
 
 const mask_card: types.MessageTransform = .{ .kind = .{ .javascript_udf = .{
@@ -1957,5 +1957,5 @@ fn subscriptionTransformsAllocations(gpa: Allocator) !void {
 }
 
 test "allocation failures: a subscription's transforms on create, as read, and in an update" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, subscriptionTransformsAllocations, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, subscriptionTransformsAllocations, .{});
 }

@@ -1533,7 +1533,7 @@ test "every allocation failure is OutOfMemory without leaks" {
             end_request.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.calls, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.calls, .{});
 }
 
 /// 2026-10-18T13:46:35.949Z.

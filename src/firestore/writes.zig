@@ -597,7 +597,7 @@ test "commit: every allocation failure is OutOfMemory without leaks" {
             r.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 /// The commit body of `w` alone, for comparing writes.

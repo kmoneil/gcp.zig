@@ -17,7 +17,6 @@ pub const FakeClock = core.testing.FakeClock;
 pub const ByteGen = core.testing.ByteGen;
 pub const fuzzBytes = core.testing.fuzzBytes;
 pub const repeat = core.testing.repeat;
-pub const no_grow_allocator = core.testing.no_grow_allocator;
 /// The allocator a property runs on: the one that looks for leaks in every
 /// test run, a plain one under the fuzzer, where the leak checker's record
 /// of every allocation is most of a run's cost and grows without end.

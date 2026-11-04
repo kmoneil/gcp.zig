@@ -1131,7 +1131,7 @@ fn keyedEverything(gpa: Allocator) !void {
 }
 
 test "keys: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, keyedEverything, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, keyedEverything, .{});
 }
 
 test "keys: a resumable upload names its key at the start, and its chunks carry none" {

@@ -454,7 +454,7 @@ test "every allocation failure is OutOfMemory without leaks" {
             try s.finish();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 /// Parses `text` whole, the reference: its elements re-written in one

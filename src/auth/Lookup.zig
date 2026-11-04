@@ -249,7 +249,7 @@ test "Lookup: every allocation failure while reading the environment is OutOfMem
             _ = try fromEnv(&map, arena.allocator());
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 fn varsProperty(_: void, input: []const u8) !void {

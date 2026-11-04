@@ -532,7 +532,7 @@ fn iamAllocations(gpa: std.mem.Allocator) !void {
 }
 
 test "bucket IAM: every allocation failure is OutOfMemory without leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, iamAllocations, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, iamAllocations, .{});
 }
 
 fn iamModelProperty(_: void, bytes: []const u8) !void {
@@ -863,7 +863,7 @@ test "object IAM: every allocation failure is OutOfMemory without leaks" {
             t.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 test "object IAM on the fake: production's policy from the object's list, and its refusals" {

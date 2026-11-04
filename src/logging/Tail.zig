@@ -838,7 +838,7 @@ test "tail: every allocation failure in a poll is OutOfMemory without leaks" {
             batch.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 const Arrival = struct { id: [4]u8, ts_ms: i64, visible_ms: i64 };

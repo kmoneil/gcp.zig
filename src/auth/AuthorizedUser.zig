@@ -867,14 +867,14 @@ test "AuthorizedUser: every allocation failure is OutOfMemory without leaks" {
             _ = try user.account(clock.io(), arena.allocator());
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.get, .{token_ok});
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.account, .{tokenWith(id_token_mine)});
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.account, .{token_ok});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.get, .{token_ok});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.account, .{tokenWith(id_token_mine)});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.account, .{token_ok});
     // Escapes make std.json allocate; without them it points into the body.
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.get, .{Reply{ .respond = .{
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.get, .{Reply{ .respond = .{
         .body = "{\"access_token\":\"ya29.\\u0053ECRET-at\",\"expires_in\":3599}",
     } }});
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.refused, .{Reply{ .respond = .{
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.refused, .{Reply{ .respond = .{
         .status = 400,
         .body = "{\"error\":\"invalid_grant\",\"error_description\":\"Token has been \\\"revoked\\\".\"}",
     } }});
@@ -884,7 +884,7 @@ test "AuthorizedUser: every allocation failure is OutOfMemory without leaks" {
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "adc.json", .data = file_json });
     var buf: [256]u8 = undefined;
     const path = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/adc.json", .{&tmp.sub_path});
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.fromFile, .{path});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.fromFile, .{path});
 }
 
 test "AuthorizedUser: initFromFile reads the file, and reports a missing or oversized one" {

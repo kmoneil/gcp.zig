@@ -2862,7 +2862,7 @@ test "log hygiene: no plaintext, ciphertext, signature, MAC, random bytes, check
 }
 
 test "crypto calls against the fake: every allocation failure is OutOfMemory without leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, cryptoAllocations, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, cryptoAllocations, .{});
 }
 
 fn lifecycleAllocations(gpa: Allocator) !void {
@@ -2893,5 +2893,5 @@ fn lifecycleAllocations(gpa: Allocator) !void {
 }
 
 test "a lifecycle against the fake: every allocation failure is OutOfMemory without leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, lifecycleAllocations, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, lifecycleAllocations, .{});
 }

@@ -832,7 +832,7 @@ test "ImpersonatedServiceAccount: init without a transport survives every alloca
             account.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.init, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.init, .{});
 }
 
 test "ImpersonatedServiceAccount: every allocation failure is OutOfMemory without leaks" {
@@ -851,7 +851,7 @@ test "ImpersonatedServiceAccount: every allocation failure is OutOfMemory withou
             _ = try account.provider().getToken(testing.io, scratch.allocator(), test_scopes);
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.get, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.get, .{});
 }
 
 fn anyIamReplyProperty(_: void, input: []const u8) !void {

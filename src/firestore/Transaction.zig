@@ -509,5 +509,5 @@ test "runTransaction: every allocation failure is OutOfMemory without leaks" {
             try client.runTransaction(inc.handler(), .{});
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run_, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run_, .{});
 }

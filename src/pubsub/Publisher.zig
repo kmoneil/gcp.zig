@@ -2115,7 +2115,7 @@ test "init and deinit: every allocation failure is OutOfMemory without leaks" {
             publisher.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.initDeinit, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.initDeinit, .{});
 }
 
 test "publish, send and resolve: every allocation failure is OutOfMemory without leaks" {
@@ -2149,9 +2149,9 @@ test "publish, send and resolve: every allocation failure is OutOfMemory without
             for (fake.requests.items) |seen| try testing.expectEqual(compression != null, seen.gzipped);
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.wholePath, .{null});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.wholePath, .{null});
     // Every body compressed, however short.
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.wholePath, .{@as(?types.Compression, .{ .min_bytes = 0 })});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.wholePath, .{@as(?types.Compression, .{ .min_bytes = 0 })});
 }
 
 test "keys: a key needs enable_message_ordering, an empty key is none, and a bad key is refused" {
@@ -2368,7 +2368,7 @@ test "keys: every allocation failure on a keyed path is OutOfMemory without leak
             publisher.resumePublish("k1");
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.keyedPath, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.keyedPath, .{});
 }
 
 /// A publisher running for real, with its own tasks, against the fake.

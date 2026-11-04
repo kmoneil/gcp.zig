@@ -2296,7 +2296,7 @@ test "decodePull: every allocation failure is OutOfMemory without leaks" {
             try testing.expectEqual(3 * 4096, result.messages[0].data.len);
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.decode, .{@as([]const u8, body)});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.decode, .{@as([]const u8, body)});
 }
 
 fn stringLenProperty(_: void, input: []const u8) !void {

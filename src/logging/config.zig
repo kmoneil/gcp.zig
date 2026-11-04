@@ -509,7 +509,7 @@ test "picker: every allocation failure is OutOfMemory without leaks" {
             p.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 test "picker: of a folder, an organization and a billing account" {

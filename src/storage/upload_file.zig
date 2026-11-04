@@ -970,7 +970,7 @@ fn uploadFileWithCheckpoint(gpa: Allocator) !void {
 }
 
 test "uploadFile with a checkpoint: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, uploadFileWithCheckpoint, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, uploadFileWithCheckpoint, .{});
 }
 
 /// Draws each session request's fate from fuzz bytes: mostly nothing,
@@ -1488,7 +1488,7 @@ fn compressedUploadWithCheckpoint(gpa: Allocator) !void {
 }
 
 test "compressed uploadFile with a checkpoint: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, compressedUploadWithCheckpoint, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, compressedUploadWithCheckpoint, .{});
 }
 
 /// `resumeUnderFaults` for a compressed upload: whatever the faults cut,

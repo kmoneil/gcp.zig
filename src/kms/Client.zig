@@ -374,7 +374,7 @@ test "init: every allocation failure is OutOfMemory without leaks" {
             c.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, S.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, S.run, .{});
 }
 
 test "golden: lists of key rings, locations and retired keys" {

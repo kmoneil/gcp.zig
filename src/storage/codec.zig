@@ -1956,7 +1956,7 @@ fn decodeEverySettingsBody(allocator: Allocator) !void {
 }
 
 test "decode the new settings under every allocation failure" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, decodeEverySettingsBody, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, decodeEverySettingsBody, .{});
 }
 
 test "decode objects' custom time, media link and class time, as production answered them" {

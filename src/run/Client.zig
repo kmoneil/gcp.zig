@@ -1103,7 +1103,7 @@ test "every allocation failure is OutOfMemory without leaks" {
             failed.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.calls, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.calls, .{});
 }
 
 const job_url = "https://run.googleapis.com/v2/projects/my-project/locations/us-central1/jobs/zigps-6b8297-quick";
@@ -1390,7 +1390,7 @@ test "every allocation failure in a write is OutOfMemory without leaks" {
             preview.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.calls, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.calls, .{});
 }
 
 test "golden: a service's and a job's IAM policy and permissions, production's answers" {
@@ -1523,5 +1523,5 @@ test "every allocation failure in an IAM read is OutOfMemory without leaks" {
             d.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }

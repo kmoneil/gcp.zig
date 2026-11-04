@@ -452,7 +452,7 @@ test "Cache: every allocation failure is OutOfMemory without leaks" {
             _ = try cache.getToken(clock.io(), arena.allocator(), source.source());
         }
     };
-    try testing.checkAllAllocationFailures(core.testing.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 test "Cache: callers that arrive during a fetch wait for it and share its token" {

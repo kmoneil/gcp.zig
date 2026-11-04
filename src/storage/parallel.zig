@@ -1739,7 +1739,7 @@ fn parallelEverything(gpa: Allocator) !void {
 }
 
 test "uploadParallel: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, parallelEverything, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, parallelEverything, .{});
 }
 
 /// Draws each request's fate from fuzz bytes, under the fake's lock:
@@ -3321,7 +3321,7 @@ fn uploadWithCheckpoint(gpa: Allocator) !void {
 }
 
 test "uploadParallel with a checkpoint: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, uploadWithCheckpoint, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, uploadWithCheckpoint, .{});
 }
 
 /// Lets every request through, recording each part number sent, so a

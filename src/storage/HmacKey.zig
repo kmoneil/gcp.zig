@@ -383,7 +383,7 @@ fn createSweep(gpa: std.mem.Allocator) !void {
 }
 
 test "createHmacKey: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, createSweep, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, createSweep, .{});
 }
 
 fn decodeProperty(_: void, input: []const u8) anyerror!void {

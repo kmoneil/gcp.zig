@@ -10761,7 +10761,7 @@ fn sessionAllocations(gpa: Allocator) !void {
 }
 
 test "allocation failures: a session of every call leaks nothing and breaks nothing" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, sessionAllocations, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, sessionAllocations, .{});
 }
 
 test "many tasks at once: every message published is pulled and acknowledged exactly once" {

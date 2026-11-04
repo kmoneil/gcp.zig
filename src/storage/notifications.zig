@@ -875,7 +875,7 @@ fn everyCall(gpa: Allocator) !void {
 }
 
 test "notifications: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, everyCall, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, everyCall, .{});
 }
 
 /// A configuration drawn from `bytes`, near the bounds production holds it

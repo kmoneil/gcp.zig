@@ -4,7 +4,8 @@
 
 Each of these is worked around here, and covered by a regression test in
 `src/core/transport.zig` unless it says otherwise. Each was checked
-against Zig 0.17.0's source when the library moved to it.
+against Zig 0.17.0's source when the library moved to it, and against
+0.17.1's when it moved to that.
 
 - A chunk size near 2^64 overflows `std.http`'s chunked decoder (a
   panic in a safe build), so the transport decodes chunked bodies
@@ -22,13 +23,14 @@ against Zig 0.17.0's source when the library moved to it.
   writer with no buffer of its own trips an assertion in std's readers,
   which need somewhere writable; the transport passes bodies through a
   small buffer of its own.
-- On Windows, std does not map `0xC000013B` (the peer hung up), so it
-  arrives as `error.Unexpected`. The transport reads that as a dropped
-  connection and retries, which is right for it and is also what any
-  other unmapped Windows error gets: a retry it may not deserve. On
-  other platforms `error.Unexpected` stays a permanent `NetworkFailure`.
-  Zig 0.16 also left `0xC0000236` (connection refused) unmapped; Zig
-  0.17 maps it to `error.ConnectionRefused`.
+- On Windows, std maps only the socket statuses it expects, and any
+  other arrives as `error.Unexpected`. The transport reads that as a
+  dropped connection and retries, a retry an unmapped error may not
+  deserve. On other platforms `error.Unexpected` stays a permanent
+  `NetworkFailure`. Zig 0.16 left `0xC0000236` (connection refused)
+  unmapped, and Zig 0.17.0 `0xC000013B` (the peer hung up) on a read
+  or write; Zig 0.17 maps the first to `error.ConnectionRefused`, and
+  0.17.1 the second to `error.ConnectionResetByPeer`.
 - `std.compress.flate.Decompress` reads each gzip member's trailer, its
   CRC-32 and length, and checks neither, so a corrupted member
   decompresses to wrong bytes without complaint. `storage`'s downloads
@@ -39,7 +41,7 @@ against Zig 0.17.0's source when the library moved to it.
   one; the code calls `initHasher` instead. There is nothing to test: the
   other call would not compile.
 
-Two more are handled in this repository's tests:
+One more is handled in this repository's tests:
 
 - `std.testing.allocator`, a `std.heap.SafeAllocator`, records a stack
   trace for every allocation. On macOS, capturing one locks the debug
@@ -59,13 +61,23 @@ Two more are handled in this repository's tests:
   flag on every way out, and their tasks watch it within bounded waits,
   so even a task whose cancel was swallowed ends soon after, instead of
   leaving `run` waiting on it forever.
-- The same allocator grows a block in place only while nothing was
-  handed out after it, which depends on what earlier runs did, so the
-  same code made a different number of allocations from one run to the
-  next, and `std.testing.checkAllAllocationFailures` failed with
-  `NondeterministicMemoryUsage`. Every sweep backs onto
-  `core.testing.no_grow_allocator`, which refuses to grow a block in
-  place, tested in `src/core/testing.zig`.
+
+## Fixed in Zig 0.17.1
+
+This had a workaround here until the library moved to Zig 0.17.1, and
+its test now holds std to the fix:
+
+- `std.testing.checkAllAllocationFailures` let the testing allocator
+  grow a block in place or not depending on what earlier runs did, so
+  the same code made a different number of allocations from one run to
+  the next, and the sweep failed with `NondeterministicMemoryUsage`.
+  Every sweep backed onto `core.testing.no_grow_allocator`, which
+  refused to grow a block in place. Zig 0.17.1's sweep refuses every
+  resize itself, so the sweeps back onto `std.testing.allocator` again.
+  The seven that failed on 0.17.0 without it hold std to the fix:
+  firestore's `batchGet`, kms's fake, pubsub's `Schema`, run's `Client`
+  writes, secret_manager's IAM, and storage's encryption keys and
+  `downloadParallel`.
 
 ## Fixed in Zig 0.17
 

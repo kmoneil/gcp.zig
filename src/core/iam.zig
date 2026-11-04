@@ -785,7 +785,7 @@ fn updateAllocations(gpa: Allocator) !void {
 }
 
 test "update: every allocation failure is OutOfMemory, and nothing leaks" {
-    try std.testing.checkAllAllocationFailures(test_util.no_grow_allocator, updateAllocations, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, updateAllocations, .{});
 }
 
 fn updateProperty(_: void, bytes: []const u8) !void {

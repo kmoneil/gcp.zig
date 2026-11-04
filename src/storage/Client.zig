@@ -551,7 +551,7 @@ test "init: every allocation failure is OutOfMemory without leaks" {
             client.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 test "golden: listBuckets needs a project and pages" {
@@ -634,5 +634,5 @@ fn siblingOf(gpa: Allocator) !void {
 }
 
 test "sibling: every allocation failure is OutOfMemory without leaks" {
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, siblingOf, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, siblingOf, .{});
 }

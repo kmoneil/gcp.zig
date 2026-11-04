@@ -320,5 +320,5 @@ test "create and list: every allocation failure is OutOfMemory without leaks" {
             page.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }

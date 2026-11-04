@@ -442,7 +442,7 @@ test "decode: the event outlives the message, and every allocation failure is cl
             }
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 fn decodeProperty(_: void, input: []const u8) !void {

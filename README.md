@@ -9,7 +9,7 @@ Pub/Sub, Cloud Storage, Secret Manager and Firestore, with credentials that find
 
 [![CI](https://github.com/kmoneil/gcp.zig/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/kmoneil/gcp.zig/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/kmoneil/gcp.zig?sort=semver&color=4285F4)](https://github.com/kmoneil/gcp.zig/releases)
-[![Zig 0.17.0](https://img.shields.io/badge/zig-0.17.0-F7A41D?logo=zig&logoColor=white)](https://ziglang.org/download/)
+[![Zig 0.17.1](https://img.shields.io/badge/zig-0.17.1-F7A41D?logo=zig&logoColor=white)](https://ziglang.org/download/)
 [![Dependencies: none](https://img.shields.io/badge/dependencies-none-34A853)](build.zig.zon)
 [![License: MIT](https://img.shields.io/badge/license-MIT-34A853)](LICENSE)
 
@@ -81,7 +81,8 @@ that brings its own tokens needs no `auth` at all.
 
 ## Install
 
-Zig **0.17.0** (`minimum_zig_version` enforces it). For Zig 0.16.0, use
+Zig **0.17.1**, the version `minimum_zig_version` names and the only one
+CI tests (Zig does not check that field itself). For Zig 0.16.0, use
 v0.30.0, the last release that builds with it.
 
 ```sh

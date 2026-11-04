@@ -818,5 +818,5 @@ test "runQuery and runAggregationQuery: every allocation failure is OutOfMemory 
             agg.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }

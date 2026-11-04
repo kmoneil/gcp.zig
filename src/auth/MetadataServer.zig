@@ -1072,14 +1072,14 @@ test "MetadataServer: every allocation failure is OutOfMemory without leaks" {
             metadata.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.token, .{token_ok});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.token, .{token_ok});
     // Escapes make std.json allocate; without them it points into the body.
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.token, .{Reply{ .respond = .{
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.token, .{Reply{ .respond = .{
         .body = "{\"access_token\":\"ya29.\\u0053ECRET\",\"expires_in\":3599}",
         .headers = flavor,
     } }});
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.project, .{});
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.withOwnTransport, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.project, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.withOwnTransport, .{});
 }
 
 test "MetadataServer: against a metadata server on loopback" {

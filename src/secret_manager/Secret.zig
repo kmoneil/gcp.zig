@@ -482,7 +482,7 @@ test "addVersion: every allocation failure is OutOfMemory without leaks" {
             added.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 const created_secret: Reply = .{ .respond = .{ .body =
@@ -637,7 +637,7 @@ test "secret administration: every allocation failure is OutOfMemory without lea
             try secret.delete();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 /// Production's refusal of a write under a stale etag, word for word.
@@ -872,7 +872,7 @@ test "update and deleteIf: every allocation failure is OutOfMemory without leaks
             try secret.deleteIf("\"e\"");
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 test "golden: topics and rotation, on create and update" {

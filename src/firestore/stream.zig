@@ -461,5 +461,5 @@ test "runQueryEach and batchGetEach: every allocation failure is OutOfMemory wit
             _ = try client.batchGetEach(&.{ "c/a", "c/b" }, .{}, c.items());
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }

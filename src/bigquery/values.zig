@@ -972,7 +972,7 @@ test "every allocation failure in a row's decode is OutOfMemory without leaks" {
             writeRows(&written.writer, page.schema, page.rows) catch return error.OutOfMemory;
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.decode, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.decode, .{});
 }
 
 test "errorPosition reads a query error's at [line:column]" {

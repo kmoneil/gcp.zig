@@ -274,7 +274,7 @@ test "walk: every allocation failure is OutOfMemory without leaks" {
             list.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 test "parents: every page of folders, then organizations, each once by name, one pause between each page" {
@@ -392,5 +392,5 @@ test "parents: every allocation failure is OutOfMemory without leaks" {
             gpa.free(path);
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }

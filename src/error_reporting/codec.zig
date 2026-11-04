@@ -446,7 +446,7 @@ test "decoding: every allocation failure is OutOfMemory without leaks" {
             _ = try encodeGroup(arena.allocator(), .{ .name = "n", .id = "i", .tracking_issues = &.{.{ .url = "u" }} }, .open);
         }
     };
-    try testing.checkAllAllocationFailures(core.testing.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 fn arbitraryProperty(_: void, input: []const u8) !void {

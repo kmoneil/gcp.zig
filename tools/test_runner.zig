@@ -23,11 +23,12 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//! Zig 0.17.0's test runner (lib/compiler/test_runner.zig), with two
-//! changes: `std_options_debug_io` below, which makes `std.debug`'s futex
-//! waits uncancelable, and `runner_test_run` putting the fuzzed tests'
-//! `testing.io` on the runner's gpa, which outlives the per-input swaps of
-//! `testing.allocator_instance` (see the comment there).
+//! Zig 0.17.0's test runner (lib/compiler/test_runner.zig), which 0.17.1
+//! left unchanged, with two changes: `std_options_debug_io` below, which
+//! makes `std.debug`'s futex waits uncancelable, and `runner_test_run`
+//! putting the fuzzed tests' `testing.io` on the runner's gpa, which
+//! outlives the per-input swaps of `testing.allocator_instance` (see the
+//! comment there).
 //!
 //! `std.testing.allocator` is a `std.heap.SafeAllocator`, which records a
 //! stack trace for every allocation. On macOS, capturing one locks the

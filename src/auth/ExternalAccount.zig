@@ -1082,7 +1082,7 @@ test "ExternalAccount: every allocation failure is OutOfMemory without leaks" {
             _ = try external.provider().getToken(testing.io, scratch.allocator(), test_scopes);
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.get, .{json});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.get, .{json});
 }
 
 test "ExternalAccount: a url source with headers survives every allocation failure" {
@@ -1104,7 +1104,7 @@ test "ExternalAccount: a url source with headers survives every allocation failu
             external.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.init, .{json});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.init, .{json});
 }
 
 test "ExternalAccount: against an STS on loopback" {

@@ -655,7 +655,7 @@ test "credentials: every allocation failure on the token path is OutOfMemory wit
             info.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.get, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.get, .{});
 }
 
 const unauthenticated: Reply = .{ .respond = .{

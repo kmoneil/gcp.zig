@@ -377,7 +377,7 @@ test "init: every allocation failure is OutOfMemory without leaks" {
             client.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 test "every public call: every allocation failure is OutOfMemory without leaks" {
@@ -463,7 +463,7 @@ test "every public call: every allocation failure is OutOfMemory without leaks" 
             try testing.expectEqual(replies.len, fake.requests.items.len);
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.all, .{@as([]const Reply, &script)});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.all, .{@as([]const Reply, &script)});
 }
 
 test "golden: listTopics and listSubscriptions pass page options" {

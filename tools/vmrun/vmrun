@@ -124,7 +124,7 @@ esac
 # hash (ziglang.org/download/index.json).
 ZIG_VERSION=$(sed -n 's/.*\.minimum_zig_version = "\(.*\)".*/\1/p' "$ROOT/build.zig.zon")
 case $ZIG_VERSION in
-  0.17.0) ZIG_SHA=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026 ;;
+  0.17.1) ZIG_SHA=3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a ;;
   *) echo "vmrun: no pinned hash for Zig $ZIG_VERSION; add it to tools/vmrun/vmrun (ziglang.org/download/index.json)" >&2; exit 2 ;;
 esac
 

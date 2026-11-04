@@ -137,8 +137,8 @@ pub const StreamRequest = struct {
 
     pub const Body = union(enum) {
         /// No body and no Content-Length, as GET and DELETE send. POST, PUT
-        /// and PATCH send an empty one, `Content-Length: 0`, since std
-        /// requires them to carry a body.
+        /// and PATCH send an empty one, `Content-Length: 0`, since Google's
+        /// front ends refuse a POST that gives no length (411).
         none,
         /// Sent back to back with an exact Content-Length, without being
         /// copied into one buffer. A multipart body is framing, caller data,
@@ -649,7 +649,8 @@ fn sendBody(
     // streams into it, and readers require a writable destination.
     var body_buffer: [4096]u8 = undefined;
     switch (body) {
-        // std asserts that a method that takes a body sends one.
+        // A method that takes a body sends an empty one, with its length.
+        // (Zig 0.17.0's std asserted that it did; 0.17.1's sends none.)
         .none => return if (request.method.requestHasBody()) sendBody(request, .{ .segments = &.{} }) else request.sendBodiless(),
         .segments => |segments| {
             var total: u64 = 0;
@@ -855,11 +856,11 @@ fn mapError(err: anyerror, connection: ?*http.Client.Connection) Error {
         error.UnsupportedUriScheme, error.UriMissingHost => error.InvalidEndpoint,
 
         // std on Windows returns Unexpected for socket statuses it does not
-        // map, among them a peer that hangs up (STATUS_LOCAL_DISCONNECT);
-        // Zig 0.16 also left a refused connection unmapped. Which status it
-        // was is lost by now, and a hang-up is worth retrying, so call it a
-        // dropped connection. Elsewhere std maps every socket error it
-        // expects.
+        // map. Zig 0.16 left a refused connection among them, and 0.17.0 a
+        // peer that hangs up mid-read or write (STATUS_LOCAL_DISCONNECT),
+        // which 0.17.1 maps. Which status it was is lost by now, and a
+        // hang-up is worth retrying, so call it a dropped connection.
+        // Elsewhere std maps every socket error it expects.
         error.Unexpected => if (builtin.target.os.tag == .windows) error.ConnectionResetByPeer else error.NetworkFailure,
 
         error.HttpHeadersOversize,

@@ -816,7 +816,7 @@ test "ServiceAccount: init without a transport survives every allocation failure
             account.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.init, .{json});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.init, .{json});
 }
 
 test "ServiceAccount: an explicit token_url wins over the file's token_uri" {
@@ -876,7 +876,7 @@ test "ServiceAccount: every allocation failure while signing is OutOfMemory" {
     var h: Harness = undefined;
     try h.init(&.{});
     defer h.deinit();
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, signOnce, .{ h.account.signer(), h.clock.io() });
+    try testing.checkAllAllocationFailures(std.testing.allocator, signOnce, .{ h.account.signer(), h.clock.io() });
 }
 
 test "ServiceAccount: secrets reach neither the log nor Diagnostics" {
@@ -933,7 +933,7 @@ test "ServiceAccount: every allocation failure is OutOfMemory without leaks" {
             _ = try account.provider().getToken(clock.io(), arena.allocator(), test_scopes);
         }
     };
-    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.get, .{token_ok});
+    try testing.checkAllAllocationFailures(std.testing.allocator, Run.get, .{token_ok});
 }
 
 test "ServiceAccount: initFromFile reads the file, and reports a missing one" {
