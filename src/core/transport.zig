@@ -1560,13 +1560,11 @@ test "HttpTransport: a failed TLS handshake forgets the TLS clock" {
     ht.client.now = std.Io.Clock.real.now(io);
     var buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&buf, "https://127.0.0.1:{d}/v1/x", .{server.port});
-    // The server hangs up mid-handshake: a failure worth retrying. std on
-    // Windows reports that as a socket error rather than a TLS failure
-    // (see mapError), and only a TLS failure forgets the clock.
-    if (builtin.target.os.tag == .windows) {
-        try testing.expectError(error.ConnectionResetByPeer, ht.transport().send(.{ .method = .GET, .url = url }, arena.allocator()));
-        return;
-    }
+    // The server hangs up mid-handshake: a TLS failure, which is retried,
+    // and which forgets the clock. On every platform since Zig 0.17.1:
+    // 0.17.0 on Windows left the hang-up's status (STATUS_LOCAL_DISCONNECT)
+    // unmapped, and std's TLS connect passes error.Unexpected through
+    // rather than calling it a TLS failure.
     try testing.expectError(error.TlsFailure, ht.transport().send(.{ .method = .GET, .url = url }, arena.allocator()));
     try testing.expectEqual(null, ht.client.now);
 }
