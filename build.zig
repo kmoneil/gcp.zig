@@ -147,6 +147,15 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "core", .module = core }},
     });
 
+    // Cloud Billing Catalog: services and SKUs with their list prices. It
+    // imports core, never a service.
+    const billing = b.addModule("billing", .{
+        .root_source_file = b.path("src/billing/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core }},
+    });
+
     // Every test build runs under std's test runner with one fix, which
     // keeps std.debug from swallowing a task's cancel (see the top of
     // tools/test_runner.zig).
@@ -182,6 +191,7 @@ pub fn build(b: *std.Build) void {
         .{ "bigquery", bigquery },
         .{ "datatransfer", datatransfer },
         .{ "compute", compute },
+        .{ "billing", billing },
     };
     // The nightly fuzz job runs one module per job, so each gets the whole
     // time budget: `--fuzz=N` fuzzes every property N times, and the
@@ -189,12 +199,12 @@ pub fn build(b: *std.Build) void {
     const only_module = b.option(
         []const u8,
         "module",
-        "Run only this module's unit tests: core, auth, pubsub, secret_manager, storage, firestore, logging, resource_manager, error_reporting, monitoring, kms, scheduler, run, dataflow, bigquery, datatransfer or compute",
+        "Run only this module's unit tests: core, auth, pubsub, secret_manager, storage, firestore, logging, resource_manager, error_reporting, monitoring, kms, scheduler, run, dataflow, bigquery, datatransfer, compute or billing",
     );
     if (only_module) |name| {
         for (unit_modules) |entry| {
             if (std.mem.eql(u8, entry[0], name)) break;
-        } else std.process.fatal("-Dmodule={s} names no module; use core, auth, pubsub, secret_manager, storage, firestore, logging, resource_manager, error_reporting, monitoring, kms, scheduler, run, dataflow, bigquery, datatransfer or compute", .{name});
+        } else std.process.fatal("-Dmodule={s} names no module; use core, auth, pubsub, secret_manager, storage, firestore, logging, resource_manager, error_reporting, monitoring, kms, scheduler, run, dataflow, bigquery, datatransfer, compute or billing", .{name});
     }
     const test_step = b.step("test", "Run unit, property and fuzz-corpus tests");
     // The same tests without what `test` compiles beside them, the examples
@@ -263,6 +273,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "bigquery", .module = bigquery },
                 .{ .name = "datatransfer", .module = datatransfer },
                 .{ .name = "compute", .module = compute },
+                .{ .name = "billing", .module = billing },
                 .{ .name = "core", .module = core },
             },
         }),

@@ -2806,3 +2806,58 @@ test "a spot VM in the first zone with room, against the in-memory Compute Engin
     try std.testing.expectEqual(.running, vm.value.status);
 }
 // end snippet
+
+const billing = @import("billing");
+
+// snippet: billing-fake
+test "an hourly price, read from the in-memory catalog" {
+    var fake: billing.testing.FakeBilling = .init(std.testing.allocator, std.testing.io);
+    defer fake.deinit();
+    const engine = billing.compute_engine_service_id;
+    try fake.putService(.{ .id = engine, .display_name = "Compute Engine" });
+    // E2's vCPU and memory in us-central1, priced as production priced
+    // them on 2026-11-04, standing in for Google's catalog.
+    const since: std.Io.Timestamp = .{ .nanoseconds = 1_767_254_400 * std.time.ns_per_s };
+    const americas: []const []const u8 = &.{ "us-central1", "us-east1", "us-west1" };
+    try fake.putSku(.{
+        .id = "CF4E-A0C7-E3BF",
+        .service_id = engine,
+        .description = "E2 Instance Core running in Americas",
+        .regions = americas,
+        .geo_type = "MULTI_REGIONAL",
+        .prices = &.{.{ .from = since, .tiers = &.{.{ .usd_nanos = 21_811_590 }} }},
+    });
+    try fake.putSku(.{
+        .id = "F449-33EC-A5EF",
+        .service_id = engine,
+        .description = "E2 Instance Ram running in Americas",
+        .resource_group = "RAM",
+        .usage_unit = "GiBy.h",
+        .usage_unit_description = "gibibyte hour",
+        .base_unit = "By.s",
+        .base_unit_description = "byte second",
+        .base_unit_conversion_factor = 3_865_470_566_400,
+        .regions = americas,
+        .geo_type = "MULTI_REGIONAL",
+        .prices = &.{.{ .from = since, .tiers = &.{.{ .usd_nanos = 2_923_530 }} }},
+    });
+
+    var token: billing.StaticToken = .{ .token = "none" };
+    var client = try billing.Client.init(std.testing.allocator, std.testing.io, .{
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    var page = try client.listSkus(engine, .{});
+    defer page.deinit();
+
+    // e2-standard-2: two vCPUs and 8 GiB, each priced apart.
+    var nanos: i128 = 0;
+    for (page.value.skus) |sku| {
+        if (!sku.offeredIn("us-central1")) continue;
+        const unit = sku.latest().?.unitPrice().?.toNanos();
+        nanos += if (std.mem.eql(u8, sku.resource_group, "CPU")) 2 * unit else 8 * unit;
+    }
+    try std.testing.expectEqual(67_011_420, nanos); // $0.06701142 an hour
+}
+// end snippet

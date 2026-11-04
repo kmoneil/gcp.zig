@@ -105,7 +105,7 @@ fn daysInMonth(year: i64, month: i64) i64 {
 
 /// Days since 1970-01-01 in the proleptic Gregorian calendar
 /// (Howard Hinnant's algorithm).
-fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
+pub fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
     const y = if (month <= 2) year - 1 else year;
     const era = @divFloor(y, 400);
     const yoe = y - era * 400;
