@@ -45,10 +45,15 @@
 //!   total over the period), ALIGN_RATE (a second) and min, max, mean and
 //!   count, the aligners production refused on each kind refused in its
 //!   words; the reducers min, max, mean, sum and count and group-by fields;
+//!   on a DELTA distribution (issue #315), ALIGN_DELTA and ALIGN_SUM (the
+//!   period's points merged) and the four percentiles, and the reducers
+//!   sum (a merge), count, mean, stddev and the four percentiles, as
+//!   production computed them on 2026-11-05 (`fake_distributions.zig`),
+//!   the rest refused in production's words;
 //!   the unit as production gave it, `1` for a count and a second for a
 //!   rate.
 //! - Google's own metrics: the nine of Pub/Sub's a console reads (issue
-//!   #239), the four quota metrics under
+//!   #239) and its message sizes (issue #315), the four quota metrics under
 //!   `serviceruntime.googleapis.com/quota/` a console reads for quota
 //!   warnings (issue #247), and the five of Cloud Storage's a bucket page
 //!   charts (issue #338), their descriptors as production gave them,
@@ -66,12 +71,17 @@
 //! and `gcs_bucket`, only generic_task's and the last four's text
 //! production's; nothing put in
 //! arrives late, where production showed a minute's counts about 130 s
-//! after it. Not modelled, each
+//! after it; a merged distribution's mean and squared deviations can
+//! differ from production's in the last place or two, since production
+//! merges what it holds under each minute's point. Not modelled, each
 //! answered 501 with the reason: another project, a cumulative start
 //! moved later but inside the series' last interval (production took one,
 //! and the earlier point vanished), distribution rules production was not
 //! asked about, more than one point in a series, deleting one of Google's
-//! metrics, and filters other than a type prefix.
+//! metrics, and filters other than a type prefix; a percentile of buckets
+//! not exponential or in the underflow or overflow bucket, a merge of
+//! distributions with different buckets, and stddev and the percentile
+//! reducers on numbers, which production bins in a layout of its own.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -82,6 +92,7 @@ const tp = core.transport;
 const types = @import("types.zig");
 const validate = @import("validate.zig");
 const fake_policies = @import("fake_policies.zig");
+const fake_distributions = @import("fake_distributions.zig");
 
 pub const FakeMonitoring = struct {
     gpa: Allocator,
@@ -1344,6 +1355,11 @@ pub const FakeMonitoring = struct {
         value_type: types.ValueType,
         /// Newest first.
         points: []const Point,
+        /// An aligned series' own points, newest first: a reducer merges
+        /// distributions from these, every member's in a period at once,
+        /// as production merged them (2026-11-05: merging each member's
+        /// merge was off in the last place).
+        source: []const Point = &.{},
     };
 
     fn read(f: *FakeMonitoring, arena: Allocator, params: []const Param) Allocator.Error!Reply {
@@ -1367,7 +1383,7 @@ pub const FakeMonitoring = struct {
             period_ns = @as(i96, seconds) * std.time.ns_per_s;
         }
         const aligner = alignerOf(aligner_name) orelse return notModelled(arena, try arena.print("the aligner {s}", .{aligner_name}));
-        const reducer = reducerOf(reducer_name) orelse return notModelled(arena, try arena.print("the reducer {s}", .{reducer_name}));
+        const reducer = types.Reducer.fromWire(reducer_name) orelse return notModelled(arena, try arena.print("the reducer {s}", .{reducer_name}));
         const headers = if (paramOf(params, "view")) |v| std.mem.eql(u8, v, "HEADERS") else false;
 
         const d = f.descriptors.get(metric_type) orelse return fail(arena, 404, "NOT_FOUND", try arena.print("Cannot find metric(s) that match type = \"{s}\". If a metric was created recently, it could take up to 10 minutes to become available. Please try again soon.", .{metric_type}));
@@ -1393,26 +1409,8 @@ pub const FakeMonitoring = struct {
             },
             .resource_type => {},
         };
-        // The aligners production took on each kind, and those it refused
-        // in its words, on 2026-10-19.
-        if (aligner != .none) switch (d.kind) {
-            .gauge => switch (d.value_type) {
-                .int64, .double => switch (aligner) {
-                    .min, .max, .mean, .sum, .count => {},
-                    .delta, .rate => return misaligned(arena, aligner, d),
-                    else => return notModelled(arena, try arena.print("the aligner {s} on a gauge", .{aligner.wire()})),
-                },
-                .bool => if (aligner != .count) return notModelled(arena, "this aligner on a bool metric"),
-                else => return notModelled(arena, "aligning this value type"),
-            },
-            // Only Google's, every one INT64.
-            .delta => switch (aligner) {
-                .delta, .rate, .sum, .min, .max, .mean, .count => {},
-                .interpolate, .next_older, .count_true, .count_false, .fraction_true, .percentile_99, .percentile_95, .percentile_50, .percentile_05 => return misaligned(arena, aligner, d),
-                else => return notModelled(arena, try arena.print("the aligner {s} on a DELTA metric", .{aligner.wire()})),
-            },
-            else => return notModelled(arena, "aligning a cumulative metric"),
-        };
+        if (try alignerRefusal(arena, d, aligner)) |answer| return answer;
+        if (try reducerRefusal(arena, d, aligner, reducer)) |answer| return answer;
 
         // The series the filter selects. A raw read keeps the points in
         // (start, end]; an aligned read keeps them all, since a period
@@ -1448,18 +1446,78 @@ pub const FakeMonitoring = struct {
         if (aligner != .none) {
             var kept: usize = 0;
             for (raw.items) |s| {
-                const aligned = try alignSeries(arena, s, aligner, start, end, period_ns);
+                const aligned = alignSeries(arena, s, aligner, start, end, period_ns) catch |err| return distributionsUnmodelled(arena, err);
                 if (aligned.points.len == 0) continue;
                 out[kept] = aligned;
                 kept += 1;
             }
             out = out[0..kept];
-            if (reducer != .none) out = try f.reduce(arena, out, reducer, paramsOf(arena, params, "aggregation.groupByFields") catch return error.OutOfMemory);
+            if (reducer != .none) out = f.reduce(arena, out, reducer, paramsOf(arena, params, "aggregation.groupByFields") catch return error.OutOfMemory) catch |err| return distributionsUnmodelled(arena, err);
         }
         // The unit production gave: `1` for a count, the metric's a second
         // for a rate, `{not_a_unit}` for a metric without one.
         const unit: []const u8 = if (aligner == .count or reducer == .count) "1" else if (aligner == .rate) try arena.print("{s}/s", .{d.unit}) else if (d.unit.len == 0) "{not_a_unit}" else d.unit;
         return f.renderRead(arena, out, params, headers, unit);
+    }
+
+    /// The aligners production took on each kind, and those it refused in
+    /// its words, on 2026-10-19 and, on Pub/Sub's message sizes, on
+    /// 2026-11-05; a 501 for one not measured; null for one taken.
+    fn alignerRefusal(arena: Allocator, d: *const Descriptor, aligner: types.Aligner) Allocator.Error!?Reply {
+        if (aligner == .none) return null;
+        return switch (d.kind) {
+            .gauge => try gaugeAlignerRefusal(arena, d, aligner),
+            // Only Google's: every one INT64 but Pub/Sub's message sizes.
+            .delta => if (d.value_type == .distribution) try distributionAlignerRefusal(arena, d, aligner) else try deltaAlignerRefusal(arena, d, aligner),
+            else => try notModelled(arena, "aligning a cumulative metric"),
+        };
+    }
+
+    fn gaugeAlignerRefusal(arena: Allocator, d: *const Descriptor, aligner: types.Aligner) Allocator.Error!?Reply {
+        return switch (d.value_type) {
+            .int64, .double => switch (aligner) {
+                .min, .max, .mean, .sum, .count => null,
+                .delta, .rate => try misaligned(arena, aligner, d),
+                else => try notModelled(arena, try arena.print("the aligner {s} on a gauge", .{aligner.wire()})),
+            },
+            .bool => if (aligner != .count) try notModelled(arena, "this aligner on a bool metric") else null,
+            else => try notModelled(arena, "aligning this value type"),
+        };
+    }
+
+    fn deltaAlignerRefusal(arena: Allocator, d: *const Descriptor, aligner: types.Aligner) Allocator.Error!?Reply {
+        return switch (aligner) {
+            .delta, .rate, .sum, .min, .max, .mean, .count => null,
+            .interpolate, .next_older, .count_true, .count_false, .fraction_true, .percentile_99, .percentile_95, .percentile_50, .percentile_05 => try misaligned(arena, aligner, d),
+            else => try notModelled(arena, try arena.print("the aligner {s} on a DELTA metric", .{aligner.wire()})),
+        };
+    }
+
+    /// A DELTA distribution: production aligned it by its merge and its
+    /// percentiles alone, and refused the other twelve.
+    fn distributionAlignerRefusal(arena: Allocator, d: *const Descriptor, aligner: types.Aligner) Allocator.Error!?Reply {
+        return switch (aligner) {
+            .delta, .sum, .percentile_99, .percentile_95, .percentile_50, .percentile_05 => null,
+            else => try misaligned(arena, aligner, d),
+        };
+    }
+
+    /// The reducers production took on merged distributions, and those it
+    /// refused in its words, on 2026-11-05; on numbers, the five measured
+    /// on 2026-10-19 and the bool ones refused on a percentile's doubles;
+    /// a 501 for the rest; null for one taken.
+    fn reducerRefusal(arena: Allocator, d: *const Descriptor, aligner: types.Aligner, reducer: types.Reducer) Allocator.Error!?Reply {
+        if (reducer == .none) return null;
+        const distribution = d.value_type == .distribution;
+        if (distribution and (aligner == .delta or aligner == .sum)) return switch (reducer) {
+            .sum, .count, .mean, .stddev, .percentile_99, .percentile_95, .percentile_50, .percentile_05 => null,
+            else => try unreducible(arena, reducer, .distribution),
+        };
+        return switch (reducer) {
+            .min, .max, .mean, .sum, .count => null,
+            .count_true, .count_false, .fraction_true => if (distribution) try unreducible(arena, reducer, .double) else try notModelled(arena, try arena.print("the reducer {s} on numbers", .{reducer.wire()})),
+            else => try notModelled(arena, try arena.print("the reducer {s} on numbers", .{reducer.wire()})),
+        };
     }
 
     /// The resource's labels with `project_id` first, as a read shows them.
@@ -1492,8 +1550,10 @@ pub const FakeMonitoring = struct {
 
     /// Series grouped by their resource type and the `group_by` fields,
     /// each group's aligned values combined at each period's end, of the
-    /// kind and interval alignment gave them.
-    fn reduce(f: *const FakeMonitoring, arena: Allocator, series: []const OutSeries, reducer: types.Reducer, group_by: []const []const u8) Allocator.Error![]OutSeries {
+    /// kind and interval alignment gave them; distributions' mean, stddev
+    /// and percentiles a gauge at the period's end, none for a period
+    /// whose merge is empty, as production gave them.
+    fn reduce(f: *const FakeMonitoring, arena: Allocator, series: []const OutSeries, reducer: types.Reducer, group_by: []const []const u8) (Allocator.Error || fake_distributions.Error)![]OutSeries {
         var groups: std.StringArrayHashMapUnmanaged(std.ArrayList(OutSeries)) = .empty;
         for (series) |s| {
             var key: std.Io.Writer.Allocating = .init(arena);
@@ -1503,8 +1563,8 @@ pub const FakeMonitoring = struct {
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             try gop.value_ptr.append(arena, s);
         }
-        const out = try arena.alloc(OutSeries, groups.count());
-        for (groups.values(), out) |members, *o| {
+        var out: std.ArrayList(OutSeries) = .empty;
+        for (groups.values()) |members| {
             const first = members.items[0];
             var metric_labels: std.ArrayList(types.Label) = .empty;
             var resource_labels: std.ArrayList(types.Label) = .empty;
@@ -1522,32 +1582,52 @@ pub const FakeMonitoring = struct {
                 } else try ends.append(arena, p.end.nanoseconds);
             };
             std.mem.sort(i96, ends.items, {}, std.sort.desc(i96));
-            var value_type = first.value_type;
-            const pts = try arena.alloc(Point, ends.items.len);
-            for (ends.items, pts) |e, *p| {
-                var values: std.ArrayList(types.Value) = .empty;
-                // Every member's period ending at `e` starts at one time.
-                var start: i96 = e;
-                for (members.items) |m| for (m.points) |mp| {
-                    if (mp.end.nanoseconds != e) continue;
-                    try values.append(arena, mp.value);
-                    if (mp.start) |t| start = t.nanoseconds;
-                };
-                const reduced = combine(reducer, values.items);
-                value_type = reduced.valueType();
-                p.* = .{ .start = .{ .nanoseconds = start }, .end = .{ .nanoseconds = e }, .value = reduced };
-            }
-            o.* = .{
+            var pts: std.ArrayList(Point) = .empty;
+            for (ends.items) |e| if (try reducedPoint(arena, members.items, reducer, e)) |p| try pts.append(arena, p);
+            if (pts.items.len == 0) continue;
+            try out.append(arena, .{
                 .metric_type = first.metric_type,
                 .metric_labels = metric_labels.items,
                 .resource_type = first.resource_type,
                 .resource_labels = resource_labels.items,
-                .kind = first.kind,
-                .value_type = value_type,
-                .points = pts,
-            };
+                .kind = if (toNumber(first, reducer)) .gauge else first.kind,
+                .value_type = pts.items[0].value.valueType(),
+                .points = pts.items,
+            });
         }
-        return out;
+        return out.items;
+    }
+
+    /// Whether a reducer makes `first`'s group numbers from distributions:
+    /// a gauge at each period's end, as production gave a mean, a stddev
+    /// and the percentiles.
+    fn toNumber(first: OutSeries, reducer: types.Reducer) bool {
+        return first.value_type == .distribution and reducer != .sum and reducer != .count;
+    }
+
+    /// A group's members' periods ending at `e` reduced to one point, over
+    /// their period or at its end (`toNumber`); null for distributions
+    /// whose merge leaves nothing to say (`reduceDistributions`).
+    fn reducedPoint(arena: Allocator, members: []const OutSeries, reducer: types.Reducer, e: i96) (Allocator.Error || fake_distributions.Error)!?Point {
+        const distributions = members[0].value_type == .distribution;
+        var values: std.ArrayList(types.Value) = .empty;
+        // The distributions the members' periods were merged from.
+        var merged_from: std.ArrayList(types.Value) = .empty;
+        // Every member's period ending at `e` starts at one time.
+        var start: i96 = e;
+        for (members) |m| for (m.points) |mp| {
+            if (mp.end.nanoseconds != e) continue;
+            try values.append(arena, mp.value);
+            if (mp.start) |t| start = t.nanoseconds;
+            if (distributions) try sourcesIn(arena, &merged_from, m.source, start, e);
+        };
+        const reduced = if (distributions) try reduceDistributions(arena, reducer, values.items.len, merged_from.items) orelse return null else combine(reducer, values.items);
+        return .{ .start = .{ .nanoseconds = if (toNumber(members[0], reducer)) e else start }, .end = .{ .nanoseconds = e }, .value = reduced };
+    }
+
+    /// The values of `source`'s points ending in (`after`, `upto`].
+    fn sourcesIn(arena: Allocator, into: *std.ArrayList(types.Value), source: []const Point, after: i96, upto: i96) Allocator.Error!void {
+        for (source) |sp| if (sp.end.nanoseconds > after and sp.end.nanoseconds <= upto) try into.append(arena, sp.value);
     }
 
     fn renderRead(f: *const FakeMonitoring, arena: Allocator, series: []const OutSeries, params: []const Param, headers: bool, unit: []const u8) Allocator.Error!Reply {
@@ -1823,19 +1903,12 @@ fn alignerOf(name: []const u8) ?types.Aligner {
     return null;
 }
 
-fn reducerOf(name: []const u8) ?types.Reducer {
-    inline for (.{ .none, .min, .max, .mean, .sum, .count }) |r| {
-        if (std.mem.eql(u8, name, comptime types.Reducer.wire(r))) return r;
-    }
-    return null;
-}
-
 /// A series' points, one per period: periods end at the read's end and
 /// every `period_ns` before it, down to the first ending after the read's
 /// start, each holding the points that end in (its end minus the period,
 /// its end], wherever they lie; a period with none has no point. Newest
 /// first.
-fn alignSeries(arena: Allocator, s: FakeMonitoring.OutSeries, aligner: types.Aligner, start: i96, end: i96, period_ns: i96) Allocator.Error!FakeMonitoring.OutSeries {
+fn alignSeries(arena: Allocator, s: FakeMonitoring.OutSeries, aligner: types.Aligner, start: i96, end: i96, period_ns: i96) (Allocator.Error || fake_distributions.Error)!FakeMonitoring.OutSeries {
     // ALIGN_DELTA's points span their period, and so do ALIGN_SUM's on a
     // DELTA metric; the others' are at the period's end.
     const spans = aligner == .delta or (aligner == .sum and s.kind == .delta);
@@ -1846,10 +1919,11 @@ fn alignSeries(arena: Allocator, s: FakeMonitoring.OutSeries, aligner: types.Ali
         for (s.points) |p| {
             if (p.end.nanoseconds > window_end - period_ns and p.end.nanoseconds <= window_end) try values.append(arena, p.value);
         }
-        if (values.items.len > 0) try pts.append(arena, alignedPoint(aligner, spans, values.items, window_end, period_ns));
+        if (values.items.len > 0) if (try alignedPoint(arena, aligner, spans, values.items, window_end, period_ns)) |p| try pts.append(arena, p);
         if (start == end) break;
     }
     var out = s;
+    out.source = s.points;
     out.points = pts.items;
     out.kind = if (spans) .delta else .gauge;
     if (pts.items.len > 0) out.value_type = pts.items[0].value.valueType();
@@ -1859,8 +1933,21 @@ fn alignSeries(arena: Allocator, s: FakeMonitoring.OutSeries, aligner: types.Ali
 /// One period's values as an aligner makes them a point: a total for
 /// ALIGN_DELTA and ALIGN_SUM, a total a second for ALIGN_RATE, the others'
 /// value; over the period if it `spans` it, else at the period's end.
-fn alignedPoint(aligner: types.Aligner, spans: bool, values: []const types.Value, window_end: i96, period_ns: i96) FakeMonitoring.Point {
+/// Distributions merged for ALIGN_DELTA and ALIGN_SUM, and the merge's
+/// percentile for the percentiles, none when the merge is empty.
+fn alignedPoint(arena: Allocator, aligner: types.Aligner, spans: bool, values: []const types.Value, window_end: i96, period_ns: i96) (Allocator.Error || fake_distributions.Error)!?FakeMonitoring.Point {
     const at: std.Io.Timestamp = .{ .nanoseconds = window_end };
+    if (values[0] == .distribution) {
+        const merged = try fake_distributions.merge(arena, values);
+        return .{
+            .start = if (spans) .{ .nanoseconds = window_end - period_ns } else at,
+            .end = at,
+            .value = switch (aligner) {
+                .delta, .sum => .{ .distribution = merged },
+                else => .{ .double = try fake_distributions.percentile(merged, percentOf(aligner)) orelse return null },
+            },
+        };
+    }
     return .{
         .start = if (spans) .{ .nanoseconds = window_end - period_ns } else at,
         .end = at,
@@ -1902,6 +1989,32 @@ fn combine(how: types.Reducer, values: []const types.Value) types.Value {
     };
     if (how == .mean) acc /= @floatFromInt(values.len);
     return .{ .double = acc };
+}
+
+/// One period's distributions as a reducer makes them a value: COUNT the
+/// `members` with a point (an empty one counted); SUM the merge of every
+/// point they were aligned from, MEAN, STDDEV and the percentiles that
+/// merge's, null for those when it is empty.
+fn reduceDistributions(arena: Allocator, how: types.Reducer, members: usize, merged_from: []const types.Value) (Allocator.Error || fake_distributions.Error)!?types.Value {
+    if (how == .count) return .{ .int64 = @intCast(members) };
+    const merged = try fake_distributions.merge(arena, merged_from);
+    return switch (how) {
+        .sum => .{ .distribution = merged },
+        .mean => .{ .double = fake_distributions.mean(merged) orelse return null },
+        .stddev => .{ .double = fake_distributions.stddev(merged) orelse return null },
+        else => .{ .double = try fake_distributions.percentile(merged, percentOf(how)) orelse return null },
+    };
+}
+
+/// 99, 95, 50 or 5, for an aligner's or a reducer's percentile.
+fn percentOf(tag: anytype) u8 {
+    return switch (tag) {
+        .percentile_99 => 99,
+        .percentile_95 => 95,
+        .percentile_50 => 50,
+        .percentile_05 => 5,
+        else => unreachable,
+    };
 }
 
 /// What min, max, sum and mean see: only numbers reach them.
@@ -2377,12 +2490,12 @@ const storage_call_labels = .{ .{ "response_code", "The response code of the req
 /// or "Total number of objects".
 const storage_gauge_rest = "Soft-deleted objects are not included in the total; use the updated v2 metric for a breakdown of total usage including soft-deleted objects. This value is measured once per day, and there might be a delay after measuring before the value becomes available in Cloud Monitoring. Once available, the value is repeated at each sampling interval throughout the day. Buckets with no objects in them are not tracked by this metric. For this metric, the sampling period is a reporting period, not a measurement period.";
 
-/// Pub/Sub's metrics a console reads, the four quota metrics a console
-/// reads for quota warnings, and the five of Cloud Storage's a bucket
-/// page charts, as production described them on 2026-10-19 and
-/// 2026-11-05 (issues #239, #247 and #338): usage and limits on
-/// `consumer_quota`, the producer side named in their descriptors but
-/// not held.
+/// Pub/Sub's metrics a console reads and its message sizes, the four
+/// quota metrics a console reads for quota warnings, and the five of
+/// Cloud Storage's a bucket page charts, as production described them on
+/// 2026-10-19 and 2026-11-05 (issues #239, #315, #247 and #338): usage
+/// and limits on `consumer_quota`, the producer side named in their
+/// descriptors but not held.
 const google_metrics = [_]GoogleMetric{
     .{
         .type = "pubsub.googleapis.com/subscription/num_undelivered_messages",
@@ -2474,6 +2587,15 @@ const google_metrics = [_]GoogleMetric{
         .display_name = "Topic byte cost",
         .description = "Cost of operations, measured in bytes. This is used to measure utilization for quotas.",
         .labels = &.{ .{ "operation_type", "Type of operation performed." }, response_code },
+        .resource_type = "pubsub_topic",
+    },
+    .{
+        .type = "pubsub.googleapis.com/topic/message_sizes",
+        .kind = .delta,
+        .value_type = .distribution,
+        .unit = "By",
+        .display_name = "Publish message size",
+        .description = "Distribution of publish message sizes (in bytes).",
         .resource_type = "pubsub_topic",
     },
     .{
@@ -2572,9 +2694,9 @@ const google_metrics = [_]GoogleMetric{
 };
 
 comptime {
-    // A read aligns a DELTA metric's values as numbers, and its 400s name
-    // the value type.
-    for (google_metrics) |g| if (g.kind == .delta and g.value_type != .int64) @compileError(g.type ++ ": the fake aligns only INT64 DELTA metrics");
+    // A read aligns a DELTA metric's values as numbers or distributions,
+    // and its 400s name the value type.
+    for (google_metrics) |g| if (g.kind == .delta and g.value_type != .int64 and g.value_type != .distribution) @compileError(g.type ++ ": the fake aligns only INT64 and DISTRIBUTION DELTA metrics");
 }
 
 /// Whether `metric_type` is under a domain of Google's the fake holds
@@ -2760,6 +2882,21 @@ fn fail(arena: Allocator, code: u16, status: []const u8, message: []const u8) Al
 /// Production's answer to a write or a create of one of Google's metrics.
 fn noPermission(arena: Allocator, metric_type: []const u8) Allocator.Error!FakeMonitoring.Reply {
     return fail(arena, 403, "PERMISSION_DENIED", try arena.print("User does not have permission to write to metric {s}.", .{metric_type}));
+}
+
+/// Production's answer to a reducer the aligned values' type does not
+/// take, as it refused MIN and MAX on distributions on 2026-11-05.
+fn unreducible(arena: Allocator, reducer: types.Reducer, value_type: types.ValueType) Allocator.Error!FakeMonitoring.Reply {
+    return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Field aggregation.crossSeriesReducer had an invalid value of \"{s}\": The reducer cannot be applied to metrics with value type {s}.", .{ reducer.wire(), value_type.wire() }));
+}
+
+/// What `fake_distributions` was not measured on, as a 501.
+fn distributionsUnmodelled(arena: Allocator, err: (Allocator.Error || fake_distributions.Error)) Allocator.Error!FakeMonitoring.Reply {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.MixedLayouts => notModelled(arena, "a merge of distributions with different buckets"),
+        error.UnmodelledPercentile => notModelled(arena, "a percentile of buckets not exponential, or in the underflow or overflow bucket"),
+    };
 }
 
 /// Production's answer to an aligner the metric's kind and value type do
@@ -2999,6 +3136,7 @@ const Stamp = struct {
 const testing = std.testing;
 const test_util = @import("test_util.zig");
 const production = @import("production_bodies.zig");
+const sizes_m0 = @import("fake_message_sizes_m0.zig");
 const Client = @import("Client.zig");
 
 /// 2026-10-18T13:46:35.949Z, about when milestone 0 ran.
@@ -4830,6 +4968,233 @@ test "the Cloud Storage descriptors and gcs_bucket are production's, word for wo
         try testing.expectEqualStrings(w.key, g.key);
         try testing.expectEqualStrings(w.description, g.description);
     }
+}
+
+const sizes_type = "pubsub.googleapis.com/topic/message_sizes";
+const sizes_buckets: types.Distribution.Buckets = .{ .exponential = .{ .num_finite = 122, .growth_factor = 1.2, .scale = 1 } };
+
+/// Milestone 0's two topics put into `fake`, as production held them.
+fn putSizesM0(fake: *FakeMonitoring, a: Allocator) !void {
+    for (sizes_m0.raw) |s| {
+        const pts = try a.alloc(FakeMonitoring.Point, s.points.len);
+        for (s.points, pts) |p, *o| o.* = .{
+            .start = try core.timestamp.parse(p.start),
+            .end = try core.timestamp.parse(p.end),
+            .value = .{ .distribution = .{ .count = p.count, .mean = p.mean, .sum_of_squared_deviation = p.ssd, .buckets = sizes_buckets, .bucket_counts = p.counts } },
+        };
+        try fake.put(.{ .metric_type = sizes_type, .resource_type = "pubsub_topic", .resource_labels = &.{.{ .key = "topic_id", .value = s.topic_id }}, .kind = .delta, .value_type = .distribution, .points = pts });
+    }
+}
+
+/// A read's answer as text, to the bit: its status, and its message or
+/// its unit and series, sorted, every double by its bits. Labels are
+/// sorted too: production writes a resource's in an order it varies.
+fn answerText(a: Allocator, status: u16, body: []const u8) ![]const u8 {
+    if (status != 200) return a.print("{d} {s}", .{ status, try messageOf(a, body) });
+    const page = try codec.decodeSeriesPage(a, a, body);
+    const lines = try a.alloc([]const u8, page.series.len);
+    const byKey = struct {
+        fn lessThan(_: void, x: types.Label, y: types.Label) bool {
+            return std.mem.lessThan(u8, x.key, y.key);
+        }
+    }.lessThan;
+    for (page.series, lines) |s, *line| {
+        var w: std.Io.Writer.Allocating = .init(a);
+        try w.writer.print("{s} {s} {t} {t}", .{ s.metric_type, s.resource_type, s.kind, s.value_type });
+        const metric_labels = try a.dupe(types.Label, s.metric_labels);
+        std.mem.sort(types.Label, metric_labels, {}, byKey);
+        const resource_labels = try a.dupe(types.Label, s.resource_labels);
+        std.mem.sort(types.Label, resource_labels, {}, byKey);
+        for (metric_labels) |l| try w.writer.print(" m.{s}={s}", .{ l.key, l.value });
+        for (resource_labels) |l| try w.writer.print(" r.{s}={s}", .{ l.key, l.value });
+        for (s.points) |p| {
+            try w.writer.print(" | {d}", .{p.end.nanoseconds});
+            if (p.start) |t| try w.writer.print("@{d}", .{t.nanoseconds});
+            switch (p.value.?) {
+                .int64 => |n| try w.writer.print(" int {d}", .{n}),
+                .double => |d| try w.writer.print(" double {x}", .{@as(u64, @bitCast(d))}),
+                .distribution => |d| {
+                    try w.writer.print(" n {d} mean {x} ssd {x} {any} counts", .{ d.count, @as(u64, @bitCast(d.mean)), @as(u64, @bitCast(d.sum_of_squared_deviation)), d.buckets });
+                    // Trailing zeros are production's to leave off.
+                    var len = d.bucket_counts.len;
+                    while (len > 0 and d.bucket_counts[len - 1] == 0) len -= 1;
+                    for (d.bucket_counts[0..len]) |c| try w.writer.print(" {d}", .{c});
+                },
+                else => try w.writer.writeAll(" ?"),
+            }
+        }
+        line.* = w.written();
+    }
+    std.mem.sort([]const u8, lines, {}, struct {
+        fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lessThan);
+    var out: std.Io.Writer.Allocating = .init(a);
+    try out.writer.print("200 unit {s}, {d} series", .{ page.unit, lines.len });
+    if (page.next_page_token != null) try out.writer.writeAll(", more pages");
+    for (lines) |l| try out.writer.print("\n  {s}", .{l});
+    return out.written();
+}
+
+test "message sizes: 123 of milestone 0's 128 reads answered as production answered them, the rest 501" {
+    var b: Bench = undefined;
+    try b.init(.{ .project_id = "extractctl" });
+    defer b.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try putSizesM0(&b.fake, a);
+    // Stddev and percentiles of a percentile's doubles: production bins
+    // numbers in a layout of its own (one value alone had a 99th
+    // percentile above it), and only one order of one form gave its four
+    // stddevs. The fake says it does not model them.
+    const not_modelled = [_][]const u8{
+        "ALIGN_PERCENTILE_99 60 REDUCE_STDDEV",
+        "ALIGN_PERCENTILE_99 60 REDUCE_PERCENTILE_99",
+        "ALIGN_PERCENTILE_99 60 REDUCE_PERCENTILE_95",
+        "ALIGN_PERCENTILE_99 60 REDUCE_PERCENTILE_50",
+        "ALIGN_PERCENTILE_99 60 REDUCE_PERCENTILE_05",
+    };
+    var differ: usize = 0;
+    var ok: usize = 0;
+    var unmodelled: usize = 0;
+    reads: for (sizes_m0.reads) |r| {
+        const reply = try b.raw(a, .GET, try a.print("timeSeries?{s}", .{r.query}), null);
+        for (not_modelled) |name| if (std.mem.eql(u8, name, r.name)) {
+            try testing.expectEqual(200, r.status);
+            try testing.expectEqual(501, reply.status);
+            unmodelled += 1;
+            continue :reads;
+        };
+        const want = try answerText(a, r.status, r.body);
+        const got = try answerText(a, reply.status, reply.body);
+        if (std.mem.eql(u8, want, got)) {
+            ok += 1;
+        } else {
+            differ += 1;
+            std.debug.print("{s}\n production: {s}\n fake:       {s}\n", .{ r.name, want, got });
+        }
+    }
+    try testing.expectEqual(0, differ);
+    try testing.expectEqual(123, ok);
+    try testing.expectEqual(not_modelled.len, unmodelled);
+}
+
+test "message sizes: the descriptor, puts refused, and what the fake does not model" {
+    var b: Bench = undefined;
+    try b.init(.{ .project_id = "extractctl" });
+    defer b.deinit();
+    // As production's list gave it on 2026-11-05.
+    var info = try b.client.metric(sizes_type).get();
+    defer info.deinit();
+    try testing.expectEqual(types.Kind.delta, info.value.kind);
+    try testing.expectEqual(types.ValueType.distribution, info.value.value_type);
+    try testing.expectEqualStrings("By", info.value.unit);
+    try testing.expectEqualStrings("Publish message size", info.value.display_name);
+    try testing.expectEqualStrings("Distribution of publish message sizes (in bytes).", info.value.description);
+    try testing.expectEqual(0, info.value.labels.len);
+    try testing.expectEqual(1, info.value.resource_types.len);
+    try testing.expectEqualStrings("pubsub_topic", info.value.resource_types[0]);
+    var listed = try b.client.listMetrics(.{ .prefix = "pubsub.googleapis.com/topic/" });
+    defer listed.deinit();
+    try testing.expectEqual(3, listed.value.metrics.len);
+
+    // Its points are a topic's distributions, a minute each.
+    const one = [_]u64{ 0, 0, 0, 1 };
+    const point = [_]FakeMonitoring.Point{.{ .start = b.at(-60_000), .end = b.at(0), .value = .{ .distribution = .{ .count = 1, .mean = 2, .buckets = sizes_buckets, .bucket_counts = &one } } }};
+    const topic: []const types.Label = &.{.{ .key = "topic_id", .value = "t" }};
+    const base: FakeMonitoring.PutSeries = .{ .metric_type = sizes_type, .resource_type = "pubsub_topic", .resource_labels = topic, .kind = .delta, .value_type = .distribution, .points = &point };
+    var labelled = base;
+    labelled.metric_labels = &.{.{ .key = "response_code", .value = "success" }};
+    try testing.expectError(error.InvalidEntry, b.fake.put(labelled));
+    var gauge = base;
+    gauge.kind = .gauge;
+    try testing.expectError(error.InvalidEntry, b.fake.put(gauge));
+    var int = base;
+    int.value_type = .int64;
+    try testing.expectError(error.InvalidEntry, b.fake.put(int));
+    var on_sub = base;
+    on_sub.resource_type = "pubsub_subscription";
+    on_sub.resource_labels = &.{.{ .key = "subscription_id", .value = "s" }};
+    try testing.expectError(error.InvalidEntry, b.fake.put(on_sub));
+    try b.fake.put(base);
+    // No program writes one, as production answered for Pub/Sub's others.
+    try testing.expectError(error.PermissionDenied, b.client.write(&.{.{ .metric_type = sizes_type, .resource = .{ .other = .{ .type = "pubsub_topic", .labels = topic } }, .kind = .delta, .start = b.at(-60_000), .end = b.at(0), .value = point[0].value }}));
+
+    const m = b.client.metric(sizes_type);
+    const window: struct { start: std.Io.Timestamp, end: std.Io.Timestamp } = .{ .start = b.at(-300_000), .end = b.at(60_000) };
+    // A percentile of other buckets, and a merge of two layouts.
+    const linear = [_]FakeMonitoring.Point{.{ .start = b.at(-60_000), .end = b.at(0), .value = .{ .distribution = .{ .count = 1, .mean = 2, .buckets = .{ .linear = .{ .num_finite = 2, .width = 1, .offset = 0 } }, .bucket_counts = &.{ 0, 1 } } } }};
+    var other = base;
+    other.resource_labels = &.{.{ .key = "topic_id", .value = "linear" }};
+    other.points = &linear;
+    try b.fake.put(other);
+    const only_linear: types.Filter = .{ .resource_labels = &.{.{ .key = "topic_id", .value = "linear" }} };
+    try testing.expectError(error.Unimplemented, m.read(.{ .start = window.start, .end = window.end, .filter = only_linear, .aggregation = .{ .alignment_period_s = 60, .aligner = .percentile_50 } }));
+    try testing.expectEqualStrings("fake: a percentile of buckets not exponential, or in the underflow or overflow bucket is not modelled yet", b.diag.message());
+    var merged_alone = try m.read(.{ .start = window.start, .end = window.end, .filter = only_linear, .aggregation = .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum } });
+    merged_alone.deinit();
+    try testing.expectError(error.Unimplemented, m.read(.{ .start = window.start, .end = window.end, .aggregation = .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum } }));
+    try testing.expectEqualStrings("fake: a merge of distributions with different buckets is not modelled yet", b.diag.message());
+    // Stddev and percentiles of numbers: production bins them its own way.
+    const only_t: types.Filter = .{ .resource_labels = &.{.{ .key = "topic_id", .value = "t" }} };
+    for ([_]types.Reducer{ .stddev, .percentile_99, .percentile_05 }) |reducer| {
+        try testing.expectError(error.Unimplemented, m.read(.{ .start = window.start, .end = window.end, .filter = only_t, .aggregation = .{ .alignment_period_s = 60, .aligner = .percentile_99, .reducer = reducer } }));
+        try testing.expect(std.mem.endsWith(u8, b.diag.message(), " on numbers is not modelled yet"));
+    }
+    // The numbers' reducers production took, on a percentile aligner.
+    var max = try m.read(.{ .start = window.start, .end = window.end, .filter = only_t, .aggregation = .{ .alignment_period_s = 60, .aligner = .percentile_50, .reducer = .max } });
+    defer max.deinit();
+    try testing.expectEqual(types.ValueType.double, max.value.series[0].value_type);
+    // The bool reducers on distributions, refused in production's words.
+    try testing.expectError(error.InvalidArgument, m.read(.{ .start = window.start, .end = window.end, .filter = only_t, .aggregation = .{ .alignment_period_s = 60, .aligner = .sum, .reducer = .fraction_true } }));
+    try testing.expectEqualStrings("Field aggregation.crossSeriesReducer had an invalid value of \"REDUCE_FRACTION_TRUE\": The reducer cannot be applied to metrics with value type DISTRIBUTION.", b.diag.message());
+}
+
+test "message sizes: an empty minute is merged, counted, and has no percentile" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    const one = [_]u64{ 0, 0, 0, 1 };
+    const pts = [_]FakeMonitoring.Point{
+        .{ .start = b.at(-120_000), .end = b.at(-60_000), .value = .{ .distribution = .{ .count = 1, .mean = 1.5, .buckets = sizes_buckets, .bucket_counts = &one } } },
+        .{ .start = b.at(-60_000), .end = b.at(0), .value = .{ .distribution = .{ .buckets = sizes_buckets } } },
+    };
+    try b.fake.put(.{ .metric_type = sizes_type, .resource_type = "pubsub_topic", .resource_labels = &.{.{ .key = "topic_id", .value = "t" }}, .kind = .delta, .value_type = .distribution, .points = &pts });
+    const m = b.client.metric(sizes_type);
+    const start = b.at(-180_000);
+    var delta = try m.read(.{ .start = start, .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .delta } });
+    defer delta.deinit();
+    try testing.expectEqual(2, delta.value.series[0].points.len);
+    try testing.expectEqual(0, delta.value.series[0].points[0].value.?.distribution.count);
+    try testing.expectEqual(b.at(-60_000), delta.value.series[0].points[0].start.?);
+    var p99 = try m.read(.{ .start = start, .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .percentile_99 } });
+    defer p99.deinit();
+    try testing.expectEqual(1, p99.value.series[0].points.len);
+    try testing.expectEqual(types.Kind.gauge, p99.value.series[0].kind);
+    // 1.2^2 + 0.99 * (1.2^3 - 1.2^2), the one value's bucket.
+    try testing.expectApproxEqAbs(1.72512, p99.value.series[0].points[0].value.?.double, 1e-12);
+    var count = try m.read(.{ .start = start, .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .count } });
+    defer count.deinit();
+    try testing.expectEqual(2, count.value.series[0].points.len);
+    try testing.expectEqual(1, count.value.series[0].points[0].value.?.int64);
+    try testing.expectEqualStrings("1", count.value.unit);
+    // Over two minutes it counts the one series, not its two points.
+    var series_count = try m.read(.{ .start = b.at(-120_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 120, .aligner = .delta, .reducer = .count } });
+    defer series_count.deinit();
+    try testing.expectEqual(1, series_count.value.series[0].points.len);
+    try testing.expectEqual(1, series_count.value.series[0].points[0].value.?.int64);
+    var mean = try m.read(.{ .start = start, .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .mean } });
+    defer mean.deinit();
+    try testing.expectEqual(1, mean.value.series[0].points.len);
+    try testing.expectEqual(1.5, mean.value.series[0].points[0].value.?.double);
+    try testing.expectEqual(types.Kind.gauge, mean.value.series[0].kind);
+    // Only the empty minute: a mean has no series at all.
+    var empty_only = try m.read(.{ .start = b.at(-60_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .stddev } });
+    defer empty_only.deinit();
+    try testing.expectEqual(0, empty_only.value.series.len);
+    try testing.expectEqualStrings("By", empty_only.value.unit);
 }
 
 test "put: refused whole for what production could not hold" {

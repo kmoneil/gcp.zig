@@ -1838,6 +1838,61 @@ test "Pub/Sub's own counts, put in the in-memory Cloud Monitoring and read back"
 }
 // end snippet
 
+// snippet: mon-sizes
+test "a topic's message sizes, put in as Pub/Sub reports them and read as a percentile" {
+    var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_331_195 * std.time.ns_per_s };
+    var fake: monitoring.testing.FakeMonitoring = .init(std.testing.allocator, clock.io(), .{ .project_id = "my-project" });
+    defer fake.deinit();
+
+    // Pub/Sub's buckets for message sizes: 122, each 1.2 times the one
+    // before, from 1 byte. Bucket 26 holds 95 to 114 bytes, 38 holds 850
+    // to 1020.
+    const buckets: monitoring.Distribution.Buckets = .{ .exponential = .{ .num_finite = 122, .growth_factor = 1.2, .scale = 1 } };
+    var small: [27]u64 = @splat(0);
+    small[26] = 3;
+    var mixed: [39]u64 = @splat(0);
+    mixed[26] = 1;
+    mixed[38] = 1;
+    const t = std.Io.Clock.real.now(clock.io()).nanoseconds;
+    const minute: i96 = 60 * std.time.ns_per_s;
+    const points = [_]monitoring.testing.FakeMonitoring.Point{
+        // Three messages of 102 bytes, then one of 102 and one of 1002.
+        .{ .start = .{ .nanoseconds = t - 2 * minute }, .end = .{ .nanoseconds = t - minute }, .value = .{ .distribution = .{ .count = 3, .mean = 102, .buckets = buckets, .bucket_counts = &small } } },
+        .{ .start = .{ .nanoseconds = t - minute }, .end = .{ .nanoseconds = t }, .value = .{ .distribution = .{ .count = 2, .mean = 552, .sum_of_squared_deviation = 405_000, .buckets = buckets, .bucket_counts = &mixed } } },
+    };
+    try fake.put(.{
+        .metric_type = "pubsub.googleapis.com/topic/message_sizes",
+        .resource_type = "pubsub_topic",
+        .resource_labels = &.{.{ .key = "topic_id", .value = "orders" }},
+        .kind = .delta,
+        .value_type = .distribution,
+        .points = &points,
+    });
+
+    var token: monitoring.StaticToken = .{ .token = "none" };
+    var client = try monitoring.Client.init(std.testing.allocator, clock.io(), .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    const sizes = client.metric("pubsub.googleapis.com/topic/message_sizes");
+    const from: std.Io.Timestamp = .{ .nanoseconds = t - 2 * minute };
+    // The 99th percentile a minute, newest first: interpolated inside the
+    // bucket it falls in, as Cloud Monitoring does.
+    var p99 = try sizes.read(.{ .start = from, .end = .{ .nanoseconds = t }, .aggregation = .{ .alignment_period_s = 60, .aligner = .percentile_99 } });
+    defer p99.deinit();
+    try std.testing.expectEqual(1017.2724509786024, p99.value.series[0].points[0].value.?.double);
+    try std.testing.expectEqual(114.28466753959457, p99.value.series[0].points[1].value.?.double);
+    // Both minutes as one distribution: five messages, 282 bytes on average.
+    var both = try sizes.read(.{ .start = from, .end = .{ .nanoseconds = t }, .aggregation = .{ .alignment_period_s = 120, .aligner = .delta } });
+    defer both.deinit();
+    const merged = both.value.series[0].points[0].value.?.distribution;
+    try std.testing.expectEqual(5, merged.count);
+    try std.testing.expectEqual(282.0, merged.mean);
+}
+// end snippet
+
 // snippet: mon-alerts
 test "the open incidents, as a console draws them" {
     var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_331_195 * std.time.ns_per_s };

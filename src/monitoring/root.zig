@@ -105,6 +105,7 @@ test {
     _ = @import("codec.zig");
     _ = @import("errors.zig");
     _ = @import("filter.zig");
+    _ = @import("fake_distributions.zig");
     _ = @import("fake_monitoring.zig");
     _ = @import("logging.zig");
     _ = @import("names.zig");
