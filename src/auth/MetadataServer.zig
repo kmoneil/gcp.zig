@@ -723,10 +723,11 @@ const isProjectId = core.names.isProjectId;
 /// name, no query: the server would collapse, walk or misread them, and
 /// the query is `watch`'s.
 pub fn isValidPath(path: []const u8) bool {
-    if (path.len == 0 or path.len > max_path_len or path[0] == '/') return false;
+    if (path.len == 0 or path.len > max_path_len) return false;
     var names = std.mem.splitScalar(u8, path, '/');
     while (names.next()) |name| {
-        // Empty only after a directory's trailing slash.
+        // Empty only after a directory's trailing slash: not first, as a
+        // leading slash would make it, nor between two.
         if (name.len == 0) return names.peek() == null;
         if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
         for (name) |c| switch (c) {
@@ -1646,7 +1647,7 @@ test "MetadataServer.watch: a directory, a wait outside 1 to 3600 s and an ETag 
     }
     var long_etag: [65]u8 = undefined;
     @memset(&long_etag, 'e');
-    for ([_][]const u8{ "", "91573307ec3f06b7&timeout_sec=-1", "a b", &long_etag }) |etag| {
+    for ([_][]const u8{ "", "91573307ec3f06b7&timeout_sec=-1", "a&b", "a b", &long_etag }) |etag| {
         try testing.expectError(error.InvalidRequest, h.metadata.watch(io, a, "instance/preempted", .{ .last_etag = etag }));
         try testing.expectEqualStrings("invalid ETag: expected 1 to 64 letters and digits, as the metadata server sends", h.diag.message());
     }

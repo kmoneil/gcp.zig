@@ -143,7 +143,7 @@ fn line(a: Allocator, case: Case, res: core.transport.Response, asked_etag: ?[]c
             const end = std.mem.indexOfPos(u8, res.body, start, "</title>") orelse res.body.len;
             try w.print(", title \"{s}\"", .{res.body[@min(start + "<title>".len, res.body.len)..end]});
         },
-        .none => try w.print(", {d} bytes", .{if (token) 0 else res.body.len}),
+        .none => {},
     }
     return out.written();
 }
