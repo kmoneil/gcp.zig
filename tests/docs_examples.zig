@@ -2961,6 +2961,37 @@ test "an hourly price, read from the in-memory catalog" {
 }
 // end snippet
 
+// snippet: storage-offsets
+test "a log reader lists only what came after the last name it read" {
+    var fake: storage.testing.FakeStorage = .init(std.testing.allocator, std.testing.io, .{ .project_id = "my-project" });
+    defer fake.deinit();
+    try fake.putBucket(.{ .name = "my-logs" });
+    // Named in sequence, zero-padded, so byte order is time order.
+    for ([_][]const u8{ "log/000000011998", "log/000000011999", "log/000000012000", "log/000000012001", "log/000000012002" }) |name| {
+        try fake.putObject(.{ .bucket = "my-logs", .name = name, .bytes = "entry\n" });
+    }
+    var token: storage.StaticToken = .{ .token = "none" };
+    var client = try storage.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+
+    // The reader stopped after 000000011999: the next page starts there,
+    // whatever came before it, with no paging through earlier names.
+    var page = try client.bucket("my-logs").listObjects(.{
+        .prefix = "log/",
+        .start_offset = "log/000000012000",
+        .end_offset = "log/000000012002",
+    });
+    defer page.deinit();
+    try std.testing.expectEqual(2, page.value.objects.len);
+    try std.testing.expectEqualStrings("log/000000012000", page.value.objects[0].name);
+    try std.testing.expectEqualStrings("log/000000012001", page.value.objects[1].name);
+}
+// end snippet
+
 // snippet: storage-fake
 test "a bucket browsed as a console shows it, from the in-memory Cloud Storage" {
     var fake: storage.testing.FakeStorage = .init(std.testing.allocator, std.testing.io, .{ .project_id = "my-project" });

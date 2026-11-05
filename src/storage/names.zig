@@ -478,6 +478,8 @@ pub fn objectsPath(arena: Allocator, bucket: []const u8, options: types.ListOpti
         .prefix = options.prefix,
         .delimiter = options.delimiter,
         .match_glob = options.match_glob,
+        .start_offset = options.start_offset,
+        .end_offset = options.end_offset,
         .versions = options.versions,
         .soft_deleted = options.soft_deleted,
         .folders_as_prefixes = options.include_folders_as_prefixes,
@@ -769,6 +771,8 @@ const Parts = struct {
     prefix: ?[]const u8 = null,
     delimiter: ?[]const u8 = null,
     match_glob: ?[]const u8 = null,
+    start_offset: ?[]const u8 = null,
+    end_offset: ?[]const u8 = null,
     versions: bool = false,
     soft_deleted: bool = false,
     folders_as_prefixes: bool = false,
@@ -805,6 +809,8 @@ fn write(w: *Writer, parts: Parts) Writer.Error!void {
     try params.addOptional("prefix", parts.prefix);
     try params.addOptional("delimiter", parts.delimiter);
     try params.addOptional("matchGlob", parts.match_glob);
+    try params.addOptional("startOffset", parts.start_offset);
+    try params.addOptional("endOffset", parts.end_offset);
     if (parts.versions) try params.add("versions", "true");
     if (parts.soft_deleted) try params.add("softDeleted", "true");
     if (parts.folders_as_prefixes) try params.add("includeFoldersAsPrefixes", "true");
@@ -961,6 +967,16 @@ test "object listing paths" {
             .delimiter = "/",
             .page_size = 2,
             .page_token = "t",
+        }),
+    );
+    // The offsets as names, escaped as names are.
+    try expectPath(
+        "/storage/v1/b/my-bucket/o?prefix=log%2F&startOffset=log%2F000000012000&endOffset=log%2F%C3%BC%20%2B&maxResults=1000",
+        try objectsPath(gpa, "my-bucket", .{
+            .prefix = "log/",
+            .start_offset = "log/000000012000",
+            .end_offset = "log/\u{fc} +",
+            .page_size = 1000,
         }),
     );
 }

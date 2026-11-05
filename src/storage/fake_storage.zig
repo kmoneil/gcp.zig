@@ -15,6 +15,11 @@
 //!   (`**/` also matching no folder), `?`, `[a-z]`, `[!a-z]`, `{a,b}` and
 //!   `\` escapes, and an unclosed `[` or `{` is refused in production's
 //!   words. A glob's literal start folds prefixes as a `prefix` does.
+//!   `startOffset` and `endOffset` keep the names from the one up to the
+//!   other in byte order, before folders are folded, as measured on
+//!   2026-11-05 (issue #365): a folder is listed when a name under it is
+//!   in range, a start at or past the end is an empty page, and an empty
+//!   offset is no bound.
 //! - Everything else a bucket's objects take, the fake serves as the
 //!   package's own tests' fake of uploads, reads and deletes does, one per
 //!   bucket: metadata reads, media reads whole or by range (206, 416
@@ -482,6 +487,8 @@ pub const FakeStorage = struct {
             .prefix = (try paramDecoded(arena, query, "prefix")) orelse "",
             .delimiter = try paramDecoded(arena, query, "delimiter"),
             .glob = try paramDecoded(arena, query, "matchGlob"),
+            .start = try paramDecoded(arena, query, "startOffset"),
+            .end = try paramDecoded(arena, query, "endOffset"),
             .versions = if (paramOf(query, "versions")) |v| std.mem.eql(u8, v, "true") else false,
             .full = if (paramOf(query, "projection")) |p| std.mem.eql(u8, p, "full") else false,
         };
@@ -499,8 +506,18 @@ pub const FakeStorage = struct {
         prefix: []const u8,
         delimiter: ?[]const u8,
         glob: ?[]const u8,
+        /// Bounds on the names, start kept and end not; empty is none.
+        start: ?[]const u8 = null,
+        end: ?[]const u8 = null,
         versions: bool,
         full: bool,
+
+        fn inRange(ask: Ask, name: []const u8) bool {
+            if (ask.start) |s| if (std.mem.order(u8, name, s) == .lt) return false;
+            // An empty end would keep nothing; production takes it as none.
+            if (ask.end) |e| if (e.len > 0 and std.mem.order(u8, name, e) != .lt) return false;
+            return true;
+        }
     };
 
     /// Every object generation and prefix the ask lists, in one sorted
@@ -528,6 +545,7 @@ pub const FakeStorage = struct {
     /// was added, whose metadata the caller fills in.
     fn keep(arena: Allocator, list: *std.ArrayList(Listed), prefixes: *std.StringHashMapUnmanaged(void), ask: Ask, fold_from: usize, name: []const u8, generation: u64) Allocator.Error!bool {
         if (!std.mem.startsWith(u8, name, ask.prefix)) return false;
+        if (!ask.inRange(name)) return false;
         if (ask.glob) |g| if (!try globMatch(arena, g, name)) return false;
         if (ask.delimiter) |d| if (d.len > 0 and fold_from <= name.len) {
             if (std.mem.indexOf(u8, name[fold_from..], d)) |at| {
@@ -915,6 +933,7 @@ fn refusal(arena: Allocator, status: u16) Allocator.Error!tp.Response {
 
 const testing = std.testing;
 const m0 = @import("fake_storage_m0.zig");
+const offsets = @import("fake_storage_offsets.zig");
 
 /// The layout milestone 0 made in production (run 04848f): bucket -a
 /// flat, bucket -v versioned, every object `text/plain`.
@@ -951,14 +970,14 @@ fn headerOf(headers: []const Header, name: []const u8) ?[]const u8 {
     return null;
 }
 
-test "held to production: every listing milestone 0 read, as production answered it" {
+test "held to production: every listing milestone 0 read, and every one with offsets, as production answered it" {
     var f: FakeStorage = .init(testing.allocator, testing.io, .{});
     defer f.deinit();
     try putMilestone0(&f);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    for (m0.listings) |case| {
+    for (m0.listings ++ offsets.listings) |case| {
         const res = try askPlain(&f, a, case.target, &.{});
         errdefer std.debug.print("case {s}: {d} {s}\n", .{ case.target, res.status, res.body[0..@min(res.body.len, 400)] });
         try testing.expectEqual(case.status, res.status);
