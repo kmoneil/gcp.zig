@@ -49,6 +49,15 @@
 //! resource type. It creates and deletes nothing but the run's own user
 //! descriptor.
 //!
+//! A Cloud Storage test (MONITORING_TEST_STORAGE=1, about eight minutes;
+//! issue #338) makes a bucket `zigps-mon-<run>`, sends it about seventy
+//! requests (uploads, reads whole and by range, metadata, lists, misses),
+//! waits until Monitoring shows their minutes, puts the bucket's counts
+//! and every bucket's daily-measured size and object count into the
+//! fake, and holds the fake to production's answers, refusals,
+//! descriptors and the `gcs_bucket` resource type. It deletes its
+//! objects and bucket as it ends, failed or not.
+//!
 //! A policies test (MONITORING_TEST_POLICIES=1, about two minutes; issue
 //! #275) makes a threshold and an MQL policy named `zigps-pol-<run>-`
 //! raw, reads them through the client, disables and enables one, and
@@ -67,6 +76,7 @@ const std = @import("std");
 const core = @import("core");
 const monitoring = @import("monitoring");
 const pubsub = @import("pubsub");
+const storage = @import("storage");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
@@ -738,6 +748,100 @@ fn floorMinute(ns: i96) i96 {
     return @divFloor(ns, std.time.ns_per_min) * std.time.ns_per_min;
 }
 
+/// Production's raw points of `metric_type` that `filter` selects, in
+/// (`start`, `end`], put into `fake` series by series; `count` gains the
+/// series and the points.
+fn putProduction(f: *Fixture, a: Allocator, fake: *monitoring.testing.FakeMonitoring, metric_type: []const u8, start: std.Io.Timestamp, end: std.Io.Timestamp, filter: monitoring.Filter, count: *[2]usize) !void {
+    var raw = try f.client.metric(metric_type).read(.{ .start = start, .end = end, .filter = filter });
+    defer raw.deinit();
+    try testing.expectEqual(null, raw.value.next_page_token);
+    for (raw.value.series) |s| {
+        const pts = try a.alloc(monitoring.testing.FakeMonitoring.Point, s.points.len);
+        // Newest first in a read; oldest first in a put.
+        for (s.points, 0..) |p, i| pts[pts.len - 1 - i] = .{ .start = if (s.kind == .gauge) null else p.start, .end = p.end, .value = p.value.? };
+        try fake.put(.{ .metric_type = s.metric_type, .metric_labels = s.metric_labels, .resource_type = s.resource_type, .resource_labels = s.resource_labels, .kind = s.kind, .value_type = s.value_type, .points = pts });
+        count[0] += 1;
+        count[1] += pts.len;
+    }
+}
+
+/// The writes production refuses on a resource type only Google's
+/// metrics are on: one of Google's metrics; a user metric, the run's
+/// `user_metric`, whose descriptor production makes all the same; and a
+/// create under Google's domain.
+const RefusedWrites = struct {
+    resource: monitoring.Resource,
+    google_metric: []const u8,
+    google_value: monitoring.Value,
+    create_type: []const u8,
+    user_metric: []const u8,
+};
+
+/// Tries `w`'s writes on production and on the fake, compares what each
+/// answered, and checks that both made the user metric's descriptor.
+fn compareRefusedWrites(f: *Fixture, a: Allocator, fake_client: *monitoring.Client, fake_diag: *monitoring.Diagnostics, w: RefusedWrites, differences: *usize) !void {
+    const user_type = try f.name(w.user_metric);
+    var lines: [2][]const u8 = undefined;
+    for ([_]*monitoring.Client{ &f.client, fake_client }, [_]*monitoring.Diagnostics{ &f.diag, fake_diag }, &lines) |client, diag, *line| {
+        var out: std.Io.Writer.Allocating = .init(a);
+        const now: std.Io.Timestamp = .{ .nanoseconds = nowMs() };
+        if (client.write(&.{.{ .metric_type = w.google_metric, .resource = w.resource, .kind = .gauge, .end = now, .value = w.google_value }})) |r| {
+            var owned = r;
+            owned.deinit();
+            try out.writer.writeAll("Google's: written");
+        } else |err| try out.writer.print("Google's: {t}: {s}", .{ err, diag.message() });
+        if (client.write(&.{.{ .metric_type = user_type, .resource = w.resource, .kind = .gauge, .end = now, .value = .{ .int64 = 1 } }})) |r| {
+            var owned = r;
+            defer owned.deinit();
+            // From the reason on: the summary names the resource's
+            // labels in an order production varies call to call.
+            try out.writer.print(" | a user metric: {d} written, {s}", .{ owned.value.written, reasonOf(owned.value.message) });
+        } else |err| try out.writer.print(" | a user metric: {t}: {s}", .{ err, diag.message() });
+        if (client.metric(w.create_type).create(.{ .kind = .gauge, .value_type = .int64 })) |d| {
+            var owned = d;
+            owned.deinit();
+            try out.writer.writeAll(" | a create: made");
+        } else |err| try out.writer.print(" | a create: {t}: {s}", .{ err, diag.message() });
+        line.* = out.written();
+    }
+    agree(differences, "writes production refused", lines[0], lines[1]);
+    var made = try f.awaitDescriptor(user_type);
+    made.deinit();
+    var fake_made = try fake_client.metric(user_type).get();
+    fake_made.deinit();
+    fact("the user metric's descriptor was made by both", .{});
+}
+
+/// Holds the fake's descriptors of `metrics`, after `prefix`, and its
+/// `resource_types` to production's, as text.
+fn compareCatalog(f: *Fixture, a: Allocator, fake_client: *monitoring.Client, prefix: []const u8, metrics: []const []const u8, resource_types: []const []const u8, differences: *usize) !void {
+    for (metrics) |m| {
+        const t = try a.print("{s}{s}", .{ prefix, m });
+        agree(differences, m, try descriptorLine(a, &f.client, t), try descriptorLine(a, fake_client, t));
+    }
+    for (resource_types) |rt| agree(differences, rt, try resourceTypeLine(a, &f.client, rt), try resourceTypeLine(a, fake_client, rt));
+}
+
+fn descriptorLine(a: Allocator, client: *monitoring.Client, metric_type: []const u8) ![]const u8 {
+    var info = try client.metric(metric_type).get();
+    defer info.deinit();
+    var out: std.Io.Writer.Allocating = .init(a);
+    try out.writer.print("{t} {t} unit {s}, \"{s}\", \"{s}\", labels", .{ info.value.kind, info.value.value_type, info.value.unit, info.value.display_name, info.value.description });
+    for (info.value.labels) |l| try out.writer.print(" {s} \"{s}\"", .{ l.key, l.description });
+    try out.writer.writeAll(", on");
+    for (info.value.resource_types) |rt| try out.writer.print(" {s}", .{rt});
+    return out.written();
+}
+
+fn resourceTypeLine(a: Allocator, client: *monitoring.Client, name: []const u8) ![]const u8 {
+    var info = try client.resourceType(name);
+    defer info.deinit();
+    var out: std.Io.Writer.Allocating = .init(a);
+    try out.writer.print("\"{s}\", \"{s}\", labels", .{ info.value.display_name, info.value.description });
+    for (info.value.labels) |l| try out.writer.print(" {s} \"{s}\"", .{ l.key, l.description });
+    return out.written();
+}
+
 // Alerts (issue #246).
 
 /// One raw call beside the client, for what it deliberately has no verb
@@ -1073,20 +1177,11 @@ test "monitoring: Pub/Sub's own metrics, and the fake given production's points 
     var fake_diag: monitoring.Diagnostics = .{};
     var fake_client = try monitoring.Client.init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = f.token.provider(), .transport = fake.transport(), .diagnostics = &fake_diag });
     defer fake_client.deinit();
-    var put_series: usize = 0;
+    var put_count: [2]usize = .{ 0, 0 };
     for (pubsub_metrics) |m| {
-        var raw = try f.client.metric(try a.print("{s}{s}", .{ pubsub_prefix, m })).read(.{ .start = window_start, .end = end, .filter = if (std.mem.startsWith(u8, m, "topic/")) by_topic else by_subs });
-        defer raw.deinit();
-        try testing.expectEqual(null, raw.value.next_page_token);
-        for (raw.value.series) |s| {
-            const pts = try a.alloc(monitoring.testing.FakeMonitoring.Point, s.points.len);
-            // Newest first in a read; oldest first in a put.
-            for (s.points, 0..) |p, i| pts[pts.len - 1 - i] = .{ .start = if (s.kind == .gauge) null else p.start, .end = p.end, .value = p.value.? };
-            try fake.put(.{ .metric_type = s.metric_type, .metric_labels = s.metric_labels, .resource_type = s.resource_type, .resource_labels = s.resource_labels, .kind = s.kind, .value_type = s.value_type, .points = pts });
-            put_series += 1;
-        }
+        try putProduction(&f, a, &fake, try a.print("{s}{s}", .{ pubsub_prefix, m }), window_start, end, if (std.mem.startsWith(u8, m, "topic/")) by_topic else by_subs, &put_count);
     }
-    fact("{d} series put into the fake", .{put_series});
+    fact("{d} series put into the fake", .{put_count[0]});
 
     // The reads a console makes, and the edges of their periods.
     const by_type: []const []const u8 = &.{"metric.labels.delivery_type"};
@@ -1228,67 +1323,16 @@ test "monitoring: Pub/Sub's own metrics, and the fake given production's points 
     // Writes production refused: one of Google's metrics; a user metric on
     // Pub/Sub's resource type, its descriptor made all the same; a create
     // under Google's domain.
-    {
-        const on_sub = try f.name("on_sub");
-        const sub_resource: monitoring.Resource = .{ .other = .{ .type = "pubsub_subscription", .labels = &.{.{ .key = "subscription_id", .value = subs[0] }} } };
-        const google_type = try a.print("{s}subscription/zigps_mon_{s}", .{ pubsub_prefix, f.run });
-        var lines: [2][]const u8 = undefined;
-        for ([_]*monitoring.Client{ &f.client, &fake_client }, [_]*monitoring.Diagnostics{ &f.diag, &fake_diag }, &lines) |client, diag, *line| {
-            var out: std.Io.Writer.Allocating = .init(a);
-            const now: std.Io.Timestamp = .{ .nanoseconds = nowMs() };
-            if (client.write(&.{.{ .metric_type = pubsub_prefix ++ "subscription/num_undelivered_messages", .resource = sub_resource, .kind = .gauge, .end = now, .value = .{ .int64 = 1 } }})) |r| {
-                var owned = r;
-                owned.deinit();
-                try out.writer.writeAll("Google's: written");
-            } else |err| try out.writer.print("Google's: {t}: {s}", .{ err, diag.message() });
-            if (client.write(&.{.{ .metric_type = on_sub, .resource = sub_resource, .kind = .gauge, .end = now, .value = .{ .int64 = 1 } }})) |r| {
-                var owned = r;
-                defer owned.deinit();
-                try out.writer.print(" | a user metric: {d} written, {s}", .{ owned.value.written, owned.value.message });
-            } else |err| try out.writer.print(" | a user metric: {t}: {s}", .{ err, diag.message() });
-            if (client.metric(google_type).create(.{ .kind = .gauge, .value_type = .int64 })) |d| {
-                var owned = d;
-                owned.deinit();
-                try out.writer.writeAll(" | a create: made");
-            } else |err| try out.writer.print(" | a create: {t}: {s}", .{ err, diag.message() });
-            line.* = out.written();
-        }
-        agree(&differences, "writes production refused", lines[0], lines[1]);
-        var on_sub_info = try f.awaitDescriptor(on_sub);
-        on_sub_info.deinit();
-        var fake_made = try fake_client.metric(on_sub).get();
-        fake_made.deinit();
-        fact("the user metric's descriptor was made by both", .{});
-    }
+    try compareRefusedWrites(&f, a, &fake_client, &fake_diag, .{
+        .resource = .{ .other = .{ .type = "pubsub_subscription", .labels = &.{.{ .key = "subscription_id", .value = subs[0] }} } },
+        .google_metric = pubsub_prefix ++ "subscription/num_undelivered_messages",
+        .google_value = .{ .int64 = 1 },
+        .create_type = try a.print("{s}subscription/zigps_mon_{s}", .{ pubsub_prefix, f.run }),
+        .user_metric = "on_sub",
+    }, &differences);
 
     // Descriptors and resource types, as production gives them.
-    for (pubsub_metrics) |m| {
-        const t = try a.print("{s}{s}", .{ pubsub_prefix, m });
-        var lines: [2][]const u8 = undefined;
-        for ([_]*monitoring.Client{ &f.client, &fake_client }, &lines) |client, *line| {
-            var info = try client.metric(t).get();
-            defer info.deinit();
-            var out: std.Io.Writer.Allocating = .init(a);
-            try out.writer.print("{t} {t} unit {s}, \"{s}\", \"{s}\", labels", .{ info.value.kind, info.value.value_type, info.value.unit, info.value.display_name, info.value.description });
-            for (info.value.labels) |l| try out.writer.print(" {s} \"{s}\"", .{ l.key, l.description });
-            try out.writer.writeAll(", on");
-            for (info.value.resource_types) |rt| try out.writer.print(" {s}", .{rt});
-            line.* = out.written();
-        }
-        agree(&differences, m, lines[0], lines[1]);
-    }
-    for ([_][]const u8{ "pubsub_subscription", "pubsub_topic" }) |rt| {
-        var lines: [2][]const u8 = undefined;
-        for ([_]*monitoring.Client{ &f.client, &fake_client }, &lines) |client, *line| {
-            var info = try client.resourceType(rt);
-            defer info.deinit();
-            var out: std.Io.Writer.Allocating = .init(a);
-            try out.writer.print("\"{s}\", \"{s}\", labels", .{ info.value.display_name, info.value.description });
-            for (info.value.labels) |l| try out.writer.print(" {s} \"{s}\"", .{ l.key, l.description });
-            line.* = out.written();
-        }
-        agree(&differences, rt, lines[0], lines[1]);
-    }
+    try compareCatalog(&f, a, &fake_client, pubsub_prefix, &pubsub_metrics, &.{ "pubsub_subscription", "pubsub_topic" }, &differences);
     try testing.expectEqual(0, differences);
 }
 
@@ -1363,22 +1407,11 @@ test "monitoring: Cloud's quota metrics, and the fake given production's points 
     var fake_client = try monitoring.Client.init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = f.token.provider(), .transport = fake.transport(), .diagnostics = &fake_diag });
     defer fake_client.deinit();
     const services = [_][]const u8{ "pubsub.googleapis.com", "monitoring.googleapis.com" };
-    var put_series: usize = 0;
-    var put_points: usize = 0;
+    var put_count: [2]usize = .{ 0, 0 };
     for (quota_metrics) |m| for (services) |svc| {
-        var raw = try f.client.metric(try a.print("{s}{s}", .{ quota_prefix, m })).read(.{ .start = put_start, .end = end, .filter = .{ .resource_labels = &.{.{ .key = "service", .value = svc }} } });
-        defer raw.deinit();
-        try testing.expectEqual(null, raw.value.next_page_token);
-        for (raw.value.series) |s| {
-            const pts = try a.alloc(monitoring.testing.FakeMonitoring.Point, s.points.len);
-            // Newest first in a read; oldest first in a put.
-            for (s.points, 0..) |p, i| pts[pts.len - 1 - i] = .{ .start = if (s.kind == .gauge) null else p.start, .end = p.end, .value = p.value.? };
-            try fake.put(.{ .metric_type = s.metric_type, .metric_labels = s.metric_labels, .resource_type = s.resource_type, .resource_labels = s.resource_labels, .kind = s.kind, .value_type = s.value_type, .points = pts });
-            put_series += 1;
-            put_points += pts.len;
-        }
+        try putProduction(&f, a, &fake, try a.print("{s}{s}", .{ quota_prefix, m }), put_start, end, .{ .resource_labels = &.{.{ .key = "service", .value = svc }} }, &put_count);
     };
-    fact("{d} series put into the fake, {d} points", .{ put_series, put_points });
+    fact("{d} series put into the fake, {d} points", .{ put_count[0], put_count[1] });
 
     // The reads a console makes: raw by service, and the aligners each
     // kind takes, with the refusals production answers on the rest.
@@ -1457,69 +1490,250 @@ test "monitoring: Cloud's quota metrics, and the fake given production's points 
     // Writes production refused: one of the quota metrics; a user metric
     // on consumer_quota, its descriptor made all the same; a create under
     // serviceruntime's domain.
-    {
-        const on_quota = try f.name("on_quota");
-        const quota_resource: monitoring.Resource = .{ .other = .{ .type = "consumer_quota", .labels = &.{ .{ .key = "service", .value = "pubsub.googleapis.com" }, .{ .key = "location", .value = "global" } } } };
-        const google_type = try a.print("{s}zigps_mon_{s}", .{ quota_prefix, f.run });
-        var lines: [2][]const u8 = undefined;
-        for ([_]*monitoring.Client{ &f.client, &fake_client }, [_]*monitoring.Diagnostics{ &f.diag, &fake_diag }, &lines) |client, diag, *line| {
-            var out: std.Io.Writer.Allocating = .init(a);
-            const now: std.Io.Timestamp = .{ .nanoseconds = nowMs() };
-            if (client.write(&.{.{ .metric_type = quota_prefix ++ "allocation/usage", .resource = quota_resource, .kind = .gauge, .end = now, .value = .{ .int64 = 1 } }})) |r| {
-                var owned = r;
-                owned.deinit();
-                try out.writer.writeAll("Google's: written");
-            } else |err| try out.writer.print("Google's: {t}: {s}", .{ err, diag.message() });
-            if (client.write(&.{.{ .metric_type = on_quota, .resource = quota_resource, .kind = .gauge, .end = now, .value = .{ .int64 = 1 } }})) |r| {
-                var owned = r;
-                defer owned.deinit();
-                // From the reason on: the summary names the resource's
-                // labels in an order production varies call to call.
-                try out.writer.print(" | a user metric: {d} written, {s}", .{ owned.value.written, reasonOf(owned.value.message) });
-            } else |err| try out.writer.print(" | a user metric: {t}: {s}", .{ err, diag.message() });
-            if (client.metric(google_type).create(.{ .kind = .gauge, .value_type = .int64 })) |d| {
-                var owned = d;
-                owned.deinit();
-                try out.writer.writeAll(" | a create: made");
-            } else |err| try out.writer.print(" | a create: {t}: {s}", .{ err, diag.message() });
-            line.* = out.written();
-        }
-        agree(&differences, "writes production refused", lines[0], lines[1]);
-        var on_quota_info = try f.awaitDescriptor(on_quota);
-        on_quota_info.deinit();
-        var fake_made = try fake_client.metric(on_quota).get();
-        fake_made.deinit();
-        fact("the user metric's descriptor was made by both", .{});
-    }
+    try compareRefusedWrites(&f, a, &fake_client, &fake_diag, .{
+        .resource = .{ .other = .{ .type = "consumer_quota", .labels = &.{ .{ .key = "service", .value = "pubsub.googleapis.com" }, .{ .key = "location", .value = "global" } } } },
+        .google_metric = quota_prefix ++ "allocation/usage",
+        .google_value = .{ .int64 = 1 },
+        .create_type = try a.print("{s}zigps_mon_{s}", .{ quota_prefix, f.run }),
+        .user_metric = "on_quota",
+    }, &differences);
 
     // Descriptors and the resource type, as production gives them.
-    for (quota_metrics) |m| {
-        const t = try a.print("{s}{s}", .{ quota_prefix, m });
-        var lines: [2][]const u8 = undefined;
-        for ([_]*monitoring.Client{ &f.client, &fake_client }, &lines) |client, *line| {
-            var info = try client.metric(t).get();
-            defer info.deinit();
-            var out: std.Io.Writer.Allocating = .init(a);
-            try out.writer.print("{t} {t} unit {s}, \"{s}\", \"{s}\", labels", .{ info.value.kind, info.value.value_type, info.value.unit, info.value.display_name, info.value.description });
-            for (info.value.labels) |l| try out.writer.print(" {s} \"{s}\"", .{ l.key, l.description });
-            try out.writer.writeAll(", on");
-            for (info.value.resource_types) |rt| try out.writer.print(" {s}", .{rt});
-            line.* = out.written();
-        }
-        agree(&differences, m, lines[0], lines[1]);
+    try compareCatalog(&f, a, &fake_client, quota_prefix, &quota_metrics, &.{"consumer_quota"}, &differences);
+    try testing.expectEqual(0, differences);
+}
+
+// Cloud Storage's own metrics (issue #338).
+
+const storage_prefix = "storage.googleapis.com/";
+
+/// The three counts `FakeMonitoring` holds, after `storage_prefix`.
+const storage_counts = [_][]const u8{
+    "api/request_count",
+    "network/received_bytes_count",
+    "network/sent_bytes_count",
+};
+
+/// The two gauges, measured once a day and reported every 5 minutes.
+const storage_gauges = [_][]const u8{
+    "storage/object_count",
+    "storage/total_bytes",
+};
+
+/// The objects the run's bucket holds while its traffic runs.
+const storage_objects = 10;
+
+/// The reads made of each count: a bucket page's (each step's total over
+/// a 1 h and a 6 h window), by method and by response code, and the
+/// other aligners and reducers a DELTA metric takes, and one it refuses.
+const count_aggregations = [_]monitoring.Aggregation{
+    .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum },
+    .{ .alignment_period_s = 300, .aligner = .delta, .reducer = .sum },
+    .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum, .group_by = &.{"metric.labels.method"} },
+    .{ .alignment_period_s = 300, .aligner = .delta, .reducer = .sum, .group_by = &.{"metric.labels.response_code"} },
+    .{ .alignment_period_s = 60, .aligner = .rate, .reducer = .sum },
+    .{ .alignment_period_s = 60, .aligner = .delta },
+    .{ .alignment_period_s = 3600, .aligner = .sum, .reducer = .sum },
+    .{ .alignment_period_s = 300, .aligner = .max, .reducer = .max },
+    .{ .alignment_period_s = 300, .aligner = .mean },
+    .{ .alignment_period_s = 300, .aligner = .count, .reducer = .sum },
+    .{ .alignment_period_s = 60, .aligner = .interpolate },
+};
+
+/// The reads made of each gauge: a bucket page's (the largest an hour,
+/// summed over storage classes), by bucket and by class, the other
+/// aligners a gauge takes, and the two it refuses.
+const gauge_aggregations = [_]monitoring.Aggregation{
+    .{ .alignment_period_s = 3600, .aligner = .max, .reducer = .sum },
+    .{ .alignment_period_s = 3600, .aligner = .max, .reducer = .sum, .group_by = &.{"resource.labels.bucket_name"} },
+    .{ .alignment_period_s = 3600, .aligner = .max, .reducer = .sum, .group_by = &.{"metric.labels.storage_class"} },
+    .{ .alignment_period_s = 3600, .aligner = .mean },
+    .{ .alignment_period_s = 86400, .aligner = .max },
+    .{ .alignment_period_s = 3600, .aligner = .min, .reducer = .min },
+    .{ .alignment_period_s = 3600, .aligner = .sum },
+    .{ .alignment_period_s = 3600, .aligner = .count, .reducer = .count },
+    .{ .alignment_period_s = 3600, .aligner = .delta },
+    .{ .alignment_period_s = 3600, .aligner = .rate },
+};
+
+fn objectName(a: Allocator, i: usize) ![]const u8 {
+    return a.print("object-{d}.txt", .{i});
+}
+
+/// Requests of the kinds a bucket page counts, in the run's bucket:
+/// uploads, reads whole and by range, metadata, lists and misses.
+fn storageTraffic(a: Allocator, bucket: storage.Bucket) !void {
+    for (0..storage_objects) |i| {
+        const data = try a.alloc(u8, 100 * (i + 1));
+        @memset(data, 'x');
+        var written = try bucket.object(try objectName(a, i)).upload(data, .{ .content_type = "text/plain" });
+        written.deinit();
     }
-    {
-        var lines: [2][]const u8 = undefined;
-        for ([_]*monitoring.Client{ &f.client, &fake_client }, &lines) |client, *line| {
-            var info = try client.resourceType("consumer_quota");
-            defer info.deinit();
-            var out: std.Io.Writer.Allocating = .init(a);
-            try out.writer.print("\"{s}\", \"{s}\", labels", .{ info.value.display_name, info.value.description });
-            for (info.value.labels) |l| try out.writer.print(" {s} \"{s}\"", .{ l.key, l.description });
-            line.* = out.written();
+    for (0..storage_objects) |i| {
+        const object = bucket.object(try objectName(a, i));
+        var whole = try object.downloadAlloc(1 << 20, .{});
+        whole.deinit();
+        if (i % 2 == 0) {
+            var part = try object.downloadAlloc(1 << 20, .{ .range = .{ .offset = 0, .length = 10 } });
+            part.deinit();
         }
-        agree(&differences, "consumer_quota", lines[0], lines[1]);
+        var info = try object.get(.{});
+        info.deinit();
     }
+    for (0..5) |_| {
+        var page = try bucket.listObjects(.{});
+        page.deinit();
+    }
+    for (0..5) |_| {
+        var missing = bucket.object("nobody.txt").get(.{}) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        missing.deinit();
+        return error.TestUnexpectedObject;
+    }
+}
+
+/// The windows the storage reads compare: the run's bucket's counts over
+/// the hour to `end`, and every bucket's gauges over the 26 hours to
+/// `gauge_end`.
+const StorageWindows = struct {
+    counts_start: std.Io.Timestamp,
+    end: std.Io.Timestamp,
+    gauge_start: std.Io.Timestamp,
+    gauge_end: std.Io.Timestamp,
+};
+
+/// Waits until the traffic's last minute shows (sampled every 60 s,
+/// ingested within 210 s) and is a minute older than the window's end.
+fn awaitStorageCounts(f: *Fixture, by_bucket: monitoring.Filter, began: i96, called: i96) !void {
+    for (0..32) |_| {
+        try testing.io.sleep(.fromSeconds(30), .awake);
+        const now: std.Io.Timestamp = .{ .nanoseconds = nowMs() };
+        var counted = try f.client.metric(storage_prefix ++ "api/request_count").read(.{ .start = .{ .nanoseconds = floorMinute(began) - std.time.ns_per_min }, .end = now, .filter = by_bucket });
+        defer counted.deinit();
+        var latest: i96 = 0;
+        for (counted.value.series) |s| for (s.points) |p| {
+            latest = @max(latest, p.end.nanoseconds);
+        };
+        if (latest > floorMinute(called) and now.nanoseconds - floorMinute(called) >= 6 * std.time.ns_per_min) return;
+    }
+    return error.TestPointsNeverReadable;
+}
+
+/// Every read the storage test makes of production and of the fake: each
+/// metric raw and by each of its aggregations, one bucket's size as its
+/// page reads it, and the filters.
+fn storageReads(a: Allocator, fake_client: *monitoring.Client, w: StorageWindows, by_bucket: monitoring.Filter) !std.ArrayList(PubsubRead) {
+    const every_bucket: monitoring.Filter = .{ .resource_type = "gcs_bucket" };
+    var reads: std.ArrayList(PubsubRead) = .empty;
+    for (storage_counts) |m| {
+        try reads.append(a, .{ .label = try a.print("raw {s}", .{m}), .metric = m, .prefix = storage_prefix, .start = w.counts_start, .end = w.end, .filter = by_bucket });
+        for (count_aggregations, 0..) |agg, i| try reads.append(a, .{ .label = try a.print("{s} #{d}", .{ m, i }), .metric = m, .prefix = storage_prefix, .start = w.counts_start, .end = w.end, .filter = by_bucket, .aggregation = agg });
+    }
+    for (storage_gauges) |m| {
+        // Raw over the last two hours only: 24 points a bucket.
+        try reads.append(a, .{ .label = try a.print("raw {s}", .{m}), .metric = m, .prefix = storage_prefix, .start = at(w.gauge_end.nanoseconds, -2 * 3_600_000), .end = w.gauge_end, .filter = every_bucket });
+        for (gauge_aggregations, 0..) |agg, i| try reads.append(a, .{ .label = try a.print("{s} #{d}", .{ m, i }), .metric = m, .prefix = storage_prefix, .start = w.gauge_start, .end = w.gauge_end, .filter = every_bucket, .aggregation = agg });
+        // An instant aligned read: the one hour reaching back from the end.
+        try reads.append(a, .{ .label = try a.print("{s} max instant", .{m}), .metric = m, .prefix = storage_prefix, .start = null, .end = w.gauge_end, .filter = every_bucket, .aggregation = .{ .alignment_period_s = 3600, .aligner = .max } });
+    }
+    // One bucket's size, as its page reads it.
+    var sized = try fake_client.metric(storage_prefix ++ "storage/total_bytes").read(.{ .start = w.gauge_start, .end = w.gauge_end });
+    defer sized.deinit();
+    if (sized.value.series.len > 0) {
+        const named = try a.alloc(monitoring.Match, 1);
+        named[0] = .{ .key = "bucket_name", .value = try a.dupe(u8, sized.value.series[0].resourceLabel("bucket_name").?) };
+        for (storage_gauges) |m| try reads.append(a, .{ .label = try a.print("{s} of {s}", .{ m, named[0].value }), .metric = m, .prefix = storage_prefix, .start = w.gauge_start, .end = w.gauge_end, .filter = .{ .resource_type = "gcs_bucket", .resource_labels = named }, .aggregation = gauge_aggregations[0] });
+    } else fact("no bucket has gauges: no one-bucket reads", .{});
+    // Filters production refused, or did not.
+    const one_method = try a.alloc(monitoring.Match, 1);
+    one_method[0] = .{ .key = "method", .value = "WriteObject" };
+    for ([_]struct { []const u8, []const u8, monitoring.Filter }{
+        .{ "filter: location us", "storage/total_bytes", .{ .resource_labels = &.{.{ .key = "location", .value = "us" }} } },
+        .{ "filter: location us-central1", "storage/object_count", .{ .resource_labels = &.{.{ .key = "location", .value = "us-central1" }} } },
+        .{ "filter: a storage class", "storage/total_bytes", .{ .metric_labels = &.{.{ .key = "storage_class", .value = "REGIONAL" }} } },
+        .{ "filter: a count on subscription_id", "api/request_count", .{ .resource_labels = &.{.{ .key = "subscription_id", .value = "x" }} } },
+        .{ "filter: a metric label the metric lacks", "api/request_count", .{ .metric_labels = &.{.{ .key = "storage_class", .value = "x" }} } },
+        .{ "filter: resource type global", "api/request_count", .{ .resource_type = "global" } },
+        .{ "filter: resource type pubsub_topic", "storage/total_bytes", .{ .resource_type = "pubsub_topic" } },
+        .{ "filter: one method of the bucket", "api/request_count", .{ .resource_type = "gcs_bucket", .resource_labels = by_bucket.resource_labels, .metric_labels = one_method } },
+    }) |c| {
+        const counts = std.mem.startsWith(u8, c[1], "api/");
+        try reads.append(a, .{ .label = c[0], .metric = c[1], .prefix = storage_prefix, .start = if (counts) w.counts_start else w.gauge_start, .end = if (counts) w.end else w.gauge_end, .filter = c[2] });
+    }
+    return reads;
+}
+
+test "monitoring: Cloud Storage's own metrics, and the fake given production's points answers as production did" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    if (f.env.get("MONITORING_TEST_STORAGE") == null) return error.SkipZigTest;
+    const a = f.arena.allocator();
+
+    // A bucket of the run's own, and traffic in it.
+    var gcs_diag: storage.Diagnostics = .{};
+    var gcs = try storage.Client.init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = f.token.provider(), .scope = .cloud_platform, .diagnostics = &gcs_diag, .user_agent = "gcp-zig-monitoring-gcp-integration/0.1" });
+    defer gcs.deinit();
+    const bucket_name = try a.print("zigps-mon-{s}", .{f.run});
+    const bucket = gcs.bucket(bucket_name);
+    var made = false;
+    defer if (made) {
+        for (0..storage_objects) |i| bucket.object(objectName(a, i) catch continue).delete(.{}) catch {};
+        if (bucket.delete()) {
+            fact("deleted {s}", .{bucket_name});
+        } else |err| fact("delete {s}: {t} {s}", .{ bucket_name, err, gcs_diag.message() });
+    };
+    var info = try bucket.create(.{ .location = "US-CENTRAL1", .labels = &.{.{ .key = "purpose", .value = "gcp-zig-test" }}, .soft_delete_retention_s = 0 });
+    info.deinit();
+    made = true;
+    const began = nowMs();
+    try storageTraffic(a, bucket);
+    const called = nowMs();
+    fact("made {s} and sent its traffic in {d} ms", .{ bucket_name, @divFloor(called - began, std.time.ns_per_ms) });
+    const one_bucket = try a.alloc(monitoring.Match, 1);
+    one_bucket[0] = .{ .key = "bucket_name", .value = bucket_name };
+    const by_bucket: monitoring.Filter = .{ .resource_type = "gcs_bucket", .resource_labels = one_bucket };
+    try awaitStorageCounts(&f, by_bucket, began, called);
+    fact("counts readable {d} s after the traffic", .{@divFloor(nowMs() - called, std.time.ns_per_s)});
+
+    // Production's raw points, put into the fake: the bucket's counts over
+    // the hour to five minutes back; and every bucket's gauges over the
+    // 26 hours the reads compare and the day before, so a period reaching
+    // back holds the same points in both, ending on a 5-minute mark 15
+    // minutes back, past the gauges' 690 s ingest delay. A new bucket has
+    // no gauge until its first daily measurement, so the gauges are the
+    // project's other buckets'.
+    const five_minutes: i96 = 5 * std.time.ns_per_min;
+    const end: std.Io.Timestamp = .{ .nanoseconds = floorMinute(nowMs()) - five_minutes };
+    const gauge_end: std.Io.Timestamp = .{ .nanoseconds = @divFloor(nowMs() - 3 * five_minutes, five_minutes) * five_minutes };
+    const w: StorageWindows = .{ .counts_start = at(end.nanoseconds, -3_600_000), .end = end, .gauge_start = at(gauge_end.nanoseconds, -26 * 3_600_000), .gauge_end = gauge_end };
+    var fake: monitoring.testing.FakeMonitoring = .init(testing.allocator, testing.io, .{ .project_id = f.project });
+    defer fake.deinit();
+    var fake_diag: monitoring.Diagnostics = .{};
+    var fake_client = try monitoring.Client.init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = f.token.provider(), .transport = fake.transport(), .diagnostics = &fake_diag });
+    defer fake_client.deinit();
+    var put_count: [2]usize = .{ 0, 0 };
+    for (storage_counts) |m| try putProduction(&f, a, &fake, try a.print("{s}{s}", .{ storage_prefix, m }), w.counts_start, w.end, by_bucket, &put_count);
+    for (storage_gauges) |m| try putProduction(&f, a, &fake, try a.print("{s}{s}", .{ storage_prefix, m }), at(w.gauge_start.nanoseconds, -24 * 3_600_000), w.gauge_end, .{ .resource_type = "gcs_bucket" }, &put_count);
+    fact("{d} series put into the fake, {d} points", .{ put_count[0], put_count[1] });
+
+    var differences: usize = 0;
+    const reads = try storageReads(a, &fake_client, w, by_bucket);
+    for (reads.items) |r| {
+        const in_memory = try pubsubOutcome(a, &fake_client, &fake_diag, w.gauge_start.nanoseconds, r);
+        const production = try pubsubOutcome(a, &f.client, &f.diag, w.gauge_start.nanoseconds, r);
+        agree(&differences, r.label, production, in_memory);
+    }
+    try compareRefusedWrites(&f, a, &fake_client, &fake_diag, .{
+        .resource = .{ .other = .{ .type = "gcs_bucket", .labels = &.{ .{ .key = "bucket_name", .value = bucket_name }, .{ .key = "location", .value = "us-central1" } } } },
+        .google_metric = storage_prefix ++ "storage/total_bytes",
+        .google_value = .{ .double = 1 },
+        .create_type = try a.print("{s}zigps_mon_{s}", .{ storage_prefix, f.run }),
+        .user_metric = "on_bucket",
+    }, &differences);
+    try compareCatalog(&f, a, &fake_client, storage_prefix, &(storage_counts ++ storage_gauges), &.{"gcs_bucket"}, &differences);
     try testing.expectEqual(0, differences);
 }
 
