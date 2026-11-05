@@ -260,7 +260,7 @@ src/storage/fake_buckets.zig	FakeBuckets.setPolicy	28	60	35	4	3	3
 src/storage/fake_multipart.zig	FakeMultipart.handle	89	76	123	3	6	6
 src/storage/fake_multipart.zig	FakeMultipart.json	29	45	48	4	6	6
 src/storage/fake_multipart.zig	FakeMultipart.multipartRequest	30	44	87	2	6	6
-src/storage/fake_multipart.zig	FakeMultipart.patchObject	40	68	64	4	3	3
+src/storage/fake_multipart.zig	FakeMultipart.patchObject	40	68	65	4	3	3
 src/storage/fake_multipart.zig	FakeMultipart.serveFolders	58	116	89	4	3	3
 src/storage/fake_multipart.zig	FakeMultipart.serveManaged	46	76	79	4	3	3
 src/storage/fake_multipart.zig	FakeMultipart.sessionPut	24	40	38	3	4	4
