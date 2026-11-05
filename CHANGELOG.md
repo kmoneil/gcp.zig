@@ -6,6 +6,17 @@ including the ones that did not change.
 
 ## 0.65.0 (unreleased)
 
+- monitoring: `FakeMonitoring` holds Cloud Storage's own metrics, for
+  issue #338: the five a bucket page charts (`storage/total_bytes`,
+  `storage/object_count`, `api/request_count`,
+  `network/received_bytes_count`, `network/sent_bytes_count`, under
+  `storage.googleapis.com/`) on the resource type `gcs_bucket`, with
+  production's descriptors of 2026-11-05. A test puts their points in
+  with `put`, as for Pub/Sub's and the quota metrics; writing or
+  creating one is production's 403. `docs/monitoring/testing.md` says
+  how production shapes them: lowercase locations, the older storage
+  class names, a gauge every 5 minutes, a count a minute. No call
+  changes.
 - storage: `storage.testing.FakeStorage`, a public in-memory Cloud
   Storage for your own tests, for issue #337. Buckets and objects a test
   puts in (`putBucket`, `putObject`, `deleteObject`), read back as
@@ -19,8 +30,8 @@ including the ones that did not change.
   writes to versioned buckets, cross-bucket copies, soft-deleted
   listings and folders answer 501. No call changes.
 - auth, billing, bigquery, compute, core, dataflow, datatransfer,
-  error_reporting, firestore, kms, logging, monitoring, pubsub,
-  resource_manager, run, scheduler and secret_manager: unchanged.
+  error_reporting, firestore, kms, logging, pubsub, resource_manager,
+  run, scheduler and secret_manager: unchanged.
 
 ## 0.64.0 (2026-11-04)
 

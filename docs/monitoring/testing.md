@@ -121,7 +121,8 @@ nothing put in answers no series: production answered that way for a
 metric with nothing to count, rather than with zeros. None of them can
 be created or written: each is production's 403,
 `error.PermissionDenied`. A delete is a 501. A program's own metric
-written to Pub/Sub's resource types is refused in the summary, as
+written to Pub/Sub's resource types (or to `consumer_quota` or
+`gcs_bucket`, below) is refused in the summary, as
 production refused it, and its descriptor is made all the same, as
 production made it.
 
@@ -202,6 +203,105 @@ test "quota usage against its limit, put in the in-memory Cloud Monitoring" {
     const cap = limit.value.series[0].points[0].value.?.int64;
     // Near its limit: the widget warns.
     try std.testing.expect(used * 100 >= cap * 95);
+}
+```
+
+### Cloud Storage's metrics
+
+A bucket's size and traffic are Google's own metrics too, on the
+resource type `gcs_bucket` (labels `bucket_name` and `location`). The
+fake knows the five a bucket page charts, as production described them
+on 5 November 2026 (issue #338):
+
+| Metric, after `storage.googleapis.com/` | Kind | Value | Unit | Labels |
+| --- | --- | --- | --- | --- |
+| `storage/total_bytes` | GAUGE | DOUBLE | `By` | `storage_class` |
+| `storage/object_count` | GAUGE | INT64 | `1` | `storage_class` |
+| `api/request_count` | DELTA | INT64 | `1` | `response_code`, `method` |
+| `network/received_bytes_count` | DELTA | INT64 | `By` | `response_code`, `method` |
+| `network/sent_bytes_count` | DELTA | INT64 | `By` | `response_code`, `method` |
+
+A test puts them in with `put`, as Pub/Sub's above, and they read, list
+and refuse creates, writes and deletes the same way. To put in what
+production would show, follow what it sent on that day:
+
+- `location` is the bucket's location in lowercase: `us-central1` for a
+  bucket in `US-CENTRAL1`, and `us` for the multi-region `US`.
+- `storage_class` uses the older class names: a STANDARD bucket reported
+  `REGIONAL` in a region and `MULTI_REGIONAL` in a multi-region.
+- The two gauges have a point every 5 minutes, on the 5-minute mark. The
+  value is measured once a day and repeated all day. An emptied bucket
+  reported `0`.
+- The counts have one point a minute, starting 1 ms after the minute
+  before ended. A series has points only around activity, with one `0`
+  minute after it; quiet minutes have none.
+- `method` is the gRPC method's name even for JSON API calls
+  (`WriteObject`, `ReadObject`, `GetObjectMetadata`, `ListObjects`,
+  `DeleteObject`), and `response_code` the status code's name (`OK`,
+  `NOT_FOUND`).
+
+<!-- snippet: tests/docs_examples.zig#mon-storage -->
+```zig
+test "a bucket's size and requests, put in the in-memory Cloud Monitoring" {
+    var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_331_195 * std.time.ns_per_s };
+    var fake: monitoring.testing.FakeMonitoring = .init(std.testing.allocator, clock.io(), .{ .project_id = "my-project" });
+    defer fake.deinit();
+
+    // A bucket's size and traffic are Google's own metrics on the
+    // resource type gcs_bucket, so the test puts them in: the size a
+    // point every 5 minutes, requests a minute at a time.
+    const t = std.Io.Clock.real.now(clock.io()).nanoseconds;
+    const s = std.time.ns_per_s;
+    const bucket: []const monitoring.Label = &.{ .{ .key = "bucket_name", .value = "assets" }, .{ .key = "location", .value = "us-central1" } };
+    try fake.put(.{
+        .metric_type = "storage.googleapis.com/storage/total_bytes",
+        .metric_labels = &.{.{ .key = "storage_class", .value = "REGIONAL" }},
+        .resource_type = "gcs_bucket",
+        .resource_labels = bucket,
+        .kind = .gauge,
+        .value_type = .double,
+        .points = &.{
+            .{ .start = null, .end = .{ .nanoseconds = t - 600 * s }, .value = .{ .double = 4_096 } },
+            .{ .start = null, .end = .{ .nanoseconds = t - 300 * s }, .value = .{ .double = 8_192 } },
+        },
+    });
+    try fake.put(.{
+        .metric_type = "storage.googleapis.com/api/request_count",
+        .metric_labels = &.{ .{ .key = "response_code", .value = "OK" }, .{ .key = "method", .value = "ReadObject" } },
+        .resource_type = "gcs_bucket",
+        .resource_labels = bucket,
+        .kind = .delta,
+        .value_type = .int64,
+        .points = &.{.{ .start = .{ .nanoseconds = t - 60 * s + std.time.ns_per_ms }, .end = .{ .nanoseconds = t }, .value = .{ .int64 = 42 } }},
+    });
+
+    var token: monitoring.StaticToken = .{ .token = "none" };
+    var client = try monitoring.Client.init(std.testing.allocator, clock.io(), .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    const assets: monitoring.Filter = .{ .resource_type = "gcs_bucket", .resource_labels = &.{.{ .key = "bucket_name", .value = "assets" }} };
+    // The bucket's size over the hour: its largest, summed over storage
+    // classes.
+    var size = try client.metric("storage.googleapis.com/storage/total_bytes").read(.{
+        .start = .{ .nanoseconds = t - 3600 * s },
+        .end = .{ .nanoseconds = t },
+        .filter = assets,
+        .aggregation = .{ .alignment_period_s = 3600, .aligner = .max, .reducer = .sum },
+    });
+    defer size.deinit();
+    try std.testing.expectEqual(8_192, size.value.series[0].points[0].value.?.double);
+    // Its requests in the last minute, every method and response summed.
+    var requests = try client.metric("storage.googleapis.com/api/request_count").read(.{
+        .start = .{ .nanoseconds = t - 60 * s },
+        .end = .{ .nanoseconds = t },
+        .filter = assets,
+        .aggregation = .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum },
+    });
+    defer requests.deinit();
+    try std.testing.expectEqual(42, requests.value.series[0].points[0].value.?.int64);
 }
 ```
 
@@ -400,7 +500,7 @@ Each as production answered when measured, refusals in its words:
   - missing resource labels, or a location that is not a region or zone;
   - label and string limits, and a distribution that does not add up;
   - a cumulative start moved earlier;
-  - a program's metric on one of Pub/Sub's resource types.
+  - a program's metric on a resource type only Google's metrics are on.
 
   A reset, the last point sent again, and a falling total are taken.
   Times are kept to the microsecond.
@@ -411,7 +511,7 @@ Each as production answered when measured, refusals in its words:
 - **Descriptors**: created (again with the same shape, or 409 with
   another), read, listed by prefix and in pages, deleted with their
   points. A first write creates one; a write with a new label adds it.
-  Pub/Sub's own are there from the start.
+  Google's own are there from the start.
 - **Reads**:
   - its own reading of the filter the client writes, labels it does not know refused as production refused them, by the resource types the metric can be on, and a resource type it cannot be on;
   - (start, end], newest first;
@@ -420,8 +520,8 @@ Each as production answered when measured, refusals in its words:
   - the aligners production refused on a kind, refused in its words: `ALIGN_DELTA` and `ALIGN_RATE` on a gauge; interpolate, next older, the true and false counts and the percentiles on a DELTA metric;
   - the unit production gave: `1` for a count, aligned or reduced, the metric's unit a second for a rate (`1/s`, `By/s`), and `{not_a_unit}` for a metric without one;
   - pages by points with series split across them, and HEADERS.
-- **The resource types** the `Resource` union names, Pub/Sub's two and
-  `consumer_quota`, which carry only Google's metrics.
+- **The resource types** the `Resource` union names, and Pub/Sub's two,
+  `consumer_quota` and `gcs_bucket`, which carry only Google's metrics.
 - **Faults**: `refuseNext`, `refuseNextWithDelay`, `dropNext`, and
   `loseNext`, which serves a call and answers it with an error, as a 504
   that stored a write.
@@ -431,15 +531,20 @@ and the fake, and holds the fake to every outcome. Another sends Pub/Sub
 traffic, puts production's points for it into the fake, and holds the
 fake to production's answers to about 90 reads, its descriptors and its
 resource types. A third reads the project's own quota series, puts them
-into the fake, and holds it to production's answers the same way.
+into the fake, and holds it to production's answers the same way. A
+fourth makes a bucket and sends it about seventy requests, puts that
+bucket's counts and every bucket's size and object count into the fake,
+and holds the fake to production's answers to 75 reads, its refusals,
+its descriptors and `gcs_bucket`: on 5 November 2026 they agreed on
+every one.
 
 ## Where it differs
 
 - Its messages give times in UTC, where production wrote US Pacific.
 - A descriptor just created reads back at once, where production
   answered 404 for about 2 s, and once for more than 15 s.
-- Only generic_task's, Pub/Sub's and consumer_quota's resource type
-  text is production's.
+- Only the resource type text of generic_task, Pub/Sub's two,
+  consumer_quota and gcs_bucket is production's.
 - A write summary prints the resource's labels in one order, where
   production's order varies call to call.
 - A reduced double can differ from production's in its last bits, since

@@ -2,8 +2,9 @@
 //! Monitoring spec (`_tmp/monitoring-m0/`), for tests: the probes' own
 //! `zigps-m0*` metrics and refusals, verbatim but for a final line break;
 //! and on 2026-10-19, for issue #239, at the end; and on 2026-10-20, for
-//! issue #275, alert policies and snoozes (`_tmp/policies-m0/`). Test code
-//! only.
+//! issue #275, alert policies and snoozes (`_tmp/policies-m0/`); and on
+//! 2026-11-05, for issue #338, Cloud Storage's descriptors and
+//! `gcs_bucket`, at the very end. Test code only.
 
 /// A descriptor the probe made: GAUGE INT64, unit 1, one string label. HTTP 200.
 pub const descriptor_get_status = 200;
@@ -2155,3 +2156,208 @@ pub const snooze_filter_display_name =
     \\ }
     \\}
 ;
+
+// Cloud Storage's own metrics, read on 2026-11-05 for issue #338
+// (`_tmp/gcs-metrics-m0/out/`): the five a bucket page charts, by GET,
+// and their resource type.
+
+/// Cloud Storage's storage/total_bytes. HTTP 200.
+pub const descriptor_storage_total_bytes_status = 200;
+pub const descriptor_storage_total_bytes =
+    \\{
+    \\  "name": "projects/extractctl/metricDescriptors/storage.googleapis.com/storage/total_bytes",
+    \\  "labels": [
+    \\    {
+    \\      "key": "storage_class",
+    \\      "description": "Storage class of the data."
+    \\    }
+    \\  ],
+    \\  "metricKind": "GAUGE",
+    \\  "valueType": "DOUBLE",
+    \\  "unit": "By",
+    \\  "description": "Total size of all objects in the bucket, grouped by storage class. Soft-deleted objects are not included in the total; use the updated v2 metric for a breakdown of total usage including soft-deleted objects. This value is measured once per day, and there might be a delay after measuring before the value becomes available in Cloud Monitoring. Once available, the value is repeated at each sampling interval throughout the day. Buckets with no objects in them are not tracked by this metric. For this metric, the sampling period is a reporting period, not a measurement period.",
+    \\  "displayName": "Total bytes",
+    \\  "type": "storage.googleapis.com/storage/total_bytes",
+    \\  "metadata": {
+    \\    "launchStage": "GA",
+    \\    "samplePeriod": "300s",
+    \\    "ingestDelay": "690s",
+    \\    "timeSeriesResourceHierarchyLevel": [
+    \\      "PROJECT"
+    \\    ]
+    \\  },
+    \\  "launchStage": "GA",
+    \\  "monitoredResourceTypes": [
+    \\    "gcs_bucket"
+    \\  ]
+    \\}
+;
+
+/// Cloud Storage's storage/object_count. HTTP 200.
+pub const descriptor_storage_object_count_status = 200;
+pub const descriptor_storage_object_count =
+    \\{
+    \\  "name": "projects/extractctl/metricDescriptors/storage.googleapis.com/storage/object_count",
+    \\  "labels": [
+    \\    {
+    \\      "key": "storage_class",
+    \\      "description": "Storage class of the data."
+    \\    }
+    \\  ],
+    \\  "metricKind": "GAUGE",
+    \\  "valueType": "INT64",
+    \\  "unit": "1",
+    \\  "description": "Total number of objects per bucket, grouped by storage class. Soft-deleted objects are not included in the total; use the updated v2 metric for a breakdown of total usage including soft-deleted objects. This value is measured once per day, and there might be a delay after measuring before the value becomes available in Cloud Monitoring. Once available, the value is repeated at each sampling interval throughout the day. Buckets with no objects in them are not tracked by this metric. For this metric, the sampling period is a reporting period, not a measurement period.",
+    \\  "displayName": "Object count",
+    \\  "type": "storage.googleapis.com/storage/object_count",
+    \\  "metadata": {
+    \\    "launchStage": "GA",
+    \\    "samplePeriod": "300s",
+    \\    "ingestDelay": "690s",
+    \\    "timeSeriesResourceHierarchyLevel": [
+    \\      "PROJECT"
+    \\    ]
+    \\  },
+    \\  "launchStage": "GA",
+    \\  "monitoredResourceTypes": [
+    \\    "gcs_bucket"
+    \\  ]
+    \\}
+;
+
+/// Cloud Storage's api/request_count. HTTP 200.
+pub const descriptor_api_request_count_status = 200;
+pub const descriptor_api_request_count =
+    \\{
+    \\  "name": "projects/extractctl/metricDescriptors/storage.googleapis.com/api/request_count",
+    \\  "labels": [
+    \\    {
+    \\      "key": "response_code",
+    \\      "description": "The response code of the requests."
+    \\    },
+    \\    {
+    \\      "key": "method",
+    \\      "description": "The name of the API method called."
+    \\    }
+    \\  ],
+    \\  "metricKind": "DELTA",
+    \\  "valueType": "INT64",
+    \\  "unit": "1",
+    \\  "description": "Delta count of API calls, grouped by the API method name and response code.",
+    \\  "displayName": "Request count",
+    \\  "type": "storage.googleapis.com/api/request_count",
+    \\  "metadata": {
+    \\    "launchStage": "GA",
+    \\    "samplePeriod": "60s",
+    \\    "ingestDelay": "210s",
+    \\    "timeSeriesResourceHierarchyLevel": [
+    \\      "PROJECT"
+    \\    ]
+    \\  },
+    \\  "launchStage": "GA",
+    \\  "monitoredResourceTypes": [
+    \\    "gcs_bucket"
+    \\  ]
+    \\}
+;
+
+/// Cloud Storage's network/received_bytes_count. HTTP 200.
+pub const descriptor_network_received_bytes_count_status = 200;
+pub const descriptor_network_received_bytes_count =
+    \\{
+    \\  "name": "projects/extractctl/metricDescriptors/storage.googleapis.com/network/received_bytes_count",
+    \\  "labels": [
+    \\    {
+    \\      "key": "response_code",
+    \\      "description": "The response code of the requests."
+    \\    },
+    \\    {
+    \\      "key": "method",
+    \\      "description": "The name of the API method called."
+    \\    }
+    \\  ],
+    \\  "metricKind": "DELTA",
+    \\  "valueType": "INT64",
+    \\  "unit": "By",
+    \\  "description": "Delta count of bytes received over the network, grouped by the API method name and response code.",
+    \\  "displayName": "Received bytes",
+    \\  "type": "storage.googleapis.com/network/received_bytes_count",
+    \\  "metadata": {
+    \\    "launchStage": "GA",
+    \\    "samplePeriod": "60s",
+    \\    "ingestDelay": "210s",
+    \\    "timeSeriesResourceHierarchyLevel": [
+    \\      "PROJECT"
+    \\    ]
+    \\  },
+    \\  "launchStage": "GA",
+    \\  "monitoredResourceTypes": [
+    \\    "gcs_bucket"
+    \\  ]
+    \\}
+;
+
+/// Cloud Storage's network/sent_bytes_count. HTTP 200.
+pub const descriptor_network_sent_bytes_count_status = 200;
+pub const descriptor_network_sent_bytes_count =
+    \\{
+    \\  "name": "projects/extractctl/metricDescriptors/storage.googleapis.com/network/sent_bytes_count",
+    \\  "labels": [
+    \\    {
+    \\      "key": "response_code",
+    \\      "description": "The response code of the requests."
+    \\    },
+    \\    {
+    \\      "key": "method",
+    \\      "description": "The name of the API method called."
+    \\    }
+    \\  ],
+    \\  "metricKind": "DELTA",
+    \\  "valueType": "INT64",
+    \\  "unit": "By",
+    \\  "description": "Delta count of bytes sent over the network, grouped by the API method name and response code.",
+    \\  "displayName": "Sent bytes",
+    \\  "type": "storage.googleapis.com/network/sent_bytes_count",
+    \\  "metadata": {
+    \\    "launchStage": "GA",
+    \\    "samplePeriod": "60s",
+    \\    "ingestDelay": "210s",
+    \\    "timeSeriesResourceHierarchyLevel": [
+    \\      "PROJECT"
+    \\    ]
+    \\  },
+    \\  "launchStage": "GA",
+    \\  "monitoredResourceTypes": [
+    \\    "gcs_bucket"
+    \\  ]
+    \\}
+;
+
+/// The gcs_bucket resource type. HTTP 200.
+pub const resource_gcs_bucket_status = 200;
+pub const resource_gcs_bucket =
+    \\{
+    \\  "type": "gcs_bucket",
+    \\  "displayName": "GCS Bucket",
+    \\  "description": "A Google Cloud Storage (GCS) bucket.",
+    \\  "labels": [
+    \\    {
+    \\      "key": "project_id",
+    \\      "description": "The identifier of the GCP project associated with this resource, such as \"my-project\"."
+    \\    },
+    \\    {
+    \\      "key": "bucket_name",
+    \\      "description": "An immutable name of the bucket."
+    \\    },
+    \\    {
+    \\      "key": "location",
+    \\      "description": "Location of the bucket."
+    \\    }
+    \\  ],
+    \\  "name": "projects/extractctl/monitoredResourceDescriptors/gcs_bucket",
+    \\  "launchStage": "GA"
+    \\}
+;
+
+/// The five, for a test that holds each to the fake's.
+pub const storage_descriptors = [_][]const u8{ descriptor_storage_total_bytes, descriptor_storage_object_count, descriptor_api_request_count, descriptor_network_received_bytes_count, descriptor_network_sent_bytes_count };
