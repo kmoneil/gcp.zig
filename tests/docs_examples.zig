@@ -2921,6 +2921,49 @@ test "the exact stop a console would send, for the user to confirm, then sent" {
 }
 // end snippet
 
+// snippet: compute-sibling
+/// Inserts `spec` in `zone` and waits for it: ten seconds and more in
+/// production, the whole of its task's time.
+fn insertAndWait(client: *compute.Client, zone: []const u8, spec: compute.InstanceSpec) !void {
+    var op = try client.insertInstance(zone, spec, .{});
+    defer op.deinit();
+    var done = try client.waitOperation(op.value.ref(), .{});
+    defer done.deinit();
+    if (!done.value.succeeded()) return error.InsertFailed;
+}
+
+test "two VMs inserted and waited on at once, a client a task" {
+    const io = std.testing.io;
+    var fake: compute.testing.FakeCompute = .init(std.testing.allocator, io, .{});
+    defer fake.deinit();
+    var token: compute.StaticToken = .{ .token = "none" };
+    var client = try compute.Client.init(std.testing.allocator, io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .scope = .read_write,
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    // A client is one task's: each task gets a sibling, with the same
+    // settings and a connection of its own.
+    var first = try client.sibling(null);
+    defer first.deinit();
+    var second = try client.sibling(null);
+    defer second.deinit();
+    const debian: compute.ImageRef = .{ .family = .{ .project = "debian-cloud", .name = "debian-12" } };
+    var a = try io.concurrent(insertAndWait, .{ &first, "us-central1-a", compute.InstanceSpec{ .name = "batch-1", .machine_type = "e2-micro", .image = debian } });
+    defer a.cancel(io) catch {};
+    var b = try io.concurrent(insertAndWait, .{ &second, "us-central1-b", compute.InstanceSpec{ .name = "batch-2", .machine_type = "e2-micro", .image = debian } });
+    defer b.cancel(io) catch {};
+    try a.await(io);
+    try b.await(io);
+    var all = try client.listAllInstances(.{});
+    defer all.deinit();
+    try std.testing.expectEqual(2, all.value.instances.len);
+    for (all.value.instances) |vm| try std.testing.expectEqual(.running, vm.status);
+}
+// end snippet
+
 // snippet: compute-fake
 /// Creates the VM in the first of `zones` with room for it.
 fn createSomewhere(client: *compute.Client, zones: []const []const u8, spec: compute.InstanceSpec) ![]const u8 {
