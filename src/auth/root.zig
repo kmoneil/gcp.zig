@@ -24,6 +24,12 @@ pub const IamSigner = @import("IamSigner.zig");
 pub const MetadataServer = @import("MetadataServer.zig");
 pub const Lookup = @import("Lookup.zig");
 pub const Credentials = @import("Credentials.zig");
+/// For tests of code that uses this module.
+pub const testing = struct {
+    /// The metadata server in memory, behind
+    /// `MetadataServer.Options.transport`.
+    pub const FakeMetadataServer = @import("FakeMetadataServer.zig");
+};
 /// The credentials this environment points at: the file
 /// `GOOGLE_APPLICATION_CREDENTIALS` names, the file gcloud's login wrote,
 /// or the metadata server, in that order.
@@ -37,6 +43,7 @@ test {
     _ = @import("ImpersonatedServiceAccount.zig");
     _ = @import("IamSigner.zig");
     _ = @import("MetadataServer.zig");
+    _ = @import("FakeMetadataServer.zig");
 
     _ = @import("Lookup.zig");
     _ = @import("Credentials.zig");

@@ -4,6 +4,30 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.66.0 (unreleased)
+
+- auth: `MetadataServer` reads any metadata key, for issue #355, with
+  the checks its token requests have. `get` reads one key's value as
+  text, as it was set, or a directory's names; `instanceAttribute`
+  reads `instance/attributes/<key>`, null when it is not set;
+  `preempted` says whether Compute Engine has begun to preempt a spot
+  VM; `watch` waits for a key to change with the metadata server's
+  `wait_for_change`, the ETag in and out, so a worker wakes within
+  moments of `TRUE` with no polling. A key not set is
+  `error.NotFound`; a path with a query, a `..` or a doubled slash, a
+  watch on a directory, and a wait outside 1 to 3600 s are refused
+  before sending. Its own transport now reads up to 512 KiB, all a VM's
+  metadata, where it read 64 KiB, which a 256 KB attribute outgrew.
+  `auth.testing.FakeMetadataServer`, new, answers as Compute Engine's
+  metadata server did when measured on 2026-11-05, with `set`,
+  `remove`, `preempt` and waits that block. `examples/spot_worker.zig`
+  watches for preemption, and runs with no VM under `--fake`. No call
+  changes.
+- billing, bigquery, compute, core, dataflow, datatransfer,
+  error_reporting, firestore, kms, logging, monitoring, pubsub,
+  resource_manager, run, scheduler, secret_manager and storage:
+  unchanged.
+
 ## 0.65.0 (2026-11-05)
 
 - monitoring: `FakeMonitoring` holds Cloud Storage's own metrics, for
