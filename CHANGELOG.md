@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.66.0 (unreleased)
+## 0.66.0 (2026-11-05)
 
 - auth: `MetadataServer` reads any metadata key, for issue #355, with
   the checks its token requests have. `get` reads one key's value as
