@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.67.0 (unreleased)
+## 0.67.0 (2026-11-05)
 
 - monitoring: `FakeMonitoring` holds Pub/Sub's
   `topic/message_sizes`, for issue #315: a DELTA distribution on
