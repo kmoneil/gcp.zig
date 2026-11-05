@@ -165,8 +165,9 @@ fn untilPreempted(metadata: *auth.MetadataServer, io: std.Io, arena: std.mem.All
 ```
 
 When measured on 2026-11-05, a spot VM's `instance/preempted` turned
-`TRUE` 9.5 s after Compute Engine was asked to preempt it, and a watch
-woke 240 ms before a poll every half second saw it.
+`TRUE` between 5 and 56 s after Compute Engine was asked to preempt it,
+in three runs, and a watch woke 240 ms before a poll every half second
+saw it.
 `instance/maintenance-event` stayed `NONE` throughout, so it is not the
 key to watch on a spot VM. `examples/spot_worker.zig` is such a worker,
 and `--fake` runs it with no VM.
