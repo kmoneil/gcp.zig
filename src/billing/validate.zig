@@ -138,7 +138,7 @@ test "service ids, currencies, tokens and agents" {
     try testing.expect(isPageToken("NTAwMA=="));
     try testing.expect(!isPageToken("a b"));
     try testing.expect(!isPageToken(""));
-    try testing.expect(isUserAgent("gcp-zig-billing/0.66"));
+    try testing.expect(isUserAgent("gcp-zig-billing/0.67"));
     try testing.expect(!isUserAgent("a\nb"));
 }
 
