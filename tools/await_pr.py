@@ -2,7 +2,9 @@
 """Waits for a pull request to merge, then checks that what landed is
 what CI tested: the merged commit's tree equals the tested head's, and
 the base branch holds the merged commit. It merges nothing itself; auto-
-merge, or a person, does that.
+merge, or a person, does that. When every check is green and auto-merge
+is not armed, nothing will merge it, so it says so and stops (exit 6)
+with the head to merge; run it again after the merge to check it.
 
     python3 -I tools/await_pr.py PR [--repo OWNER/NAME] [--interval SECONDS]
                                     [--timeout MINUTES]
@@ -17,11 +19,16 @@ It prints a line when the checks move, and one at the end. Exit codes:
      branch does not hold the merged commit
   4  still open at the timeout
   5  gh or git failed (their message on stderr)
+  6  open, every check green on the head it names, auto-merge not armed:
+     ready for a person to merge
   64 a usage error
 
 A rebase merge rewrites commit ids, so ids are not compared; trees are.
 Every id is checked to be non-empty before it is compared, since two
 failed lookups would otherwise compare equal.
+
+Ready takes two polls in a row on the same head, since a workflow's
+checks can appear a poll after another's have finished.
 """
 
 import argparse
@@ -88,6 +95,16 @@ def progress(pr):
     return line
 
 
+def ready_head(pr):
+    """The head to merge when nothing else will: open, at least one check,
+    none failed or pending, auto-merge not armed. Empty otherwise."""
+    if pr.get("autoMergeRequest") or not checks_of(pr):
+        return ""
+    if classify(pr) != ("open", ""):
+        return ""
+    return pr.get("headRefOid") or ""
+
+
 def same_tree(git, merged, head):
     """Whether two commits hold the same tree. Refuses empty ids."""
     if not merged or not head:
@@ -127,6 +144,7 @@ def await_pr(args, gh, git, sleep=time.sleep, clock=time.monotonic, say=None):
         base_cmd += ["--repo", args.repo]
     deadline = clock() + args.timeout * 60
     last = None
+    ready_before = ""
     while True:
         pr = json.loads(gh(base_cmd))
         verdict, detail = classify(pr)
@@ -144,6 +162,12 @@ def await_pr(args, gh, git, sleep=time.sleep, clock=time.monotonic, say=None):
         if line != last:
             say(line)
             last = line
+        head = ready_head(pr)
+        if head and head == ready_before:
+            say(f"ready to merge: every check is green on {head} and auto-merge is not armed; "
+                f"merge it with gh pr merge {args.pr} --rebase --match-head-commit {head}, then run this again to check what landed")
+            return 6
+        ready_before = head
         if clock() >= deadline:
             say(f"still open after {args.timeout} minutes: {line}")
             return 4
@@ -217,6 +241,27 @@ def self_test():
     ticks = iter([0, 0, 61 * 60])
     assert await_pr(Args, scripted([open_pr, open_pr]), fake_git(), sleep=quiet, clock=lambda: next(ticks), say=say) == 4
     assert said[-1].startswith("still open after 60 minutes")
+
+    # Green with nothing armed: ready on the second poll that agrees, the
+    # head named for the merge.
+    green = lambda head, **more: {"state": "OPEN", "headRefOid": head, "statusCheckRollup": [ok("test"), ok("lint")], **more}
+    said.clear()
+    assert await_pr(Args, scripted([open_pr, green("h1"), green("h1")]), fake_git(), sleep=quiet, say=say) == 6
+    assert said[-1].startswith("ready to merge: every check is green on h1"), said
+    assert "--match-head-commit h1," in said[-1], said
+    # A push between the two polls starts the count again.
+    assert await_pr(Args, scripted([green("h1"), green("h2"), green("h2")]), fake_git(), sleep=quiet, say=say) == 6
+    assert "green on h2" in said[-1], said
+    # Merged by a person between polls: verified, as ever.
+    assert await_pr(Args, scripted([green("h1"), merged_pr]), fake_git(), sleep=quiet, say=say) == 0
+    # Armed, it waits for the merge; with no checks yet, it waits for them.
+    armed = green("h1", autoMergeRequest={"mergeMethod": "REBASE"})
+    assert await_pr(Args, scripted([armed, armed, armed, merged_pr]), fake_git(), sleep=quiet, say=say) == 0
+    none_yet = {"state": "OPEN", "headRefOid": "h1", "statusCheckRollup": []}
+    assert await_pr(Args, scripted([none_yet, none_yet, merged_pr]), fake_git(), sleep=quiet, say=say) == 0
+    assert ready_head(green("h1")) == "h1"
+    assert ready_head({"state": "OPEN", "headRefOid": "h1", "statusCheckRollup": [ok("test"), running("lint")]}) == ""
+    assert ready_head({"state": "OPEN", "headRefOid": "h1", "statusCheckRollup": [ok("a"), {"name": "z", "status": "COMPLETED", "conclusion": "FAILURE"}]}) == ""
     print("await_pr self-test: ok")
 
 
@@ -229,7 +274,8 @@ class Parser(argparse.ArgumentParser):
 
 
 def main():
-    parser = Parser(description="Wait for a pull request to merge, then check that what landed is what CI tested.")
+    parser = Parser(description="Wait for a pull request to merge, then check that what landed is what CI tested; "
+                    "stop at exit 6 when it is green with nothing armed to merge it.")
     parser.add_argument("pr", nargs="?", type=int, help="the pull request's number")
     parser.add_argument("--repo", help="OWNER/NAME; the current repository's when absent")
     parser.add_argument("--interval", type=int, default=30, help="seconds between polls (default 30)")
