@@ -277,7 +277,7 @@ fn notKey(f: *FakeMetadataServer, arena: Allocator, path: []const u8, asked: Ask
 /// A key's value, once it has changed when the request waits for that.
 fn keyAnswer(f: *FakeMetadataServer, arena: Allocator, path: []const u8, asked: Asked) tp.Error!tp.Response {
     if (asked.wait) {
-        if (f.keys.get(path).?.json) return respond(arena, 400, "application/text", null, "wait_for_change is not supported here.\n");
+        if (f.keys.get(path).?.json) return respond(arena, 400, "application/text", null, "Wait for change is not supported on token.");
         try f.waitForChange(path, asked);
     }
     // A watch whose key was removed while it waited.
@@ -535,6 +535,30 @@ test "FakeMetadataServer: a watch that runs out answers the value unchanged, wit
     try testing.expectEqualStrings(first.etag, again.etag);
 }
 
+test "FakeMetadataServer: an ETag follows the value: a change of the same length moves it, the same value back restores it" {
+    var h: Harness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    try h.fake.set("instance/attributes/shard", "a");
+    const a1 = try h.metadata.watch(testing.io, h.a(), "instance/attributes/shard", .{});
+    try h.fake.set("instance/attributes/shard", "b");
+    const b = try h.metadata.watch(testing.io, h.a(), "instance/attributes/shard", .{});
+    try testing.expect(!std.mem.eql(u8, a1.etag, b.etag));
+    try h.fake.set("instance/attributes/shard", "a");
+    const a2 = try h.metadata.watch(testing.io, h.a(), "instance/attributes/shard", .{});
+    try testing.expectEqualStrings(a1.etag, a2.etag);
+}
+
+test "FakeMetadataServer: wait_for_change with no last_etag waits for the next change, as production's does" {
+    var h: Harness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    const started = std.Io.Clock.awake.now(testing.io);
+    const res = try h.raw(.GET, "/computeMetadata/v1/instance/preempted?wait_for_change=true&timeout_sec=1", flavor_header);
+    try testing.expect(elapsedMs(started) >= 900);
+    try testing.expectEqualStrings("FALSE", res.body);
+}
+
 test "FakeMetadataServer: a watch on a key removed while it waits is NotFound, and on one never set at once" {
     var h: Harness = undefined;
     try h.init(.{});
@@ -616,7 +640,9 @@ test "FakeMetadataServer: the refusals, redirects and listings production gave" 
     const token = try h.raw(.GET, "/computeMetadata/v1/instance/service-accounts/default/token", flavor_header);
     try testing.expectEqualStrings("application/json", token.header("Content-Type").?);
     try testing.expectEqual(null, token.header("ETag"));
-    try testing.expectEqual(400, (try h.raw(.GET, "/computeMetadata/v1/instance/service-accounts/default/token?wait_for_change=true&timeout_sec=2", flavor_header)).status);
+    const token_watch = try h.raw(.GET, "/computeMetadata/v1/instance/service-accounts/default/token?wait_for_change=true&timeout_sec=2", flavor_header);
+    try testing.expectEqual(400, token_watch.status);
+    try testing.expectEqualStrings("Wait for change is not supported on token.", token_watch.body);
     const listing_watch = try h.raw(.GET, "/computeMetadata/v1/instance/attributes/?wait_for_change=true&timeout_sec=2", flavor_header);
     try testing.expectEqual(400, listing_watch.status);
     try testing.expectEqualStrings("Wait for change is not supported on directory listings.  Did you mean to request recursive contents?", listing_watch.body);
