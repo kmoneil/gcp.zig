@@ -23,10 +23,17 @@ including the ones that did not change.
   `remove`, `preempt` and waits that block. `examples/spot_worker.zig`
   watches for preemption, and runs with no VM under `--fake`. No call
   changes.
+- storage: `Bucket.listObjects` takes `start_offset` and `end_offset`,
+  for issue #365, sent as `startOffset` and `endOffset`: only names from
+  the one, kept, up to the other, not, in byte order, so a reader that
+  knows the last name it read lists only what came after. With a
+  delimiter, a folder is listed when a name under it is in range; a
+  start at or past the end is an empty page. `storage.testing.FakeStorage`
+  answers them as production did when measured on 2026-11-05. No call
+  changes.
 - billing, bigquery, compute, core, dataflow, datatransfer,
   error_reporting, firestore, kms, logging, monitoring, pubsub,
-  resource_manager, run, scheduler, secret_manager and storage:
-  unchanged.
+  resource_manager, run, scheduler and secret_manager: unchanged.
 
 ## 0.65.0 (2026-11-05)
 
