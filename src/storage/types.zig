@@ -135,6 +135,15 @@ pub const ListOptions = struct {
     /// Only names matching this glob, such as `logs/**/*.gz`: `*` matches
     /// within a folder, `**` across folders.
     match_glob: ?[]const u8 = null,
+    /// Only names at or after this one, in byte order, so a reader that
+    /// knows the last name it read lists only what came after. With a
+    /// delimiter, folders are made from the names in range: a folder is
+    /// listed when any name under it is.
+    start_offset: ?[]const u8 = null,
+    /// Only names before this one, in byte order. A start at or past the
+    /// end lists nothing; Cloud Storage answers an empty page, not an
+    /// error.
+    end_offset: ?[]const u8 = null,
     /// Add folders to `prefixes` whether or not objects sit under them: a
     /// hierarchical-namespace bucket's folders, and any bucket's managed
     /// folders. Cloud Storage takes it only with the `/` delimiter, so

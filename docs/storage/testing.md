@@ -59,7 +59,10 @@ test "a bucket browsed as a console shows it, from the in-memory Cloud Storage" 
   page, as it was in production. A glob takes `*`, `**` (`**/` also
   matching no folder at all), `?`, `[a-z]`, `[!a-z]`, `{a,b}` and `\`
   escapes; an unclosed `[` or `{` is refused in production's words,
-  naming the index.
+  naming the index. `start_offset` and `end_offset` keep the names from
+  one up to the other in byte order, before folders are made, as
+  production did on 2026-11-05: a folder is listed when a name under it
+  is in range, and a start at or past the end is an empty page.
 - An object's metadata carries what production's does, `updated`,
   `md5Hash`, `crc32c`, custom metadata and the rest.
 - Media reads, whole or by range: 206 with `Content-Range`, 416 "Request
@@ -75,6 +78,41 @@ test "a bucket browsed as a console shows it, from the in-memory Cloud Storage" 
   `versions` lists them oldest first, with `timeDeleted`, and a read by
   generation finds them.
 - `refuseNext(n, status)` and `dropNext(n)` fail the next calls.
+
+A reader that knows the last name it read lists only what came after,
+with no paging through the names before it:
+
+<!-- snippet: tests/docs_examples.zig#storage-offsets -->
+```zig
+test "a log reader lists only what came after the last name it read" {
+    var fake: storage.testing.FakeStorage = .init(std.testing.allocator, std.testing.io, .{ .project_id = "my-project" });
+    defer fake.deinit();
+    try fake.putBucket(.{ .name = "my-logs" });
+    // Named in sequence, zero-padded, so byte order is time order.
+    for ([_][]const u8{ "log/000000011998", "log/000000011999", "log/000000012000", "log/000000012001", "log/000000012002" }) |name| {
+        try fake.putObject(.{ .bucket = "my-logs", .name = name, .bytes = "entry\n" });
+    }
+    var token: storage.StaticToken = .{ .token = "none" };
+    var client = try storage.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+
+    // The reader stopped after 000000011999: the next page starts there,
+    // whatever came before it, with no paging through earlier names.
+    var page = try client.bucket("my-logs").listObjects(.{
+        .prefix = "log/",
+        .start_offset = "log/000000012000",
+        .end_offset = "log/000000012002",
+    });
+    defer page.deinit();
+    try std.testing.expectEqual(2, page.value.objects.len);
+    try std.testing.expectEqualStrings("log/000000012000", page.value.objects[0].name);
+    try std.testing.expectEqualStrings("log/000000012001", page.value.objects[1].name);
+}
+```
 
 Not modelled, answered 501 with the reason: making or deleting a bucket
 through the API, a write to a versioned bucket's objects (only

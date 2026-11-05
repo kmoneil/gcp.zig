@@ -66,7 +66,7 @@ it differs from Cloud Storage.
 | --- | --- | --- |
 | `client.bucket(name).create(config)`, `.get()`, `.update(changes)`, `.delete()` | A bucket and its settings, in the project `Options.project_id` names | [Buckets](buckets.md#bucket-settings) |
 | `client.listBuckets(page)` | One page of the project's buckets | |
-| `bucket.listObjects(options)` | One page of objects, with `prefix`, a `delimiter` for folders, a `match_glob`, and paging: live ones, every version, or the soft-deleted ones | [Versions](buckets.md#versions-and-soft-delete) |
+| `bucket.listObjects(options)` | One page of objects, with `prefix`, a `delimiter` for folders, a `match_glob`, bounds on the names (`start_offset`, `end_offset`), and paging: live ones, every version, or the soft-deleted ones | [Versions](buckets.md#versions-and-soft-delete) |
 | `bucket.object(name).get(options)`, `.exists()`, `.delete(options)` | An object's metadata, whether it exists, and deleting it or one generation of it | |
 | `.upload(data, options)`, `.uploadFrom(reader, options)` | Bytes in memory, or any reader | [Transfers](transfers.md#files-of-any-size) |
 | `.uploadFile(file, options)` | A file, read at offsets, resumable in a later process with `options.checkpoint` | [Transfers](transfers.md#transfers-that-outlive-the-process) |
