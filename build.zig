@@ -541,6 +541,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "monitoring", .module = monitoring },
                 .{ .name = "core", .module = core },
                 .{ .name = "pubsub", .module = mod },
+                .{ .name = "storage", .module = storage },
             },
         }),
         .filters = test_filters,

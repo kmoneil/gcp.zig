@@ -313,8 +313,7 @@ tests/iam_gcp_integration.zig	test "iam reads: a project's, a Cloud Run service'
 tests/kms_gcp_integration.zig	Fixture.sweep	18	37	38	4	0	0
 tests/kms_gcp_integration.zig	outcome	63	44	122	2	2	2
 tests/monitoring_gcp_integration.zig	outcome	27	44	67	3	5	5
-tests/monitoring_gcp_integration.zig	test "monitoring: Cloud's quota metrics, and the fake given production's points answers as production did"	33	64	161	5	0	0
-tests/monitoring_gcp_integration.zig	test "monitoring: Pub/Sub's own metrics, and the fake given production's points answers as production did"	49	88	245	4	0	0
+tests/monitoring_gcp_integration.zig	test "monitoring: Pub/Sub's own metrics, and the fake given production's points answers as production did"	35	54	193	3	0	0
 tests/monitoring_gcp_integration.zig	test "monitoring: alert policies and snoozes, and the fake seeded with production's answers as production did"	29	45	155	3	0	0
 tests/scheduler_gcp_integration.zig	test "scheduler writes: run, pause and resume through the client, and the fake replaying them agrees"	31	48	129	4	0	0
 tests/secret_manager_integration.zig	test "regional: topics refused before the grant, then every event received and decoded"	22	36	54	4	0	0
