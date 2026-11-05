@@ -22,7 +22,12 @@
 //! It puts production's raw points into `FakeMonitoring` and holds every
 //! aligned answer of the fake to production's, and its refusals of
 //! filters, aligners and writes, its descriptors and resource types
-//! (issue #239). Production refuses the writes it tries: one of Google's
+//! (issue #239). Its messages are of many sizes, 1 to 2500 bytes, so
+//! `topic/message_sizes`' distributions spread across their buckets, and
+//! the fake's merges and percentiles of them are held to production's
+//! (issue #315): counts and bucket counts exactly, means and squared
+//! deviations to 12 digits as every double here. Production refuses the
+//! writes it tries: one of Google's
 //! metrics, a create under Google's domain, and a user metric on
 //! `pubsub_subscription`, whose descriptor it makes all the same, under
 //! the run's prefix.
@@ -582,10 +587,32 @@ fn seriesLine(a: Allocator, base: i96, s: monitoring.Series) ![]const u8 {
             .int64 => |n| try line.writer.print("{d}", .{n}),
             .double => |d| try line.writer.print("{e:.11}", .{d}),
             .bool => |b| try line.writer.print("{}", .{b}),
+            .distribution => |d| try writeDistribution(&line.writer, d),
             else => try line.writer.writeAll("?"),
         } else try line.writer.writeAll("null");
     }
     return line.written();
+}
+
+/// A distribution: its count, its buckets, and its bucket counts with
+/// trailing zeros left off, as production leaves them off, exactly; its
+/// mean and squared deviations to 12 significant digits. Production
+/// merges what it holds under each minute's point, so their last bits
+/// move with the period asked for: on 2026-11-05 one minute's squared
+/// deviations read 615719.5495058699 at 120 s and 615719.5495058706 at
+/// 90 s, where its own point said 615719.5495058701.
+fn writeDistribution(w: *std.Io.Writer, d: monitoring.Distribution) !void {
+    try w.print("dist(n {d}, mean {e:.11}, ssd {e:.11}, ", .{ d.count, d.mean, d.sum_of_squared_deviation });
+    switch (d.buckets) {
+        .exponential => |e| try w.print("exponential {d} x{e} from {e}", .{ e.num_finite, e.growth_factor, e.scale }),
+        .linear => |l| try w.print("linear {d} +{e} from {e}", .{ l.num_finite, l.width, l.offset }),
+        .explicit => |bounds| try w.print("explicit {d} bounds", .{bounds.len}),
+    }
+    var len = d.bucket_counts.len;
+    while (len > 0 and d.bucket_counts[len - 1] == 0) len -= 1;
+    try w.writeAll(", counts");
+    for (d.bucket_counts[0..len], 0..) |c, i| if (c != 0) try w.print(" {d}:{d}", .{ i, c });
+    try w.writeByte(')');
 }
 
 fn isServerError(text: []const u8) bool {
@@ -688,6 +715,7 @@ const pubsub_metrics = [_][]const u8{
     "subscription/push_request_count",
     "topic/send_message_operation_count",
     "topic/byte_cost",
+    "topic/message_sizes",
 };
 
 /// One read of the Pub/Sub and quota tests, made of production and of
@@ -1128,9 +1156,14 @@ test "monitoring: Pub/Sub's own metrics, and the fake given production's points 
     const created = nowMs();
     fact("made {s} and its two subscriptions", .{topic_id});
 
-    var messages: [10]pubsub.Message = @splat(.{ .data = "zigps" });
+    // Messages of many sizes, 1 to 2500 bytes, another set each round, so
+    // topic/message_sizes spreads across its buckets.
+    var payload: [2500]u8 = undefined;
+    @memset(&payload, 'z');
+    var messages: [10]pubsub.Message = undefined;
     for (0..8) |round| {
         const t0 = nowMs();
+        sizedMessages(messages[0 .. 2 + round], &payload, round);
         var sent = try topic.publish(messages[0 .. 2 + round], .{});
         sent.deinit();
         try pullAndAck(&ps, subs[0], 1);
@@ -1243,6 +1276,7 @@ test "monitoring: Pub/Sub's own metrics, and the fake given production's points 
     try reads.append(a, .{ .label = "delta 60 sum instant", .metric = sent_metric, .start = null, .end = end, .filter = by_subs, .aggregation = .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum } });
     try reads.append(a, .{ .label = "push by response class", .metric = "subscription/push_request_count", .start = window_start, .end = end, .filter = by_subs, .aggregation = .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum, .group_by = &.{"metric.labels.response_class"} } });
     try reads.append(a, .{ .label = "publishes by response code", .metric = "topic/send_message_operation_count", .start = window_start, .end = end, .filter = by_topic, .aggregation = .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum, .group_by = &.{"metric.labels.response_code"} } });
+    try appendSizesReads(a, &reads, window_start, end, by_topic);
     // Around one point of -a's sent count: which reads hold it.
     {
         const only_a: monitoring.Filter = .{ .resource_labels = &.{.{ .key = "subscription_id", .value = subs[0] }} };
@@ -1334,6 +1368,38 @@ test "monitoring: Pub/Sub's own metrics, and the fake given production's points 
     // Descriptors and resource types, as production gives them.
     try compareCatalog(&f, a, &fake_client, pubsub_prefix, &pubsub_metrics, &.{ "pubsub_subscription", "pubsub_topic" }, &differences);
     try testing.expectEqual(0, differences);
+}
+
+/// Message sizes, a distribution: its merges and percentiles, and what
+/// production refused on it (issue #315), as reads of the Pub/Sub test.
+fn appendSizesReads(a: Allocator, reads: *std.ArrayList(PubsubRead), window_start: std.Io.Timestamp, end: std.Io.Timestamp, by_topic: monitoring.Filter) !void {
+    for ([_]struct { []const u8, monitoring.Aggregation }{
+        .{ "sizes: percentile 99", .{ .alignment_period_s = 60, .aligner = .percentile_99 } },
+        .{ "sizes: percentile 50 at 120", .{ .alignment_period_s = 120, .aligner = .percentile_50 } },
+        .{ "sizes: percentile 05 at 90", .{ .alignment_period_s = 90, .aligner = .percentile_05 } },
+        .{ "sizes: percentile 95 at 300", .{ .alignment_period_s = 300, .aligner = .percentile_95 } },
+        .{ "sizes: delta 300", .{ .alignment_period_s = 300, .aligner = .delta } },
+        .{ "sizes: sum 90", .{ .alignment_period_s = 90, .aligner = .sum } },
+        .{ "sizes: delta 60 mean", .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .mean } },
+        .{ "sizes: delta 120 stddev", .{ .alignment_period_s = 120, .aligner = .delta, .reducer = .stddev } },
+        .{ "sizes: delta 120 percentile 95", .{ .alignment_period_s = 120, .aligner = .delta, .reducer = .percentile_95 } },
+        .{ "sizes: delta 60 count", .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .count } },
+        .{ "sizes: sum 300 sum", .{ .alignment_period_s = 300, .aligner = .sum, .reducer = .sum } },
+        .{ "sizes: delta 60 sum by topic", .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum, .group_by = &.{"resource.labels.topic_id"} } },
+        .{ "sizes: delta 60 min", .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .min } },
+        .{ "sizes: delta 60 fraction true", .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .fraction_true } },
+        .{ "sizes: percentile 99 max", .{ .alignment_period_s = 60, .aligner = .percentile_99, .reducer = .max } },
+        .{ "sizes: percentile 50 mean", .{ .alignment_period_s = 120, .aligner = .percentile_50, .reducer = .mean } },
+        .{ "sizes: percentile 95 count true", .{ .alignment_period_s = 60, .aligner = .percentile_95, .reducer = .count_true } },
+        .{ "sizes: stddev", .{ .alignment_period_s = 60, .aligner = .stddev } },
+        .{ "sizes: percent change", .{ .alignment_period_s = 60, .aligner = .percent_change } },
+    }) |c| try reads.append(a, .{ .label = c[0], .metric = "topic/message_sizes", .start = window_start, .end = end, .filter = by_topic, .aggregation = c[1] });
+}
+
+/// Messages of 1 to `payload.len` bytes, another set each `round`, so
+/// topic/message_sizes spreads across its buckets.
+fn sizedMessages(messages: []pubsub.Message, payload: []const u8, round: usize) void {
+    for (messages, 0..) |*m, i| m.* = .{ .data = payload[0 .. 1 + (i * 257 + round * 61) % payload.len] };
 }
 
 /// The tail of a write summary's message, from after the series it names:

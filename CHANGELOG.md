@@ -4,6 +4,26 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.67.0 (unreleased)
+
+- monitoring: `FakeMonitoring` holds Pub/Sub's
+  `topic/message_sizes`, for issue #315: a DELTA distribution on
+  `pubsub_topic` with production's descriptor of 2026-11-05, put in
+  with `put` a `Distribution` a point. Its reads are production's,
+  counts and percentiles exactly and merged means to their last place
+  or two: `ALIGN_DELTA` and `ALIGN_SUM` merge a period's points,
+  the four percentile aligners interpolate inside the bucket the
+  percentile falls in, and across series `REDUCE_SUM` merges,
+  `REDUCE_COUNT` counts, and `REDUCE_MEAN`, `REDUCE_STDDEV` and the
+  percentile reducers read the merge. The aligners and reducers
+  production refused on a distribution are refused in its words.
+  `docs/monitoring/testing.md` says what a message's size is (its
+  encoding: 100 bytes of data count as 102) and what is not modelled.
+  No call changes.
+- auth, billing, bigquery, compute, core, dataflow, datatransfer,
+  error_reporting, firestore, kms, logging, pubsub, resource_manager,
+  run, scheduler, secret_manager and storage: unchanged.
+
 ## 0.66.0 (2026-11-05)
 
 - auth: `MetadataServer` reads any metadata key, for issue #355, with

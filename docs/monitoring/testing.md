@@ -99,7 +99,9 @@ resource's labels, and points in order. Anything production could not
 hold is `error.InvalidEntry`, and nothing is kept.
 
 The fake knows the Pub/Sub metrics a console reads, as production
-described them on 18 October 2026. Every value is INT64:
+described them on 18 October 2026, and a topic's message sizes,
+described on 5 November. Every value is INT64 but the sizes', a
+distribution:
 
 | Metric, after `pubsub.googleapis.com/` | Kind | Unit | Labels |
 | --- | --- | --- | --- |
@@ -112,6 +114,7 @@ described them on 18 October 2026. Every value is INT64:
 | `subscription/push_request_count` | DELTA | `1` | `response_class`, `response_code`, `delivery_type` |
 | `topic/send_message_operation_count` | DELTA | `1` | `response_code` |
 | `topic/byte_cost` | DELTA | `By` | `operation_type`, `response_code` |
+| `topic/message_sizes` | DELTA | `By` | none |
 
 The subscription metrics are on the resource type `pubsub_subscription`
 (label `subscription_id`), and the topic metrics on `pubsub_topic`
@@ -127,8 +130,104 @@ production refused it, and its descriptor is made all the same, as
 production made it.
 
 Google marks `topic/send_message_operation_count` as deprecated, and
-suggests counting `topic/message_sizes` instead. The fake does not hold
-that metric yet.
+suggests counting `topic/message_sizes` instead.
+
+### Pub/Sub's message sizes
+
+`topic/message_sizes` is a distribution: a point a minute on each
+`pubsub_topic`, holding the sizes of the messages published that
+minute, in Pub/Sub's buckets (122 of them, each 1.2 times the one
+before, from 1 byte). A size is the message as Pub/Sub encodes it, a
+little more than its data: 100 bytes of data count as 102, 300 as 303,
+and an attribute adds its key, its value and a few bytes more. The
+minute after the last publish held an empty distribution in
+production, and a test may put one in too.
+
+A test puts the sizes in as it puts Pub/Sub's counts, a `Distribution`
+a point:
+
+<!-- snippet: tests/docs_examples.zig#mon-sizes -->
+```zig
+test "a topic's message sizes, put in as Pub/Sub reports them and read as a percentile" {
+    var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_331_195 * std.time.ns_per_s };
+    var fake: monitoring.testing.FakeMonitoring = .init(std.testing.allocator, clock.io(), .{ .project_id = "my-project" });
+    defer fake.deinit();
+
+    // Pub/Sub's buckets for message sizes: 122, each 1.2 times the one
+    // before, from 1 byte. Bucket 26 holds 95 to 114 bytes, 38 holds 850
+    // to 1020.
+    const buckets: monitoring.Distribution.Buckets = .{ .exponential = .{ .num_finite = 122, .growth_factor = 1.2, .scale = 1 } };
+    var small: [27]u64 = @splat(0);
+    small[26] = 3;
+    var mixed: [39]u64 = @splat(0);
+    mixed[26] = 1;
+    mixed[38] = 1;
+    const t = std.Io.Clock.real.now(clock.io()).nanoseconds;
+    const minute: i96 = 60 * std.time.ns_per_s;
+    const points = [_]monitoring.testing.FakeMonitoring.Point{
+        // Three messages of 102 bytes, then one of 102 and one of 1002.
+        .{ .start = .{ .nanoseconds = t - 2 * minute }, .end = .{ .nanoseconds = t - minute }, .value = .{ .distribution = .{ .count = 3, .mean = 102, .buckets = buckets, .bucket_counts = &small } } },
+        .{ .start = .{ .nanoseconds = t - minute }, .end = .{ .nanoseconds = t }, .value = .{ .distribution = .{ .count = 2, .mean = 552, .sum_of_squared_deviation = 405_000, .buckets = buckets, .bucket_counts = &mixed } } },
+    };
+    try fake.put(.{
+        .metric_type = "pubsub.googleapis.com/topic/message_sizes",
+        .resource_type = "pubsub_topic",
+        .resource_labels = &.{.{ .key = "topic_id", .value = "orders" }},
+        .kind = .delta,
+        .value_type = .distribution,
+        .points = &points,
+    });
+
+    var token: monitoring.StaticToken = .{ .token = "none" };
+    var client = try monitoring.Client.init(std.testing.allocator, clock.io(), .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    const sizes = client.metric("pubsub.googleapis.com/topic/message_sizes");
+    const from: std.Io.Timestamp = .{ .nanoseconds = t - 2 * minute };
+    // The 99th percentile a minute, newest first: interpolated inside the
+    // bucket it falls in, as Cloud Monitoring does.
+    var p99 = try sizes.read(.{ .start = from, .end = .{ .nanoseconds = t }, .aggregation = .{ .alignment_period_s = 60, .aligner = .percentile_99 } });
+    defer p99.deinit();
+    try std.testing.expectEqual(1017.2724509786024, p99.value.series[0].points[0].value.?.double);
+    try std.testing.expectEqual(114.28466753959457, p99.value.series[0].points[1].value.?.double);
+    // Both minutes as one distribution: five messages, 282 bytes on average.
+    var both = try sizes.read(.{ .start = from, .end = .{ .nanoseconds = t }, .aggregation = .{ .alignment_period_s = 120, .aligner = .delta } });
+    defer both.deinit();
+    const merged = both.value.series[0].points[0].value.?.distribution;
+    try std.testing.expectEqual(5, merged.count);
+    try std.testing.expectEqual(282.0, merged.mean);
+}
+```
+
+The fake reads them as production did on 5 November 2026. Counts,
+bucket counts and percentiles are production's exactly. A merged mean
+or squared deviation can differ from production's in its last place or
+two: production merges what it holds under each minute's point, and
+its last bits move with the period asked for.
+
+- `ALIGN_DELTA` and `ALIGN_SUM` merge a period's points into one
+  distribution. The percentile aligners (99, 95, 50 and 5) give a
+  number at the period's end, interpolated inside the bucket the
+  percentile falls in, and no point for a period whose points are all
+  empty.
+- Across series, after `ALIGN_DELTA` or `ALIGN_SUM`: `REDUCE_SUM`
+  merges them, `REDUCE_COUNT` counts them, and `REDUCE_MEAN`,
+  `REDUCE_STDDEV` and the percentile reducers give the merge's mean,
+  standard deviation and percentiles, each a gauge at the period's end.
+  After a percentile aligner, the reducers min, max, mean, sum and
+  count take its numbers.
+- Refused in production's words, `error.InvalidArgument`: the other
+  twelve aligners, the min and max reducers and the true and false ones
+  on distributions, and the true and false ones on a percentile's
+  numbers.
+- Not modelled, `error.Unimplemented` with the reason: the standard
+  deviation and the percentiles of a percentile's numbers (production
+  bins numbers in a layout of its own), a percentile of buckets that are
+  not exponential or that falls in the underflow or overflow bucket, and
+  a merge of distributions in different buckets.
 
 ### Cloud's quota metrics
 
@@ -518,6 +617,7 @@ Each as production answered when measured, refusals in its words:
   - the gauge aligners and reducers min, max, mean, sum and count with group-by fields, periods ending at the read's end; a period that reaches back before the read's start holds the series' earlier points, as production held them;
   - on DELTA metrics, `ALIGN_DELTA` and `ALIGN_SUM` (each period's total over the period, DELTA), `ALIGN_RATE` (each period's total a second, GAUGE DOUBLE), and min, max, mean and count (a gauge at the period's end), with the same reducers; a point counts whole in the period its end falls in, as production counted it;
   - the aligners production refused on a kind, refused in its words: `ALIGN_DELTA` and `ALIGN_RATE` on a gauge; interpolate, next older, the true and false counts and the percentiles on a DELTA metric;
+  - on Pub/Sub's message sizes, a DELTA distribution, the merges and percentiles above, aligned and reduced, counts and percentiles exactly;
   - the unit production gave: `1` for a count, aligned or reduced, the metric's unit a second for a rate (`1/s`, `By/s`), and `{not_a_unit}` for a metric without one;
   - pages by points with series split across them, and HEADERS.
 - **The resource types** the `Resource` union names, and Pub/Sub's two,
@@ -549,7 +649,9 @@ every one.
   production's order varies call to call.
 - A reduced double can differ from production's in its last bits, since
   the sums run in another order; the production suite compares 12
-  significant digits.
+  significant digits. So can a merged distribution's mean and squared
+  deviations, since production merges what it holds under each
+  minute's point.
 - Nothing arrives late. Production's DELTA points each covered a minute
   and could be read about 130 s after their end, and a new
   subscription's first backlog point about 400 s after it was made. A
