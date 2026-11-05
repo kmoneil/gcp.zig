@@ -27,8 +27,8 @@
 //!   location that is not a region or zone; label keys, label values and
 //!   strings past their limits, more than 30 labels; a distribution whose
 //!   counts do not add up, or of linear width 0; a cumulative start moved
-//!   earlier; a user metric on one of Pub/Sub's resource types, though
-//!   its descriptor is made. A reset, a start 1 ms or more after the
+//!   earlier; a user metric on a resource type only Google's metrics are
+//!   on, though its descriptor is made. A reset, a start 1 ms or more after the
 //!   series' last end, is taken, and so is a total that falls under the
 //!   same start, and the series' last point sent again as it was, kept
 //!   once; with another value it is too soon after itself.
@@ -48,11 +48,12 @@
 //!   the unit as production gave it, `1` for a count and a second for a
 //!   rate.
 //! - Google's own metrics: the nine of Pub/Sub's a console reads (issue
-//!   #239) and the four quota metrics under
+//!   #239), the four quota metrics under
 //!   `serviceruntime.googleapis.com/quota/` a console reads for quota
-//!   warnings (issue #247), their descriptors as production gave them,
+//!   warnings (issue #247), and the five of Cloud Storage's a bucket page
+//!   charts (issue #338), their descriptors as production gave them,
 //!   there from the start, on the resource types `pubsub_subscription`,
-//!   `pubsub_topic` and `consumer_quota`.
+//!   `pubsub_topic`, `consumer_quota` and `gcs_bucket`.
 //!   No program writes or creates one, as production answered; `put` puts
 //!   their points in, as it does any series a program could not write.
 //! - Faults a test asks for, and a write served and then answered with an
@@ -61,9 +62,9 @@
 //! Where it differs: times in its messages are UTC, where production wrote
 //! US Pacific; a descriptor just made reads back at once, where production
 //! answered 404 for about 2 s, once for more than 15 s; its resource
-//! types are the seven `Resource` names, Pub/Sub's two and
-//! `consumer_quota`, only generic_task's, Pub/Sub's and consumer_quota's
-//! text production's; nothing put in
+//! types are the seven `Resource` names, Pub/Sub's two, `consumer_quota`
+//! and `gcs_bucket`, only generic_task's and the last four's text
+//! production's; nothing put in
 //! arrives late, where production showed a minute's counts about 130 s
 //! after it. Not modelled, each
 //! answered 501 with the reason: another project, a cumulative start
@@ -2261,10 +2262,10 @@ const CatalogType = struct {
 
 const project_label = .{ "project_id", "The identifier of the GCP project associated with this resource, such as \"my-project\"." };
 
-/// generic_task's, Pub/Sub's and consumer_quota's text is production's,
-/// measured 2026-10-18 and 2026-10-19 (consumer_quota by issue #247's
-/// replay); the others' labels are the ones `Resource` names, with no
-/// descriptions.
+/// generic_task's, Pub/Sub's, consumer_quota's and gcs_bucket's text is
+/// production's, measured 2026-10-18, 2026-10-19 (consumer_quota by
+/// issue #247's replay) and 2026-11-05 (gcs_bucket, issue #338); the
+/// others' labels are the ones `Resource` names, with no descriptions.
 const catalog = [_]CatalogType{
     .{
         .type = "consumer_quota",
@@ -2279,6 +2280,16 @@ const catalog = [_]CatalogType{
         .writable = false,
     },
     .{ .type = "gce_instance", .display_name = "VM Instance", .labels = &.{ project_label, .{ "instance_id", "" }, .{ "zone", "" } }, .location_labels = &.{"zone"} },
+    .{
+        .type = "gcs_bucket",
+        .display_name = "GCS Bucket",
+        .description = "A Google Cloud Storage (GCS) bucket.",
+        // A series' location is the bucket's, lowercased: `us-central1`,
+        // or `us` for the multi-region, so not always a region or zone.
+        .labels = &.{ project_label, .{ "bucket_name", "An immutable name of the bucket." }, .{ "location", "Location of the bucket." } },
+        .location_labels = &.{},
+        .writable = false,
+    },
     .{ .type = "generic_node", .display_name = "Generic Node", .labels = &.{ project_label, .{ "location", "" }, .{ "namespace", "" }, .{ "node_id", "" } }, .location_labels = &.{"location"} },
     .{
         .type = "generic_task",
@@ -2360,9 +2371,16 @@ const response_code = .{ "response_code", "Operation response code string, deriv
 const quota_metric_label = .{ "quota_metric", "The name of quota metric or quota group." };
 const limit_name_label = .{ "limit_name", "The quota limit name, such as \"Requests per day\" or \"In-use IP addresses\"." };
 
-/// Pub/Sub's metrics a console reads, and the four quota metrics a
-/// console reads for quota warnings, as production described them on
-/// 2026-10-19 (issues #239 and #247): usage and limits on
+const storage_class_label = .{ "storage_class", "Storage class of the data." };
+const storage_call_labels = .{ .{ "response_code", "The response code of the requests." }, .{ "method", "The name of the API method called." } };
+/// The two storage gauges' description after "Total size of all objects"
+/// or "Total number of objects".
+const storage_gauge_rest = "Soft-deleted objects are not included in the total; use the updated v2 metric for a breakdown of total usage including soft-deleted objects. This value is measured once per day, and there might be a delay after measuring before the value becomes available in Cloud Monitoring. Once available, the value is repeated at each sampling interval throughout the day. Buckets with no objects in them are not tracked by this metric. For this metric, the sampling period is a reporting period, not a measurement period.";
+
+/// Pub/Sub's metrics a console reads, the four quota metrics a console
+/// reads for quota warnings, and the five of Cloud Storage's a bucket
+/// page charts, as production described them on 2026-10-19 and
+/// 2026-11-05 (issues #239, #247 and #338): usage and limits on
 /// `consumer_quota`, the producer side named in their descriptors but
 /// not held.
 const google_metrics = [_]GoogleMetric{
@@ -2501,6 +2519,56 @@ const google_metrics = [_]GoogleMetric{
         .resource_type = "consumer_quota",
         .also_on = &.{"producer_quota"},
     },
+    .{
+        .type = "storage.googleapis.com/api/request_count",
+        .kind = .delta,
+        .value_type = .int64,
+        .unit = "1",
+        .display_name = "Request count",
+        .description = "Delta count of API calls, grouped by the API method name and response code.",
+        .labels = &storage_call_labels,
+        .resource_type = "gcs_bucket",
+    },
+    .{
+        .type = "storage.googleapis.com/network/received_bytes_count",
+        .kind = .delta,
+        .value_type = .int64,
+        .unit = "By",
+        .display_name = "Received bytes",
+        .description = "Delta count of bytes received over the network, grouped by the API method name and response code.",
+        .labels = &storage_call_labels,
+        .resource_type = "gcs_bucket",
+    },
+    .{
+        .type = "storage.googleapis.com/network/sent_bytes_count",
+        .kind = .delta,
+        .value_type = .int64,
+        .unit = "By",
+        .display_name = "Sent bytes",
+        .description = "Delta count of bytes sent over the network, grouped by the API method name and response code.",
+        .labels = &storage_call_labels,
+        .resource_type = "gcs_bucket",
+    },
+    .{
+        .type = "storage.googleapis.com/storage/object_count",
+        .kind = .gauge,
+        .value_type = .int64,
+        .unit = "1",
+        .display_name = "Object count",
+        .description = "Total number of objects per bucket, grouped by storage class. " ++ storage_gauge_rest,
+        .labels = &.{storage_class_label},
+        .resource_type = "gcs_bucket",
+    },
+    .{
+        .type = "storage.googleapis.com/storage/total_bytes",
+        .kind = .gauge,
+        .value_type = .double,
+        .unit = "By",
+        .display_name = "Total bytes",
+        .description = "Total size of all objects in the bucket, grouped by storage class. " ++ storage_gauge_rest,
+        .labels = &.{storage_class_label},
+        .resource_type = "gcs_bucket",
+    },
 };
 
 comptime {
@@ -2513,7 +2581,8 @@ comptime {
 /// metrics of, which no program writes or creates.
 fn googleDomain(metric_type: []const u8) bool {
     return std.mem.startsWith(u8, metric_type, "pubsub.googleapis.com/") or
-        std.mem.startsWith(u8, metric_type, "serviceruntime.googleapis.com/");
+        std.mem.startsWith(u8, metric_type, "serviceruntime.googleapis.com/") or
+        std.mem.startsWith(u8, metric_type, "storage.googleapis.com/");
 }
 
 fn catalogType(name: []const u8) ?*const CatalogType {
@@ -3404,7 +3473,7 @@ test "resource types: generic_task as production wrote it, the others, and one t
     try testing.expectEqual(3, page.value.types.len);
     var rest = try b.client.listResourceTypes(.{ .page_token = page.value.next_page_token });
     defer rest.deinit();
-    try testing.expectEqual(7, rest.value.types.len);
+    try testing.expectEqual(8, rest.value.types.len);
     try testing.expectEqual(null, rest.value.next_page_token);
     // Every named resource writes; .other's types are not modelled.
     const resources = [_]types.Resource{
@@ -4466,6 +4535,301 @@ test "the quota descriptors and consumer_quota: read and listed, never created, 
     defer own.deinit();
     try testing.expectEqual(1, own.value.series.len);
     try testing.expectError(error.Unimplemented, m.read(.{ .end = b.at(0), .filter = .{ .resource_type = "producer_quota" } }));
+}
+
+// Cloud Storage's own metrics, put in by a test (issue #338).
+
+const total_bytes_type = "storage.googleapis.com/storage/total_bytes";
+const object_count_type = "storage.googleapis.com/storage/object_count";
+const request_count_type = "storage.googleapis.com/api/request_count";
+const received_type = "storage.googleapis.com/network/received_bytes_count";
+const sent_type_gcs = "storage.googleapis.com/network/sent_bytes_count";
+
+/// A regional bucket as a series names it: its location lowercased.
+const assets_bucket: []const types.Label = &.{ .{ .key = "bucket_name", .value = "assets" }, .{ .key = "location", .value = "us-central1" } };
+/// A multi-region one: `us`, which is no region or zone.
+const logs_bucket: []const types.Label = &.{ .{ .key = "bucket_name", .value = "logs" }, .{ .key = "location", .value = "us" } };
+
+/// A storage gauge's point `ms` from the bench's start: bytes are DOUBLE.
+fn bytesPoint(b: *const Bench, ms: i64, value: f64) FakeMonitoring.Point {
+    return .{ .start = null, .end = b.at(ms), .value = .{ .double = value } };
+}
+
+/// A storage count's minute ending `ms` from the bench's start, as
+/// production gives them: starting 1 ms after the minute before ends.
+fn callMinute(b: *const Bench, ms: i64, value: i64) FakeMonitoring.Point {
+    return .{ .start = b.at(ms - 59_999), .end = b.at(ms), .value = .{ .int64 = value } };
+}
+
+fn callLabels(method: []const u8, code: []const u8) [2]types.Label {
+    return .{ .{ .key = "response_code", .value = code }, .{ .key = "method", .value = method } };
+}
+
+test "put: Cloud Storage's own metrics, read back as a bucket page reads them" {
+    var b: Bench = undefined;
+    try b.init(.{ .project_id = "atlas-prod" });
+    defer b.deinit();
+
+    // No program writes them.
+    try testing.expectError(error.PermissionDenied, b.client.write(&.{.{ .metric_type = total_bytes_type, .resource = .{ .other = .{ .type = "gcs_bucket", .labels = assets_bucket } }, .kind = .gauge, .end = b.at(0), .value = .{ .double = 1 } }}));
+    try testing.expectEqualStrings("User does not have permission to write to metric storage.googleapis.com/storage/total_bytes.", b.diag.message());
+
+    // A bucket's size by storage class, every 5 minutes as production
+    // reports it, and another bucket's to filter away.
+    const regional_class = [_]types.Label{.{ .key = "storage_class", .value = "REGIONAL" }};
+    const nearline_class = [_]types.Label{.{ .key = "storage_class", .value = "NEARLINE" }};
+    const regional = [_]FakeMonitoring.Point{ bytesPoint(&b, -3_300_000, 1000), bytesPoint(&b, -1_800_000, 1500.5), bytesPoint(&b, -300_000, 1200) };
+    try b.fake.put(.{ .metric_type = total_bytes_type, .metric_labels = &regional_class, .resource_type = "gcs_bucket", .resource_labels = assets_bucket, .kind = .gauge, .value_type = .double, .points = &regional });
+    const nearline = [_]FakeMonitoring.Point{bytesPoint(&b, -1_800_000, 250)};
+    try b.fake.put(.{ .metric_type = total_bytes_type, .metric_labels = &nearline_class, .resource_type = "gcs_bucket", .resource_labels = assets_bucket, .kind = .gauge, .value_type = .double, .points = &nearline });
+    const big = [_]FakeMonitoring.Point{bytesPoint(&b, -300_000, 9e9)};
+    try b.fake.put(.{ .metric_type = total_bytes_type, .metric_labels = &.{.{ .key = "storage_class", .value = "MULTI_REGIONAL" }}, .resource_type = "gcs_bucket", .resource_labels = logs_bucket, .kind = .gauge, .value_type = .double, .points = &big });
+
+    // Raw, filtered on the bucket, the resource as production gives it.
+    const assets: types.Filter = .{ .resource_type = "gcs_bucket", .resource_labels = &.{.{ .key = "bucket_name", .value = "assets" }} };
+    var raw = try b.client.metric(total_bytes_type).read(.{ .start = b.at(-3_600_000), .end = b.at(0), .filter = assets });
+    defer raw.deinit();
+    try testing.expectEqual(2, raw.value.series.len);
+    for (raw.value.series) |s| {
+        try testing.expectEqualStrings("gcs_bucket", s.resource_type);
+        try testing.expectEqualStrings("atlas-prod", s.resourceLabel("project_id").?);
+        try testing.expectEqualStrings("us-central1", s.resourceLabel("location").?);
+        try testing.expectEqual(types.ValueType.double, s.value_type);
+        try testing.expectEqual(types.Kind.gauge, s.kind);
+    }
+    try testing.expectEqualStrings("By", raw.value.unit);
+
+    // The page's read: the largest an hour, summed over storage class.
+    var size = try b.client.metric(total_bytes_type).read(.{ .start = b.at(-3_600_000), .end = b.at(0), .filter = assets, .aggregation = .{ .alignment_period_s = 3600, .aligner = .max, .reducer = .sum } });
+    defer size.deinit();
+    try testing.expectEqual(1, size.value.series.len);
+    try testing.expectEqual(1, size.value.series[0].points.len);
+    try testing.expectEqual(1750.5, size.value.series[0].points[0].value.?.double);
+    try testing.expectEqualStrings("By", size.value.unit);
+    // By location: the multi-region's `us` selects.
+    var us = try b.client.metric(total_bytes_type).read(.{ .start = b.at(-3_600_000), .end = b.at(0), .filter = .{ .resource_labels = &.{.{ .key = "location", .value = "us" }} } });
+    defer us.deinit();
+    try testing.expectEqual(1, us.value.series.len);
+    try testing.expectEqualStrings("logs", us.value.series[0].resourceLabel("bucket_name").?);
+    // A gauge takes no delta or rate, as production's other gauges.
+    try testing.expectError(error.InvalidArgument, b.client.metric(total_bytes_type).read(.{ .start = b.at(-3_600_000), .end = b.at(0), .aggregation = .{ .alignment_period_s = 3600, .aligner = .rate } }));
+
+    // Objects, INT64, the same way.
+    const objects = [_]FakeMonitoring.Point{ gaugePoint(&b, -1_800_000, 10), gaugePoint(&b, -300_000, 12) };
+    try b.fake.put(.{ .metric_type = object_count_type, .metric_labels = &regional_class, .resource_type = "gcs_bucket", .resource_labels = assets_bucket, .kind = .gauge, .value_type = .int64, .points = &objects });
+    const cold = [_]FakeMonitoring.Point{gaugePoint(&b, -1_800_000, 3)};
+    try b.fake.put(.{ .metric_type = object_count_type, .metric_labels = &nearline_class, .resource_type = "gcs_bucket", .resource_labels = assets_bucket, .kind = .gauge, .value_type = .int64, .points = &cold });
+    var count = try b.client.metric(object_count_type).read(.{ .start = b.at(-3_600_000), .end = b.at(0), .filter = assets, .aggregation = .{ .alignment_period_s = 3600, .aligner = .max, .reducer = .sum } });
+    defer count.deinit();
+    try testing.expectEqual(15, count.value.series[0].points[0].value.?.int64);
+    try testing.expectEqualStrings("1", count.value.unit);
+
+    // Requests a minute, by method and response code, a trailing zero
+    // after a burst as production sends one.
+    const write_ok = callLabels("WriteObject", "OK");
+    const read_ok = callLabels("ReadObject", "OK");
+    const read_missing = callLabels("ReadObject", "NOT_FOUND");
+    const writes = [_]FakeMonitoring.Point{ callMinute(&b, -120_000, 4), callMinute(&b, -60_000, 0) };
+    try b.fake.put(.{ .metric_type = request_count_type, .metric_labels = &write_ok, .resource_type = "gcs_bucket", .resource_labels = assets_bucket, .kind = .delta, .value_type = .int64, .points = &writes });
+    const reads = [_]FakeMonitoring.Point{ callMinute(&b, -60_000, 7), callMinute(&b, 0, 2) };
+    try b.fake.put(.{ .metric_type = request_count_type, .metric_labels = &read_ok, .resource_type = "gcs_bucket", .resource_labels = assets_bucket, .kind = .delta, .value_type = .int64, .points = &reads });
+    const misses = [_]FakeMonitoring.Point{callMinute(&b, 0, 1)};
+    try b.fake.put(.{ .metric_type = request_count_type, .metric_labels = &read_missing, .resource_type = "gcs_bucket", .resource_labels = assets_bucket, .kind = .delta, .value_type = .int64, .points = &misses });
+
+    // The page's read: each step's total, summed over the labels.
+    var per_minute = try b.client.metric(request_count_type).read(.{ .start = b.at(-180_000), .end = b.at(0), .filter = assets, .aggregation = .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum } });
+    defer per_minute.deinit();
+    try testing.expectEqual(1, per_minute.value.series.len);
+    const totals = per_minute.value.series[0].points;
+    try testing.expectEqual(3, totals.len);
+    try testing.expectEqual(3, totals[0].value.?.int64);
+    try testing.expectEqual(7, totals[1].value.?.int64);
+    try testing.expectEqual(4, totals[2].value.?.int64);
+    try testing.expectEqualStrings("1", per_minute.value.unit);
+    // By method, over the three minutes.
+    var by_method = try b.client.metric(request_count_type).read(.{ .start = b.at(-180_000), .end = b.at(0), .filter = assets, .aggregation = .{ .alignment_period_s = 180, .aligner = .delta, .reducer = .sum, .group_by = &.{"metric.labels.method"} } });
+    defer by_method.deinit();
+    try testing.expectEqual(2, by_method.value.series.len);
+    for (by_method.value.series) |s| {
+        const want: i64 = if (std.mem.eql(u8, s.label("method").?, "ReadObject")) 10 else 4;
+        try testing.expectEqual(want, s.points[0].value.?.int64);
+        try testing.expectEqual(null, s.label("response_code"));
+    }
+
+    // Bytes sent and received, a second.
+    const sent = [_]FakeMonitoring.Point{ callMinute(&b, -60_000, 6000), callMinute(&b, 0, 1200) };
+    try b.fake.put(.{ .metric_type = sent_type_gcs, .metric_labels = &read_ok, .resource_type = "gcs_bucket", .resource_labels = assets_bucket, .kind = .delta, .value_type = .int64, .points = &sent });
+    var rate = try b.client.metric(sent_type_gcs).read(.{ .start = b.at(-120_000), .end = b.at(0), .filter = assets, .aggregation = .{ .alignment_period_s = 60, .aligner = .rate, .reducer = .sum } });
+    defer rate.deinit();
+    try testing.expectEqual(20.0, rate.value.series[0].points[0].value.?.double);
+    try testing.expectEqual(100.0, rate.value.series[0].points[1].value.?.double);
+    try testing.expectEqualStrings("By/s", rate.value.unit);
+    const received = [_]FakeMonitoring.Point{callMinute(&b, -60_000, 512)};
+    try b.fake.put(.{ .metric_type = received_type, .metric_labels = &write_ok, .resource_type = "gcs_bucket", .resource_labels = assets_bucket, .kind = .delta, .value_type = .int64, .points = &received });
+    var received_read = try b.client.metric(received_type).read(.{ .start = b.at(-120_000), .end = b.at(0), .filter = assets, .aggregation = .{ .alignment_period_s = 120, .aligner = .delta, .reducer = .sum } });
+    defer received_read.deinit();
+    try testing.expectEqual(512, received_read.value.series[0].points[0].value.?.int64);
+    try testing.expectEqualStrings("By", received_read.value.unit);
+
+    // Nothing for a bucket with nothing put in: no series, not zeros.
+    var quiet = try b.client.metric(request_count_type).read(.{ .start = b.at(-180_000), .end = b.at(0), .filter = .{ .resource_labels = &.{.{ .key = "bucket_name", .value = "logs" }} } });
+    defer quiet.deinit();
+    try testing.expectEqual(0, quiet.value.series.len);
+}
+
+test "put: a Cloud Storage series production could not hold is refused" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    const regional_class = [_]types.Label{.{ .key = "storage_class", .value = "REGIONAL" }};
+    const bytes = [_]FakeMonitoring.Point{bytesPoint(&b, 0, 1)};
+    const base: FakeMonitoring.PutSeries = .{ .metric_type = total_bytes_type, .metric_labels = &regional_class, .resource_type = "gcs_bucket", .resource_labels = assets_bucket, .kind = .gauge, .value_type = .double, .points = &bytes };
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cases: std.ArrayList(FakeMonitoring.PutSeries) = .empty;
+    // The value type: total_bytes is DOUBLE, object_count INT64.
+    const whole = [_]FakeMonitoring.Point{gaugePoint(&b, 0, 1)};
+    try cases.append(a, with(base, .{ .value_type = .int64, .points = &whole }));
+    try cases.append(a, with(base, .{ .metric_type = object_count_type }));
+    // The kind: the counts are DELTA, the sizes gauges.
+    const one_minute = [_]FakeMonitoring.Point{callMinute(&b, 0, 1)};
+    try cases.append(a, with(base, .{ .kind = .delta, .value_type = .int64, .points = &one_minute }));
+    const call_labels = callLabels("ReadObject", "OK");
+    try cases.append(a, with(base, .{ .metric_type = request_count_type, .metric_labels = &call_labels, .value_type = .int64, .points = &whole }));
+    // A label the metric lacks: a count's on a gauge, a gauge's on a count.
+    try cases.append(a, with(base, .{ .metric_labels = &call_labels }));
+    try cases.append(a, with(base, .{ .metric_type = request_count_type, .kind = .delta, .value_type = .int64, .points = &one_minute }));
+    // A resource label missing, or one the type lacks.
+    try cases.append(a, with(base, .{ .resource_labels = assets_bucket[0..1] }));
+    try cases.append(a, with(base, .{ .resource_labels = &.{ assets_bucket[0], assets_bucket[1], .{ .key = "zone", .value = "us-central1-a" } } }));
+    // Another resource type than the metric's.
+    try cases.append(a, with(base, .{ .resource_type = "global", .resource_labels = &.{} }));
+    // A metric of Google's domain the fake does not hold, and a
+    // program's metric on gcs_bucket.
+    try cases.append(a, with(base, .{ .metric_type = "storage.googleapis.com/storage/v2/total_bytes" }));
+    try cases.append(a, with(base, .{ .metric_type = "custom.googleapis.com/mine", .metric_labels = &.{} }));
+    for (cases.items, 0..) |c, i| {
+        errdefer std.debug.print("case {d}\n", .{i});
+        try testing.expectError(error.InvalidEntry, b.fake.put(c));
+    }
+    try testing.expectEqual(0, b.fake.pointCount());
+    // The same series as production holds one is taken.
+    try b.fake.put(base);
+    try testing.expectEqual(1, b.fake.pointCount());
+}
+
+test "the Cloud Storage descriptors and gcs_bucket: read and listed, never created, written or deleted" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var size = try b.client.metric(total_bytes_type).get();
+    defer size.deinit();
+    try testing.expectEqual(types.Kind.gauge, size.value.kind);
+    try testing.expectEqual(types.ValueType.double, size.value.value_type);
+    try testing.expectEqualStrings("By", size.value.unit);
+    try testing.expectEqualStrings("Total bytes", size.value.display_name);
+    try testing.expect(std.mem.startsWith(u8, size.value.description, "Total size of all objects in the bucket, grouped by storage class. Soft-deleted objects are not included"));
+    try testing.expect(std.mem.endsWith(u8, size.value.description, "the sampling period is a reporting period, not a measurement period."));
+    try testing.expectEqual(1, size.value.labels.len);
+    try testing.expectEqualStrings("Storage class of the data.", size.value.label("storage_class").?.description);
+    try testing.expectEqual(1, size.value.resource_types.len);
+    try testing.expectEqualStrings("gcs_bucket", size.value.resource_types[0]);
+    var objects = try b.client.metric(object_count_type).get();
+    defer objects.deinit();
+    try testing.expectEqual(types.ValueType.int64, objects.value.value_type);
+    try testing.expectEqualStrings("1", objects.value.unit);
+    try testing.expect(std.mem.startsWith(u8, objects.value.description, "Total number of objects per bucket, grouped by storage class. "));
+    var requests = try b.client.metric(request_count_type).get();
+    defer requests.deinit();
+    try testing.expectEqual(types.Kind.delta, requests.value.kind);
+    try testing.expectEqualStrings("Request count", requests.value.display_name);
+    try testing.expectEqual(2, requests.value.labels.len);
+    try testing.expectEqualStrings("response_code", requests.value.labels[0].key);
+    try testing.expectEqualStrings("The name of the API method called.", requests.value.label("method").?.description);
+    var out = try b.client.metric(sent_type_gcs).get();
+    defer out.deinit();
+    try testing.expectEqualStrings("By", out.value.unit);
+    try testing.expectEqualStrings("Delta count of bytes sent over the network, grouped by the API method name and response code.", out.value.description);
+
+    var listed = try b.client.listMetrics(.{ .prefix = "storage.googleapis.com/" });
+    defer listed.deinit();
+    try testing.expectEqual(5, listed.value.metrics.len);
+    try testing.expectEqualStrings(request_count_type, listed.value.metrics[0].type);
+    try testing.expectEqualStrings(total_bytes_type, listed.value.metrics[4].type);
+
+    // Never created, written or deleted, as production answers for
+    // Google's own.
+    const created = try b.raw(a, .POST, "metricDescriptors", "{\"type\":\"storage.googleapis.com/zigps\",\"metricKind\":\"GAUGE\",\"valueType\":\"INT64\"}");
+    try testing.expectEqual(403, created.status);
+    try testing.expectEqualStrings("User does not have permission to write to metric storage.googleapis.com/zigps.", try messageOf(a, created.body));
+    try testing.expectEqual(501, (try b.raw(a, .DELETE, "metricDescriptors/" ++ total_bytes_type, null)).status);
+    // A user metric on gcs_bucket: refused in the summary, its
+    // descriptor made, as a write on Pub/Sub's types is.
+    var on_bucket = try b.client.write(&.{.{ .metric_type = "custom.googleapis.com/zigps/on_bucket", .resource = .{ .other = .{ .type = "gcs_bucket", .labels = assets_bucket } }, .kind = .gauge, .end = b.at(0), .value = .{ .int64 = 1 } }});
+    defer on_bucket.deinit();
+    try testing.expectEqual(0, on_bucket.value.written);
+    try testing.expect(std.mem.indexOf(u8, on_bucket.value.message, "metrics cannot be written to gcs_bucket") != null);
+    try testing.expectEqual(types.Kind.gauge, (try b.fake.descriptor(a, "custom.googleapis.com/zigps/on_bucket")).?.kind);
+
+    var rt = try b.client.resourceType("gcs_bucket");
+    defer rt.deinit();
+    try testing.expectEqualStrings("GCS Bucket", rt.value.display_name);
+    try testing.expectEqualStrings("A Google Cloud Storage (GCS) bucket.", rt.value.description);
+    try testing.expectEqual(3, rt.value.labels.len);
+    try testing.expectEqualStrings("project_id", rt.value.labels[0].key);
+    try testing.expectEqualStrings("An immutable name of the bucket.", rt.value.labels[1].description);
+    try testing.expectEqualStrings("Location of the bucket.", rt.value.labels[2].description);
+
+    // Filters: a resource label the type lacks is 400, a metric label the
+    // metric lacks 404, another resource type 400.
+    const m = b.client.metric(request_count_type);
+    try testing.expectError(error.InvalidArgument, m.read(.{ .end = b.at(0), .filter = .{ .resource_labels = &.{.{ .key = "subscription_id", .value = "x" }} } }));
+    try testing.expectError(error.NotFound, m.read(.{ .end = b.at(0), .filter = .{ .metric_labels = &.{.{ .key = "storage_class", .value = "x" }} } }));
+    try testing.expectError(error.InvalidArgument, m.read(.{ .end = b.at(0), .filter = .{ .resource_type = "global" } }));
+}
+
+test "the Cloud Storage descriptors and gcs_bucket are production's, word for word" {
+    var b: Bench = undefined;
+    try b.init(.{ .project_id = "extractctl" });
+    defer b.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (production.storage_descriptors) |body| {
+        const want = try codec.decodeMetricInfo(a, a, body);
+        var got = try b.client.metric(want.type).get();
+        defer got.deinit();
+        errdefer std.debug.print("{s}\n", .{want.type});
+        try testing.expectEqual(want.kind, got.value.kind);
+        try testing.expectEqual(want.value_type, got.value.value_type);
+        try testing.expectEqualStrings(want.unit, got.value.unit);
+        try testing.expectEqualStrings(want.display_name, got.value.display_name);
+        try testing.expectEqualStrings(want.description, got.value.description);
+        try testing.expectEqual(want.labels.len, got.value.labels.len);
+        for (want.labels, got.value.labels) |w, g| {
+            try testing.expectEqualStrings(w.key, g.key);
+            try testing.expectEqualStrings(w.description, g.description);
+            try testing.expectEqual(w.value_type, g.value_type);
+        }
+        try testing.expectEqual(want.resource_types.len, got.value.resource_types.len);
+        for (want.resource_types, got.value.resource_types) |w, g| try testing.expectEqualStrings(w, g);
+    }
+    const want = try codec.decodeResourceType(a, a, production.resource_gcs_bucket);
+    var rt = try b.client.resourceType("gcs_bucket");
+    defer rt.deinit();
+    try testing.expectEqualStrings(want.display_name, rt.value.display_name);
+    try testing.expectEqualStrings(want.description, rt.value.description);
+    try testing.expectEqual(want.labels.len, rt.value.labels.len);
+    for (want.labels, rt.value.labels) |w, g| {
+        try testing.expectEqualStrings(w.key, g.key);
+        try testing.expectEqualStrings(w.description, g.description);
+    }
 }
 
 test "put: refused whole for what production could not hold" {

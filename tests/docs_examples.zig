@@ -1987,6 +1987,70 @@ test "quota usage against its limit, put in the in-memory Cloud Monitoring" {
 }
 // end snippet
 
+// snippet: mon-storage
+test "a bucket's size and requests, put in the in-memory Cloud Monitoring" {
+    var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_331_195 * std.time.ns_per_s };
+    var fake: monitoring.testing.FakeMonitoring = .init(std.testing.allocator, clock.io(), .{ .project_id = "my-project" });
+    defer fake.deinit();
+
+    // A bucket's size and traffic are Google's own metrics on the
+    // resource type gcs_bucket, so the test puts them in: the size a
+    // point every 5 minutes, requests a minute at a time.
+    const t = std.Io.Clock.real.now(clock.io()).nanoseconds;
+    const s = std.time.ns_per_s;
+    const bucket: []const monitoring.Label = &.{ .{ .key = "bucket_name", .value = "assets" }, .{ .key = "location", .value = "us-central1" } };
+    try fake.put(.{
+        .metric_type = "storage.googleapis.com/storage/total_bytes",
+        .metric_labels = &.{.{ .key = "storage_class", .value = "REGIONAL" }},
+        .resource_type = "gcs_bucket",
+        .resource_labels = bucket,
+        .kind = .gauge,
+        .value_type = .double,
+        .points = &.{
+            .{ .start = null, .end = .{ .nanoseconds = t - 600 * s }, .value = .{ .double = 4_096 } },
+            .{ .start = null, .end = .{ .nanoseconds = t - 300 * s }, .value = .{ .double = 8_192 } },
+        },
+    });
+    try fake.put(.{
+        .metric_type = "storage.googleapis.com/api/request_count",
+        .metric_labels = &.{ .{ .key = "response_code", .value = "OK" }, .{ .key = "method", .value = "ReadObject" } },
+        .resource_type = "gcs_bucket",
+        .resource_labels = bucket,
+        .kind = .delta,
+        .value_type = .int64,
+        .points = &.{.{ .start = .{ .nanoseconds = t - 60 * s + std.time.ns_per_ms }, .end = .{ .nanoseconds = t }, .value = .{ .int64 = 42 } }},
+    });
+
+    var token: monitoring.StaticToken = .{ .token = "none" };
+    var client = try monitoring.Client.init(std.testing.allocator, clock.io(), .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    const assets: monitoring.Filter = .{ .resource_type = "gcs_bucket", .resource_labels = &.{.{ .key = "bucket_name", .value = "assets" }} };
+    // The bucket's size over the hour: its largest, summed over storage
+    // classes.
+    var size = try client.metric("storage.googleapis.com/storage/total_bytes").read(.{
+        .start = .{ .nanoseconds = t - 3600 * s },
+        .end = .{ .nanoseconds = t },
+        .filter = assets,
+        .aggregation = .{ .alignment_period_s = 3600, .aligner = .max, .reducer = .sum },
+    });
+    defer size.deinit();
+    try std.testing.expectEqual(8_192, size.value.series[0].points[0].value.?.double);
+    // Its requests in the last minute, every method and response summed.
+    var requests = try client.metric("storage.googleapis.com/api/request_count").read(.{
+        .start = .{ .nanoseconds = t - 60 * s },
+        .end = .{ .nanoseconds = t },
+        .filter = assets,
+        .aggregation = .{ .alignment_period_s = 60, .aligner = .delta, .reducer = .sum },
+    });
+    defer requests.deinit();
+    try std.testing.expectEqual(42, requests.value.series[0].points[0].value.?.int64);
+}
+// end snippet
+
 test "the Monitoring guides' code, against the in-memory Cloud Monitoring" {
     const gpa = std.testing.allocator;
     var clock: monitoring.testing.FakeClock = .{ .now_ns = 1_792_331_195 * std.time.ns_per_s };
