@@ -19,6 +19,74 @@ fn reply(status: u16, body: []const u8) test_util.FakeTransport.Reply {
     return .{ .respond = .{ .status = status, .body = body } };
 }
 
+test "sibling: the same settings, a connection of its own, and diagnostics of its own" {
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var diag: core.Diagnostics = .{};
+    var client: Client = try .init(testing.allocator, testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .scope = .read_write,
+        .retry = .{ .max_attempts = 7 },
+        .request_timeout_ms = 1234,
+        .max_response_bytes = 4096,
+        .send_quota_project = false,
+        .user_agent = "gcp-zig-test/1",
+        .diagnostics = &diag,
+    });
+    defer client.deinit();
+    client.server_delay_ms = 5000;
+    var sibling_diag: core.Diagnostics = .{};
+    var s = try client.sibling(&sibling_diag);
+    defer s.deinit();
+    // A built-in transport is never shared: one per task, with the same
+    // limit on an answer's size.
+    try testing.expect(s.http != null and s.http != client.http);
+    try testing.expect(s.transport.ptr != client.transport.ptr);
+    try testing.expectEqual(4096, s.http.?.max_response_bytes);
+    try testing.expectEqual(&sibling_diag, s.diagnostics.?);
+    // Its own copies of the strings, equal to the original's.
+    try testing.expect(s.base_url.ptr != client.base_url.ptr);
+    try testing.expectEqualStrings(client.base_url, s.base_url);
+    try testing.expect(s.project.ptr != client.project.ptr);
+    try testing.expectEqualStrings("my-project", s.project);
+    try testing.expect(s.user_agent.ptr != client.user_agent.ptr);
+    try testing.expectEqualStrings("gcp-zig-test/1", s.user_agent);
+    try testing.expectEqual(.read_write, s.scope);
+    try testing.expectEqual(7, s.retry.max_attempts);
+    try testing.expectEqual(1234, s.request_timeout_ms);
+    try testing.expectEqual(4096, s.max_response_bytes);
+    try testing.expect(!s.send_quota_project);
+    try testing.expectEqual(client.token_provider.ptr, s.token_provider.ptr);
+    // A delay the original's last refusal asked for is not the sibling's.
+    try testing.expectEqual(null, s.server_delay_ms);
+    try testing.expectEqual(5000, client.server_delay_ms);
+
+    // A custom transport is shared, as documented.
+    var h: Harness = undefined;
+    try h.init(&.{});
+    defer h.deinit();
+    var shared = try h.client.sibling(null);
+    defer shared.deinit();
+    try testing.expectEqual(null, shared.http);
+    try testing.expectEqual(h.client.transport.ptr, shared.transport.ptr);
+    try testing.expectEqual(null, shared.diagnostics);
+}
+
+fn siblingOf(gpa: std.mem.Allocator) !void {
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var client: Client = try .init(gpa, testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+    });
+    defer client.deinit();
+    var s = try client.sibling(null);
+    s.deinit();
+}
+
+test "sibling: every allocation failure is OutOfMemory without leaks" {
+    try testing.checkAllAllocationFailures(testing.allocator, siblingOf, .{});
+}
+
 test "listInstances: the path and query as sent" {
     var h: Harness = undefined;
     try h.init(&.{reply(200, production.instance_list_empty)});

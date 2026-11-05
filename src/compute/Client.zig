@@ -9,7 +9,8 @@
 //!
 //! Every call blocks the calling task until it completes, using the
 //! `std.Io` and allocator passed to `init`. A client must not be used from
-//! two tasks at once; give each task its own.
+//! two tasks at once; give each task its own, which `sibling` makes with
+//! this one's settings.
 
 const Client = @This();
 
@@ -161,6 +162,43 @@ fn checkOptions(options: Options) Error!void {
         if (diag) |d| d.print("invalid max_response_bytes: 0 would refuse every answer", .{});
         return error.InvalidOptions;
     }
+}
+
+/// A client with this one's settings and a connection of its own, for a
+/// task that runs beside this one's, as `storage.Client.sibling` makes: a
+/// client must not be used from two tasks at once, and the built-in
+/// transport is not safe to share, so the sibling gets its own, with the
+/// same `max_response_bytes`. A custom `Options.transport` is shared, so it
+/// must take calls from several tasks at once, as `testing.FakeCompute`
+/// does. The token provider is shared; it is asked for tokens from every
+/// task. The sibling reports into `diagnostics`, and is freed with its own
+/// `deinit`.
+pub fn sibling(self: *const Client, diagnostics: ?*Diagnostics) Error!Client {
+    const base_url = try self.gpa.dupe(u8, self.base_url);
+    errdefer self.gpa.free(base_url);
+    const project = try self.gpa.dupe(u8, self.project);
+    errdefer self.gpa.free(project);
+    const user_agent = try self.gpa.dupe(u8, self.user_agent);
+    errdefer self.gpa.free(user_agent);
+
+    var http: ?*HttpTransport = null;
+    const transport = if (self.http == null) self.transport else t: {
+        const h = try self.gpa.create(HttpTransport);
+        h.* = .init(self.gpa, self.io, user_agent);
+        h.max_response_bytes = self.max_response_bytes;
+        http = h;
+        break :t h.transport();
+    };
+    var copy = self.*;
+    copy.base_url = base_url;
+    copy.project = project;
+    copy.user_agent = user_agent;
+    copy.transport = transport;
+    copy.http = http;
+    copy.diagnostics = diagnostics;
+    // The delay a refusal asked of this client's last call is its own.
+    copy.server_delay_ms = null;
+    return copy;
 }
 
 pub fn deinit(self: *Client) void {

@@ -20,7 +20,14 @@ including the ones that did not change.
   `docs/monitoring/testing.md` says what a message's size is (its
   encoding: 100 bytes of data count as 102) and what is not modelled.
   No call changes.
-- auth, billing, bigquery, compute, core, dataflow, datatransfer,
+- compute: `Client.sibling` makes a client with the same settings and a
+  connection of its own, for a task that runs beside the first, for
+  issue #371, as `storage.Client.sibling` does: a write and its wait
+  hold a task for ten seconds and more, and a client must not be used
+  from two tasks at once. The token provider and a custom transport are
+  shared, the built-in transport never. `docs/compute/README.md` shows
+  two VMs inserted and waited on at once. No call changes.
+- auth, billing, bigquery, core, dataflow, datatransfer,
   error_reporting, firestore, kms, logging, pubsub, resource_manager,
   run, scheduler, secret_manager and storage: unchanged.
 
