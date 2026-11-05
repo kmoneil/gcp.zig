@@ -903,7 +903,6 @@ fn jsonError(arena: Allocator, code: u16, reason: []const u8, message: []const u
     } }, .{}) };
 }
 
-
 fn notModelled(arena: Allocator, what: []const u8) Allocator.Error!tp.Response {
     return jsonError(arena, 501, "notImplemented", try arena.print("fake: {s} is not modelled yet", .{what}));
 }
@@ -911,7 +910,6 @@ fn notModelled(arena: Allocator, what: []const u8) Allocator.Error!tp.Response {
 fn refusal(arena: Allocator, status: u16) Allocator.Error!tp.Response {
     return jsonError(arena, status, "fake", "fake: refused as the test asked");
 }
-
 
 // Tests, held to what production answered in milestone 0.
 
