@@ -182,7 +182,7 @@ test "projects, tokens, paths, expressions and agents" {
     try testing.expect(isListExpression("labels.tool = compute-m0"));
     try testing.expect(!isListExpression("a\nb"));
     try testing.expect(!isListExpression(""));
-    try testing.expect(isUserAgent("gcp-zig-compute/0.64"));
+    try testing.expect(isUserAgent("gcp-zig-compute/0.65"));
     try testing.expect(!isUserAgent("a\nb"));
 }
 
