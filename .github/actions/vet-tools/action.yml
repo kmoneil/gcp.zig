@@ -28,14 +28,14 @@ runs:
         install() {
           local name=$1 version=$2 want
           case "$name-$platform" in
-            zigvet-linux-amd64) want=0df3995ef0f28f30f28923a1c06fa7784aa133d725dac5e71e63a6478f4fd268 ;;
-            zigvet-darwin-arm64) want=09fe5be5a365f74de18564be6833dd0424feca3e3853eb6f10eb446e9838cdb4 ;;
-            zigvet-darwin-amd64) want=05187d52b4c1acc010aac336ce47539fd26eeb3d8bfbd212108b9d6f68d20cbb ;;
-            zigvet-windows-amd64) want=7532d4b12e82c5e0f53a80f2ab0b482cc2bded952c595c3836f6fd34bfd7e254 ;;
-            gnarl-linux-amd64) want=d8cde27f1230843e5c65d9d1bade415609de3fa6bbc8d00acfb9e75617d00900 ;;
-            gnarl-darwin-arm64) want=16cb0f54f0db4ed4577fb9462c463de24ca03ef1350589f4e60c45f7573d74ee ;;
-            gnarl-darwin-amd64) want=58a785b1d5938a66106e12b9fa6bf31c5153f4a0fce40173246e7edd7c42c815 ;;
-            gnarl-windows-amd64) want=8b701a912f529e10e56e317392e7ab38e27b90cef0413582e1b5a57160feac57 ;;
+            zigvet-linux-amd64) want=8713072e80cb245d780b5de502e9cc4e6abd068015c9fe73ca614b1979348ad6 ;;
+            zigvet-darwin-arm64) want=149d724e18ee1396e77e3ab96ee13c629f52d5b314f234e1d9068ca71d1991d1 ;;
+            zigvet-darwin-amd64) want=bc3aa5570f836546fd8a8b4f7d4834d8b81e56d585f8ff2fbe645e77c5a9c6f9 ;;
+            zigvet-windows-amd64) want=6a988bf438b4a81c7da16890dd7995f45e4155e4574b7b506e1a734f831ca238 ;;
+            gnarl-linux-amd64) want=3b98843a610e74862a2e62edf3dbb2d35be3e74485718e703429c84f2b8e57f3 ;;
+            gnarl-darwin-arm64) want=82ccdb87a5ef91ea2eff5b1e9cdc58f26e6a9563622bbadf457fb37f6f3311e8 ;;
+            gnarl-darwin-amd64) want=64a94697c2abbc7f4fe9500ba68ce70e1e2954726f32939f665c9f3083b84b68 ;;
+            gnarl-windows-amd64) want=e150110d613e77ff109404b4addd36f550bc87d89b48b7e52d95003d209a8918 ;;
           esac
           curl -fsSLo "$dir/$name$exe" "https://github.com/kmoneil/$name/releases/download/$version/$name-$platform$exe"
           # The file on stdin: given a path with a backslash, as Windows'
@@ -50,7 +50,7 @@ runs:
           chmod +x "$dir/$name$exe"
           "$dir/$name$exe" --version
         }
-        install zigvet v0.24.1
-        install gnarl v0.6.0
+        install zigvet v0.25.1
+        install gnarl v0.7.0
 
         if [ "$RUNNER_OS" = Windows ]; then cygpath -w "$dir"; else echo "$dir"; fi >> "$GITHUB_PATH"
