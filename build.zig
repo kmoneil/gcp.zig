@@ -417,7 +417,7 @@ pub fn build(b: *std.Build) void {
     // examples, so they cannot rot between runs.
     const gcp_step = b.step(
         "test-integration-gcp",
-        "Run the Secret Manager, Cloud Storage, signed URL, Firestore, Logging, Resource Manager, Error Reporting, Monitoring and KMS tests against Google: GCP_TEST_PROJECT, GCP_TEST_BUCKET, FIRESTORE_TEST_DATABASE, KMS_TEST_KEY_RING",
+        "Run the Secret Manager, Cloud Storage, signed URL, Firestore, Logging, Resource Manager, Error Reporting, Monitoring and KMS tests against Google: GCP_TEST_PROJECT, GCP_TEST_BUCKET, FIRESTORE_TEST_DATABASE, KMS_TEST_KEY_RING; and on a Compute Engine VM, the metadata server's with AUTH_TEST_METADATA=1",
     );
     // Secret Manager has no emulator, so its tests need GCP_TEST_PROJECT
     // and GCP_TEST_TOKEN.
@@ -549,6 +549,25 @@ pub fn build(b: *std.Build) void {
     });
     gcp_step.dependOn(&streamed(b, monitoring_gcp_tests).step);
     test_step.dependOn(&monitoring_gcp_tests.step);
+    // The metadata server's keys, on a Compute Engine VM only, gated on
+    // AUTH_TEST_METADATA=1: tools/vmrun/metadata-test runs it there, and
+    // holds auth.testing.FakeMetadataServer to the server's answers.
+    const auth_metadata_gcp_tests = b.addTest(.{
+        .name = "auth-metadata-gcp-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/auth_metadata_gcp_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "auth", .module = auth },
+                .{ .name = "core", .module = core },
+            },
+        }),
+        .filters = test_filters,
+        .test_runner = test_runner,
+    });
+    gcp_step.dependOn(&streamed(b, auth_metadata_gcp_tests).step);
+    test_step.dependOn(&auth_metadata_gcp_tests.step);
     // Cloud Scheduler against a real project with the API on, gated on
     // SCHEDULER_TEST=1 beside the usual two variables: the suite makes,
     // runs, pauses and deletes two zigps- jobs raw, since the client
@@ -819,15 +838,17 @@ pub fn build(b: *std.Build) void {
         .{ &.{"compute"}, &.{ .{ .name = "compute", .module = compute }, .{ .name = "auth", .module = auth } } },
         .{ &.{"permissions"}, &.{ .{ .name = "resource_manager", .module = resource_manager }, .{ .name = "run", .module = cloud_run }, .{ .name = "storage", .module = storage }, .{ .name = "auth", .module = auth } } },
         .{ &.{ "gcs_notify", "quickstart" }, &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } } },
+        .{ &.{"spot_worker"}, &.{.{ .name = "auth", .module = auth }} },
     };
-    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "gcs_mv", "gcs_bucket", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "monitoring_policies", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "run_actions", "dataflow_jobs", "dataflow_stop", "bigquery_query", "datatransfer_runs", "permissions", "run_service", "compute", "billing_prices" }) |name| {
+    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "gcs_mv", "gcs_bucket", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "monitoring_policies", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "run_actions", "dataflow_jobs", "dataflow_stop", "bigquery_query", "datatransfer_runs", "permissions", "run_service", "compute", "billing_prices", "spot_worker" }) |name| {
         // whoami, secret, gcs_cp, gcs_sign, gcs_notify, gcs_mv, gcs_bucket, quickstart, iam,
         // secret_rotation, firestore, logs_read, logs_tail, projects_list,
         // error_dashboard, monitoring, monitoring_alerts,
         // monitoring_policies, pubsub_metrics,
         // kms, scheduler_jobs, scheduler_run, run_revisions, run_actions, run_service,
         // dataflow_jobs, dataflow_stop, bigquery_query, datatransfer_runs,
-        // permissions, compute and billing_prices pick their own credentials.
+        // permissions, compute and billing_prices pick their own credentials;
+        // spot_worker reads the metadata server alone.
         const pubsub_only: []const std.Build.Module.Import = &.{.{ .name = "pubsub", .module = mod }};
         const imports = importsOf(&example_imports, name) orelse pubsub_only;
         const exe = b.addExecutable(.{

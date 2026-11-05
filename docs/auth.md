@@ -122,6 +122,100 @@ has none) and whose `projectId` says which project it runs in. None of
 them may move while a client uses its provider; the `Credentials` that
 `findDefault` returns may, because it keeps the provider on the heap.
 
+## The metadata server's other keys
+
+On Compute Engine the metadata server holds more than the account: the
+VM's zone, the attributes whoever made it set, and whether a spot VM is
+being taken back. `auth.MetadataServer` reads any of them with the
+checks its token requests have: `Metadata-Flavor: Google` both ways, an
+answer of 512 KiB at most, 10 s a request, and retries on 429 and 5xx.
+
+- `get(io, arena, "instance/zone")` reads one key as text, as it was
+  set (an attribute's trailing newline included). A path ending in `/`
+  reads a directory's names, one a line.
+- `instanceAttribute(io, arena, "job")` reads `instance/attributes/job`,
+  or null when it is not set.
+- `preempted(io)` says whether Compute Engine has begun to preempt this
+  spot VM.
+- `watch(io, arena, path, .{ .last_etag = etag, .timeout_s = 300 })`
+  waits for a key to change. The metadata server holds the request until
+  the value's ETag is not `last_etag` or `timeout_s` (1 to 3600) runs
+  out, and the answer carries the ETag to pass next time. With no
+  `last_etag` it answers at once. Cancel the task to end a watch early.
+
+A key that is not set is `error.NotFound`. The metadata server answers
+that itself, so it does not mean this is not Google Cloud. A path with a
+query, a `..` or a doubled slash is refused before it is sent
+(`error.InvalidRequest`), as is a watch on a directory, which the server
+refuses.
+
+<!-- snippet: tests/docs_examples.zig#auth-preempted -->
+```zig
+/// A spot VM's worker runs until Compute Engine takes the VM back. The
+/// metadata server holds each request until `instance/preempted` changes
+/// or five minutes pass, so the worker wakes within moments of `TRUE`.
+fn untilPreempted(metadata: *auth.MetadataServer, io: std.Io, arena: std.mem.Allocator) !void {
+    var etag: ?[]const u8 = null;
+    while (true) {
+        const seen = try metadata.watch(io, arena, "instance/preempted", .{ .last_etag = etag, .timeout_s = 300 });
+        if (std.mem.eql(u8, seen.value, "TRUE")) return;
+        etag = seen.etag;
+    }
+}
+```
+
+When measured on 2026-11-05, a spot VM's `instance/preempted` turned
+`TRUE` 9.5 s after Compute Engine was asked to preempt it, and a watch
+woke 240 ms before a poll every half second saw it.
+`instance/maintenance-event` stayed `NONE` throughout, so it is not the
+key to watch on a spot VM. `examples/spot_worker.zig` is such a worker,
+and `--fake` runs it with no VM.
+
+### Testing with the in-memory metadata server
+
+`auth.testing.FakeMetadataServer` goes behind `Options.transport` and
+answers as Compute Engine's metadata server did when measured on
+2026-11-05. It starts with the project, the zone, the attached account's
+email and token, `instance/preempted` as `FALSE` and
+`instance/maintenance-event` as `NONE`, so `provider()` and `projectId`
+work against it too. `set` puts in any other key, or replaces one, and
+wakes a watch on it; `remove` takes one out; `preempt` sets
+`instance/preempted` to `TRUE`, as Compute Engine does when it takes a
+spot VM back. `refuseNext(n, status)` answers the next requests busy,
+and `callCount` shows that a watch held one request instead of polling.
+Its waits block on the `io` it is given, so give it one that can
+(`std.testing.io` does).
+
+<!-- snippet: tests/docs_examples.zig#auth-metadata-fake -->
+```zig
+test "a worker stops when its spot VM is preempted, with no VM" {
+    const io = std.testing.io;
+    var fake: auth.testing.FakeMetadataServer = .init(std.testing.allocator, io, .{});
+    defer fake.deinit();
+    // What the worker's controller set when it made the VM.
+    try fake.set("instance/attributes/job", "resize-images");
+    var metadata = try auth.MetadataServer.init(std.testing.allocator, io, .{ .transport = fake.transport() });
+    defer metadata.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings("resize-images", (try metadata.instanceAttribute(io, arena.allocator(), "job")).?);
+
+    // Compute Engine takes the VM back while the worker watches.
+    var worker = try io.concurrent(untilPreempted, .{ &metadata, io, arena.allocator() });
+    try fake.preempt();
+    try worker.await(io);
+    try std.testing.expect(try metadata.preempted(io));
+}
+```
+
+It answers as production does where a test could tell: a key not set,
+or no such path, is 404 with the flavor header; a request without
+`Metadata-Flavor: Google` (its value's case counts) is 403; a directory
+without its trailing `/` is a 301 to it; a watch answers at once for
+`last_etag=0` or an ETag that is not the current one, and waits for good
+on a `timeout_sec` that is not a whole number. `?recursive=true` is not
+modelled, and answers 501.
+
 ## Service account keys
 
 A `ServiceAccount` signs a short-lived JWT with the key file's RSA key

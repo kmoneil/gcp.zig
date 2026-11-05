@@ -1568,6 +1568,41 @@ test "the auth guide's code: the account a gcloud login names" {
     try std.testing.expectEqual(1, fake.requests.items.len);
 }
 
+// snippet: auth-preempted
+/// A spot VM's worker runs until Compute Engine takes the VM back. The
+/// metadata server holds each request until `instance/preempted` changes
+/// or five minutes pass, so the worker wakes within moments of `TRUE`.
+fn untilPreempted(metadata: *auth.MetadataServer, io: std.Io, arena: std.mem.Allocator) !void {
+    var etag: ?[]const u8 = null;
+    while (true) {
+        const seen = try metadata.watch(io, arena, "instance/preempted", .{ .last_etag = etag, .timeout_s = 300 });
+        if (std.mem.eql(u8, seen.value, "TRUE")) return;
+        etag = seen.etag;
+    }
+}
+// end snippet
+
+// snippet: auth-metadata-fake
+test "a worker stops when its spot VM is preempted, with no VM" {
+    const io = std.testing.io;
+    var fake: auth.testing.FakeMetadataServer = .init(std.testing.allocator, io, .{});
+    defer fake.deinit();
+    // What the worker's controller set when it made the VM.
+    try fake.set("instance/attributes/job", "resize-images");
+    var metadata = try auth.MetadataServer.init(std.testing.allocator, io, .{ .transport = fake.transport() });
+    defer metadata.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings("resize-images", (try metadata.instanceAttribute(io, arena.allocator(), "job")).?);
+
+    // Compute Engine takes the VM back while the worker watches.
+    var worker = try io.concurrent(untilPreempted, .{ &metadata, io, arena.allocator() });
+    try fake.preempt();
+    try worker.await(io);
+    try std.testing.expect(try metadata.preempted(io));
+}
+// end snippet
+
 const er = @import("error_reporting");
 
 // snippet: er-dashboard

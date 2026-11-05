@@ -11,6 +11,10 @@
 //!
 //! `signer()` signs as the attached account through IAM `signBlob`, since
 //! the account has no key this code could hold.
+//!
+//! `get`, `instanceAttribute`, `preempted` and `watch` read any other key
+//! with the same checks: a VM's custom attributes, its zone, whether a
+//! spot VM is being preempted, and a wait for any of them to change.
 
 const MetadataServer = @This();
 
@@ -34,6 +38,8 @@ token_url: []u8,
 project_url: []u8,
 email_url: []u8,
 root_url: []u8,
+/// `http://HOST/computeMetadata/v1/`, which a key's path follows.
+base_url: []u8,
 user_agent: []u8,
 probe_timeout_ms: u32,
 request_timeout_ms: u32,
@@ -111,9 +117,16 @@ const request_headers: []const core.transport.Header = &.{
     .{ .name = "Metadata-Flavor", .value = "Google" },
 };
 
-/// The metadata server's answers are small. A local service pretending to
-/// be one does not get to hand this client 32 MiB.
-const max_response_bytes = 64 * 1024;
+/// The metadata server's answers are small: Compute Engine holds a value
+/// to 256 KB and all of a VM's metadata to 512 KB. A local service
+/// pretending to be one does not get to hand this client 32 MiB.
+const max_response_bytes = 512 * 1024;
+
+/// The longest wait `watch` asks for. A longer one is a loop of these.
+const max_watch_s = 3600;
+
+/// The longest key path `get` sends; real ones are far shorter.
+const max_path_len = 1024;
 
 pub fn init(gpa: Allocator, io: std.Io, options: Options) InitError!MetadataServer {
     const diag = options.diagnostics;
@@ -152,6 +165,8 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) InitError!MetadataServ
     errdefer wipeFree(gpa, email_url);
     const root_url = try allocUrl(gpa, "http://{s}/", .{options.host});
     errdefer wipeFree(gpa, root_url);
+    const base_url = try allocUrl(gpa, "http://{s}/computeMetadata/v1/", .{options.host});
+    errdefer wipeFree(gpa, base_url);
     const user_agent = try gpa.dupe(u8, options.user_agent);
     errdefer wipeFree(gpa, user_agent);
 
@@ -169,6 +184,7 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) InitError!MetadataServ
         .project_url = project_url,
         .email_url = email_url,
         .root_url = root_url,
+        .base_url = base_url,
         .user_agent = user_agent,
         .probe_timeout_ms = options.probe_timeout_ms,
         .request_timeout_ms = options.request_timeout_ms,
@@ -191,6 +207,7 @@ pub fn deinit(self: *MetadataServer) void {
     wipeFree(self.gpa, self.project_url);
     wipeFree(self.gpa, self.email_url);
     wipeFree(self.gpa, self.root_url);
+    wipeFree(self.gpa, self.base_url);
     if (self.signer_email) |address| wipeFree(self.gpa, address);
     if (self.account_name) |name| wipeFree(self.gpa, name);
     wipeFree(self.gpa, self.user_agent);
@@ -241,7 +258,7 @@ pub fn probeChecked(self: *MetadataServer, io: std.Io) ProbeError!bool {
 /// The project this workload runs in, copied into `arena`. It saves a
 /// caller on Google Cloud from naming its own project.
 pub fn projectId(self: *MetadataServer, io: std.Io, arena: Allocator) ProjectIdError![]const u8 {
-    const res = self.getRetrying(io, arena, self.project_url) catch |err| switch (err) {
+    const res = self.getRetrying(io, arena, self.project_url, .account, self.request_timeout_ms) catch |err| switch (err) {
         // Any refusal means no metadata server this code can use.
         error.TokenUnavailable, error.TokenEndpointRejected => return error.MetadataUnavailable,
         else => |e| return e,
@@ -298,11 +315,126 @@ pub fn account(self: *MetadataServer, io: std.Io, arena: Allocator) EmailError![
 /// The answer to the email URL, trimmed. A refusal means no metadata
 /// server this code can use.
 fn askEmail(self: *MetadataServer, io: std.Io, arena: Allocator) EmailError!struct { Response, []const u8 } {
-    const res = self.getRetrying(io, arena, self.email_url) catch |err| switch (err) {
+    const res = self.getRetrying(io, arena, self.email_url, .account, self.request_timeout_ms) catch |err| switch (err) {
         error.TokenUnavailable, error.TokenEndpointRejected => return error.MetadataUnavailable,
         else => |e| return e,
     };
     return .{ res, std.mem.trim(u8, res.body, " \t\r\n") };
+}
+
+/// What reading a key can fail with.
+pub const GetError = error{
+    /// Nothing answered, or the answer was not the metadata server's.
+    MetadataUnavailable,
+    /// 404: the key is not set, or there is no such path. The metadata
+    /// server sends this one itself, flavor header and all, so it says
+    /// nothing about whether this is Google Cloud.
+    NotFound,
+    /// A path, attribute key, ETag or wait the metadata server could never
+    /// be asked with, refused before sending, with the reason in
+    /// `Diagnostics`.
+    InvalidRequest,
+    /// Busy (429 or 5xx) on every attempt, or refused: 400, 403, 405, or
+    /// a redirect, which a directory's path without its `/` gets.
+    MetadataRefused,
+} || core.transport.Error;
+
+/// The value of one key, in `arena`, as the metadata server holds it:
+/// `path` is what follows `computeMetadata/v1/`, such as `instance/zone`,
+/// `instance/attributes/job` or `project/attributes/env`; a path ending in
+/// `/` reads a directory's names, one a line. Not trimmed: an attribute
+/// set with a trailing newline keeps it. Retried on 429 and 5xx as
+/// `projectId` is.
+pub fn get(self: *MetadataServer, io: std.Io, arena: Allocator, path: []const u8) GetError![]const u8 {
+    if (!isValidPath(path)) return self.refuse("invalid metadata path: expected names of letters, digits, '-', '_', '.' and '@' between single slashes, with no leading slash and no '.' or '..' name");
+    const url = try std.fmt.allocPrint(arena, "{s}{s}", .{ self.base_url, path });
+    const res = try self.getRetrying(io, arena, url, .key, self.request_timeout_ms);
+    return res.body;
+}
+
+/// A custom attribute set on this VM, `instance/attributes/<key>`, in
+/// `arena`, or null when it is not set. A key is 1 to 128 letters,
+/// digits, `-` and `_`, as Compute Engine takes them; case matters.
+pub fn instanceAttribute(self: *MetadataServer, io: std.Io, arena: Allocator, key: []const u8) GetError!?[]const u8 {
+    if (!isAttributeKey(key)) return self.refuse("invalid attribute key: expected 1 to 128 letters, digits, '-' and '_'");
+    const path = try std.fmt.allocPrint(arena, "instance/attributes/{s}", .{key});
+    return self.get(io, arena, path) catch |err| switch (err) {
+        error.NotFound => null,
+        else => |e| e,
+    };
+}
+
+/// Whether Compute Engine has begun to preempt this spot VM:
+/// `instance/preempted` reads `TRUE` once it has, about when the VM's
+/// shutdown begins. Only Compute Engine's metadata server has the key;
+/// elsewhere this is `NotFound`. To be woken instead of asking again,
+/// `watch` the key.
+pub fn preempted(self: *MetadataServer, io: std.Io) GetError!bool {
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const value = std.mem.trim(u8, try self.get(io, scratch.allocator(), "instance/preempted"), " \t\r\n");
+    if (std.mem.eql(u8, value, "TRUE")) return true;
+    if (std.mem.eql(u8, value, "FALSE")) return false;
+    if (self.diagnostics) |d| d.set(200, "", "the metadata server's instance/preempted is neither TRUE nor FALSE");
+    return error.MetadataUnavailable;
+}
+
+pub const WatchOptions = struct {
+    /// The ETag the last answer carried. Null answers at once with the
+    /// current value and its ETag, which is how a watch starts.
+    last_etag: ?[]const u8 = null,
+    /// How long the metadata server holds the request before answering
+    /// the value unchanged, 1 to 3600 seconds. The request's own limit is
+    /// this plus `Options.request_timeout_ms`.
+    timeout_s: u32 = 60,
+};
+
+pub const Watched = struct {
+    /// The key's value, as `get` reads it.
+    value: []const u8,
+    /// Pass as the next `last_etag`. The same ETag as the last means the
+    /// wait ran out with nothing changed.
+    etag: []const u8,
+};
+
+/// The value of `path` once it differs from the one `last_etag` names,
+/// or when `timeout_s` runs out, whichever comes first, with its ETag:
+/// the metadata server's `wait_for_change`. A worker on a spot VM watches
+/// `instance/preempted` so, and is woken within moments of `TRUE` with no
+/// polling. A directory cannot be watched. The watch holds this task;
+/// cancel the task to end it early. Copied into `arena`.
+pub fn watch(self: *MetadataServer, io: std.Io, arena: Allocator, path: []const u8, options: WatchOptions) GetError!Watched {
+    if (!isValidPath(path)) return self.refuse("invalid metadata path: expected names of letters, digits, '-', '_', '.' and '@' between single slashes, with no leading slash and no '.' or '..' name");
+    if (path[path.len - 1] == '/') return self.refuse("a directory cannot be watched: the metadata server refuses wait_for_change on a listing");
+    if (options.timeout_s < 1 or options.timeout_s > max_watch_s) return self.refuse("invalid watch timeout: expected 1 to 3600 seconds");
+    // The server takes no last_etag as "wait for the next change", and a
+    // value it already has gone by, so a watch that starts with one could
+    // miss it. "0" answers at once.
+    const last = options.last_etag orelse "0";
+    if (!isValidEtag(last)) return self.refuse("invalid ETag: expected 1 to 64 letters and digits, as the metadata server sends");
+    // Always a whole timeout_sec: the server waits forever on one it
+    // cannot read (-1, 1.5, none at all).
+    const url = try std.fmt.allocPrint(arena, "{s}{s}?wait_for_change=true&last_etag={s}&timeout_sec={d}", .{ self.base_url, path, last, options.timeout_s });
+    const res = try self.getRetrying(io, arena, url, .key, watchTimeoutMs(self.request_timeout_ms, options.timeout_s));
+    const etag = std.mem.trim(u8, res.header("ETag") orelse "", " \t");
+    if (!isValidEtag(etag)) {
+        if (self.diagnostics) |d| d.set(res.status, "", "the metadata server's answer has no usable ETag");
+        return error.MetadataUnavailable;
+    }
+    return .{ .value = res.body, .etag = etag };
+}
+
+/// A watch's request limit: the wait asked for plus the usual limit, so
+/// the request is not cut while the server holds it. 0 stays no limit.
+fn watchTimeoutMs(request_timeout_ms: u32, timeout_s: u32) u32 {
+    if (request_timeout_ms == 0) return 0;
+    return request_timeout_ms +| timeout_s *| std.time.ms_per_s;
+}
+
+/// Puts `reason` in `Diagnostics` and refuses the call before sending.
+fn refuse(self: *MetadataServer, comptime reason: []const u8) error{InvalidRequest} {
+    if (self.diagnostics) |d| d.print(reason, .{});
+    return error.InvalidRequest;
 }
 
 /// Signs as the attached account through IAM `signBlob`, with this
@@ -376,7 +508,7 @@ fn quotaProject(ptr: *anyopaque) ?[]const u8 {
 /// the cache's scratch memory, which it wipes.
 fn fetch(ptr: *anyopaque, io: std.Io, arena: Allocator) TokenProvider.Error!Cache.Fetched {
     const self = fromPtr(ptr);
-    const res = try self.getRetrying(io, arena, self.token_url);
+    const res = try self.getRetrying(io, arena, self.token_url, .account, self.request_timeout_ms);
     return token_response.parse(arena, res.body) catch |err| {
         if (err == error.InvalidTokenResponse) {
             if (self.diagnostics) |d| d.set(res.status, "", "the metadata server's answer has no usable access_token and expires_in");
@@ -385,14 +517,30 @@ fn fetch(ptr: *anyopaque, io: std.Io, arena: Allocator) TokenProvider.Error!Cach
     };
 }
 
+/// What a request asks for, which decides what a refusal means.
+const Asking = enum {
+    /// The token, the email or the project: a 404 means no service
+    /// account is attached.
+    account,
+    /// A key a caller names: a 404 means it is not set.
+    key,
+};
+
+fn AskError(comptime asking: Asking) type {
+    return switch (asking) {
+        .account => Error,
+        .key => GetError,
+    };
+}
+
 /// One GET, retried while the answer says "later".
-fn getRetrying(self: *MetadataServer, io: std.Io, arena: Allocator, url: []const u8) Error!Response {
+fn getRetrying(self: *MetadataServer, io: std.Io, arena: Allocator, url: []const u8, comptime asking: Asking, timeout_ms: u32) AskError(asking)!Response {
     const max_attempts = self.retry.max_attempts;
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {
         const started = std.Io.Clock.awake.now(io);
         var asked: ?u32 = null;
-        const result = self.get(io, arena, url, &asked);
+        const result = self.getOnce(io, arena, url, asking, timeout_ms, &asked);
         const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
         switch (result) {
             .ok => |res| {
@@ -421,23 +569,25 @@ fn getRetrying(self: *MetadataServer, io: std.Io, arena: Allocator, url: []const
     }
 }
 
-const Attempt = union(enum) {
-    ok: Response,
-    /// Worth another attempt.
-    retry: Error,
-    fail: Error,
-};
+fn Attempt(comptime asking: Asking) type {
+    return union(enum) {
+        ok: Response,
+        /// Worth another attempt.
+        retry: AskError(asking),
+        fail: AskError(asking),
+    };
+}
 
 /// One GET, and what to make of the answer. The body is never copied into
 /// `Diagnostics`: the metadata server answers in plain text, and whatever
 /// answered may not be the metadata server at all. `asked` gets the wait a
 /// refusal from the metadata server asks for.
-fn get(self: *MetadataServer, io: std.Io, arena: Allocator, url: []const u8, asked: *?u32) Attempt {
+fn getOnce(self: *MetadataServer, io: std.Io, arena: Allocator, url: []const u8, comptime asking: Asking, timeout_ms: u32, asked: *?u32) Attempt(asking) {
     const res = self.transport.send(.{
         .method = .GET,
         .url = url,
         .headers = request_headers,
-        .timeout_ms = self.request_timeout_ms,
+        .timeout_ms = timeout_ms,
     }, arena) catch |err| {
         if (self.diagnostics) |d| d.print("the metadata server could not be reached: {t}", .{err});
         return if (core.isRetryable(err)) .{ .retry = err } else .{ .fail = err };
@@ -447,28 +597,57 @@ fn get(self: *MetadataServer, io: std.Io, arena: Allocator, url: []const u8, ask
         return .{ .fail = error.MetadataUnavailable };
     }
     if (res.status == 200) return .{ .ok = res };
-    const outcome = self.describeRefusal(res);
+    const outcome = self.describeRefusal(res, asking);
     asked.* = token_response.askedDelayMs(io, arena, res, self.diagnostics) catch return .{ .fail = error.OutOfMemory };
     return outcome;
 }
 
 /// What a refusal from the metadata server means, put in `Diagnostics`.
-fn describeRefusal(self: *MetadataServer, res: Response) Attempt {
-    if (res.status == 404) {
-        if (self.diagnostics) |d| d.set(res.status, "", "no service account is attached to this workload");
-        return .{ .fail = error.MetadataUnavailable };
-    }
-    if (res.status >= 300 and res.status < 400) {
-        if (self.diagnostics) |d| d.set(res.status, "", "the metadata server answered with a redirect, which is never followed");
-        return .{ .fail = error.MetadataUnavailable };
-    }
-    if (res.status == 429 or res.status >= 500) {
-        if (self.diagnostics) |d| d.set(res.status, "", "the metadata server is busy or broken");
-        return .{ .retry = error.TokenUnavailable };
-    }
-    if (self.diagnostics) |d| d.set(res.status, "", "the metadata server refused the request");
-    return .{ .fail = error.TokenEndpointRejected };
+fn describeRefusal(self: *MetadataServer, res: Response, comptime asking: Asking) Attempt(asking) {
+    const refusal: Refusal = .of(res.status);
+    if (self.diagnostics) |d| d.set(res.status, "", refusal.message(asking));
+    return refusal.attempt(asking);
 }
+
+/// The kinds of answer other than 200, each meaning one thing for the
+/// account's requests and another for a key's.
+const Refusal = enum {
+    not_found,
+    redirect,
+    busy,
+    refused,
+
+    fn of(status: u16) Refusal {
+        if (status == 404) return .not_found;
+        if (status >= 300 and status < 400) return .redirect;
+        if (status == 429 or status >= 500) return .busy;
+        return .refused;
+    }
+
+    fn message(r: Refusal, comptime asking: Asking) []const u8 {
+        return switch (r) {
+            .not_found => if (asking == .key) "the metadata server has no such key, or it is not set" else "no service account is attached to this workload",
+            .redirect => if (asking == .key) "the metadata server answered with a redirect, which is never followed: a directory's path ends in /" else "the metadata server answered with a redirect, which is never followed",
+            .busy => "the metadata server is busy or broken",
+            .refused => "the metadata server refused the request",
+        };
+    }
+
+    fn attempt(r: Refusal, comptime asking: Asking) Attempt(asking) {
+        return switch (asking) {
+            .account => switch (r) {
+                .not_found, .redirect => .{ .fail = error.MetadataUnavailable },
+                .busy => .{ .retry = error.TokenUnavailable },
+                .refused => .{ .fail = error.TokenEndpointRejected },
+            },
+            .key => switch (r) {
+                .not_found => .{ .fail = error.NotFound },
+                .redirect, .refused => .{ .fail = error.MetadataRefused },
+                .busy => .{ .retry = error.MetadataRefused },
+            },
+        };
+    }
+};
 
 /// One probe request. Every failure but the two above answers "no
 /// metadata server here".
@@ -536,6 +715,46 @@ fn isValidServiceAccount(name: []const u8) bool {
 /// Project ids and numbers, including legacy domain-scoped ids such as
 /// `example.com:my-project`. Shared with the service modules.
 const isProjectId = core.names.isProjectId;
+
+/// A key's or directory's path after `computeMetadata/v1/`, as it goes
+/// into the URL: names of letters, digits, `-`, `_`, `.` and `@` (a
+/// service account's email names a directory) between single slashes,
+/// and a trailing one for a directory. No leading slash, no `.` or `..`
+/// name, no query: the server would collapse, walk or misread them, and
+/// the query is `watch`'s.
+pub fn isValidPath(path: []const u8) bool {
+    if (path.len == 0 or path.len > max_path_len or path[0] == '/') return false;
+    var names = std.mem.splitScalar(u8, path, '/');
+    while (names.next()) |name| {
+        // Empty only after a directory's trailing slash.
+        if (name.len == 0) return names.peek() == null;
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
+        for (name) |c| switch (c) {
+            'A'...'Z', 'a'...'z', '0'...'9', '-', '_', '.', '@' => {},
+            else => return false,
+        };
+    }
+    return true;
+}
+
+/// A custom metadata key as Compute Engine takes one: 1 to 128 letters,
+/// digits, `-` and `_`.
+fn isAttributeKey(key: []const u8) bool {
+    if (key.len == 0 or key.len > 128) return false;
+    for (key) |c| switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9', '-', '_' => {},
+        else => return false,
+    };
+    return true;
+}
+
+/// An ETag as the metadata server sends one (16 hex digits, measured), or
+/// `0`, held to what can go into a URL as it stands.
+fn isValidEtag(etag: []const u8) bool {
+    if (etag.len == 0 or etag.len > 64) return false;
+    for (etag) |c| if (!std.ascii.isAlphanumeric(c)) return false;
+    return true;
+}
 
 fn isPrintable(text: []const u8) bool {
     if (text.len == 0) return false;
@@ -994,11 +1213,12 @@ test "MetadataServer: a host with a port and another service account are asked a
     );
 }
 
-test "MetadataServer: its own transport reads at most 64 KiB from the answer" {
+test "MetadataServer: its own transport reads at most 512 KiB from the answer" {
     var metadata: MetadataServer = try .init(testing.allocator, testing.io, .{});
     defer metadata.deinit();
-    // Whatever answers on the metadata address does not get to send 32 MiB.
-    try testing.expectEqual(64 * 1024, metadata.http.?.max_response_bytes);
+    // All a VM's metadata fits, a 256 KB attribute with room to spare; and
+    // whatever answers on the metadata address does not get to send 32 MiB.
+    try testing.expectEqual(512 * 1024, metadata.http.?.max_response_bytes);
     try testing.expect(max_response_bytes < core.transport.default_max_response_bytes);
 }
 
@@ -1218,6 +1438,284 @@ test "fuzz MetadataServer: an accepted host cannot reshape the URL" {
             "P:y",
             "a:1:2",
             "host:65536",
+        },
+    });
+}
+
+const key_ok: Reply = .{ .respond = .{
+    .body = "600\n",
+    .headers = &.{ .{ .name = "Metadata-Flavor", .value = "Google" }, .{ .name = "ETag", .value = "623fc8199b709f03" } },
+} };
+
+fn keyReply(status: u16, body: []const u8) Reply {
+    return .{ .respond = .{ .status = status, .body = body, .headers = flavor } };
+}
+
+test "MetadataServer.get: one key, its URL and headers, and its value as held" {
+    var h: Harness = undefined;
+    try h.init(&.{key_ok});
+    defer h.deinit();
+    // Not trimmed: the attribute was set with its newline.
+    try testing.expectEqualStrings("600\n", try h.metadata.get(h.clock.io(), h.arena.allocator(), "instance/attributes/job-args"));
+    const req = try h.fake.request(0);
+    try testing.expectEqual(.GET, req.method);
+    try testing.expectEqualStrings("http://metadata.google.internal/computeMetadata/v1/instance/attributes/job-args", req.url);
+    try testing.expectEqualStrings("Google", req.header("metadata-flavor").?);
+    try testing.expectEqual(null, req.bearer);
+    try testing.expectEqual(10_000, req.timeout_ms);
+}
+
+test "MetadataServer.get: a directory's names, and a host from the options" {
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{keyReply(200, "bucket\njob\n")});
+    defer fake.deinit();
+    var metadata: MetadataServer = try .init(testing.allocator, testing.io, .{ .host = "169.254.169.254", .transport = fake.transport() });
+    defer metadata.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("bucket\njob\n", try metadata.get(testing.io, arena.allocator(), "instance/attributes/"));
+    try testing.expectEqualStrings("http://169.254.169.254/computeMetadata/v1/instance/attributes/", (try fake.request(0)).url);
+}
+
+test "MetadataServer.get: 404 is a key not set, not a workload with no account" {
+    var h: Harness = undefined;
+    try h.init(&.{keyReply(404, "<!DOCTYPE html>")});
+    defer h.deinit();
+    try testing.expectError(error.NotFound, h.metadata.get(h.clock.io(), h.arena.allocator(), "instance/attributes/no-such-key"));
+    try testing.expectEqual(1, h.fake.requests.items.len);
+    try testing.expectEqual(404, h.diag.http_status);
+    try testing.expectEqualStrings("the metadata server has no such key, or it is not set", h.diag.message());
+}
+
+test "MetadataServer.get: a 404 without the flavor header is not the metadata server's" {
+    var h: Harness = undefined;
+    try h.init(&.{.{ .respond = .{ .status = 404, .body = "Not Found" } }});
+    defer h.deinit();
+    try testing.expectError(error.MetadataUnavailable, h.metadata.get(h.clock.io(), h.arena.allocator(), "instance/zone"));
+}
+
+test "MetadataServer.get: 400, 403, 405 and a redirect are refusals, not retried" {
+    for ([_]u16{ 400, 403, 405, 301 }) |status| {
+        var h: Harness = undefined;
+        try h.init(&.{keyReply(status, "")});
+        defer h.deinit();
+        try testing.expectError(error.MetadataRefused, h.metadata.get(h.clock.io(), h.arena.allocator(), "instance/attributes"));
+        try testing.expectEqual(1, h.fake.requests.items.len);
+        try testing.expectEqual(status, h.diag.http_status);
+    }
+    var h: Harness = undefined;
+    try h.init(&.{keyReply(301, "")});
+    defer h.deinit();
+    _ = h.metadata.get(h.clock.io(), h.arena.allocator(), "instance/attributes") catch {};
+    try testing.expectEqualStrings("the metadata server answered with a redirect, which is never followed: a directory's path ends in /", h.diag.message());
+}
+
+test "MetadataServer.get: busy is retried, and busy on every attempt is MetadataRefused" {
+    var h: Harness = undefined;
+    try h.init(&.{ busy, keyReply(429, ""), key_ok });
+    defer h.deinit();
+    try testing.expectEqualStrings("600\n", try h.metadata.get(h.clock.io(), h.arena.allocator(), "instance/attributes/job-args"));
+    try testing.expectEqual(3, h.fake.requests.items.len);
+
+    var h2: Harness = undefined;
+    try h2.init(&.{ busy, busy, busy });
+    defer h2.deinit();
+    try testing.expectError(error.MetadataRefused, h2.metadata.get(h2.clock.io(), h2.arena.allocator(), "instance/zone"));
+    try testing.expectEqual(3, h2.fake.requests.items.len);
+    try testing.expectEqualStrings("the metadata server is busy or broken", h2.diag.message());
+}
+
+test "MetadataServer.get: a path the server would misread is refused before sending" {
+    var h: Harness = undefined;
+    try h.init(&.{});
+    defer h.deinit();
+    var long: [max_path_len + 1]u8 = undefined;
+    @memset(&long, 'a');
+    for ([_][]const u8{
+        "",
+        "/instance/zone",
+        "instance//zone",
+        "instance/../project/project-id",
+        "instance/./zone",
+        "..",
+        "instance/zone?alt=json",
+        "instance/zone#x",
+        "instance/zo ne",
+        "instance%2Fzone",
+        "instance/zone\n",
+        "instance/attributes/caf\u{e9}",
+        &long,
+    }) |path| {
+        h.diag.clear();
+        try testing.expectError(error.InvalidRequest, h.metadata.get(h.clock.io(), h.arena.allocator(), path));
+        try testing.expectEqual(0, h.diag.http_status);
+        try testing.expect(std.mem.startsWith(u8, h.diag.message(), "invalid metadata path"));
+    }
+    try testing.expectEqual(0, h.fake.requests.items.len);
+    for ([_][]const u8{
+        "instance/zone",
+        "instance/attributes/",
+        "instance/service-accounts/robot@my-project.iam.gserviceaccount.com/email",
+        "project/attributes/ssh-keys",
+        long[0..max_path_len],
+    }) |path| try testing.expect(isValidPath(path));
+}
+
+test "MetadataServer.instanceAttribute: the value, null when not set, and a key checked first" {
+    var h: Harness = undefined;
+    try h.init(&.{ key_ok, keyReply(404, "") });
+    defer h.deinit();
+    const io = h.clock.io();
+    const a = h.arena.allocator();
+    try testing.expectEqualStrings("600\n", (try h.metadata.instanceAttribute(io, a, "job-args")).?);
+    try testing.expectEqualStrings("http://metadata.google.internal/computeMetadata/v1/instance/attributes/job-args", (try h.fake.request(0)).url);
+    try testing.expectEqual(null, try h.metadata.instanceAttribute(io, a, "no-such-key"));
+    var keys: [129]u8 = undefined;
+    @memset(&keys, 'k');
+    const max = keys[0..128];
+    for ([_][]const u8{ "", "a/b", "a.b", "a b", "../zone", &keys }) |key| {
+        try testing.expectError(error.InvalidRequest, h.metadata.instanceAttribute(io, a, key));
+        try testing.expectEqualStrings("invalid attribute key: expected 1 to 128 letters, digits, '-' and '_'", h.diag.message());
+    }
+    try testing.expectEqual(2, h.fake.requests.items.len);
+    try testing.expect(isAttributeKey(max) and isAttributeKey("Job_Shard-2"));
+}
+
+test "MetadataServer.preempted: TRUE and FALSE, trimmed; anything else is not the metadata server's" {
+    var h: Harness = undefined;
+    try h.init(&.{ keyReply(200, "FALSE"), keyReply(200, "TRUE"), keyReply(200, "TRUE\n"), keyReply(200, "true"), keyReply(404, "") });
+    defer h.deinit();
+    const io = h.clock.io();
+    try testing.expect(!try h.metadata.preempted(io));
+    try testing.expectEqualStrings("http://metadata.google.internal/computeMetadata/v1/instance/preempted", (try h.fake.request(0)).url);
+    try testing.expect(try h.metadata.preempted(io));
+    try testing.expect(try h.metadata.preempted(io));
+    try testing.expectError(error.MetadataUnavailable, h.metadata.preempted(io));
+    try testing.expectEqualStrings("the metadata server's instance/preempted is neither TRUE nor FALSE", h.diag.message());
+    // Not Compute Engine: Cloud Run's server has no such key.
+    try testing.expectError(error.NotFound, h.metadata.preempted(io));
+}
+
+test "MetadataServer.watch: the query, the ETag, and a request limit past the wait" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "FALSE", .headers = &.{ .{ .name = "Metadata-Flavor", .value = "Google" }, .{ .name = "ETag", .value = "91573307ec3f06b7" } } } },
+        .{ .respond = .{ .body = "TRUE", .headers = &.{ .{ .name = "Metadata-Flavor", .value = "Google" }, .{ .name = "etag", .value = " 2439a9379ecdcf4c " } } } },
+    });
+    defer h.deinit();
+    const io = h.clock.io();
+    const a = h.arena.allocator();
+    // The first answers at once, and starts the watch.
+    const first = try h.metadata.watch(io, a, "instance/preempted", .{});
+    try testing.expectEqualStrings("FALSE", first.value);
+    try testing.expectEqualStrings("91573307ec3f06b7", first.etag);
+    const req0 = try h.fake.request(0);
+    try testing.expectEqualStrings("http://metadata.google.internal/computeMetadata/v1/instance/preempted?wait_for_change=true&last_etag=0&timeout_sec=60", req0.url);
+    try testing.expectEqual(70_000, req0.timeout_ms);
+    try testing.expectEqualStrings("Google", req0.header("metadata-flavor").?);
+
+    const next = try h.metadata.watch(io, a, "instance/preempted", .{ .last_etag = first.etag, .timeout_s = 3600 });
+    try testing.expectEqualStrings("TRUE", next.value);
+    try testing.expectEqualStrings("2439a9379ecdcf4c", next.etag);
+    const req1 = try h.fake.request(1);
+    try testing.expectEqualStrings("http://metadata.google.internal/computeMetadata/v1/instance/preempted?wait_for_change=true&last_etag=91573307ec3f06b7&timeout_sec=3600", req1.url);
+    try testing.expectEqual(3_610_000, req1.timeout_ms);
+}
+
+test "MetadataServer.watch: no request limit stays none" {
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{key_ok});
+    defer fake.deinit();
+    var metadata: MetadataServer = try .init(testing.allocator, testing.io, .{ .request_timeout_ms = 0, .transport = fake.transport() });
+    defer metadata.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    _ = try metadata.watch(testing.io, arena.allocator(), "instance/attributes/job-args", .{ .timeout_s = 5 });
+    try testing.expectEqual(0, (try fake.request(0)).timeout_ms);
+}
+
+test "MetadataServer.watch: a directory, a wait outside 1 to 3600 s and an ETag that is not one are refused before sending" {
+    var h: Harness = undefined;
+    try h.init(&.{});
+    defer h.deinit();
+    const io = h.clock.io();
+    const a = h.arena.allocator();
+    try testing.expectError(error.InvalidRequest, h.metadata.watch(io, a, "instance/attributes/", .{}));
+    try testing.expectEqualStrings("a directory cannot be watched: the metadata server refuses wait_for_change on a listing", h.diag.message());
+    for ([_]u32{ 0, 3601, std.math.maxInt(u32) }) |t| {
+        try testing.expectError(error.InvalidRequest, h.metadata.watch(io, a, "instance/preempted", .{ .timeout_s = t }));
+        try testing.expectEqualStrings("invalid watch timeout: expected 1 to 3600 seconds", h.diag.message());
+    }
+    var long_etag: [65]u8 = undefined;
+    @memset(&long_etag, 'e');
+    for ([_][]const u8{ "", "91573307ec3f06b7&timeout_sec=-1", "a b", &long_etag }) |etag| {
+        try testing.expectError(error.InvalidRequest, h.metadata.watch(io, a, "instance/preempted", .{ .last_etag = etag }));
+        try testing.expectEqualStrings("invalid ETag: expected 1 to 64 letters and digits, as the metadata server sends", h.diag.message());
+    }
+    try testing.expectError(error.InvalidRequest, h.metadata.watch(io, a, "instance/preempted?x=1", .{}));
+    try testing.expectEqual(0, h.fake.requests.items.len);
+}
+
+test "MetadataServer.watch: an answer with no usable ETag is not the metadata server's" {
+    for ([_][]const core.transport.Header{
+        flavor,
+        &.{ .{ .name = "Metadata-Flavor", .value = "Google" }, .{ .name = "ETag", .value = "" } },
+        &.{ .{ .name = "Metadata-Flavor", .value = "Google" }, .{ .name = "ETag", .value = "\"quoted\"" } },
+    }) |headers| {
+        var h: Harness = undefined;
+        try h.init(&.{.{ .respond = .{ .body = "FALSE", .headers = headers } }});
+        defer h.deinit();
+        try testing.expectError(error.MetadataUnavailable, h.metadata.watch(h.clock.io(), h.arena.allocator(), "instance/preempted", .{}));
+        try testing.expectEqualStrings("the metadata server's answer has no usable ETag", h.diag.message());
+    }
+}
+
+test "MetadataServer.watch: a 404 is NotFound, and busy is retried as get's is" {
+    var h: Harness = undefined;
+    try h.init(&.{ keyReply(404, ""), busy, key_ok });
+    defer h.deinit();
+    const io = h.clock.io();
+    const a = h.arena.allocator();
+    try testing.expectError(error.NotFound, h.metadata.watch(io, a, "instance/attributes/no-such-key", .{}));
+    const w = try h.metadata.watch(io, a, "instance/attributes/job-args", .{});
+    try testing.expectEqualStrings("623fc8199b709f03", w.etag);
+    try testing.expectEqual(3, h.fake.requests.items.len);
+}
+
+test "MetadataServer: the account calls keep 404 as no account, beside the key calls" {
+    var h: Harness = undefined;
+    try h.init(&.{ keyReply(404, ""), keyReply(404, "") });
+    defer h.deinit();
+    try testing.expectError(error.MetadataUnavailable, h.metadata.email(h.clock.io(), h.arena.allocator()));
+    try testing.expectEqualStrings("no service account is attached to this workload", h.diag.message());
+    try testing.expectError(error.NotFound, h.metadata.get(h.clock.io(), h.arena.allocator(), "instance/service-accounts/default/email"));
+}
+
+fn pathProperty(_: void, input: []const u8) !void {
+    // Whatever is accepted goes into the URL as the path's tail: no
+    // query, no fragment, nothing walked or escaped.
+    if (!isValidPath(input)) return;
+    var buf: [2048]u8 = undefined;
+    const url = try std.fmt.bufPrint(&buf, "http://metadata.google.internal/computeMetadata/v1/{s}", .{input});
+    const uri = try std.Uri.parse(url);
+    try testing.expectEqual(null, uri.query);
+    try testing.expectEqual(null, uri.fragment);
+    try testing.expectEqualStrings(url["http://metadata.google.internal".len..], uri.path.percent_encoded);
+    try testing.expect(std.mem.indexOf(u8, input, "//") == null);
+    var names = std.mem.splitScalar(u8, input, '/');
+    while (names.next()) |name| try testing.expect(!std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, ".."));
+}
+
+test "fuzz MetadataServer: an accepted path cannot reshape the URL" {
+    try test_util.fuzzBytes({}, pathProperty, .{
+        .corpus = &.{
+            "instance/zone",
+            "instance/attributes/",
+            "instance/service-accounts/a@b.c/email",
+            "instance/../zone",
+            "instance//zone",
+            "instance/zone?x",
+            "a%2Fb",
+            ".",
+            "a/.",
         },
     });
 }
