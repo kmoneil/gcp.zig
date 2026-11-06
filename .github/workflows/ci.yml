@@ -300,14 +300,16 @@ jobs:
   # The unit tests with the optimizer on. Bugs that depend on it, such as a
   # read of undefined memory, can pass in Debug and fail here. `test-unit`
   # leaves out the examples and the server suites, which the test job
-  # compiles in Debug: optimized, they took most of this job's time.
+  # compiles in Debug: optimized, they took most of this job's time. Even
+  # so, compiling takes nearly all of it: ReleaseFast ran up to 19 minutes
+  # in November 2026, so the job has 30.
   release:
     strategy:
       fail-fast: false
       matrix:
         optimize: [ReleaseSafe, ReleaseFast]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
