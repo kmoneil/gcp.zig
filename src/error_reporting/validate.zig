@@ -12,6 +12,12 @@ pub const max_calls_per_minute = 60;
 /// The longest service filter value this client sends.
 pub const max_filter_bytes = 1024;
 
+/// The largest request body production takes, measured exactly on
+/// 2026-11-06: 1,048,576 bytes taken, one more refused ("Request payload
+/// size exceeds the limit: 1048576 bytes."), whitespace counted. Only a
+/// group's update sends a body.
+pub const max_body_bytes = 1_048_576;
+
 /// A project as the API names it: a project number, or a project id, which
 /// is 6 to 30 lowercase letters, digits and hyphens for a new project and
 /// may be older, such as the domain-scoped `example.com:my-project`.
@@ -59,6 +65,36 @@ pub fn filterProblem(value: []const u8) ?[]const u8 {
     if (!std.unicode.utf8ValidateSlice(value)) return "invalid service filter: not UTF-8";
     for (value) |c| if (c < 0x20 or c == 0x7f) return "invalid service filter: a control character";
     return null;
+}
+
+/// Why a tracking issue's URL will not be sent, or null. Production stores
+/// any string as one (measured 2026-11-06: `javascript:` links, newlines,
+/// no scheme, an empty one), so this client sends only web links: an
+/// absolute `http` or `https` URL with a host, in the characters RFC 3986
+/// allows, anything else percent-encoded.
+pub fn trackingIssueProblem(url: []const u8) ?[]const u8 {
+    for (url, 0..) |c, i| {
+        if (!isUriChar(c)) return "a character a URL must percent-encode (RFC 3986): a space, a control character, non-ASCII, or one of \"<>\\^`{|}";
+        if (c == '%' and (i + 2 >= url.len or !std.ascii.isHex(url[i + 1]) or !std.ascii.isHex(url[i + 2]))) return "a % not followed by two hex digits";
+    }
+    const web_link = "expected an absolute http or https URL with a host";
+    const uri = std.Uri.parse(url) catch return web_link;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) return web_link;
+    // std.Uri gives a host only when there is one: `https://:443/` and
+    // `https://user@/` are no URL to it.
+    if (uri.host == null) return web_link;
+    return null;
+}
+
+/// The characters RFC 3986 writes a URI in: unreserved, reserved and `%`.
+fn isUriChar(c: u8) bool {
+    return switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~' => true,
+        ':', '/', '?', '#', '[', ']', '@' => true,
+        '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=' => true,
+        '%' => true,
+        else => false,
+    };
 }
 
 /// A quota project, held to core's rule for the header.
@@ -111,6 +147,61 @@ test "filterProblem" {
     try testing.expect(std.mem.indexOf(u8, filterProblem("\xff").?, "UTF-8") != null);
     try testing.expect(std.mem.indexOf(u8, filterProblem("a\tb").?, "control") != null);
     try testing.expect(std.mem.indexOf(u8, filterProblem("a\x7f").?, "control") != null);
+}
+
+test "trackingIssueProblem: web links only, as RFC 3986 writes them" {
+    for ([_][]const u8{
+        "https://example.com/issues/1",
+        "http://example.com",
+        "HTTPS://EXAMPLE.COM/Issues/ZIGPS-313",
+        "https://tracker.example.com:8443/browse/BUG-1?focus=comments#c2",
+        "https://example.com/issues?id=313&x=a%20b#c",
+        "https://user@example.com/a",
+        "http://[2001:db8::1]/issue/7",
+        "https://example.com/%C3%A9",
+        "https://example.com/a(b)!$&'*+,;=:@~._-",
+    }) |ok| {
+        if (trackingIssueProblem(ok)) |p| {
+            std.debug.print("{s}: {s}\n", .{ ok, p });
+            return error.TestUnexpectedResult;
+        }
+    }
+    const scheme = "expected an absolute http or https URL with a host";
+    const chars = "a character a URL must percent-encode";
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "", scheme },
+        .{ "zigps-not-a-url", scheme },
+        .{ "example.com/issues/1", scheme },
+        .{ "/issues/1", scheme },
+        .{ "javascript:alert(313)", scheme },
+        .{ "mailto:zigps@example.com", scheme },
+        .{ "ftp://example.com/issues/1", scheme },
+        .{ "https://", scheme },
+        .{ "https:///issues/1", scheme },
+        .{ "https:example.com", scheme },
+        .{ "https://:443/", scheme },
+        .{ "https://user@/a", scheme },
+        .{ "https://example.com:port/", scheme },
+        .{ " https://example.com", chars },
+        .{ "https://example.com/a b", chars },
+        .{ "https://example.com/a\nb", chars },
+        .{ "https://example.com/a\tb", chars },
+        .{ "https://example.com/a\x7f", chars },
+        .{ "https://example.com/\xc3\xa9", chars },
+        .{ "https://example.com/\"><script>", chars },
+        .{ "https://example.com/a\\b", chars },
+        .{ "https://example.com/{a}|^`", chars },
+        .{ "https://example.com/%", "a % not followed by two hex digits" },
+        .{ "https://example.com/%2", "a % not followed by two hex digits" },
+        .{ "https://example.com/%zz", "a % not followed by two hex digits" },
+    };
+    for (cases) |case| {
+        const p = trackingIssueProblem(case[0]) orelse {
+            std.debug.print("taken: {s}\n", .{case[0]});
+            return error.TestUnexpectedResult;
+        };
+        try testing.expect(std.mem.startsWith(u8, p, case[1]));
+    }
 }
 
 test "isPageToken and isUserAgent" {

@@ -10,10 +10,11 @@
 //! of its own through `events.report`, which the module never calls, under
 //! the service `zigps-er-<run>`: Error Reporting keeps them 30 days and
 //! there is no way to delete one group's (`deleteEvents` deletes every
-//! error in the project). Statuses are changed only on those groups. Calls
-//! are free. The last test runs the same queries against production and
-//! against `FakeErrorReporting` fed the same reports, and holds the fake to
-//! what production said.
+//! error in the project). Statuses and tracking issues are changed only on
+//! those groups, the issues cleared at the end. Calls are free. Two tests
+//! run the same queries and updates against production and against
+//! `FakeErrorReporting` fed the same reports, and hold the fake to what
+//! production said.
 
 const std = @import("std");
 const core = @import("core");
@@ -303,6 +304,123 @@ test "error_reporting: seeded errors read back as reported, and the fake answers
     }
     try testing.expectEqualStrings(f.service, page.value.items[0].service.service.?);
     try testing.expectEqualStrings("ValueError: order has no lines", page.value.items[0].headline());
+}
+
+/// One side of a comparison: production, or the fake holding the same
+/// group.
+const Side = struct {
+    client: *er.Client,
+    id: []const u8,
+    transport: core.transport.Transport,
+    bearer: []const u8,
+    project: []const u8,
+
+    /// Sends `body` as the group's update by hand, as the module never
+    /// sends these bodies.
+    fn put(s: Side, a: std.mem.Allocator, body: []const u8) !core.transport.Response {
+        const url = try a.print("https://clouderrorreporting.googleapis.com/v1beta1/projects/{s}/groups/{s}?prettyPrint=false", .{ s.project, s.id });
+        return s.transport.send(.{ .method = .PUT, .url = url, .bearer = s.bearer, .body = body, .content_type = .json, .timeout_ms = 60_000 }, a);
+    }
+
+    /// The group as read: its status and its issues' URLs.
+    fn read(s: Side, a: std.mem.Allocator) ![]const u8 {
+        var g = try s.client.group(s.id).get();
+        defer g.deinit();
+        return describe(a, g.value);
+    }
+};
+
+fn describe(a: std.mem.Allocator, g: er.Group) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    try out.writer.print("{t} [", .{g.status});
+    for (g.tracking_issues, 0..) |issue, i| try out.writer.print("{s}\"{s}\"", .{ if (i == 0) "" else ", ", issue.url });
+    try out.writer.writeAll("]");
+    return out.written();
+}
+
+fn messageOf(a: std.mem.Allocator, r: core.transport.Response) ![]const u8 {
+    const body = try core.errors.decodeErrorBody(a, r.body) orelse return a.print("{d} with no error", .{r.status});
+    return a.print("{d} {s}", .{ r.status, body.message });
+}
+
+/// Tracking issues on one side, from a read: what `setTrackingIssues`
+/// answers, its request as shown sent by hand, none, an issue with no URL,
+/// and production's two refusals. One line each, for the two sides to
+/// match line by line.
+fn trackingIssuesScript(a: std.mem.Allocator, s: Side) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    const w = &out.writer;
+    var acked = try s.client.group(s.id).setStatus(.acknowledged);
+    acked.deinit();
+    var g = try s.client.group(s.id).get();
+    defer g.deinit();
+    const options: er.TrackingIssuesOptions = .{ .status = g.value.status };
+
+    const urls = [_][]const u8{ "https://example.com/issues/zigps-b", "HTTPS://EXAMPLE.COM/issues/zigps-a?x=a%20b#c", "https://example.com/issues/zigps-b" };
+    var set = try s.client.group(s.id).setTrackingIssues(&urls, options);
+    defer set.deinit();
+    try w.print("set: {s}; read: {s}\n", .{ try describe(a, set.value), try s.read(a) });
+
+    const shown_urls = [_][]const u8{"https://example.com/issues/zigps-shown"};
+    var shown = try s.client.group(s.id).setTrackingIssuesRequest(&shown_urls, options);
+    defer shown.deinit();
+    const sent = try s.transport.send(.{ .method = shown.value.method, .url = shown.value.url, .bearer = s.bearer, .body = shown.value.body, .content_type = .json, .timeout_ms = 60_000 }, a);
+    try w.print("the request as shown, sent by hand: {d}; read: {s}\n", .{ sent.status, try s.read(a) });
+
+    var none = try s.client.group(s.id).setTrackingIssues(&.{}, options);
+    defer none.deinit();
+    try w.print("none: {s}; read: {s}\n", .{ try describe(a, none.value), try s.read(a) });
+
+    const no_url = try s.put(a, try a.print("{{\"groupId\":\"{s}\",\"trackingIssues\":[{{}},{{\"url\":\"\"}}],\"resolutionStatus\":\"ACKNOWLEDGED\"}}", .{s.id}));
+    try w.print("no URL and an empty one: {d}; read: {s}\n", .{ no_url.status, try s.read(a) });
+
+    const field = try s.put(a, "{\"trackingIssues\":[{\"url\":\"https://example.com/issues/zigps\",\"zigps\":1}],\"resolutionStatus\":\"OPEN\"}");
+    try w.print("an unknown field: {s}\n", .{try messageOf(a, field)});
+    const head = "{\"trackingIssues\":[{\"url\":\"https://example.com/";
+    const tail = "\"}],\"resolutionStatus\":\"OPEN\"}";
+    const big = try a.alloc(u8, er.limits.max_body_bytes + 1);
+    @memcpy(big[0..head.len], head);
+    @memset(big[head.len .. big.len - tail.len], 'z');
+    @memcpy(big[big.len - tail.len ..], tail);
+    try w.print("a byte over 1 MiB: {s}; read: {s}\n", .{ try messageOf(a, try s.put(a, big)), try s.read(a) });
+    return out.written();
+}
+
+test "error_reporting: tracking issues set from a read, the request as shown, and the fake answering the same" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    try f.seed();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const id = f.id(.java);
+    // Cleared and opened whatever happens, though the group is this run's
+    // alone.
+    defer if (f.client.group(id).setTrackingIssues(&.{}, .{ .status = .open })) |g| {
+        var cleared = g;
+        cleared.deinit();
+    } else |_| {};
+
+    var fake: er.testing.FakeErrorReporting = .init(testing.allocator, testing.io, .{ .project_id = f.project });
+    defer fake.deinit();
+    const fake_id = try fake.report(.{ .message = try trace(a, .java, f.run), .service = .{ .service = f.service, .version = "v2", .resource_type = "reported_errors" } });
+    var fake_token: core.StaticToken = .{ .token = "t" };
+    var fake_client = try er.Client.init(testing.allocator, testing.io, .{ .project_id = f.project, .token_provider = fake_token.provider(), .transport = fake.transport(), .calls_per_minute = 0 });
+    defer fake_client.deinit();
+
+    const production = try trackingIssuesScript(a, .{ .client = &f.client, .id = id, .transport = f.http.transport(), .bearer = f.token.token, .project = f.project });
+    const in_memory = try trackingIssuesScript(a, .{ .client = &fake_client, .id = fake_id, .transport = fake.transport(), .bearer = "t", .project = f.project });
+    if (!std.mem.eql(u8, production, in_memory)) {
+        std.debug.print("production:\n{s}fake:\n{s}", .{ production, in_memory });
+        return error.TestUnexpectedResult;
+    }
+    fact("tracking issues, production and the fake alike:\n{s}", .{production});
+
+    // What the client will not send is refused unsent: production would
+    // have stored it.
+    try testing.expectError(error.InvalidOptions, f.client.group(id).setTrackingIssues(&.{"javascript:alert(313)"}, .{ .status = .open }));
+    try testing.expectEqualStrings("invalid tracking issue urls[0]: expected an absolute http or https URL with a host", f.diag.message());
 }
 
 test "error_reporting: statuses on the seeded groups, and what production refuses" {

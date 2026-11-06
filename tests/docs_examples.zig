@@ -1640,6 +1640,48 @@ fn resolve(client: *er.Client, group_id: []const u8) !void {
 }
 // end snippet
 
+// snippet: er-link
+/// Links a group to one more issue, keeping the issues it has and its
+/// status as the read shows them. `confirm` sees the exact request first,
+/// and nothing is sent unless it says yes.
+fn linkIssue(
+    gpa: std.mem.Allocator,
+    client: *er.Client,
+    group_id: []const u8,
+    url: []const u8,
+    confirm: *const fn (er.PreparedRequest) bool,
+) !bool {
+    var group = try client.group(group_id).get();
+    defer group.deinit();
+    var urls: std.ArrayList([]const u8) = .empty;
+    defer urls.deinit(gpa);
+    for (group.value.tracking_issues) |issue| try urls.append(gpa, issue.url);
+    try urls.append(gpa, url);
+    const options: er.TrackingIssuesOptions = .{ .status = group.value.status };
+
+    var request = try client.group(group_id).setTrackingIssuesRequest(urls.items, options);
+    defer request.deinit();
+    if (!confirm(request.value)) return false;
+    var linked = try client.group(group_id).setTrackingIssues(urls.items, options);
+    defer linked.deinit();
+    return true;
+}
+// end snippet
+
+fn confirmLink(request: er.PreparedRequest) bool {
+    const body =
+        \\{"groupId":"fakeG1","trackingIssues":[{"url":"https://tracker.example.com/BUG-1"},{"url":"https://tracker.example.com/BUG-2"}],"resolutionStatus":"ACKNOWLEDGED"}
+    ;
+    return request.method == .PUT and
+        std.mem.eql(u8, request.url, "https://clouderrorreporting.googleapis.com/v1beta1/projects/my-project/groups/fakeG1?prettyPrint=false") and
+        std.mem.eql(u8, request.body, body);
+}
+
+fn declineLink(request: er.PreparedRequest) bool {
+    _ = request;
+    return false;
+}
+
 const Row = struct { group_id: []const u8, headline: []const u8, count: u64, new: bool, trend: [24]u64 };
 
 // snippet: er-fake
@@ -1689,6 +1731,19 @@ test "the Error Reporting guides' code, against a fake" {
     defer client.deinit();
     try resolve(&client, id);
     try std.testing.expectEqual(.resolved, fake.status(id).?);
+
+    var acked = try client.group(id).setStatus(.acknowledged);
+    acked.deinit();
+    try std.testing.expect(try linkIssue(std.testing.allocator, &client, id, "https://tracker.example.com/BUG-1", confirmLink) == false);
+    var first = try client.group(id).setTrackingIssues(&.{"https://tracker.example.com/BUG-1"}, .{ .status = .acknowledged });
+    first.deinit();
+    try std.testing.expect(try linkIssue(std.testing.allocator, &client, id, "https://tracker.example.com/BUG-2", confirmLink));
+    try std.testing.expect(!try linkIssue(std.testing.allocator, &client, id, "https://tracker.example.com/BUG-3", declineLink));
+    var linked = try client.group(id).get();
+    defer linked.deinit();
+    try std.testing.expectEqual(.acknowledged, linked.value.status);
+    try std.testing.expectEqual(2, linked.value.tracking_issues.len);
+    try std.testing.expectEqualStrings("https://tracker.example.com/BUG-2", linked.value.tracking_issues[1].url);
 }
 
 const monitoring = @import("monitoring");

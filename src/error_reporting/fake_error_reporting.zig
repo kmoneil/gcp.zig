@@ -1,7 +1,8 @@
 //! Cloud Error Reporting for tests, behind the `Transport` seam: errors a
 //! test reports, grouped and counted, listed and read as production
 //! answered when measured on 2026-10-18 (milestone 0 of the Error Reporting
-//! spec, `_tmp/er-m0/`; the answers are kept verbatim in
+//! spec, `_tmp/er-m0/`), its tracking issues on 2026-11-06
+//! (`_tmp/er-313-m0/`; the answers are kept verbatim in
 //! `production_bodies.zig`, and a test holds this fake's refusals to them
 //! word for word). It parses requests with code of its own, so a request
 //! this library builds wrong is refused here as production would refuse it.
@@ -24,6 +25,9 @@
 //! - Status: a muted group is left out of group stats, even asked for by
 //!   id, and its new errors are dropped; a resolved group with a new error
 //!   is open again; an update replaces the tracking issues it leaves out.
+//! - Tracking issues: kept in the order sent, duplicates too, any string
+//!   as a URL, as production keeps them; one with no URL or an empty one
+//!   is kept as an issue without one and answered `{}`.
 //! - Events: newest first, 30 days when no period is asked.
 //! - Paging: the server's default of 20, tokens that are positions. One it
 //!   did not issue is production's 400.
@@ -31,7 +35,8 @@
 //!   region holds none.
 //! - Refusals in production's words: an id that names no group (400, never
 //!   404), events without a group id, buckets too narrow, a status that is
-//!   not one; the API off (`setApiEnabled`); the per-user quota as an
+//!   not one, a tracking issue with a field it does not have, an update
+//!   over 1 MiB; the API off (`setApiEnabled`); the per-user quota as an
 //!   option; and faults a test asks for.
 //!
 //! The representative is the group's first error to arrive in the period,
@@ -98,6 +103,7 @@ pub const FakeErrorReporting = struct {
         name: []const u8,
         key: []const u8,
         status: types.Status = .open,
+        /// "" for an issue stored with no URL.
         issues: []const []const u8 = &.{},
         /// Arrival order: the first is the one that made the group.
         events: std.ArrayList(types.Event) = .empty,
@@ -380,6 +386,7 @@ pub const FakeErrorReporting = struct {
     }
 
     fn update(f: *FakeErrorReporting, arena: Allocator, g: *Stored, body: []const u8) Allocator.Error!Reply {
+        if (body.len > validate.max_body_bytes) return fail(arena, 400, "INVALID_ARGUMENT", "Request payload size exceeds the limit: 1048576 bytes.");
         const value = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received."),
@@ -398,21 +405,35 @@ pub const FakeErrorReporting = struct {
             .null => {},
             else => return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received."),
         };
-        // Production replaces what an update leaves out: no issues sent is
-        // none kept.
-        var issues: std.ArrayList([]const u8) = .empty;
-        if (value.object.get("trackingIssues")) |list| {
-            if (list != .array and list != .null) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
-            if (list == .array) for (list.array.items) |item| {
-                if (item != .object) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
-                const url = item.object.get("url") orelse continue;
-                if (url != .string) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
-                try issues.append(f.store.allocator(), try f.store.allocator().dupe(u8, url.string));
-            };
-        }
+        var issues: []const []const u8 = &.{};
+        if (try f.issuesOf(arena, value, &issues)) |refused| return refused;
         g.status = new_status;
-        g.issues = issues.items;
+        g.issues = issues;
         return .{ .status = 200, .body = try render(arena, g) };
+    }
+
+    /// The tracking issues an update sends into `out`, or production's
+    /// refusal of them. Production replaces what an update leaves out: no
+    /// issues sent is none kept. It stored an issue with no URL, and one
+    /// with an empty URL, as an issue without one.
+    fn issuesOf(f: *FakeErrorReporting, arena: Allocator, value: std.json.Value, out: *[]const []const u8) Allocator.Error!?Reply {
+        const list = value.object.get("trackingIssues") orelse return null;
+        if (list == .null) return null;
+        if (list != .array) return try fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        const store = f.store.allocator();
+        var issues: std.ArrayList([]const u8) = .empty;
+        for (list.array.items, 0..) |item, i| {
+            if (item != .object) return try fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+            for (item.object.keys()) |key| if (!std.mem.eql(u8, key, "url")) {
+                const where = try arena.print("group.tracking_issues[{d}]", .{i});
+                return try fieldRefusal(arena, where, try arena.print("Invalid JSON payload received. Unknown name \"{s}\" at '{s}': Cannot find field.", .{ key, where }));
+            };
+            const url = item.object.get("url") orelse std.json.Value{ .string = "" };
+            if (url != .string) return try fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+            try issues.append(store, try store.dupe(u8, url.string));
+        }
+        out.* = issues.items;
+        return null;
     }
 };
 
@@ -581,8 +602,11 @@ fn writeGroup(jw: *Stringify, g: *const FakeErrorReporting.Stored) Stringify.Err
         try jw.beginArray();
         for (g.issues) |url| {
             try jw.beginObject();
-            try jw.objectField("url");
-            try jw.write(url);
+            // Production answers an issue stored with no URL as {}.
+            if (url.len > 0) {
+                try jw.objectField("url");
+                try jw.write(url);
+            }
             try jw.endObject();
         }
         try jw.endArray();
@@ -1366,6 +1390,79 @@ test "updates as production takes them: a status by number, and what is not a gr
     try testing.expectEqual(501, (try r.raw(a, .POST, path, "{}")).status);
     try testing.expectEqual(501, (try r.raw(a, .DELETE, "/v1beta1/projects/my-project/groupStats", null)).status);
     try testing.expectEqual(null, r.fake.status("fakeG99"));
+}
+
+test "tracking issues as production keeps them: any string, an empty one as none, and its two refusals" {
+    var r: Rig = undefined;
+    try r.init(.{}, null);
+    defer r.deinit();
+    const g = try r.fill();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try a.print("/v1beta1/projects/my-project/groups/{s}", .{g.java});
+    const kept = try r.raw(a, .PUT, path,
+        \\{"trackingIssues":[{},{"url":""},{"url":"javascript:alert(313)"},{"url":"a\nb"},{"url":"a\nb"}],"resolutionStatus":"MUTED"}
+    );
+    try testing.expectEqual(200, kept.status);
+    try testing.expect(std.mem.indexOf(u8, kept.body,
+        \\"trackingIssues":[{},{},{"url":"javascript:alert(313)"},{"url":"a\nb"},{"url":"a\nb"}]
+    ) != null);
+    var read = try r.client.group(g.java).get();
+    defer read.deinit();
+    try testing.expectEqual(.muted, read.value.status);
+    try testing.expectEqual(5, read.value.tracking_issues.len);
+    try testing.expectEqualStrings("", read.value.tracking_issues[0].url);
+    try testing.expectEqualStrings("", read.value.tracking_issues[1].url);
+    try testing.expectEqualStrings("a\nb", read.value.tracking_issues[4].url);
+    // null clears them, as [] does and as leaving them out does.
+    const cleared = try r.raw(a, .PUT, path,
+        \\{"trackingIssues":null,"resolutionStatus":"MUTED"}
+    );
+    try testing.expectEqual(200, cleared.status);
+    try testing.expect(std.mem.indexOf(u8, cleared.body, "trackingIssues") == null);
+
+    // Production's two refusals, in its words, the issues left as they were.
+    const field = try r.raw(a, .PUT, path,
+        \\{"trackingIssues":[{"url":"https://example.com/issues/zigps-313","zigps":1}]}
+    );
+    try testing.expectEqual(bodies.refused_issue_field_status, field.status);
+    try testing.expectEqualStrings(try messageOf(a, bodies.refused_issue_field), try messageOf(a, field.body));
+    try testing.expect(std.mem.indexOf(u8, field.body,
+        \\"field":"group.tracking_issues[0]"
+    ) != null);
+    const head =
+        \\{"trackingIssues":[{"url":"https://example.com/
+    ;
+    const tail =
+        \\"}],"resolutionStatus":"OPEN"}
+    ;
+    const big = try a.alloc(u8, validate.max_body_bytes + 1);
+    @memcpy(big[0..head.len], head);
+    @memset(big[head.len .. big.len - tail.len], 'z');
+    @memcpy(big[big.len - tail.len ..], tail);
+    const too_big = try r.raw(a, .PUT, path, big);
+    try testing.expectEqual(bodies.refused_payload_size_status, too_big.status);
+    try testing.expectEqualStrings(try messageOf(a, bodies.refused_payload_size), try messageOf(a, too_big.body));
+    try testing.expectEqual(.muted, r.fake.status(g.java).?);
+
+    // A body of exactly 1 MiB is taken.
+    const limit = big[0..validate.max_body_bytes];
+    @memcpy(limit[limit.len - tail.len ..], tail);
+    try testing.expectEqual(200, (try r.raw(a, .PUT, path, limit)).status);
+    try testing.expectEqual(.open, r.fake.status(g.java).?);
+
+    // Through the client, from the read: the status goes back with them.
+    var muted = try r.client.group(g.py).setStatus(.muted);
+    defer muted.deinit();
+    var set = try r.client.group(g.py).setTrackingIssues(&.{"https://example.com/issues/zigps-313"}, .{ .status = muted.value.status });
+    defer set.deinit();
+    try testing.expectEqual(.muted, set.value.status);
+    try testing.expectEqual(1, set.value.tracking_issues.len);
+    try testing.expectEqualStrings("https://example.com/issues/zigps-313", set.value.tracking_issues[0].url);
+    var again = try r.client.group(g.py).get();
+    defer again.deinit();
+    try testing.expectEqualStrings("https://example.com/issues/zigps-313", again.value.tracking_issues[0].url);
 }
 
 test "a refusal a test asks for, in production's shape for each status" {

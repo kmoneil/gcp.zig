@@ -4,7 +4,8 @@
 //! `Client.groupStats` lists what each group's errors in a period came to,
 //! with timed counts for a trend chart; `Client.events` lists one group's
 //! errors with their stack traces; `Client.group(id)` reads a group, the
-//! only way to see a muted one, and sets its status. Counts are estimates:
+//! only way to see a muted one, and sets its status or its tracking
+//! issues, the second with its exact request first. Counts are estimates:
 //! Error Reporting samples. Data is kept 30 days. No errors are reported:
 //! this module reads them.
 //!
@@ -42,6 +43,9 @@ pub const ServiceContext = @import("types.zig").ServiceContext;
 pub const GroupStatsOptions = @import("types.zig").GroupStatsOptions;
 pub const EventsOptions = @import("types.zig").EventsOptions;
 pub const TrackingIssue = @import("types.zig").TrackingIssue;
+pub const TrackingIssuesOptions = @import("types.zig").TrackingIssuesOptions;
+/// A request built without sending it: `GroupRef.setTrackingIssuesRequest`.
+pub const PreparedRequest = core.PreparedRequest;
 pub const Group = @import("types.zig").Group;
 pub const HttpRequest = @import("types.zig").HttpRequest;
 pub const SourceLocation = @import("types.zig").SourceLocation;

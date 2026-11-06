@@ -4,6 +4,25 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.68.0 (unreleased)
+
+- error_reporting: `Client.group(id).setTrackingIssues(urls, options)`
+  sets a group's links to issues in a tracker, for issue #313, and
+  `setTrackingIssuesRequest` with the same arguments builds its exact
+  request without sending it, for a confirmation. One update, which
+  sends back `options.status`, the status from the read the change was
+  decided on, since an update replaces the whole group. Production
+  stores any string as a URL (measured 2026-11-06), so the client sends
+  only web links, absolute `http` or `https` URLs with a host in RFC
+  3986's characters, and refuses others unsent with
+  `error.InvalidOptions`, as it does a request over production's 1 MiB.
+  `FakeErrorReporting` keeps an issue sent with no URL as production
+  does, where it dropped it, and refuses an unknown field in an issue
+  and an update over 1 MiB in production's words. No call changes.
+- auth, billing, bigquery, compute, core, dataflow, datatransfer,
+  firestore, kms, logging, monitoring, pubsub, resource_manager, run,
+  scheduler, secret_manager and storage: unchanged.
+
 ## 0.67.0 (2026-11-05)
 
 - monitoring: `FakeMonitoring` holds Pub/Sub's

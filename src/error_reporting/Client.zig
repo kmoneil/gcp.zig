@@ -23,6 +23,7 @@ const Budget = budget_mod.Budget;
 const Diagnostics = core.Diagnostics;
 const Error = errors.Error;
 const HttpTransport = core.transport.HttpTransport;
+const PreparedRequest = core.PreparedRequest;
 const RetryPolicy = core.RetryPolicy;
 const TokenProvider = core.TokenProvider;
 const Transport = core.transport.Transport;
@@ -229,8 +230,8 @@ pub fn events(self: *Client, group_id: []const u8, options: types.EventsOptions)
     return .{ .client = self, .arena = arena, .path = path };
 }
 
-/// One group, to read or to set its status. Nothing is sent, nothing is
-/// checked until a call.
+/// One group, to read it or to set its status or its tracking issues.
+/// Nothing is sent, nothing is checked until a call.
 pub fn group(self: *Client, group_id: []const u8) GroupRef {
     return .{ .client = self, .id = group_id };
 }
@@ -276,6 +277,72 @@ pub const GroupRef = struct {
         const answer = try rpc.call(c, &response, .PUT, path, body, false);
         result.value = codec.decodeGroup(result.arena.allocator(), scratch.allocator(), answer) catch |err| return rpc.decodeFailed(c, err, "group");
         return result;
+    }
+
+    /// Sets the group's tracking issues to `urls`, in order: its links to
+    /// an issue tracker. `&.{}` removes them all. The API replaces the
+    /// whole group, so `options.status`, the status in the read this
+    /// change was decided on, goes back with them; a status changed by
+    /// someone else since that read is overwritten, as the API has no etag.
+    /// One call against the budget, retried as reads are, since the same
+    /// PUT again changes nothing. Answers the group as written.
+    ///
+    /// Production stores any string as a URL (measured 2026-11-06:
+    /// `javascript:` links, newlines, no scheme), so this sends only web
+    /// links: each an absolute `http` or `https` URL with a host, in the
+    /// characters RFC 3986 allows, anything else percent-encoded. Another
+    /// is `error.InvalidOptions`, unsent, naming which; so is a request
+    /// over production's 1 MiB. Reads keep what is stored, whoever set it.
+    pub fn setTrackingIssues(self: GroupRef, urls: []const []const u8, options: types.TrackingIssuesOptions) Error!types.Owned(types.Group) {
+        const c = self.client;
+        rpc.begin(c);
+        var result: types.Owned(types.Group) = try .init(c.gpa);
+        errdefer result.deinit();
+        var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+        defer scratch.deinit();
+        const put = try self.trackingIssuesCall(scratch.allocator(), urls, options);
+        var response: std.heap.ArenaAllocator = .init(c.gpa);
+        defer response.deinit();
+        const answer = try rpc.call(c, &response, .PUT, put.path, put.body, false);
+        result.value = codec.decodeGroup(result.arena.allocator(), scratch.allocator(), answer) catch |err| return rpc.decodeFailed(c, err, "group");
+        return result;
+    }
+
+    /// The request `setTrackingIssues` sends for the same arguments, built
+    /// without sending it, after the same checks with the same errors: to
+    /// show before the call, or to record after it. Credentials and other
+    /// headers are not part of it.
+    pub fn setTrackingIssuesRequest(self: GroupRef, urls: []const []const u8, options: types.TrackingIssuesOptions) Error!types.Owned(PreparedRequest) {
+        const c = self.client;
+        rpc.begin(c);
+        var result: types.Owned(PreparedRequest) = try .init(c.gpa);
+        errdefer result.deinit();
+        const a = result.arena.allocator();
+        const put = try self.trackingIssuesCall(a, urls, options);
+        result.value = try .fromCall(a, c.base_url, .{ .method = .PUT, .path = put.path, .body = put.body });
+        return result;
+    }
+
+    const Put = struct { path: []const u8, body: []const u8 };
+
+    fn trackingIssuesCall(self: GroupRef, arena: Allocator, urls: []const []const u8, options: types.TrackingIssuesOptions) Error!Put {
+        const c = self.client;
+        if (options.status == .unknown) {
+            if (c.diagnostics) |d| d.print("invalid status: .unknown is what this version cannot name, never one to set", .{});
+            return error.InvalidOptions;
+        }
+        try c.onePlace("a group");
+        const path = try self.route(arena);
+        for (urls, 0..) |url, i| if (validate.trackingIssueProblem(url)) |problem| {
+            if (c.diagnostics) |d| d.print("invalid tracking issue urls[{d}]: {s}", .{ i, problem });
+            return error.InvalidOptions;
+        };
+        const body = try codec.encodeTrackingIssues(arena, self.id, urls, options.status);
+        if (body.len > validate.max_body_bytes) {
+            if (c.diagnostics) |d| d.print("invalid tracking issues: the request would be {d} bytes, and production takes at most {d}", .{ body.len, validate.max_body_bytes });
+            return error.InvalidOptions;
+        }
+        return .{ .path = path, .body = body };
     }
 
     fn read(self: GroupRef, out: Allocator) Error!types.Group {
@@ -402,6 +469,8 @@ test "every region reads group stats only: events and groups need one place" {
     try testing.expectEqualStrings("events need one location; - reads group stats only", h.diag.message());
     try testing.expectError(error.InvalidOptions, h.client.group("G").get());
     try testing.expectError(error.InvalidOptions, h.client.group("G").setStatus(.resolved));
+    try testing.expectError(error.InvalidOptions, h.client.group("G").setTrackingIssues(&.{}, .{ .status = .open }));
+    try testing.expectError(error.InvalidOptions, h.client.group("G").setTrackingIssuesRequest(&.{}, .{ .status = .open }));
     var q = try h.client.groupStats(.{});
     defer q.deinit();
     var page = try q.page(null);
@@ -428,6 +497,94 @@ test "setStatus reads the group, then puts it back whole: its tracking issues ke
     try testing.expectEqual(1, g.value.tracking_issues.len);
     try testing.expectError(error.InvalidOptions, h.client.group("G").setStatus(.unknown));
     try h.expectRequestCount(2);
+}
+
+test "setTrackingIssues: one PUT with the status from the read, and its request byte for byte" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        ok(bodies.group_two_issues),
+        refused(503, "{\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\"}}"),
+        ok(
+            \\{"name":"projects/extractctl/groups/CNLXm_X6--zSSQ","groupId":"CNLXm_X6--zSSQ","resolutionStatus":"OPEN"}
+        ),
+        ok(bodies.group_issue_without_url),
+    }, .{ .location = "global" });
+    defer h.deinit();
+    const g = h.client.group("CNLXm_X6--zSSQ");
+    const urls = [_][]const u8{ "https://example.com/issues/zigps-313-b", "https://example.com/issues/zigps-313-a" };
+    const url = base ++ "/locations/global/groups/CNLXm_X6--zSSQ?prettyPrint=false";
+    const body =
+        \\{"groupId":"CNLXm_X6--zSSQ","trackingIssues":[{"url":"https://example.com/issues/zigps-313-b"},{"url":"https://example.com/issues/zigps-313-a"}],"resolutionStatus":"ACKNOWLEDGED"}
+    ;
+    var shown = try g.setTrackingIssuesRequest(&urls, .{ .status = .acknowledged });
+    defer shown.deinit();
+    try h.expectRequestCount(0);
+    try testing.expectEqual(.PUT, shown.value.method);
+    try testing.expectEqualStrings(url, shown.value.url);
+    try testing.expectEqualStrings(body, shown.value.body);
+
+    var set = try g.setTrackingIssues(&urls, .{ .status = .acknowledged });
+    defer set.deinit();
+    try h.expectRequest(0, .PUT, url, body);
+    try testing.expectEqual(.acknowledged, set.value.status);
+    try testing.expectEqual(2, set.value.tracking_issues.len);
+    try testing.expectEqualStrings(urls[0], set.value.tracking_issues[0].url);
+    try testing.expectEqualStrings(urls[1], set.value.tracking_issues[1].url);
+
+    // None is an empty list, so the request shows the removal; a 5xx is
+    // retried, as the same PUT again changes nothing.
+    var cleared = try g.setTrackingIssues(&.{}, .{ .status = .open });
+    defer cleared.deinit();
+    const none =
+        \\{"groupId":"CNLXm_X6--zSSQ","trackingIssues":[],"resolutionStatus":"OPEN"}
+    ;
+    try h.expectRequest(1, .PUT, url, none);
+    try h.expectRequest(2, .PUT, url, none);
+    try testing.expectEqual(0, cleared.value.tracking_issues.len);
+    try testing.expectEqual(.open, cleared.value.status);
+
+    // An issue stored with no URL, which production answers as {}, reads
+    // as an empty one.
+    var read = try g.get();
+    defer read.deinit();
+    try testing.expectEqual(1, read.value.tracking_issues.len);
+    try testing.expectEqualStrings("", read.value.tracking_issues[0].url);
+    try h.expectRequestCount(4);
+}
+
+test "setTrackingIssues: what it will not send is refused unsent, saying which" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{}, .{});
+    defer h.deinit();
+    const g = h.client.group("CNLXm_X6--zSSQ");
+    const open: types.TrackingIssuesOptions = .{ .status = .open };
+    try testing.expectError(error.InvalidOptions, g.setTrackingIssues(&.{"https://example.com/1"}, .{ .status = .unknown }));
+    try testing.expectEqualStrings("invalid status: .unknown is what this version cannot name, never one to set", h.diag.message());
+    try testing.expectError(error.InvalidOptions, g.setTrackingIssuesRequest(&.{"https://example.com/1"}, .{ .status = .unknown }));
+    try testing.expectError(error.InvalidOptions, g.setTrackingIssues(&.{ "https://example.com/1", "javascript:alert(313)" }, open));
+    try testing.expectEqualStrings("invalid tracking issue urls[1]: expected an absolute http or https URL with a host", h.diag.message());
+    try testing.expectError(error.InvalidOptions, g.setTrackingIssuesRequest(&.{"https://example.com/a b"}, open));
+    try testing.expect(std.mem.startsWith(u8, h.diag.message(), "invalid tracking issue urls[0]: a character a URL must percent-encode"));
+    try testing.expectError(error.InvalidName, h.client.group("a/b").setTrackingIssues(&.{}, open));
+    try testing.expectError(error.InvalidName, h.client.group("a/b").setTrackingIssuesRequest(&.{}, open));
+
+    // Production's limit to the byte: a request of 1 MiB is built, one a
+    // byte longer is not.
+    const empty_url =
+        \\{"groupId":"CNLXm_X6--zSSQ","trackingIssues":[{"url":""}],"resolutionStatus":"OPEN"}
+    ;
+    const head = "https://example.com/";
+    const long = try testing.allocator.alloc(u8, validate.max_body_bytes - empty_url.len + 1);
+    defer testing.allocator.free(long);
+    @memcpy(long[0..head.len], head);
+    @memset(long[head.len..], 'z');
+    try testing.expectError(error.InvalidOptions, g.setTrackingIssues(&.{long}, open));
+    try testing.expectEqualStrings("invalid tracking issues: the request would be 1048577 bytes, and production takes at most 1048576", h.diag.message());
+    try testing.expectError(error.InvalidOptions, g.setTrackingIssuesRequest(&.{long}, open));
+    var at_limit = try g.setTrackingIssuesRequest(&.{long[0 .. long.len - 1]}, open);
+    defer at_limit.deinit();
+    try testing.expectEqual(validate.max_body_bytes, at_limit.value.body.len);
+    try h.expectRequestCount(0);
 }
 
 test "production's refusals, each as an error of its own" {
@@ -594,7 +751,7 @@ test "an answer that does not decode is InvalidResponse, and says what" {
 test "every allocation failure is OutOfMemory without leaks" {
     const Run = struct {
         fn run(gpa: Allocator) !void {
-            var fake: test_util.FakeTransport = .init(testing.allocator, &.{ ok(bodies.group_stats_timed_end), ok(bodies.events_page), ok(bodies.group_with_issue), ok(bodies.group_with_issue) });
+            var fake: test_util.FakeTransport = .init(testing.allocator, &.{ ok(bodies.group_stats_timed_end), ok(bodies.events_page), ok(bodies.group_with_issue), ok(bodies.group_with_issue), ok(bodies.group_two_issues) });
             defer fake.deinit();
             var clock: test_util.FakeClock = .{};
             var token: test_util.FakeTokenProvider = .{ .token = "t" };
@@ -610,6 +767,11 @@ test "every allocation failure is OutOfMemory without leaks" {
             events_page.deinit();
             var g = try client.group("G").setStatus(.muted);
             g.deinit();
+            const urls = [_][]const u8{ "https://example.com/issues/1", "https://example.com/issues/2" };
+            var shown = try client.group("G").setTrackingIssuesRequest(&urls, .{ .status = .open });
+            shown.deinit();
+            var set = try client.group("G").setTrackingIssues(&urls, .{ .status = .open });
+            set.deinit();
         }
     };
     try testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});

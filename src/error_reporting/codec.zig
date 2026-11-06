@@ -52,6 +52,35 @@ pub fn encodeGroup(arena: Allocator, g: types.Group, new_status: types.Status) A
     return out.toOwnedSlice();
 }
 
+/// The body `setTrackingIssues` sends: the group by id, the issues in
+/// order, `[]` for none so that a confirmation shows the removal, and the
+/// status kept. No name: the URL names the group, and production takes an
+/// update without one.
+pub fn encodeTrackingIssues(arena: Allocator, id: []const u8, urls: []const []const u8, kept: types.Status) Allocator.Error![]u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
+    writeTrackingIssues(&jw, id, urls, kept) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeTrackingIssues(jw: *std.json.Stringify, id: []const u8, urls: []const []const u8, kept: types.Status) std.json.Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("groupId");
+    try jw.write(id);
+    try jw.objectField("trackingIssues");
+    try jw.beginArray();
+    for (urls) |url| {
+        try jw.beginObject();
+        try jw.objectField("url");
+        try jw.write(url);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.objectField("resolutionStatus");
+    try jw.write(kept.wire());
+    try jw.endObject();
+}
+
 fn writeGroup(jw: *std.json.Stringify, g: types.Group, new_status: types.Status) std.json.Stringify.Error!void {
     try jw.beginObject();
     try jw.objectField("name");

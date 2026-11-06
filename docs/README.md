@@ -91,7 +91,7 @@ Google, not only what Google documents, and where the emulators differ.
 
 | Guide | What's in it |
 | --- | --- |
-| [Overview](error_reporting/README.md) | A dashboard's first program, periods and buckets, statuses and muted groups, the quota, locations, and what production showed when measured |
+| [Overview](error_reporting/README.md) | A dashboard's first program, periods and buckets, statuses and muted groups, tracking issues with the exact request first, the quota, locations, and what production showed when measured |
 | [Testing](error_reporting/testing.md) | An in-memory Error Reporting for your own tests, held to production's answers |
 
 ## 📈 Monitoring
