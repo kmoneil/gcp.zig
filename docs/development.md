@@ -329,6 +329,22 @@ GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth print-access-token) \
     DATATRANSFER_TEST=1 zig build test-integration-gcp -Dtest-filter="datatransfer:"
 ```
 
+### Service Usage
+
+Service Usage has no emulator, so its suite needs a token for the
+`cloud-platform` or `cloud-platform.read-only` scope whose principal may
+list the project's services (Viewer). It reads only, about a dozen
+calls: the enabled list a page at a time and whole, a page of the
+disabled list, gets and batches, and production's refusals. Then it
+runs the same script on `FakeServiceUsage` seeded from production's
+answers, failing on any outcome the two do not share or any success
+body that differs by a byte, page tokens aside. A few seconds.
+
+```sh
+GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth print-access-token) \
+    SERVICE_USAGE_TEST=1 zig build test-integration-gcp -Dtest-filter="service_usage:"
+```
+
 ### Secret Manager and bucket settings
 
 Secret Manager has no emulator, so its tests need a real project. They

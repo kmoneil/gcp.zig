@@ -651,6 +651,13 @@ jobs:
         # 0.6 ms a run together on the Mac (200K in 122 s with the build
         # cached, clean), so 2000K, about 81 minutes at four times the
         # Mac, to be priced by its first nights.
+        # service_usage (0.69.0) starts at estimates from a local run: its
+        # two fuzz properties (the decoders, and the fake's three lists
+        # read to their end at random page sizes against a model, with a
+        # batch in the order asked) took about 0.45 ms a run together on
+        # the Mac (200K in 91 s with the build cached, clean), so 2500K,
+        # about 76 minutes at four times the Mac, to be priced by its
+        # first nights.
         # fake-storage (0.65.0) holds FakeStorage's page walks to a model:
         # up to 24 objects under a random prefix and delimiter, read a page
         # at a time, about 1 ms a run on the Mac (20K in 20 s with the
@@ -702,6 +709,7 @@ jobs:
           - { job: compute, module: compute, filter: fuzz, iterations: 700K }
           - { job: slow-compute, module: compute, filter: slow property, iterations: 250K }
           - { job: billing, module: billing, filter: fuzz, iterations: 2000K }
+          - { job: service_usage, module: service_usage, filter: fuzz, iterations: 2500K }
           - { job: slow-datatransfer, module: datatransfer, filter: slow property, iterations: 1400K }
     runs-on: ubuntu-latest
     timeout-minutes: 180
