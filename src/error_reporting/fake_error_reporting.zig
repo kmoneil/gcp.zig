@@ -17,7 +17,8 @@
 //!   distinct users (by `user` alone: production counted no error that
 //!   named only a remote address), every
 //!   timed bucket in both alignments, at most 100 a period; first seen is
-//!   the time of the group's first error to arrive, last seen the latest
+//!   the time of the group's first error to arrive (production's can be an
+//!   older error it processed with that one), last seen the latest
 //!   error's time in whole seconds, both whatever the period; the services
 //!   with errors, in the order they first had one; every order, ties in the
 //!   order the groups were made; groups with no errors in the period left

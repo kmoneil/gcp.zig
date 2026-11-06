@@ -230,7 +230,10 @@ fake to production query by query. What that changed:
   different services, and of different deployments, share a group.
 - **First seen is the time of the group's first error processed**, and
   reports sent together are not processed in order. "Newest first by
-  creation" orders by first seen.
+  creation" orders by first seen. An older error processed with the first
+  can be first seen instead: on 2026-11-06, errors sent seconds after a
+  group's first moved it to the oldest of them in one run of three, and
+  errors sent minutes after never did. A client cannot tell which.
 - **An error showed within seconds** of being reported.
 
 ## Not here

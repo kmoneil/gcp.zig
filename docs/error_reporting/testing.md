@@ -55,7 +55,9 @@ fn dashboardTest(gpa: std.mem.Allocator) !void {
   users by `user`; every bucket in both alignments, at most 100 a period;
   first seen as the first error to arrive, last seen as the latest in
   whole seconds; the services with errors; every order; groups with no
-  errors in the period left out unless asked for by id.
+  errors in the period left out unless asked for by id. Production's first
+  seen can be an older error processed with the first; a test whose
+  later errors are older than its first should not rely on either.
 - **Statuses**: a muted group hidden, even by id, its new errors dropped;
   a resolved group reopened by a new error; an update that clears the
   tracking issues it leaves out.
