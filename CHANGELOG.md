@@ -4,6 +4,31 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.69.0 (unreleased)
+
+- service_usage: a new module, **experimental**, for the Service Usage
+  API, v1, read only, for issue #316. `Client.enabledServices` reads
+  every service a project has enabled, and `listServices` one page in
+  name order, the enabled ones unless `options.state` asks for the
+  disabled ones or every one: production has no "enabled first", and
+  its other lists held all 13,018 public services, 66 pages under a
+  quota of 60 lists a minute (measured 2026-11-06). `getService` says
+  whether one service is enabled, and `getServices` up to 30 at once in
+  the order asked. Each `Service` has its name, title, summary, state
+  and project number; every call asks for only those fields, since a
+  service's whole configuration is large (Compute Engine's was 1.39
+  MB). The client refuses a name outside `a-z`, `0-9`, `.` and `-`
+  unsent with `error.InvalidName`, saying which byte, as it does a page
+  size over 200 and a batch of none or more than 30 with
+  `error.InvalidOptions`. A service production does not know is
+  `error.PermissionDenied`, as production cannot say whether it is
+  missing or hidden. `service_usage.testing.FakeServiceUsage` answers
+  as production did, byte for byte, refusals in its words.
+- auth, billing, bigquery, compute, core, dataflow, datatransfer,
+  error_reporting, firestore, kms, logging, monitoring, pubsub,
+  resource_manager, run, scheduler, secret_manager and storage:
+  unchanged.
+
 ## 0.68.0 (2026-11-06)
 
 - error_reporting: `Client.group(id).setTrackingIssues(urls, options)`

@@ -3179,3 +3179,85 @@ test "a bucket browsed as a console shows it, from the in-memory Cloud Storage" 
     try std.testing.expectEqualStrings("day,total", preview.value.data);
 }
 // end snippet
+
+const service_usage = @import("service_usage");
+
+// snippet: su-first
+/// A project's enabled APIs, then whether the one a failed call named is
+/// on, as a console's panel would say it.
+fn apiPanel(client: *service_usage.Client, out: *std.Io.Writer, failed_api: []const u8) !void {
+    var enabled = try client.enabledServices();
+    defer enabled.deinit();
+    for (enabled.value) |api| try out.print("{s}  {s}\n", .{ api.name, api.title });
+
+    var one = try client.getService(failed_api);
+    defer one.deinit();
+    switch (one.value.state) {
+        .enabled => try out.print("{s} is on\n", .{one.value.title}),
+        .disabled, .unknown => try out.print("{s} is off in this project\n", .{one.value.title}),
+    }
+}
+// end snippet
+
+test "the Service Usage guide's code, against the in-memory Service Usage" {
+    var fake: service_usage.testing.FakeServiceUsage = .init(std.testing.allocator, std.testing.io, .{ .project_id = "my-project" });
+    defer fake.deinit();
+    try fake.putService(.{ .name = "pubsub.googleapis.com", .title = "Cloud Pub/Sub API", .state = .enabled });
+    try fake.putService(.{ .name = "serviceusage.googleapis.com", .title = "Service Usage API", .state = .enabled });
+    try fake.putService(.{ .name = "dataflow.googleapis.com", .title = "Dataflow API" });
+    var token: service_usage.StaticToken = .{ .token = "none" };
+    var client = try service_usage.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try apiPanel(&client, &w, "dataflow.googleapis.com");
+    try std.testing.expectEqualStrings(
+        \\pubsub.googleapis.com  Cloud Pub/Sub API
+        \\serviceusage.googleapis.com  Service Usage API
+        \\Dataflow API is off in this project
+        \\
+    , w.buffered());
+    w = .fixed(&buf);
+    try apiPanel(&client, &w, "pubsub.googleapis.com");
+    try std.testing.expect(std.mem.endsWith(u8, w.buffered(), "Cloud Pub/Sub API is on\n"));
+    try std.testing.expectError(error.InvalidName, apiPanel(&client, &w, "Dataflow"));
+}
+
+// snippet: su-fake
+test "an API-off panel says whether the API is on, from the in-memory Service Usage" {
+    var fake: service_usage.testing.FakeServiceUsage = .init(std.testing.allocator, std.testing.io, .{ .project_id = "my-project" });
+    defer fake.deinit();
+    // Standing in for the project's settings: one API on, one off.
+    try fake.putService(.{ .name = "pubsub.googleapis.com", .title = "Cloud Pub/Sub API", .state = .enabled });
+    try fake.putService(.{ .name = "dataflow.googleapis.com", .title = "Dataflow API" });
+
+    var token: service_usage.StaticToken = .{ .token = "none" };
+    var client = try service_usage.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+
+    // The project's list: the enabled ones only.
+    var enabled = try client.enabledServices();
+    defer enabled.deinit();
+    try std.testing.expectEqual(1, enabled.value.len);
+    try std.testing.expectEqualStrings("Cloud Pub/Sub API", enabled.value[0].title);
+
+    // A Dataflow call failed: is the API on?
+    var dataflow_api = try client.getService("dataflow.googleapis.com");
+    defer dataflow_api.deinit();
+    try std.testing.expectEqual(service_usage.State.disabled, dataflow_api.value.state);
+
+    // Turned on elsewhere, it is listed.
+    try fake.setState("dataflow.googleapis.com", .enabled);
+    var now = try client.enabledServices();
+    defer now.deinit();
+    try std.testing.expectEqual(2, now.value.len);
+}
+// end snippet

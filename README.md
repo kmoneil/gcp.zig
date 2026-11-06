@@ -65,15 +65,16 @@ Pub/Sub, Cloud Storage, Secret Manager and Firestore, with credentials that find
 | 🔁 | [`datatransfer`](docs/datatransfer/README.md) | BigQuery Data Transfer v1: scheduled queries and other transfer configs in every location, with their schedules, typed query and latest state; their runs and each run's messages; run a config now, its exact request built first and sent once; an in-memory Data Transfer for your own tests | experimental |
 | 🖥️ | [`compute`](docs/compute/README.md) | Compute Engine v1: VMs in one zone or every zone, with their status, scheduling (spot or standard, run limits), disks, network, labels, metadata and fingerprints; serial consoles and guest attributes; zones, machine types and images; creating VMs (typed, raw or from a template) and starting, stopping, suspending, resuming, resetting and deleting them; changing their labels, metadata, tags, machine type, scheduling, deletion protection and disks under fingerprints; instance templates and zonal managed groups, waited on until their VMs are up; each write previewable and carrying a request id; operations listed and waited on, with what ended a VM (a preemption, a run limit, its guest); an in-memory Compute Engine for your own tests | experimental |
 | 🧾 | [`billing`](docs/billing/README.md) | Cloud Billing Catalog v1, read only: the services Google bills for, and a service's SKUs with their list prices, the latest or every one in force over a range of time, in USD or another currency, each amount exact; Compute Engine's vCPU and memory prices, on demand and spot; an in-memory Cloud Billing Catalog for your own tests | experimental |
+| 🔌 | [`service_usage`](docs/service_usage/README.md) | Service Usage v1, read only: which APIs a project has enabled, every one at once or a page at a time, and whether one or up to 30 named are, as a panel that says an API is off asks; names checked before sending; an in-memory Service Usage for your own tests | experimental |
 | 🪪 | [`auth`](docs/auth.md) | Credentials for the other modules: the metadata server, gcloud's login, service account keys, workload identity federation and impersonation; signing on this machine or through IAM | beta |
 | ⚙️ | [`core`](docs/essentials.md) | What the service modules share: the HTTP transport, retries, `Diagnostics`, CRC-32C at the CPU's speed, IAM policies, the `TokenProvider` and `Signer` seams, and test fakes. Each service re-exports what its callers need. | beta |
 
 ```mermaid
 flowchart LR
-    app(["your program"]) --> pubsub & storage & secret_manager & firestore & logging & resource_manager & error_reporting & monitoring & kms & scheduler & run & dataflow & bigquery & datatransfer & compute & billing
+    app(["your program"]) --> pubsub & storage & secret_manager & firestore & logging & resource_manager & error_reporting & monitoring & kms & scheduler & run & dataflow & bigquery & datatransfer & compute & billing & service_usage
     app --> auth
-    auth -. credentials .-> pubsub & storage & secret_manager & firestore & logging & resource_manager & error_reporting & monitoring & kms & scheduler & run & dataflow & bigquery & datatransfer & compute & billing
-    pubsub & storage & secret_manager & firestore & logging & resource_manager & error_reporting & monitoring & kms & scheduler & run & dataflow & bigquery & datatransfer & compute & billing & auth --> core
+    auth -. credentials .-> pubsub & storage & secret_manager & firestore & logging & resource_manager & error_reporting & monitoring & kms & scheduler & run & dataflow & bigquery & datatransfer & compute & billing & service_usage
+    pubsub & storage & secret_manager & firestore & logging & resource_manager & error_reporting & monitoring & kms & scheduler & run & dataflow & bigquery & datatransfer & compute & billing & service_usage & auth --> core
 ```
 
 The service modules never import one another, or `auth`: credentials

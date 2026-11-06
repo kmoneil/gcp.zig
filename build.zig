@@ -156,6 +156,15 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "core", .module = core }},
     });
 
+    // Service Usage: which APIs a project has enabled. It imports core,
+    // never a service.
+    const service_usage = b.addModule("service_usage", .{
+        .root_source_file = b.path("src/service_usage/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core }},
+    });
+
     // Every test build runs under std's test runner with one fix, which
     // keeps std.debug from swallowing a task's cancel (see the top of
     // tools/test_runner.zig).
@@ -192,6 +201,7 @@ pub fn build(b: *std.Build) void {
         .{ "datatransfer", datatransfer },
         .{ "compute", compute },
         .{ "billing", billing },
+        .{ "service_usage", service_usage },
     };
     // The nightly fuzz job runs one module per job, so each gets the whole
     // time budget: `--fuzz=N` fuzzes every property N times, and the
@@ -199,12 +209,12 @@ pub fn build(b: *std.Build) void {
     const only_module = b.option(
         []const u8,
         "module",
-        "Run only this module's unit tests: core, auth, pubsub, secret_manager, storage, firestore, logging, resource_manager, error_reporting, monitoring, kms, scheduler, run, dataflow, bigquery, datatransfer, compute or billing",
+        "Run only this module's unit tests: core, auth, pubsub, secret_manager, storage, firestore, logging, resource_manager, error_reporting, monitoring, kms, scheduler, run, dataflow, bigquery, datatransfer, compute, billing or service_usage",
     );
     if (only_module) |name| {
         for (unit_modules) |entry| {
             if (std.mem.eql(u8, entry[0], name)) break;
-        } else std.process.fatal("-Dmodule={s} names no module; use core, auth, pubsub, secret_manager, storage, firestore, logging, resource_manager, error_reporting, monitoring, kms, scheduler, run, dataflow, bigquery, datatransfer, compute or billing", .{name});
+        } else std.process.fatal("-Dmodule={s} names no module; use core, auth, pubsub, secret_manager, storage, firestore, logging, resource_manager, error_reporting, monitoring, kms, scheduler, run, dataflow, bigquery, datatransfer, compute, billing or service_usage", .{name});
     }
     const test_step = b.step("test", "Run unit, property and fuzz-corpus tests");
     // The same tests without what `test` compiles beside them, the examples
@@ -274,6 +284,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "datatransfer", .module = datatransfer },
                 .{ .name = "compute", .module = compute },
                 .{ .name = "billing", .module = billing },
+                .{ .name = "service_usage", .module = service_usage },
                 .{ .name = "core", .module = core },
             },
         }),
@@ -711,6 +722,25 @@ pub fn build(b: *std.Build) void {
     });
     gcp_step.dependOn(&streamed(b, billing_gcp_tests).step);
     test_step.dependOn(&billing_gcp_tests.step);
+    // Service Usage against production: SERVICE_USAGE_TEST=1 beside the
+    // usual two variables. Reads only, about a dozen calls, and holds
+    // FakeServiceUsage to production's answers byte for byte.
+    const service_usage_gcp_tests = b.addTest(.{
+        .name = "service-usage-gcp-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/service_usage_gcp_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "service_usage", .module = service_usage },
+                .{ .name = "core", .module = core },
+            },
+        }),
+        .filters = test_filters,
+        .test_runner = test_runner,
+    });
+    gcp_step.dependOn(&streamed(b, service_usage_gcp_tests).step);
+    test_step.dependOn(&service_usage_gcp_tests.step);
     // The IAM reads against a real project: IAM_READS_TEST=1 beside the
     // usual two variables, a cloud-platform token. The suite reads the
     // project's policy, deploys a zigps- service and job raw and makes two
@@ -830,6 +860,7 @@ pub fn build(b: *std.Build) void {
         .{ &.{"pubsub_metrics"}, &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "monitoring", .module = monitoring }, .{ .name = "auth", .module = auth } } },
         .{ &.{"kms"}, &.{ .{ .name = "kms", .module = kms }, .{ .name = "auth", .module = auth } } },
         .{ &.{"billing_prices"}, &.{ .{ .name = "billing", .module = billing }, .{ .name = "auth", .module = auth } } },
+        .{ &.{"service_usage_list"}, &.{ .{ .name = "service_usage", .module = service_usage }, .{ .name = "auth", .module = auth } } },
         .{ &.{ "scheduler_jobs", "scheduler_run" }, &.{ .{ .name = "scheduler", .module = scheduler }, .{ .name = "auth", .module = auth } } },
         .{ &.{ "run_revisions", "run_actions", "run_service" }, &.{ .{ .name = "run", .module = cloud_run }, .{ .name = "auth", .module = auth } } },
         .{ &.{ "dataflow_jobs", "dataflow_stop" }, &.{ .{ .name = "dataflow", .module = dataflow }, .{ .name = "auth", .module = auth } } },
@@ -840,15 +871,16 @@ pub fn build(b: *std.Build) void {
         .{ &.{ "gcs_notify", "quickstart" }, &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } } },
         .{ &.{"spot_worker"}, &.{.{ .name = "auth", .module = auth }} },
     };
-    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "gcs_mv", "gcs_bucket", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "monitoring_policies", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "run_actions", "dataflow_jobs", "dataflow_stop", "bigquery_query", "datatransfer_runs", "permissions", "run_service", "compute", "billing_prices", "spot_worker" }) |name| {
+    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "gcs_mv", "gcs_bucket", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "monitoring_policies", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "run_actions", "dataflow_jobs", "dataflow_stop", "bigquery_query", "datatransfer_runs", "permissions", "run_service", "compute", "billing_prices", "service_usage_list", "spot_worker" }) |name| {
         // whoami, secret, gcs_cp, gcs_sign, gcs_notify, gcs_mv, gcs_bucket, quickstart, iam,
         // secret_rotation, firestore, logs_read, logs_tail, projects_list,
         // error_dashboard, monitoring, monitoring_alerts,
         // monitoring_policies, pubsub_metrics,
         // kms, scheduler_jobs, scheduler_run, run_revisions, run_actions, run_service,
         // dataflow_jobs, dataflow_stop, bigquery_query, datatransfer_runs,
-        // permissions, compute and billing_prices pick their own credentials;
-        // spot_worker reads the metadata server alone.
+        // permissions, compute, billing_prices and service_usage_list pick
+        // their own credentials; spot_worker reads the metadata server
+        // alone.
         const pubsub_only: []const std.Build.Module.Import = &.{.{ .name = "pubsub", .module = mod }};
         const imports = importsOf(&example_imports, name) orelse pubsub_only;
         const exe = b.addExecutable(.{

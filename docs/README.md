@@ -165,6 +165,13 @@ Google, not only what Google documents, and where the emulators differ.
 | [Overview](billing/README.md) | The Cloud Billing Catalog: the services Google bills for, and a service's SKUs with their list prices, the latest or over a range of time, in USD or another currency; how a machine's vCPU and memory are priced apart, on demand and spot; and what production showed when measured (experimental) |
 | [Testing](billing/testing.md) | An in-memory Cloud Billing Catalog for your own tests: services and SKUs with price timelines, pages, ranges and currencies held to production's answers (experimental) |
 
+## 🔌 Service Usage
+
+| Guide | What's in it |
+| --- | --- |
+| [Overview](service_usage/README.md) | Which APIs a project has enabled, every one at once or a page at a time, and whether one or up to 30 named are; why the other lists are best left alone; names, errors and what production showed when measured (experimental) |
+| [Testing](service_usage/testing.md) | An in-memory Service Usage for your own tests: services put in on or off, listed, read and batched as production answered them, byte for byte (experimental) |
+
 ## 🛠️ Working on gcp.zig
 
 | Guide | What's in it |
