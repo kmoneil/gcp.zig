@@ -59,13 +59,17 @@ fn dashboardTest(gpa: std.mem.Allocator) !void {
 - **Statuses**: a muted group hidden, even by id, its new errors dropped;
   a resolved group reopened by a new error; an update that clears the
   tracking issues it leaves out.
+- **Tracking issues** in the order sent, duplicates too, and any string
+  as a URL, as production keeps them: one with no URL, or an empty one,
+  is kept as an issue without one and answered `{}`.
 - **Events** newest first, 30 days by default; **paging** with the
   server's default of 20.
 - **Locations**: none, `global` and `-` read the same groups; any other
   region holds none.
 - **Refusals in production's words**: an unknown group (400), events
   without a group id, buckets too narrow, a status or a period that is
-  not one; the API off (`setApiEnabled`); the per-user quota as an option
+  not one, a tracking issue with a field it does not have, an update over
+  1 MiB; the API off (`setApiEnabled`); the per-user quota as an option
   (`Options.calls_per_minute`); and `refuseNext`, `refuseNextWithDelay`
   and `dropNext`.
 

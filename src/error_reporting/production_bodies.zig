@@ -1,6 +1,7 @@
 //! What production answered, measured in extractctl on 2026-10-18 UTC
-//! (`_tmp/er-m0`, run f2e07a): bodies verbatim, but for a final line break.
-//! Test code only.
+//! (`_tmp/er-m0`, run f2e07a), and its tracking issues on 2026-11-06 UTC
+//! (`_tmp/er-313-m0`, run 12785d): bodies verbatim, but for a final line
+//! break. Test code only.
 
 /// Group stats of one service over 30 days, ordered by count: two groups. HTTP 200.
 pub const group_stats_30_days =
@@ -624,3 +625,72 @@ pub const refused_bad_status =
     \\}
 ;
 pub const refused_bad_status_status = 400;
+
+/// Two tracking issues set on an acknowledged group, kept in the order
+/// sent, as groups.update answers (2026-11-06). HTTP 200.
+pub const group_two_issues =
+    \\{
+    \\  "name": "projects/extractctl/groups/CNLXm_X6--zSSQ",
+    \\  "groupId": "CNLXm_X6--zSSQ",
+    \\  "trackingIssues": [
+    \\    {
+    \\      "url": "https://example.com/issues/zigps-313-b"
+    \\    },
+    \\    {
+    \\      "url": "https://example.com/issues/zigps-313-a"
+    \\    }
+    \\  ],
+    \\  "resolutionStatus": "ACKNOWLEDGED"
+    \\}
+;
+pub const group_two_issues_status = 200;
+
+/// A tracking issue sent with no URL, stored as one without (2026-11-06);
+/// an empty URL was answered the same. HTTP 200.
+pub const group_issue_without_url =
+    \\{
+    \\  "name": "projects/extractctl/groups/CNLXm_X6--zSSQ",
+    \\  "groupId": "CNLXm_X6--zSSQ",
+    \\  "trackingIssues": [
+    \\    {}
+    \\  ],
+    \\  "resolutionStatus": "OPEN"
+    \\}
+;
+pub const group_issue_without_url_status = 200;
+
+/// 400: a tracking issue with a field it does not have (2026-11-06). HTTP 400.
+pub const refused_issue_field =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "Invalid JSON payload received. Unknown name \"zigps\" at 'group.tracking_issues[0]': Cannot find field.",
+    \\    "status": "INVALID_ARGUMENT",
+    \\    "details": [
+    \\      {
+    \\        "@type": "type.googleapis.com/google.rpc.BadRequest",
+    \\        "fieldViolations": [
+    \\          {
+    \\            "field": "group.tracking_issues[0]",
+    \\            "description": "Invalid JSON payload received. Unknown name \"zigps\" at 'group.tracking_issues[0]': Cannot find field."
+    \\          }
+    \\        ]
+    \\      }
+    \\    ]
+    \\  }
+    \\}
+;
+pub const refused_issue_field_status = 400;
+
+/// 400: an update of 1,048,577 bytes, one more than production takes
+/// (2026-11-06). HTTP 400.
+pub const refused_payload_size =
+    \\{
+    \\  "error": {
+    \\    "code": 400,
+    \\    "message": "Request payload size exceeds the limit: 1048576 bytes.",
+    \\    "status": "INVALID_ARGUMENT"
+    \\  }
+    \\}
+;
+pub const refused_payload_size_status = 400;

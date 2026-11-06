@@ -166,8 +166,19 @@ pub const EventsOptions = struct {
     page_size: ?u31 = null,
 };
 
-/// A link from a group to an issue tracker.
+/// A link from a group to an issue tracker. Read as stored, whoever set
+/// it: production keeps any string, so check a URL's scheme before showing
+/// it as a link. One stored with no URL reads as "".
 pub const TrackingIssue = struct { url: []const u8 };
+
+/// What `Client.group(id).setTrackingIssues` sends back besides the issues.
+pub const TrackingIssuesOptions = struct {
+    /// Required: the group's status in the read this change was decided
+    /// on. The API replaces the whole group, so the status goes back with
+    /// the issues, and one changed by someone else since that read is
+    /// overwritten. `.unknown` is refused before sending.
+    status: Status,
+};
 
 /// An error group: errors Error Reporting found alike, by exception type
 /// and the top frames of their stack traces.

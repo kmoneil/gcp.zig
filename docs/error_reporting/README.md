@@ -5,8 +5,8 @@
 A client for Cloud Error Reporting's read side, for an error dashboard:
 what is failing in a project now, how often over time in buckets a trend
 chart draws, whether each group is new, its errors with their stack
-traces, and a group's status to resolve, acknowledge or mute it. It
-reports no errors.
+traces, a group's status to resolve, acknowledge or mute it, and its
+links to issues in a tracker. It reports no errors.
 
 ```zig
 const std = @import("std");
@@ -56,8 +56,9 @@ fn dashboard(client: *er.Client, rows: *std.ArrayList(Row), gpa: std.mem.Allocat
 ```
 
 Reading needs `errorreporting.groups.list` and
-`errorreporting.errorEvents.list` (Viewer has both); a status needs
-`errorreporting.groupMetadata.update` (Error Reporting User, or Editor).
+`errorreporting.errorEvents.list` (Viewer has both); a status or tracking
+issues need `errorreporting.groupMetadata.update` (Error Reporting User,
+or Editor).
 The API must be on in the project, and in the quota project a person's
 login is charged to. `examples/error_dashboard.zig` is a dashboard in a
 terminal, and runs offline with `--fake`.
@@ -76,6 +77,8 @@ terminal, and runs offline with `--fake`.
 | `Client.events(group_id, options)`, `query.page(token)` | One group's errors, newest first, each with its stack trace and context |
 | `Client.group(id).get()` | A group as it is: the only call that reads a muted one |
 | `Client.group(id).setStatus(status)` | Open, acknowledged, resolved or muted, its tracking issues kept |
+| `Client.group(id).setTrackingIssues(urls, options)` | Its links to issues in a tracker, the status from the read sent back with them |
+| `Client.group(id).setTrackingIssuesRequest(urls, options)` | The exact request `setTrackingIssues` sends, built without sending it, for a confirmation |
 | `Client.budgetStatus()` | Calls in the last minute, and how long until the next may go |
 | `Client.lastConsumerRefusal()` | The project a refusal named, and the link that turns the API on |
 | `headlineOf(trace)`, `Event.headline()` | The line of a stack trace that names the exception and its message |
@@ -121,6 +124,56 @@ issues clears them, so `setStatus` reads the group first and puts it back
 with the new status. An edit of the issues by someone else between the
 two calls is lost: the API has no etag.
 
+## Tracking issues
+
+A group links to issues in a tracker by URL. `setTrackingIssues` sets the
+whole list, in order, and `&.{}` removes them all. It is one update, and an
+update replaces the whole group, so it takes the status from the read the
+change was decided on and sends it back: a status changed by someone else
+since that read is overwritten. `setTrackingIssuesRequest` takes the same
+arguments, makes the same checks, and builds the exact request without
+sending it, for the user to confirm.
+
+<!-- snippet: tests/docs_examples.zig#er-link -->
+```zig
+/// Links a group to one more issue, keeping the issues it has and its
+/// status as the read shows them. `confirm` sees the exact request first,
+/// and nothing is sent unless it says yes.
+fn linkIssue(
+    gpa: std.mem.Allocator,
+    client: *er.Client,
+    group_id: []const u8,
+    url: []const u8,
+    confirm: *const fn (er.PreparedRequest) bool,
+) !bool {
+    var group = try client.group(group_id).get();
+    defer group.deinit();
+    var urls: std.ArrayList([]const u8) = .empty;
+    defer urls.deinit(gpa);
+    for (group.value.tracking_issues) |issue| try urls.append(gpa, issue.url);
+    try urls.append(gpa, url);
+    const options: er.TrackingIssuesOptions = .{ .status = group.value.status };
+
+    var request = try client.group(group_id).setTrackingIssuesRequest(urls.items, options);
+    defer request.deinit();
+    if (!confirm(request.value)) return false;
+    var linked = try client.group(group_id).setTrackingIssues(urls.items, options);
+    defer linked.deinit();
+    return true;
+}
+```
+
+Production stores any string as an issue's URL. When measured it kept
+`javascript:alert(313)`, a URL with a newline in it, one with no scheme,
+and an empty one as an issue with no URL. So this client sends only web
+links: an absolute `http` or `https` URL with a host, in the characters
+RFC 3986 allows, anything else percent-encoded (`é` as `%C3%A9`). Any
+other URL is `error.InvalidOptions`, unsent, and `Diagnostics` says which
+(`urls[1]`), including one another client stored that is being sent back.
+Reads keep what is stored, an issue with no URL as `""`, so check a URL's
+scheme before showing it as a link. A request over production's limit of
+1 MiB is refused unsent too; production took 10,000 issues of 40 bytes.
+
 ## The quota
 
 Error Reporting allows 60 calls a minute per user for event data, and 60
@@ -147,13 +200,14 @@ names groups `projects/P/groups/ID` whichever way they were read.
 | `QuotaProjectDenied` | The quota project may not be used by the caller |
 | `NotFound` | An id that names no group: production answers 400 "Invalid group id", never 404 |
 | `InvalidPageToken` | A token the server did not issue |
-| `InvalidOptions` | Buckets too narrow for the period, a page size or width of 0, `-` for events or a group, `.unknown` as a status |
+| `InvalidOptions` | Buckets too narrow for the period, a page size or width of 0, `-` for events or a group, `.unknown` as a status, a tracking issue that is not a web link, an update over 1 MiB |
 | `InvalidName` | A project, location, group id or service filter the client will not send |
 | `ResourceExhausted` | The budget is spent, or the server's quota |
 | `PermissionDenied` | The caller may not read or update the project's errors |
 
 5xx answers and dropped connections are retried with the client's
-`RetryPolicy`, a status's update too.
+`RetryPolicy`, a group's updates too: the same update again changes
+nothing.
 
 ## What was measured
 
@@ -165,6 +219,9 @@ fake to production query by query. What that changed:
   stack trace's line that names it.
 - **A muted group stays hidden even when asked for by id.**
 - **An update clears the tracking issues it leaves out.**
+- **Any string is stored as a tracking issue's URL** (measured
+  2026-11-06), so the client sends only web links. Its only limit is a
+  request of 1 MiB.
 - **At most 100 buckets a period**; Google's "recommended minimum"
   widths are not the rule.
 - **Distinct users count `user` alone**: an error that named only a
@@ -179,5 +236,5 @@ fake to production query by query. What that changed:
 ## Not here
 
 Reporting errors (`events.report`) and deleting them (`deleteEvents`
-deletes every error in the project); editing tracking issues; Error
-Reporting's notifications, which Cloud Monitoring sends.
+deletes every error in the project); Error Reporting's notifications,
+which Cloud Monitoring sends.
