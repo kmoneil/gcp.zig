@@ -28,16 +28,17 @@ const Kind = enum { python, java, node, go };
 const Seed = struct { kind: Kind, back_s: i64, user: ?[]const u8, version: []const u8 };
 
 /// Python 4 errors (three users, two by an address), Java 2, Node 2 (to be
-/// muted), Go 1 two days back (to be resolved, then reopened).
+/// muted), Go 1 two days back (to be resolved, then reopened). Each kind's
+/// oldest comes first, as `seed` says why.
 const seeds = [_]Seed{
+    .{ .kind = .python, .back_s = 5 * 3600, .user = null, .version = "v1" },
     .{ .kind = .python, .back_s = 300, .user = "u1", .version = "v1" },
     .{ .kind = .python, .back_s = 2 * 3600 + 120, .user = "u2", .version = "v1" },
     .{ .kind = .python, .back_s = 3 * 3600 + 30, .user = "u1", .version = "v1" },
-    .{ .kind = .python, .back_s = 5 * 3600, .user = null, .version = "v1" },
-    .{ .kind = .java, .back_s = 900, .user = null, .version = "v2" },
     .{ .kind = .java, .back_s = 4 * 3600 + 600, .user = "u3", .version = "v2" },
-    .{ .kind = .node, .back_s = 1800, .user = null, .version = "v1" },
+    .{ .kind = .java, .back_s = 900, .user = null, .version = "v2" },
     .{ .kind = .node, .back_s = 1900, .user = null, .version = "v1" },
+    .{ .kind = .node, .back_s = 1800, .user = null, .version = "v1" },
     .{ .kind = .go, .back_s = 2 * 24 * 3600, .user = "u2", .version = "v1" },
 };
 
@@ -139,10 +140,13 @@ const Fixture = struct {
     }
 
     /// Reports every seed, then waits until production lists the four
-    /// groups, and keeps their ids. Each kind's first seed goes alone and
-    /// first: production's first seen is the time of a group's first error
-    /// it processed, and reports sent together were not processed in the
-    /// order sent.
+    /// groups, and keeps their ids. Each kind's first seed, its oldest,
+    /// goes alone and first: production's first seen is the time of a
+    /// group's first error processed, or of an older one processed with it,
+    /// which a client cannot tell apart (measured 2026-11-06: in one run
+    /// of three, two groups moved to the oldest of errors sent seconds
+    /// after the first). With the oldest first, both are its time. Reports
+    /// sent together were not processed in the order sent.
     fn seed(f: *Fixture) !void {
         f.seeded_s = @intCast(@divFloor(std.Io.Clock.real.now(testing.io).nanoseconds, std.time.ns_per_s));
         var first: [4]bool = @splat(false);

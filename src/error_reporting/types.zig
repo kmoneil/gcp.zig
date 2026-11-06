@@ -279,8 +279,11 @@ pub const GroupStats = struct {
     /// Ascending, non-overlapping, inside the period: every bucket, those
     /// with no errors too. Empty unless `timed_count_seconds` was set.
     timed_counts: []const TimedCount = &.{},
-    /// The time of the group's first error to arrive, whatever the period:
-    /// a report backdated after the group was made does not move it.
+    /// The time of the group's first error processed, whatever the period.
+    /// An older error reported after it does not move it, unless
+    /// production processes the two together: measured on 2026-11-06,
+    /// errors sent seconds after a group's first sometimes moved it to the
+    /// oldest of them, and errors sent minutes after never did.
     first_seen: ?std.Io.Timestamp = null,
     /// The latest error's time, whatever the period, in whole seconds.
     last_seen: ?std.Io.Timestamp = null,

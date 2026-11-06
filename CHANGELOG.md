@@ -18,7 +18,10 @@ including the ones that did not change.
   `error.InvalidOptions`, as it does a request over production's 1 MiB.
   `FakeErrorReporting` keeps an issue sent with no URL as production
   does, where it dropped it, and refuses an unknown field in an issue
-  and an update over 1 MiB in production's words. No call changes.
+  and an update over 1 MiB in production's words. The docs now say that
+  production's first seen can be an older error processed with a group's
+  first (measured 2026-11-06), and the production suite sends each
+  group's oldest error first so that the two agree. No call changes.
 - auth, billing, bigquery, compute, core, dataflow, datatransfer,
   firestore, kms, logging, monitoring, pubsub, resource_manager, run,
   scheduler, secret_manager and storage: unchanged.
