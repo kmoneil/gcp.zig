@@ -279,7 +279,27 @@ the cache keeps it for at most 12 hours (`max_lifetime_s`), or until the
 provider's `invalidate` is called.
 
 What it cannot do is get a credential sent anywhere else, crash the client,
-or get a truncated body accepted as complete.
+or get a truncated body accepted as complete. One gap below is the
+exception to the first: a man in the middle with the right certificate
+can stand in for Google.
+
+## Known gaps
+
+**TLS takes a certificate signed by one that is not a CA.** Zig 0.17.1's
+TLS client, which `std.http.Client` and so this package's transport use
+(rest-core's `HttpTransport`), checks each certificate in a server's chain
+by its signature and issuer alone, never whether its issuer may issue
+certificates (Codeberg ziglang/zig#35877 and #37353; the fix, PR #37354,
+is not merged). Anyone holding a certificate a trusted root signed, for a
+domain of their own, can sign one for `oauth2.googleapis.com` or any other
+host, and a man in the middle that presents the two is trusted. It would
+receive the bearer token, and on a token exchange a service account's
+signed JWT assertion, good for its hour, or a user's refresh token. Every
+Zig 0.17.1 HTTPS client shares it. rest-core's security catalog tracks it
+as CONN-10, with a test against `openssl s_server` that fails once std
+fixes it; this package takes the fix when it moves to a Zig release that
+has it. Until then, a network you do not trust is one to keep these
+credentials off.
 
 ## Keeping this current
 
