@@ -218,8 +218,12 @@ pub fn getJob(self: *Client, location: []const u8, id: []const u8) Error!types.O
     return self.getChecked(location, id, null);
 }
 
-/// One job at a chosen view. `.description` adds labels and the pipeline
-/// description; `.all` adds the steps, and production answered a job
+/// One job at a chosen view. `.description` adds the labels, the
+/// pipeline (its graph and the parameters it was launched with), the
+/// environment and the SDK; `.all` adds the steps. A job page asks for
+/// `.description`: production's answer for a small Word_Count job was
+/// 766 KB, and `.all` 858 KB, most of it worker metadata the decode
+/// skips (measured 2026-11-07). Production answered `.all` on a job
 /// that failed provisioning with a 400 FAILED_PRECONDITION carrying the
 /// job's own error text (measured 2026-10-20), so expect
 /// `error.FailedPrecondition` there.
@@ -243,6 +247,33 @@ fn getChecked(self: *Client, location: []const u8, id: []const u8, view: ?types.
     const body = try rpc.execute(self, result.arena, .{ .method = .GET, .path = w.written() });
     result.value = codec.decodeJob(result.arena.allocator(), a, body) catch |err|
         return rpc.decodeFailed(self, err, "job");
+    return result;
+}
+
+/// A job's metrics, as the service last computed them: its own
+/// (`dataflow/v1b3`: vCPU time, memory, shuffle, elements per output
+/// collection) and the pipeline's counters (`user`). Production sent each
+/// twice, once marked tentative and once committed, so a console reads
+/// the ones with `tentative` false (measured 2026-11-07, 374 updates for
+/// a done Word_Count job). `start_time` keeps only updates made at or
+/// after it. A job nobody has is `error.NotFound`.
+pub fn getJobMetrics(self: *Client, location: []const u8, id: []const u8, options: types.MetricsOptions) Error!types.Owned(types.JobMetrics) {
+    rpc.begin(self);
+    try self.checkJob(location, id);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var w: std.Io.Writer.Allocating = .init(a);
+    w.writer.writeAll(names.metrics(a, self.project, location, id) catch return error.OutOfMemory) catch return error.OutOfMemory;
+    var params: core.query.Params = .init(&w.writer);
+    var start_buf: [core.timestamp.max_len]u8 = undefined;
+    if (options.start_time) |t| params.addOptional("startTime", core.timestamp.format(&start_buf, t)) catch return error.OutOfMemory;
+
+    var result: types.Owned(types.JobMetrics) = try .init(self.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(self, result.arena, .{ .method = .GET, .path = w.written() });
+    result.value = codec.decodeMetrics(result.arena.allocator(), a, body) catch |err|
+        return rpc.decodeFailed(self, err, "job metrics");
     return result;
 }
 
@@ -448,6 +479,48 @@ test "golden: a job's story, errors first, the events coming regardless" {
     try testing.expectEqual(6, quiet.value.autoscaling_events.len);
 }
 
+test "golden: a job in full at ALL, and its metrics, from a time or all of them" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = production.job_detail_all } },
+        .{ .respond = .{ .body = production.metrics_done } },
+        .{ .respond = .{ .body = production.metrics_future_start } },
+    });
+    defer h.deinit();
+    const id = "2026-11-07_12_14_27-5029885235339452204";
+    var full = try h.client.getJobView("us-central1", id, .all);
+    defer full.deinit();
+    try h.expectRequest(0, .GET, "https://dataflow.googleapis.com/v1b3/projects/my-project/locations/us-central1/jobs/" ++ id ++ "?view=JOB_VIEW_ALL");
+    try testing.expectEqualStrings("word_count", full.value.template().?.name);
+    try testing.expectEqualStrings("n1-standard-1", full.value.environment.worker_pools[0].machine_type);
+    try testing.expectEqual(3, full.value.steps.len);
+
+    var metrics = try h.client.getJobMetrics("us-central1", id, .{});
+    defer metrics.deinit();
+    try h.expectRequest(1, .GET, "https://dataflow.googleapis.com/v1b3/projects/my-project/locations/us-central1/jobs/" ++ id ++ "/metrics");
+    try testing.expectEqual(12, metrics.value.updates.len);
+
+    // 2030-01-01T00:00:00Z: past every update, so none come back.
+    var later = try h.client.getJobMetrics("us-central1", id, .{ .start_time = .{ .nanoseconds = 1_893_456_000 * std.time.ns_per_s } });
+    defer later.deinit();
+    try h.expectRequest(2, .GET, "https://dataflow.googleapis.com/v1b3/projects/my-project/locations/us-central1/jobs/" ++ id ++ "/metrics?startTime=2030-01-01T00%3A00%3A00Z");
+    try testing.expectEqual(0, later.value.updates.len);
+}
+
+test "getJobMetrics: production's refusals arrive as errors, its words kept" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = production.metrics_unknown_status, .body = production.metrics_unknown } },
+        .{ .respond = .{ .status = production.metrics_bad_start_status, .body = production.metrics_bad_start } },
+    });
+    defer h.deinit();
+    try testing.expectError(error.NotFound, h.client.getJobMetrics("us-central1", "2026-11-07_00_00_00-1234567890123456789", .{}));
+    // Production's words name jobs.get, even for metrics.
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "could not be found") != null);
+    try testing.expectError(error.InvalidArgument, h.client.getJobMetrics("us-central1", "j", .{}));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "Illegal timestamp format") != null);
+}
+
 test "the calls refuse what they will not send" {
     var h: Harness = undefined;
     try h.init(&.{});
@@ -464,6 +537,8 @@ test "the calls refuse what they will not send" {
     try testing.expectError(error.InvalidName, c.getJobView("us central1", "j", .all));
     try testing.expectError(error.InvalidName, c.listMessages("us-central1", "a/b", .{}));
     try testing.expectError(error.InvalidName, c.listMessages("", "j", .{}));
+    try testing.expectError(error.InvalidName, c.getJobMetrics("us-central1", "a/b", .{}));
+    try testing.expectError(error.InvalidName, c.getJobMetrics("US", "j", .{}));
     try testing.expectError(error.InvalidName, c.listMessages("us-central1", "j", .{ .page_token = "a b" }));
     try testing.expectEqualStrings("invalid page token: expected printable ASCII", h.diag.message());
     try h.expectRequestCount(0);
@@ -701,6 +776,8 @@ test "every allocation failure is OutOfMemory without leaks" {
                 .{ .respond = .{ .body = production.messages_error_failed } },
                 .{ .respond = .{ .body = production.cancel_taken } },
                 .{ .respond = .{ .body = production.drain_taken } },
+                .{ .respond = .{ .body = production.job_detail_all } },
+                .{ .respond = .{ .body = production.metrics_done } },
             });
             defer fake.deinit();
             var tokens: test_util.FakeTokenProvider = .{};
@@ -721,6 +798,10 @@ test "every allocation failure is OutOfMemory without leaks" {
             try client.drainJob("us-central1", "2026-10-20_07_09_34-8524524531325271694");
             var preview = try client.drainJobRequest("us-central1", "2026-10-20_07_09_34-8524524531325271694");
             preview.deinit();
+            var full = try client.getJobView("us-central1", "2026-11-07_12_14_27-5029885235339452204", .all);
+            full.deinit();
+            var metrics = try client.getJobMetrics("us-central1", "2026-11-07_12_14_27-5029885235339452204", .{ .start_time = .{ .nanoseconds = 0 } });
+            metrics.deinit();
         }
     };
     try testing.checkAllAllocationFailures(std.testing.allocator, Run.calls, .{});

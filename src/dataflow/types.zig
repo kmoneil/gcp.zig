@@ -99,6 +99,209 @@ pub const StageState = struct {
     current_state_time: ?std.Io.Timestamp = null,
 };
 
+/// What a transform or an execution stage does, as the pipeline
+/// description names it. A kind the wire adds later reads as `.unknown`.
+pub const TransformKind = enum {
+    unknown,
+    par_do,
+    group_by_key,
+    flatten,
+    read,
+    write,
+    constant,
+    singleton,
+    shuffle,
+
+    pub fn fromWire(name: []const u8) TransformKind {
+        inline for (.{
+            .{ "PAR_DO_KIND", .par_do },
+            .{ "GROUP_BY_KEY_KIND", .group_by_key },
+            .{ "FLATTEN_KIND", .flatten },
+            .{ "READ_KIND", .read },
+            .{ "WRITE_KIND", .write },
+            .{ "CONSTANT_KIND", .constant },
+            .{ "SINGLETON_KIND", .singleton },
+            .{ "SHUFFLE_KIND", .shuffle },
+        }) |entry| {
+            if (std.mem.eql(u8, name, entry[0])) return entry[1];
+        }
+        return .unknown;
+    }
+};
+
+/// A display datum's value, in whichever of the wire's typed forms it
+/// came. Production sent strings, and integers as strings
+/// (`"int64Value": "1"`), which read as `.integer` (measured 2026-11-07).
+pub const DisplayValue = union(enum) {
+    none,
+    string: []const u8,
+    integer: i64,
+    float: f64,
+    boolean: bool,
+    timestamp: std.Io.Timestamp,
+    /// A proto3 duration as sent, such as "1.500s".
+    duration: []const u8,
+    java_class: []const u8,
+};
+
+/// One setting the SDK, the template service or the template recorded
+/// about the pipeline. A template's own parameters carry no namespace;
+/// Beam's options carry their interface's (`org.apache.beam.sdk.options.
+/// PipelineOptions`), and the template service's settings
+/// `google.dataflow.v1beta3.TemplatesService` (measured 2026-11-07).
+pub const DisplayData = struct {
+    key: []const u8 = "",
+    namespace: []const u8 = "",
+    label: []const u8 = "",
+    url: []const u8 = "",
+    value: DisplayValue = .none,
+    /// `shortStrValue`: a short form shown beside a long string value,
+    /// such as a class's name without its package.
+    short: []const u8 = "",
+};
+
+/// A transform as the user's pipeline wrote it: one node of the graph a
+/// console draws. Collections join it to the transforms around it.
+pub const Transform = struct {
+    id: []const u8 = "",
+    /// The user's name, slashes for nesting: "CountWords/ExtractWords".
+    name: []const u8 = "",
+    kind: TransformKind = .unknown,
+    input_collections: []const []const u8 = &.{},
+    output_collections: []const []const u8 = &.{},
+    display_data: []const DisplayData = &.{},
+};
+
+/// What flows into or out of an execution stage.
+pub const StageSource = struct {
+    name: []const u8 = "",
+    user_name: []const u8 = "",
+    /// `originalTransformOrCollection`: the transform or collection of the
+    /// user's pipeline it stands for.
+    original: []const u8 = "",
+    /// An estimate: production sent round numbers (67108864).
+    size_bytes: ?i64 = null,
+};
+
+/// A transform or a source an execution stage was made from.
+pub const StageComponent = struct {
+    name: []const u8 = "",
+    user_name: []const u8 = "",
+    /// `originalTransform`, or a source's `originalTransformOrCollection`.
+    original: []const u8 = "",
+};
+
+/// A stage the service runs: several of the user's transforms fused into
+/// one, the names `stage_states` report on (`F58`).
+pub const Stage = struct {
+    id: []const u8 = "",
+    name: []const u8 = "",
+    kind: TransformKind = .unknown,
+    inputs: []const StageSource = &.{},
+    outputs: []const StageSource = &.{},
+    /// Stage ids that must finish before this one starts.
+    prerequisites: []const []const u8 = &.{},
+    transforms: []const StageComponent = &.{},
+    sources: []const StageComponent = &.{},
+};
+
+/// `pipelineDescription`: the job's graph, as the user wrote it and as
+/// the service runs it, and the settings it was launched with.
+pub const Pipeline = struct {
+    transforms: []const Transform = &.{},
+    stages: []const Stage = &.{},
+    display_data: []const DisplayData = &.{},
+    step_names_hash: []const u8 = "",
+};
+
+/// One pool of workers. Production's pool also holds about 450 KB of
+/// staged packages and metadata, which the decode skips.
+pub const WorkerPool = struct {
+    /// "harness" when measured.
+    kind: []const u8 = "",
+    machine_type: []const u8 = "",
+    num_workers: ?i64 = null,
+    /// `autoscalingSettings.maxNumWorkers`.
+    max_workers: ?i64 = null,
+    autoscaling_algorithm: []const u8 = "",
+    disk_size_gb: ?i64 = null,
+    disk_type: []const u8 = "",
+    zone: []const u8 = "",
+    network: []const u8 = "",
+    subnetwork: []const u8 = "",
+    ip_configuration: []const u8 = "",
+    teardown_policy: []const u8 = "",
+    on_host_maintenance: []const u8 = "",
+    /// `workerHarnessContainerImage`.
+    harness_image: []const u8 = "",
+};
+
+/// Where and as whom the job runs. The decode keeps these and skips the
+/// raw pipeline options (`sdkPipelineOptions`, about 100 KB when
+/// measured), whose values the pipeline's display data carries typed.
+pub const Environment = struct {
+    service_account: []const u8 = "",
+    worker_region: []const u8 = "",
+    worker_zone: []const u8 = "",
+    /// Production listed about 50, nearly all Google's own.
+    experiments: []const []const u8 = &.{},
+    service_options: []const []const u8 = &.{},
+    shuffle_mode: []const u8 = "",
+    streaming_mode: []const u8 = "",
+    flex_resource_scheduling_goal: []const u8 = "",
+    temp_storage_prefix: []const u8 = "",
+    dataset: []const u8 = "",
+    service_kms_key_name: []const u8 = "",
+    use_public_ips: ?bool = null,
+    worker_pools: []const WorkerPool = &.{},
+};
+
+pub const SdkSupportStatus = enum {
+    unknown,
+    supported,
+    stale,
+    deprecated,
+    unsupported,
+
+    pub fn fromWire(name: []const u8) SdkSupportStatus {
+        inline for (.{
+            .{ "SUPPORTED", .supported },
+            .{ "STALE", .stale },
+            .{ "DEPRECATED", .deprecated },
+            .{ "UNSUPPORTED", .unsupported },
+        }) |entry| {
+            if (std.mem.eql(u8, name, entry[0])) return entry[1];
+        }
+        return .unknown;
+    }
+};
+
+/// `jobMetadata.sdkVersion`: "Apache Beam SDK for Java" 2.77.0,
+/// supported, when measured.
+pub const Sdk = struct {
+    version: []const u8 = "",
+    /// `versionDisplayName`.
+    name: []const u8 = "",
+    support: SdkSupportStatus = .unknown,
+};
+
+/// A step as the service compiled it, which only `.all` carries. Its
+/// properties have no schema, so they are kept as JSON text.
+pub const Step = struct {
+    kind: []const u8 = "",
+    name: []const u8 = "",
+    /// The step's `properties` object as JSON, "" when it had none.
+    properties: []const u8 = "",
+};
+
+/// A Google-provided template, as its labels name it.
+pub const Template = struct {
+    name: []const u8,
+    version: []const u8 = "",
+    /// "legacy" for a classic template, "flex" for a Flex one.
+    type: []const u8 = "",
+};
+
 pub const Job = struct {
     /// Assigned by the service, immutable:
     /// `2026-10-20_07_09_34-8524524531325271694` when measured.
@@ -123,6 +326,16 @@ pub const Job = struct {
     start_time: ?std.Io.Timestamp = null,
     labels: []const Label = &.{},
     stage_states: []const StageState = &.{},
+    /// The job's graph and the settings it was launched with: a get at
+    /// `.description` or `.all` carries it, a list or a plain get not.
+    pipeline: Pipeline = .{},
+    /// Workers, region and service account, at `.description` or `.all`.
+    environment: Environment = .{},
+    /// The SDK the pipeline was built with. Lists and every get carry it,
+    /// in the summary's `jobMetadata` (measured 2026-10-20).
+    sdk: Sdk = .{},
+    /// The compiled steps, which only `.all` carries.
+    steps: []const Step = &.{},
 
     /// Whether the job has reached one of the five terminal states.
     pub fn terminal(self: Job) bool {
@@ -161,6 +374,93 @@ pub const Job = struct {
         }
         return null;
     }
+
+    /// The Google-provided template the job was launched from, as its
+    /// `goog-dataflow-provided-template-*` labels name it, or null for a
+    /// job that names none. A plain get carries the labels already.
+    pub fn template(self: Job) ?Template {
+        const name = self.label("goog-dataflow-provided-template-name") orelse return null;
+        return .{
+            .name = name,
+            .version = self.label("goog-dataflow-provided-template-version") orelse "",
+            .type = self.label("goog-dataflow-provided-template-type") orelse "",
+        };
+    }
+
+    /// A template parameter's value, as given at launch: the pipeline's
+    /// display datum of that key with no namespace (production recorded
+    /// Word_Count's `inputFile` and `output` so, beside Beam's own
+    /// options under theirs). Null without one, and on a job read at a
+    /// view that carries no pipeline.
+    pub fn parameter(self: Job, key: []const u8) ?DisplayValue {
+        for (self.pipeline.display_data) |d| {
+            if (d.namespace.len == 0 and std.mem.eql(u8, d.key, key)) return d.value;
+        }
+        return null;
+    }
+};
+
+/// A metric update's value. The wire's `scalar` is a Long, a Double or a
+/// Boolean; production sent integers and floats only (measured
+/// 2026-11-07). A value in one of the other forms is kept as JSON text.
+pub const MetricValue = union(enum) {
+    none,
+    integer: i64,
+    float: f64,
+    boolean: bool,
+    /// A value in another of the wire's fields (`meanSum` and
+    /// `meanCount`, `distribution`, `set`, `gauge`, ...), or a scalar
+    /// that is none of the three: the field's name and its JSON text.
+    other: Other,
+
+    pub const Other = struct {
+        field: []const u8,
+        json: []const u8,
+    };
+};
+
+/// One metric of a job, as the service last computed it.
+pub const MetricUpdate = struct {
+    /// "dataflow/v1b3" for the service's own, "user" for the pipeline's
+    /// counters.
+    origin: []const u8 = "",
+    name: []const u8 = "",
+    /// What the metric is about, as pairs in the server's order:
+    /// `original_name`, `step`, `execution_step`, `output_user_name` and
+    /// `namespace` when measured, and `tentative`.
+    context: []const Label = &.{},
+    /// Production sent every metric twice, once with context
+    /// `tentative: "true"` and once committed, with the same value when
+    /// the job was done. A console shows the committed ones.
+    tentative: bool = false,
+    value: MetricValue = .none,
+    update_time: ?std.Io.Timestamp = null,
+    /// "Sum", "Max" and the like; production sent none.
+    kind: []const u8 = "",
+    /// Production sent none.
+    cumulative: ?bool = null,
+
+    /// A context entry's value, or null when the update has no such key.
+    pub fn contextValue(self: MetricUpdate, key: []const u8) ?[]const u8 {
+        for (self.context) |c| {
+            if (std.mem.eql(u8, c.key, key)) return c.value;
+        }
+        return null;
+    }
+};
+
+/// What `getJobMetrics` answers. A job 20 s in had 42 updates; done, 374
+/// (152 KB), when measured.
+pub const JobMetrics = struct {
+    /// The time the server computed them at.
+    metric_time: ?std.Io.Timestamp = null,
+    updates: []const MetricUpdate = &.{},
+};
+
+pub const MetricsOptions = struct {
+    /// Only updates made at or after this time. Production answered a
+    /// time past every update with none.
+    start_time: ?std.Io.Timestamp = null,
 };
 
 /// The list filters, which also pick the order. Unset sends nothing:
