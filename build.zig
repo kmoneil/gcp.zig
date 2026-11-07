@@ -561,8 +561,8 @@ pub fn build(b: *std.Build) void {
     gcp_step.dependOn(&streamed(b, monitoring_gcp_tests).step);
     test_step.dependOn(&monitoring_gcp_tests.step);
     // The metadata server's keys, on a Compute Engine VM only, gated on
-    // AUTH_TEST_METADATA=1: tools/vmrun/metadata-test runs it there, and
-    // holds auth.testing.FakeMetadataServer to the server's answers.
+    // AUTH_TEST_METADATA=1, holding auth.testing.FakeMetadataServer to the
+    // server's answers.
     const auth_metadata_gcp_tests = b.addTest(.{
         .name = "auth-metadata-gcp-integration",
         .root_module = b.createModule(.{

@@ -6,10 +6,6 @@ _reviews/
 _reports/
 # The benchmark's staging directory (scripts/bench.sh).
 _bench/
-# What tools/vmrun/vmrun brings back from each run, and the seed corpora
-# tools/vmrun/fetch-seeds gathers for it to ship.
-_vmrun/
-tools/vmrun/seeds.tgz
 
 # OS / editor
 .DS_Store
