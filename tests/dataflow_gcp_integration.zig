@@ -166,7 +166,7 @@ fn unprefixed(message: []const u8) []const u8 {
 }
 
 fn writeJobLine(w: *std.Io.Writer, job: dataflow.Job) !void {
-    try w.print("{s} name={s} loc={s} type={t} state={t} terminal={} failing={} requested={t} created={?d} labels={d} stages={d}", .{
+    try w.print("{s} name={s} loc={s} type={t} state={t} terminal={} failing={} requested={t} created={?d} labels={d} stages={d} sdk={s}", .{
         job.id,
         job.name,
         job.location,
@@ -178,16 +178,153 @@ fn writeJobLine(w: *std.Io.Writer, job: dataflow.Job) !void {
         if (job.create_time) |t| @divFloor(t.nanoseconds, std.time.ns_per_s) else null,
         job.labels.len,
         job.stage_states.len,
+        job.sdk.version,
     });
+}
+
+/// What a view adds, as counts a reader can check and one digest of
+/// everything decoded, so any difference shows. Production lists a
+/// pipeline's transforms in another order on every read (measured
+/// 2026-11-07), so the digest is of the lists sorted.
+fn writeDetail(a: Allocator, w: *std.Io.Writer, job: dataflow.Job) !void {
+    const p = try sortedPipeline(a, job.pipeline);
+    const template_name = if (job.template()) |t| t.name else "";
+    const input_file = if (job.parameter("inputFile")) |v| switch (v) {
+        .string => |s| s,
+        else => "?",
+    } else "";
+    const pool: dataflow.WorkerPool = if (job.environment.worker_pools.len > 0) job.environment.worker_pools[0] else .{};
+    try w.print(" | transforms={d} stages={d} display={d} template={s} inputFile={s} account={s} pools={d} machine={s} workers={?d} max={?d} steps={d} digest={x}", .{
+        p.transforms.len,
+        p.stages.len,
+        p.display_data.len,
+        template_name,
+        input_file,
+        job.environment.service_account,
+        job.environment.worker_pools.len,
+        pool.machine_type,
+        pool.num_workers,
+        pool.max_workers,
+        job.steps.len,
+        try digest(a, .{ p, job.environment, job.sdk, try canonicalSteps(a, job.steps) }),
+    });
+}
+
+/// The steps by name, each one's properties with every object's members
+/// sorted: production orders them differently on every read (measured
+/// 2026-11-07).
+fn canonicalSteps(a: Allocator, steps: []const dataflow.Step) ![]const dataflow.Step {
+    const copy = try a.dupe(dataflow.Step, steps);
+    for (copy) |*step| step.properties = try canonicalJson(a, step.properties);
+    std.mem.sort(dataflow.Step, copy, {}, stepBefore);
+    return copy;
+}
+
+fn canonicalJson(a: Allocator, text: []const u8) ![]const u8 {
+    if (text.len == 0) return text;
+    var v = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{ .parse_numbers = false });
+    sortMembers(&v);
+    return std.json.Stringify.valueAlloc(a, v, .{});
+}
+
+fn sortMembers(v: *std.json.Value) void {
+    switch (v.*) {
+        .object => |*o| {
+            for (o.values()) |*member| sortMembers(member);
+            o.sort(KeyOrder{ .keys = o.keys() });
+        },
+        .array => |*items| for (items.items) |*item| sortMembers(item),
+        else => {},
+    }
+}
+
+const KeyOrder = struct {
+    keys: []const []const u8,
+    pub fn lessThan(order: KeyOrder, x: usize, y: usize) bool {
+        return std.mem.lessThan(u8, order.keys[x], order.keys[y]);
+    }
+};
+
+/// The updates in one order, each one's context by key: production
+/// orders a context's entries differently on every read (measured
+/// 2026-11-07).
+fn canonicalUpdates(a: Allocator, updates: []const dataflow.MetricUpdate) ![]const dataflow.MetricUpdate {
+    const copy = try a.dupe(dataflow.MetricUpdate, updates);
+    for (copy) |*u| u.context = try sorted(a, dataflow.Label, u.context, labelBefore);
+    std.mem.sort(dataflow.MetricUpdate, copy, {}, updateBefore);
+    return copy;
+}
+
+fn labelBefore(_: void, x: dataflow.Label, y: dataflow.Label) bool {
+    return std.mem.lessThan(u8, x.key, y.key);
+}
+
+fn sortedPipeline(a: Allocator, p: dataflow.Pipeline) !dataflow.Pipeline {
+    const transforms = try a.dupe(dataflow.Transform, p.transforms);
+    for (transforms) |*t| t.display_data = try sorted(a, dataflow.DisplayData, t.display_data, datumBefore);
+    std.mem.sort(dataflow.Transform, transforms, {}, transformBefore);
+    return .{
+        .transforms = transforms,
+        .stages = try sorted(a, dataflow.Stage, p.stages, stageBefore),
+        .display_data = try sorted(a, dataflow.DisplayData, p.display_data, datumBefore),
+        .step_names_hash = p.step_names_hash,
+    };
+}
+
+fn sorted(a: Allocator, comptime T: type, items: []const T, comptime before: fn (void, T, T) bool) ![]const T {
+    const copy = try a.dupe(T, items);
+    std.mem.sort(T, copy, {}, before);
+    return copy;
+}
+
+fn transformBefore(_: void, x: dataflow.Transform, y: dataflow.Transform) bool {
+    return std.mem.lessThan(u8, x.id, y.id);
+}
+
+fn stageBefore(_: void, x: dataflow.Stage, y: dataflow.Stage) bool {
+    return std.mem.lessThan(u8, x.id, y.id);
+}
+
+fn stepBefore(_: void, x: dataflow.Step, y: dataflow.Step) bool {
+    return std.mem.lessThan(u8, x.name, y.name);
+}
+
+fn datumBefore(_: void, x: dataflow.DisplayData, y: dataflow.DisplayData) bool {
+    const order = std.mem.order(u8, x.namespace, y.namespace);
+    return order == .lt or (order == .eq and std.mem.lessThan(u8, x.key, y.key));
+}
+
+/// A metric update's identity, for sorting: origin, name, then context.
+fn updateBefore(_: void, x: dataflow.MetricUpdate, y: dataflow.MetricUpdate) bool {
+    inline for (.{ "origin", "name" }) |name| {
+        const order = std.mem.order(u8, @field(x, name), @field(y, name));
+        if (order != .eq) return order == .lt;
+    }
+    const n = @min(x.context.len, y.context.len);
+    for (x.context[0..n], y.context[0..n]) |cx, cy| {
+        const key = std.mem.order(u8, cx.key, cy.key);
+        if (key != .eq) return key == .lt;
+        const value = std.mem.order(u8, cx.value, cy.value);
+        if (value != .eq) return value == .lt;
+    }
+    return x.context.len < y.context.len;
+}
+
+fn digest(a: Allocator, value: anytype) !u64 {
+    return std.hash.Wyhash.hash(0, try std.json.Stringify.valueAlloc(a, value, .{}));
 }
 
 const Op = union(enum) {
     aggregated: dataflow.AggregatedOptions,
     list: struct { location: []const u8, options: dataflow.ListJobsOptions = .{} },
     get: struct { location: []const u8, id: []const u8 },
-    get_description: struct { location: []const u8, id: []const u8 },
+    get_description: JobRef,
+    get_all: JobRef,
+    metrics: struct { id: []const u8, start: ?std.Io.Timestamp = null },
     messages: struct { id: []const u8, min: ?dataflow.MessageImportance },
 };
+
+const JobRef = struct { location: []const u8, id: []const u8 };
 
 fn outcome(a: Allocator, client: *dataflow.Client, diag: *dataflow.Diagnostics, op: Op) ![]const u8 {
     var w: std.Io.Writer.Allocating = .init(a);
@@ -224,13 +361,30 @@ fn outcome(a: Allocator, client: *dataflow.Client, diag: *dataflow.Diagnostics, 
             defer got.deinit();
             try writeJobLine(&w.writer, got.value);
         },
-        .get_description => |g| {
-            var got = client.getJobView(g.location, g.id, .description) catch |err| {
+        .get_description, .get_all => |g| {
+            const view: dataflow.JobView = if (op == .get_all) .all else .description;
+            var got = client.getJobView(g.location, g.id, view) catch |err| {
                 try w.writer.print("error.{t}: {s}", .{ err, unprefixed(diag.message()) });
                 return w.written();
             };
             defer got.deinit();
             try writeJobLine(&w.writer, got.value);
+            try writeDetail(a, &w.writer, got.value);
+        },
+        .metrics => |m| {
+            var got = client.getJobMetrics(location, m.id, .{ .start_time = m.start }) catch |err| {
+                try w.writer.print("error.{t}: {s}", .{ err, unprefixed(diag.message()) });
+                return w.written();
+            };
+            defer got.deinit();
+            var tentative: usize = 0;
+            for (got.value.updates) |u| tentative += @intFromBool(u.tentative);
+            try w.writer.print("n={d} tentative={d} time={?d} digest={x}", .{
+                got.value.updates.len,
+                tentative,
+                if (got.value.metric_time) |t| @divFloor(t.nanoseconds, std.time.ns_per_s) else null,
+                try digest(a, try canonicalUpdates(a, got.value.updates)),
+            });
         },
         .messages => |m| {
             var page = client.listMessages(location, m.id, .{ .minimum_importance = m.min }) catch |err| {
@@ -248,12 +402,15 @@ fn outcome(a: Allocator, client: *dataflow.Client, diag: *dataflow.Diagnostics, 
 }
 
 /// Everything production lists, fed into the fake as it answered: the
-/// summaries from the aggregated list, each job's get for the labels
-/// and stage states the summaries do not carry, and our job's story.
+/// summaries from the aggregated list, each job's get for the labels,
+/// stage states, SDK and environment the summaries do not carry, our
+/// job read at ALL for its pipeline and steps, its metrics, and its
+/// story.
 fn seed(fake: *dataflow.testing.FakeDataflow, client: *dataflow.Client, page: *const dataflow.JobPage, ours: []const u8) !void {
     for (page.jobs) |job| {
         fake.putLocation(job.location) catch |err| if (err != error.InvalidEntry) return err;
-        var whole = try client.getJob(job.location, job.id);
+        const is_ours = std.mem.eql(u8, job.id, ours);
+        var whole = if (is_ours) try client.getJobView(job.location, job.id, .all) else try client.getJob(job.location, job.id);
         defer whole.deinit();
         _ = try fake.putJob(.{
             .location = whole.value.location,
@@ -267,8 +424,16 @@ fn seed(fake: *dataflow.testing.FakeDataflow, client: *dataflow.Client, page: *c
             .start_time = whole.value.start_time,
             .labels = whole.value.labels,
             .stage_states = whole.value.stage_states,
+            .pipeline = whole.value.pipeline,
+            .environment = whole.value.environment,
+            .sdk = whole.value.sdk,
+            .steps = whole.value.steps,
         });
-        if (std.mem.eql(u8, job.id, ours)) {
+        if (is_ours) {
+            var metrics = try client.getJobMetrics(job.location, job.id, .{});
+            defer metrics.deinit();
+            try fake.setMetrics(job.id, metrics.value);
+            fact("ours: {d} metric updates, {d} transforms, {d} stages, {d} steps", .{ metrics.value.updates.len, whole.value.pipeline.transforms.len, whole.value.pipeline.stages.len, whole.value.steps.len });
             var story = try client.listMessages(job.location, job.id, .{ .minimum_importance = .@"error" });
             defer story.deinit();
             for (story.value.messages) |message| {
@@ -341,6 +506,21 @@ test "dataflow: a real Word_Count run, the fake seeded with production's lists a
     }
     try testing.expectEqual(dataflow.JobState.done, state);
 
+    // The lists catch up with a get a little later: on 2026-11-07 the
+    // aggregated list still said RUNNING right after a get said DONE.
+    // Seed only once it says the job ended, or the fake is seeded from a
+    // moment production's lists had not reached.
+    const caught_up = std.Io.Clock.real.now(testing.io).nanoseconds;
+    while (std.Io.Clock.real.now(testing.io).nanoseconds - caught_up < 2 * std.time.ns_per_min) {
+        var listed = try f.client.aggregatedJobs(.{ .filter = .all });
+        defer listed.deinit();
+        const ended = for (listed.value.jobs) |job| {
+            if (std.mem.eql(u8, job.id, job_id)) break job.terminal();
+        } else false;
+        if (ended) break;
+        try testing.io.sleep(.fromMilliseconds(5_000), .awake);
+    }
+
     // Production's state, whole, for the seed and the ops.
     var everywhere = try f.client.aggregatedJobs(.{ .filter = .all });
     defer everywhere.deinit();
@@ -366,6 +546,10 @@ test "dataflow: a real Word_Count run, the fake seeded with production's lists a
         .{ "list by name", .{ .list = .{ .location = location, .options = .{ .filter = .all, .name = job_name } } } },
         .{ "get the job", .{ .get = .{ .location = location, .id = job_id } } },
         .{ "get at DESCRIPTION", .{ .get_description = .{ .location = location, .id = job_id } } },
+        .{ "get at ALL", .{ .get_all = .{ .location = location, .id = job_id } } },
+        .{ "metrics", .{ .metrics = .{ .id = job_id } } },
+        .{ "metrics past every update", .{ .metrics = .{ .id = job_id, .start = .{ .nanoseconds = 1_893_456_000 * std.time.ns_per_s } } } },
+        .{ "metrics of an unknown job", .{ .metrics = .{ .id = "2026-10-20_00_00_00-1234567890123456789" } } },
         .{ "get an unknown job", .{ .get = .{ .location = location, .id = "2026-10-20_00_00_00-1234567890123456789" } } },
         .{ "get in a made-up region", .{ .get = .{ .location = "us-fake1", .id = job_id } } },
         .{ "list in a made-up region", .{ .list = .{ .location = "us-fake1", .options = .{ .filter = .all } } } },

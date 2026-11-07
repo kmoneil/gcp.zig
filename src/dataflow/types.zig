@@ -206,11 +206,15 @@ pub const Stage = struct {
 };
 
 /// `pipelineDescription`: the job's graph, as the user wrote it and as
-/// the service runs it, and the settings it was launched with.
+/// the service runs it, and the settings it was launched with. The
+/// transforms come in another order on every read, even of a job that
+/// has ended (measured 2026-11-07): join them by `id` and by their
+/// collections, not by position.
 pub const Pipeline = struct {
     transforms: []const Transform = &.{},
     stages: []const Stage = &.{},
     display_data: []const DisplayData = &.{},
+    /// Only `.all` carries it.
     step_names_hash: []const u8 = "",
 };
 
@@ -291,6 +295,8 @@ pub const Step = struct {
     kind: []const u8 = "",
     name: []const u8 = "",
     /// The step's `properties` object as JSON, "" when it had none.
+    /// Production orders its members differently from one read to the
+    /// next (measured 2026-11-07), so parse it rather than compare text.
     properties: []const u8 = "",
 };
 
@@ -427,7 +433,9 @@ pub const MetricUpdate = struct {
     name: []const u8 = "",
     /// What the metric is about, as pairs in the server's order:
     /// `original_name`, `step`, `execution_step`, `output_user_name` and
-    /// `namespace` when measured, and `tentative`.
+    /// `namespace` when measured, and `tentative`. That order changes
+    /// from one read to the next (measured 2026-11-07): look an entry up
+    /// with `contextValue`.
     context: []const Label = &.{},
     /// Production sent every metric twice, once with context
     /// `tentative: "true"` and once committed, with the same value when
