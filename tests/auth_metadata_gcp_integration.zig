@@ -2,14 +2,12 @@
 //! metadata server, and `auth.testing.FakeMetadataServer` held to it.
 //!
 //! - AUTH_TEST_METADATA=1, on a Compute Engine VM whose instance
-//!   attributes include `job`, as tools/vmrun/vmrun's do.
+//!   attributes include `job` and a startup script over 1 KiB.
 //!
 //! The first test reads the server through the calls; the second sends
 //! the same requests, refusals included, to the server and to a fake that
 //! holds the server's own values, and compares the answers. A token's
 //! body is never printed. Without the variable every test skips.
-//! tools/vmrun/metadata-test runs these on a spot VM, then preempts it
-//! while examples/spot_worker.zig watches.
 
 const std = @import("std");
 const auth = @import("auth");
@@ -46,7 +44,7 @@ test "metadata: a VM's keys, attributes and preemption state, read and watched" 
     std.debug.print("job: {s}\n", .{job});
     try testing.expectEqual(null, try metadata.instanceAttribute(io, a, "zigps-no-such-key"));
     try testing.expect(std.mem.indexOf(u8, try metadata.get(io, a, "instance/attributes/"), "job\n") != null);
-    // vmrun's startup script, a few KB: more than one read's worth.
+    // The VM's startup script, a few KB: more than one read's worth.
     try testing.expect((try metadata.instanceAttribute(io, a, "startup-script")).?.len > 1024);
     try testing.expect(!try metadata.preempted(io));
     try testing.expectError(error.NotFound, metadata.get(io, a, "instance/no-such-path"));
