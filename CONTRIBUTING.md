@@ -97,7 +97,7 @@ run `zig build coverage`; the report is `zig-out/coverage/index.html`.
   test that fails while being fuzzed does not fail `zig build`, which
   exits 0 all the same; the saved input and the `input saved to` line
   are the signs, and the nightly job fails on either. A fuzzer that
-  stalls saves nothing and holds its job until the fuzzing step's 150
+  stalls saves nothing and holds its job until the fuzzing step's 25
   minutes run out; then the job attaches gdb to whatever is still
   running, and the same artifact holds every thread's backtrace
   (`fuzz-stacks.txt`) and the input each fuzzer was on (`in<N>`: a
@@ -117,9 +117,9 @@ run `zig build coverage`; the report is `zig-out/coverage/index.html`.
   properties' costs on CI: run the workflow by hand twice, with
   `fuzz_iterations` at two counts such as 2K and 20K, and each job's
   cost per run is the difference in its fuzzing step's time over the
-  difference in runs, the build cancelled out. Aim at about half the
-  job's 180 minutes. A local run can be three times faster than CI, so
-  it only compares properties with each other.
+  difference in runs, the build cancelled out. Aim at about 10 minutes:
+  the nightly is a short run. A local run can be three times faster than
+  CI, so it only compares properties with each other.
   `zig build test` runs both kinds alike.
 - A function over a critical complexity limit for its class fails
   `zig build test`, unless `complexity.baseline` holds it there already and
