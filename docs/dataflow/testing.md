@@ -168,7 +168,9 @@ Each as production answered when measured on 2026-10-20:
   the pipeline; `.all` the steps and the pipeline's `step_names_hash`.
   It answers in the order a test put things in, where production
   shuffles transforms, step properties and contexts from one read to
-  the next. Metrics answer from `start_time` on,
+  the next. Metrics answer from `start_time` on (an update put with no
+  `update_time` is left out once a start time is asked, as production
+  dates every one),
   and with none left the time asked for, as production echoed a time
   past every update; a bad view or `startTime` is 400 in production's
   words. An update put as `tentative` is marked so in its context, as
