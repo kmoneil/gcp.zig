@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.70.0 (unreleased)
+## 0.70.0 (2026-11-07)
 
 - dataflow: a job in full, and its metrics, for issue #310. A
   `getJobView` at `.description` or `.all` now decodes what those views

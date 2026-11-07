@@ -91,7 +91,7 @@ CI tests (Zig does not check that field itself). For Zig 0.16.0, use
 v0.30.0, the last release that builds with it.
 
 ```sh
-zig fetch --save git+https://github.com/kmoneil/gcp.zig#v0.69.0
+zig fetch --save git+https://github.com/kmoneil/gcp.zig#v0.70.0
 ```
 
 ```zig
