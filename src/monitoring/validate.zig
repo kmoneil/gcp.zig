@@ -538,7 +538,7 @@ test "isProject, isResourceType, isUnit, isPageToken and isUserAgent" {
     try testing.expect(isPageToken("EicxMDEw="));
     try testing.expect(!isPageToken(""));
     try testing.expect(!isPageToken("a b"));
-    try testing.expect(isUserAgent("gcp-zig-monitoring/0.68"));
+    try testing.expect(isUserAgent("gcp-zig-monitoring/0.69"));
     try testing.expect(!isUserAgent("a\r\nb"));
 }
 

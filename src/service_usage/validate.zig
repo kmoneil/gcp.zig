@@ -92,6 +92,6 @@ test "page tokens and user agents: what goes into a request" {
     try testing.expect(isPageToken("ZW5hYmxlZC1zZXJ2aWNlcy1vZmZzZXQ6Mw=="));
     try testing.expect(!isPageToken(""));
     try testing.expect(!isPageToken("a b"));
-    try testing.expect(isUserAgent("gcp-zig-service_usage/0.68"));
+    try testing.expect(isUserAgent("gcp-zig-service_usage/0.69"));
     try testing.expect(!isUserAgent("a\n"));
 }
