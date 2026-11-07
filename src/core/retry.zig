@@ -33,9 +33,9 @@ test "retryable errors are exactly the transient ones" {
         try std.testing.expect(isRetryable(err));
     }
     for ([_]anyerror{
-        error.NotFound,          error.PermissionDenied,       error.InvalidArgument,
-        error.FailedPrecondition, error.Unauthenticated,       error.AlreadyExists,
-        error.OutOfMemory,       error.ConcurrencyUnavailable, error.HttpProtocolError,
+        error.NotFound,           error.PermissionDenied,       error.InvalidArgument,
+        error.FailedPrecondition, error.Unauthenticated,        error.AlreadyExists,
+        error.OutOfMemory,        error.ConcurrencyUnavailable, error.HttpProtocolError,
     }) |err| {
         try std.testing.expect(!isRetryable(err));
     }

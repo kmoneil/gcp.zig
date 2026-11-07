@@ -497,7 +497,6 @@ fn invalidate(ptr: *anyopaque) void {
     fromPtr(ptr).cache.invalidate();
 }
 
-
 /// Asks the metadata server for the attached account's token. `arena` is
 /// the cache's scratch memory, which it wipes.
 fn fetch(ptr: *anyopaque, io: std.Io, arena: Allocator) TokenProvider.Error!Cache.Fetched {
