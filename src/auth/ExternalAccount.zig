@@ -41,6 +41,8 @@ source: Source,
 impersonation_url: ?[]u8,
 impersonation_lifetime_s: u32,
 quota_project_id: ?[]u8,
+/// `quota_project_id`, as the header the provider adds to its requests.
+quota_header: core.rpc.QuotaProjectHeader,
 user_agent: []u8,
 request_timeout_ms: u32,
 retry: core.RetryPolicy,
@@ -231,6 +233,7 @@ pub fn initFromJson(gpa: Allocator, io: std.Io, json: []const u8, options: Optio
         .impersonation_url = impersonation_url,
         .impersonation_lifetime_s = lifetime,
         .quota_project_id = quota_project_id,
+        .quota_header = .init(quota_project_id),
         .user_agent = user_agent,
         .request_timeout_ms = options.request_timeout_ms,
         .retry = options.retry,
@@ -303,7 +306,7 @@ pub fn provider(self: *ExternalAccount) TokenProvider {
     return .{ .ptr = self, .vtable = &.{
         .getToken = getToken,
         .invalidate = invalidate,
-        .quotaProject = quotaProject,
+        .headers = credentialHeaders,
     } };
 }
 
@@ -342,8 +345,8 @@ fn invalidate(ptr: *anyopaque) void {
     fromPtr(ptr).cache.invalidate();
 }
 
-fn quotaProject(ptr: *anyopaque) ?[]const u8 {
-    return fromPtr(ptr).quota_project_id;
+fn credentialHeaders(ptr: *anyopaque) []const core.transport.Header {
+    return fromPtr(ptr).quota_header.slice();
 }
 
 /// One whole fetch: subject token, STS exchange, and impersonation when
@@ -783,7 +786,7 @@ test "ExternalAccount: the STS rejecting the subject token says what to check" {
     defer h.deinit();
     try testing.expectError(error.TokenEndpointRejected, h.get());
     try testing.expectEqual(1, h.fake.requests.items.len);
-    try testing.expectEqualStrings("invalid_grant", h.diag.status());
+    try testing.expectEqualStrings("invalid_grant", h.diag.code());
     try testing.expectEqualStrings("The audience in the token does not match. Check the workload identity pool, its provider, and the subject token's issuer and audience claims.", h.diag.message());
 }
 
@@ -950,7 +953,7 @@ test "ExternalAccount: the provider hands over the file's quota project, or null
     var h: Harness = undefined;
     try h.init(&.{}, .{});
     defer h.deinit();
-    try testing.expectEqual(null, h.account.provider().quotaProject());
+    try testing.expectEqual(null, core.rpc.quotaProjectOf(h.account.provider()));
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -962,7 +965,7 @@ test "ExternalAccount: the provider hands over the file's quota project, or null
     defer fake.deinit();
     var external: ExternalAccount = try .initFromJson(testing.allocator, testing.io, with_quota, .{ .transport = fake.transport() });
     defer external.deinit();
-    try testing.expectEqualStrings("quota-p", external.provider().quotaProject().?);
+    try testing.expectEqualStrings("quota-p", core.rpc.quotaProjectOf(external.provider()).?);
 }
 
 test "ExternalAccount: a credential_source url out of reach retries, then keeps its error" {

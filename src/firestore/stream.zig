@@ -254,7 +254,7 @@ test "runQueryEach: an error after documents is returned after the handler has s
     defer c.deinit();
     try testing.expectError(error.DeadlineExceeded, h.client.runQueryEach(.{ .from = .{ .collection = "c" } }, .{}, c.documents()));
     try c.expect(&.{ "a", "b" });
-    try testing.expectEqualStrings("DEADLINE_EXCEEDED", h.diag.status());
+    try testing.expectEqualStrings("DEADLINE_EXCEEDED", h.diag.code());
     try h.expectDiag("The operation exceeded the deadline during execution.");
     try testing.expectEqual(504, h.diag.http_status);
     try testing.expectEqual(1, h.fake.stream_requests.items.len);
@@ -431,7 +431,7 @@ test "batchGetEach: an answer that leaves a path out, an error inside, a drop af
     try testing.expectError(error.InvalidResponse, h.client.batchGetEach(&.{ "c/a", "c/b" }, .{}, c.items()));
     try h.expectDiag("the batchGet answer said nothing of c/b");
     try testing.expectError(error.DeadlineExceeded, h.client.batchGetEach(&.{ "c/a", "c/b" }, .{}, c.items()));
-    try testing.expectEqualStrings("DEADLINE_EXCEEDED", h.diag.status());
+    try testing.expectEqualStrings("DEADLINE_EXCEEDED", h.diag.code());
     try testing.expectError(error.ConnectionResetByPeer, h.client.batchGetEach(&.{ "c/a", "c/b" }, .{}, c.items()));
     try c.expect(&.{ "a", "a", "a" });
     try testing.expectError(error.InvalidResponse, h.client.batchGetEach(&.{"c/a"}, .{}, c.items()));

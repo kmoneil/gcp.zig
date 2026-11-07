@@ -2256,7 +2256,7 @@ test "Subscriber: a fatal pull error stops the loop and reports it" {
     h.fake.fail_pulls = 1;
     try testing.expectError(error.NotFound, h.subscriber.run(h.handler.handler()));
     try testing.expectEqual(404, diag.http_status);
-    try testing.expectEqualStrings("NOT_FOUND", diag.status());
+    try testing.expectEqualStrings("NOT_FOUND", diag.code());
 }
 
 test "Subscriber: a transient ack failure is retried on the next flush" {
@@ -2645,7 +2645,7 @@ test "Subscriber: an ack answered NotFound stops the loop and reports it" {
     h.fake.fail_acks = 1;
     try h.fake.publish("gone");
     try testing.expectError(error.NotFound, runWithin(&h, 20_000));
-    try testing.expectEqualStrings("NOT_FOUND", diag.status());
+    try testing.expectEqualStrings("NOT_FOUND", diag.code());
     try expectAccounted(h.subscriber.stats());
 }
 
@@ -2860,7 +2860,7 @@ test "Subscriber: a detach stops run with FailedPrecondition and the server's wo
 
         try testing.expectError(error.FailedPrecondition, runWithin(&h, 20_000));
         try testing.expectEqual(400, diag.http_status);
-        try testing.expectEqualStrings("FAILED_PRECONDITION", diag.status());
+        try testing.expectEqualStrings("FAILED_PRECONDITION", diag.code());
         try testing.expectEqualStrings("This method is not supported on detached subscriptions.", diag.message());
         // Nothing was acknowledged, and the stats still add up.
         const counts = h.subscriber.stats();
@@ -2882,7 +2882,7 @@ test "Subscriber: a subscription that does not pull stops run with FailedPrecond
     h.fake.push_subscription = true;
     try testing.expectError(error.FailedPrecondition, h.subscriber.run(h.handler.handler()));
     try testing.expectEqual(400, diag.http_status);
-    try testing.expectEqualStrings("FAILED_PRECONDITION", diag.status());
+    try testing.expectEqualStrings("FAILED_PRECONDITION", diag.code());
     try testing.expectEqualStrings("This method is not supported for this subscription type.", diag.message());
     try testing.expectEqual(0, h.subscriber.stats().received);
 }

@@ -10,7 +10,7 @@ Pub/Sub, Cloud Storage, Secret Manager and Firestore, with credentials that find
 [![CI](https://github.com/kmoneil/gcp.zig/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/kmoneil/gcp.zig/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/kmoneil/gcp.zig?sort=semver&color=4285F4)](https://github.com/kmoneil/gcp.zig/releases)
 [![Zig 0.17.1](https://img.shields.io/badge/zig-0.17.1-F7A41D?logo=zig&logoColor=white)](https://ziglang.org/download/)
-[![Dependencies: none](https://img.shields.io/badge/dependencies-none-34A853)](build.zig.zon)
+[![Dependencies: rest-core](https://img.shields.io/badge/dependencies-rest--core-34A853)](build.zig.zon)
 [![License: MIT](https://img.shields.io/badge/license-MIT-34A853)](LICENSE)
 
 [**Documentation**](docs/README.md) · [Quick start](#quick-start) · [Examples](#examples) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md)
@@ -19,9 +19,12 @@ Pub/Sub, Cloud Storage, Secret Manager and Firestore, with credentials that find
 
 ## Why gcp.zig
 
-- 🪶 **Nothing else to install.** No dependencies beyond the Zig standard
-  library. One package, `gcp`, with a module per service: an application
-  compiles only the modules it imports.
+- 🪶 **Nothing else to install.** One dependency,
+  [rest-core](https://github.com/kmoneil/rest-core.zig), the cloud-neutral
+  HTTP transport and request loop it is built on, which needs nothing
+  beyond the Zig standard library; the build fetches it. One package,
+  `gcp`, with a module per service: an application compiles only the
+  modules it imports.
 - 🔐 **Credentials that find themselves.** `auth.findDefault` picks the
   metadata server on Google Cloud, the login gcloud saved, or a file the
   environment names, the way Google's own libraries do, so one binary

@@ -155,7 +155,7 @@ const Fixture = struct {
     }
 
     fn report(f: *const Fixture, err: anyerror) anyerror {
-        std.debug.print("{t}: HTTP {d} {s}: {s}\n", .{ err, f.diag.http_status, f.diag.status(), f.diag.message() });
+        std.debug.print("{t}: HTTP {d} {s}: {s}\n", .{ err, f.diag.http_status, f.diag.code(), f.diag.message() });
         return err;
     }
 };

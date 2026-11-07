@@ -6,6 +6,78 @@ including the ones that did not change.
 
 ## 0.69.0 (unreleased)
 
+- core: **Breaking:** built on
+  [rest-core](https://github.com/kmoneil/rest-core.zig) 0.3.0, the
+  package's first dependency, which needs nothing beyond the Zig
+  standard library. The cloud-neutral half of core moved there, so that
+  this package and other clouds' clients share one copy: the HTTP
+  transport, the request loop under `rpc`, `Diagnostics`,
+  `TokenProvider`, `StaticToken`, `RetryPolicy`, `Owned`, `Change`,
+  `WipingAllocator`, `CountingWriter`, `base64`, `query`, `logging`,
+  `timestamp`, `rsa` and the test fakes. Each `core.X` names the same
+  thing as before, re-exported. Google's half stays here: its API errors
+  and their mapping, `rpc`'s Google hook and quota project, `iam`,
+  `names`, `endpoint`, `crc32c`, `Signer`, `JsonArraySplitter`,
+  `duration`, `gzip`, `flate` and `PreparedRequest`. What breaks:
+  - `Diagnostics.status()` is `code()`, and `max_status_len` is
+    `max_code_len`, through every module that re-exports it.
+  - `TokenProvider` has no `quotaProject`. A credential's quota project
+    is a header it adds to the requests it authorizes, `VTable.headers`,
+    and `rpc.quotaProjectOf(provider)` reads it back; a provider of
+    one's own returns an `rpc.QuotaProjectHeader`'s `slice()`. Its errors
+    `RefreshTokenInvalid` and `MetadataUnavailable` are
+    `ReauthenticationRequired` and `CredentialSourceUnavailable`.
+  - `rsa.sign`, `signDigest` and `signPss` take an `Io` after the key.
+    On Zig 0.17.1, std's modular exponentiation branches on the exponent
+    in ReleaseFast and ReleaseSafe (Codeberg ziglang/zig#37023), so each
+    signature now raises to `d + k * phi(n)` for a fresh random `k`. A
+    signature that fails its own check is never written to `out`, and a
+    key over 4096 bits, or with a public exponent past 32 bits, is
+    `error.UnsupportedKey`.
+  - `transport.Method` gains `HEAD`: a `switch` over it with no `else`
+    needs a prong for it.
+  - `rpc.Engine.classify_refusal` is `refusal`, which reads the whole
+    refusal (`rpc.Google.refusal` when null), and
+    `rpc.StreamCall.decode_error` is `refusal`, made with
+    `rpc.refusalReading(decode)`. `rpc.Call` gains `timeout_ms`, and
+    `rpc.StreamCall` gains `wipe` and `error_body_out`, which each had
+    only on the other.
+  - `retry_after.retryAfterMs`, `millisecondsMs` and `httpDate` are
+    rest-core's (`rest_core.retry_after`, `rest_core.http_date`).
+    `retry_after.serverDelayMs` stays, and reads `x-ms-retry-after-ms`
+    too.
+  - `testing.FakeTransport` refuses what `HttpTransport` refuses before
+    it connects, answers a 204, 304 or 1xx with no body, and records a
+    streamed body's `body_crc32`, std's CRC-32, where it kept
+    `body_crc32c`. `testing.FakeClock.sleepMs` panics on a sleep never
+    made.
+
+  What changes in every module, from the transport and the loop: a
+  request with a time limit on an `Io` that cannot run a second task is
+  `error.ConcurrencyUnavailable`, where it was sent with no limit. A URL
+  with a control byte, a space, a backslash, userinfo or a
+  percent-encoded host is `error.InvalidEndpoint`, and a header the
+  transport writes itself (Host, Content-Length, Accept-Encoding and the
+  like) is `error.InvalidRequestHeader`, both before connecting. A
+  response with both Transfer-Encoding and Content-Length, and a
+  compressed body with bytes after its stream or a trailer that does not
+  match, is `error.HttpProtocolError`, where the extra bytes were dropped
+  in silence. A refusal's body is read for its error to at most 64 KiB.
+  A canceled call is never retried. The bearer token is zeroed in the
+  response arena once the request is sent. `timestamp.parse` refuses an
+  instant that `format` cannot write (the year 0000, or an offset that
+  carries it past either end), where `format` then asserted.
+- auth: **Breaking:** core's renames reach every credential. A refresh
+  token Google no longer takes is `error.ReauthenticationRequired`, and
+  a metadata server that cannot be reached, or does not answer as one,
+  is `error.CredentialSourceUnavailable`, from a token and from each of
+  `MetadataServer`'s reads (`projectId`, `email`, `account`, `get`,
+  `preempted`, `watch` and signing). Each credential's quota project
+  goes as the header its provider adds; `Credentials.quotaProject()`
+  reads it as before. A service account key over 4096 bits is
+  `error.UnsupportedCredentialType`, "an unsupported size", where it
+  was `error.InvalidCredentialsFile`. Signing a JWT blinds the key, as
+  `core.rsa` does.
 - service_usage: a new module, **experimental**, for the Service Usage
   API, v1, read only, for issue #316. `Client.enabledServices` reads
   every service a project has enabled, and `listServices` one page in
@@ -24,10 +96,10 @@ including the ones that did not change.
   `error.PermissionDenied`, as production cannot say whether it is
   missing or hidden. `service_usage.testing.FakeServiceUsage` answers
   as production did, byte for byte, refusals in its words.
-- auth, billing, bigquery, compute, core, dataflow, datatransfer,
-  error_reporting, firestore, kms, logging, monitoring, pubsub,
-  resource_manager, run, scheduler, secret_manager and storage:
-  unchanged.
+- billing, bigquery, compute, dataflow, datatransfer, error_reporting,
+  firestore, kms, logging, monitoring, pubsub, resource_manager, run,
+  scheduler, secret_manager and storage: no call changes but core's
+  `Diagnostics.code()`; the transport's changes above reach them.
 
 ## 0.68.0 (2026-11-06)
 

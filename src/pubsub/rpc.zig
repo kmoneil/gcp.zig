@@ -196,7 +196,7 @@ test "retry: gives up after max_attempts and reports the last failure" {
     try h.expectRequestCount(3);
     try testing.expectEqual(2, h.clock.sleep_count);
     try testing.expectEqual(503, h.diag.http_status);
-    try testing.expectEqualStrings("UNAVAILABLE", h.diag.status());
+    try testing.expectEqualStrings("UNAVAILABLE", h.diag.code());
     try testing.expectEqualStrings("The service is currently unavailable.", h.diag.message());
 }
 
@@ -220,7 +220,7 @@ test "retry: non-retryable statuses return at once" {
     try h.expectRequestCount(1);
     try testing.expectEqual(0, h.clock.sleep_count);
     try testing.expectEqual(404, h.diag.http_status);
-    try testing.expectEqualStrings("NOT_FOUND", h.diag.status());
+    try testing.expectEqualStrings("NOT_FOUND", h.diag.code());
     try testing.expectEqualStrings("Topic not found", h.diag.message());
 }
 
@@ -335,7 +335,7 @@ test "error table end to end: every status through a real call" {
         try h.init(&.{.{ .respond = .{ .status = c[0], .body = body } }}, .{ .retry = .{ .max_attempts = 1 } });
         defer h.deinit();
         try testing.expectError(c[2], h.client.topic("orders").get());
-        try testing.expectEqualStrings(c[1], h.diag.status());
+        try testing.expectEqualStrings(c[1], h.diag.code());
     }
 }
 
@@ -345,7 +345,7 @@ test "error bodies that are not JSON map by HTTP status and keep the text" {
     try h.init(&.{.{ .respond = .{ .status = 404, .body = "Not Found" } }}, .{});
     defer h.deinit();
     try testing.expectError(error.NotFound, h.client.topic("orders").get());
-    try testing.expectEqualStrings("", h.diag.status());
+    try testing.expectEqualStrings("", h.diag.code());
     try testing.expectEqualStrings("Not Found", h.diag.message());
 
     var proxy: Harness = undefined;
@@ -409,7 +409,7 @@ test "credentials: token errors reach the caller by name" {
     // A caller can tell a dead login from a missing service account or a
     // network failure. None is retried here: providers retry their own
     // requests, and a failed token fetch would only fail again.
-    inline for (.{ error.RefreshTokenInvalid, error.MetadataUnavailable, error.ConnectionRefused }) |e| {
+    inline for (.{ error.ReauthenticationRequired, error.CredentialSourceUnavailable, error.ConnectionRefused }) |e| {
         var failing: FakeTokenProvider = .{ .fail = e };
         var h: Harness = undefined;
         try h.init(&.{topic_ok}, .{ .token = "unused" });
@@ -664,7 +664,7 @@ const unauthenticated: Reply = .{ .respond = .{
 } };
 
 test "quota: the credentials' project goes out as x-goog-user-project" {
-    var provider: FakeTokenProvider = .{ .quota_project = "billing-project" };
+    var provider: FakeTokenProvider = .{ .credential_headers = core.testing.quotaProject("billing-project") };
     var h: Harness = undefined;
     try h.init(&.{ topic_ok, topic_ok }, .{ .token = "ya29.token" });
     defer h.deinit();
@@ -694,7 +694,7 @@ test "quota: credentials that name no project send no header" {
 }
 
 test "quota: the emulator never gets the project either" {
-    var provider: FakeTokenProvider = .{ .quota_project = "billing-project" };
+    var provider: FakeTokenProvider = .{ .credential_headers = core.testing.quotaProject("billing-project") };
     var h: Harness = undefined;
     try h.init(&.{topic_ok}, .{});
     defer h.deinit();
@@ -707,7 +707,8 @@ test "quota: the emulator never gets the project either" {
 
 test "quota: a project id that is not one is refused before anything is sent" {
     for ([_][]const u8{ "bad project", "billing\r\nX-Injected: 1", test_util.repeat("x", 101), "" }) |bad| {
-        var provider: FakeTokenProvider = .{ .quota_project = bad };
+        const quota = [_]core.transport.Header{.{ .name = core.rpc.quota_project_header, .value = bad }};
+        var provider: FakeTokenProvider = .{ .credential_headers = &quota };
         var h: Harness = undefined;
         try h.init(&.{topic_ok}, .{ .token = "ya29.token" });
         defer h.deinit();
@@ -747,7 +748,7 @@ test "401: a second one is Unauthenticated, with no third attempt" {
     try h.expectRequestCount(2);
     try testing.expectEqual(1, provider.invalidations);
     try testing.expectEqual(401, h.diag.http_status);
-    try testing.expectEqualStrings("UNAUTHENTICATED", h.diag.status());
+    try testing.expectEqualStrings("UNAUTHENTICATED", h.diag.code());
 }
 
 test "401: a publish retries too, because the server refused it before storing anything" {

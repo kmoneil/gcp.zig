@@ -16,7 +16,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Stringify = std.json.Stringify;
-const Owned = @import("owned.zig").Owned;
+const Owned = @import("rest_core").Owned;
 const RetryPolicy = @import("retry.zig").RetryPolicy;
 
 pub const Policy = struct {

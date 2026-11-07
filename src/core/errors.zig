@@ -333,78 +333,15 @@ fn stringOf(value: ?std.json.Value) ?[]const u8 {
     };
 }
 
-/// Details of the most recent failed call. Zig errors carry no payload, so
-/// pass `&diagnostics` in a client's options, such as Pub/Sub's
-/// `Client.Options`, and read it after a call fails. A call that succeeds
-/// clears it. Not safe to share across concurrent tasks.
-pub const Diagnostics = struct {
-    /// HTTP status of the failed response, or 0 when the call failed without
-    /// one: client-side validation, a connection error, cancellation.
-    http_status: u16 = 0,
-    /// How long the failed response asked its client to wait before trying
-    /// again, in milliseconds, from `Retry-After`, `retry-after-ms` or a
-    /// `google.rpc.RetryInfo`, the largest of them, saturating at
-    /// `maxInt(u32)`; null when it asked for nothing, or the call failed
-    /// without a response. Kept whether or not the call was retried, for a
-    /// caller that schedules its own next try. None of the services this
-    /// library covers sent one when measured on 2026-10-17.
-    retry_after_ms: ?u32 = null,
-    status_len: u8 = 0,
-    message_len: u16 = 0,
-    buffer: [512]u8 = undefined,
-
-    /// Longest status kept. Real statuses are short, like "FAILED_PRECONDITION".
-    pub const max_status_len = 64;
-
-    /// The API status, such as "NOT_FOUND", or "" when there is none.
-    pub fn status(d: *const Diagnostics) []const u8 {
-        return d.buffer[0..d.status_len];
-    }
-
-    /// The server's message, or a client-side description of the failure,
-    /// truncated to the buffer at a UTF-8 boundary.
-    pub fn message(d: *const Diagnostics) []const u8 {
-        return d.buffer[d.status_len..][0..d.message_len];
-    }
-
-    pub fn clear(d: *Diagnostics) void {
-        d.* = .{};
-    }
-
-    /// Records a failure, copying `status_text` and `message_text`, which must
-    /// not point into `d.buffer`.
-    pub fn set(d: *Diagnostics, http_status: u16, status_text: []const u8, message_text: []const u8) void {
-        d.http_status = http_status;
-        d.retry_after_ms = null;
-        const s = truncateUtf8(status_text, max_status_len);
-        @memcpy(d.buffer[0..s.len], s);
-        d.status_len = @intCast(s.len);
-        const m = truncateUtf8(message_text, d.buffer.len - s.len);
-        @memcpy(d.buffer[s.len..][0..m.len], m);
-        d.message_len = @intCast(m.len);
-    }
-
-    /// Records a failure that has no HTTP response, with a formatted message.
-    pub fn print(d: *Diagnostics, comptime format: []const u8, args: anytype) void {
-        d.http_status = 0;
-        d.retry_after_ms = null;
-        d.status_len = 0;
-        var w: std.Io.Writer = .fixed(&d.buffer);
-        w.print(format, args) catch {}; // Keeps whatever fit.
-        d.message_len = @intCast(truncateUtf8(w.buffered(), d.buffer.len).len);
-    }
-};
+/// Details of the most recent failed call: rest-core's. Pass
+/// `&diagnostics` in a client's options, such as Pub/Sub's
+/// `Client.Options`, and read it after a call fails; `code()` is the API's
+/// status, such as "NOT_FOUND".
+pub const Diagnostics = @import("rest_core").Diagnostics;
 
 /// The longest prefix of `text` that fits in `max` bytes without splitting a
-/// UTF-8 sequence. Invalid UTF-8 is cut at `max` bytes or up to 3 before it.
-pub fn truncateUtf8(text: []const u8, max: usize) []const u8 {
-    if (text.len <= max) return text;
-    var cut = max;
-    var steps: usize = 0;
-    // A continuation byte at the cut means a sequence started before it.
-    while (cut > 0 and steps < 3 and text[cut] & 0xC0 == 0x80) : (steps += 1) cut -= 1;
-    return text[0..cut];
-}
+/// UTF-8 sequence: rest-core's.
+pub const truncateUtf8 = Diagnostics.truncateUtf8;
 
 const testing = std.testing;
 
@@ -531,70 +468,6 @@ test "decode the older error shape Cloud Storage sends" {
     try testing.expectEqualStrings("", bare.status);
     // `errors` that is not a list makes the body unreadable, not a crash.
     try testing.expectEqual(null, try decodeErrorBody(a, "{\"error\":{\"errors\":42}}"));
-}
-
-test "Diagnostics.set copies and truncates" {
-    var d: Diagnostics = .{};
-    try testing.expectEqualStrings("", d.status());
-    try testing.expectEqualStrings("", d.message());
-
-    d.set(404, "NOT_FOUND", "Resource not found (resource=orders).");
-    try testing.expectEqual(404, d.http_status);
-    try testing.expectEqualStrings("NOT_FOUND", d.status());
-    try testing.expectEqualStrings("Resource not found (resource=orders).", d.message());
-
-    // A copy stays valid: accessors index the copy's own buffer.
-    const copy = d;
-    d.clear();
-    try testing.expectEqualStrings("NOT_FOUND", copy.status());
-    try testing.expectEqualStrings("", d.status());
-
-    const long: [2000]u8 = @splat('m');
-    d.set(500, &@as([100]u8, @splat('S')), &long);
-    try testing.expectEqual(Diagnostics.max_status_len, d.status().len);
-    try testing.expectEqual(d.buffer.len - Diagnostics.max_status_len, d.message().len);
-}
-
-test "Diagnostics.set never splits a UTF-8 sequence" {
-    var d: Diagnostics = .{};
-    // 170 three-byte characters are 510 bytes; the 171st straddles the end.
-    const text = test_util.repeat("€", 171);
-    d.set(400, "", text);
-    try testing.expect(std.unicode.utf8ValidateSlice(d.message()));
-    try testing.expectEqual(510, d.message().len);
-}
-
-test "Diagnostics.print formats client-side failures" {
-    var d: Diagnostics = .{};
-    d.set(503, "UNAVAILABLE", "x");
-    d.print("message {d}: attribute key is {d} bytes", .{ 3, 300 });
-    try testing.expectEqual(0, d.http_status);
-    try testing.expectEqualStrings("", d.status());
-    try testing.expectEqualStrings("message 3: attribute key is 300 bytes", d.message());
-
-    const long: [600]u8 = @splat('x');
-    d.print("{s}", .{&long});
-    try testing.expectEqual(d.buffer.len, d.message().len);
-}
-
-fn truncateProperty(_: void, input: []const u8) !void {
-    var g: test_util.ByteGen = .init(input);
-    const max = g.intRange(usize, 0, 64);
-    const text = g.rest();
-    const out = truncateUtf8(text, max);
-    try testing.expect(out.len <= max or out.len == text.len);
-    try testing.expect(std.mem.startsWith(u8, text, out));
-    if (text.len > max) try testing.expect(out.len + 3 >= max);
-    if (std.unicode.utf8ValidateSlice(text)) try testing.expect(std.unicode.utf8ValidateSlice(out));
-}
-
-test "fuzz truncateUtf8: prefix, bounded, keeps valid UTF-8 valid" {
-    try test_util.fuzzBytes({}, truncateProperty, .{ .corpus = &.{
-        "\x05€€€€",
-        "\x04\xf0\x9f\x98\x80\xf0\x9f\x98\x80",
-        "\x02\x80\x80\x80\x80\x80",
-        "\x00abc",
-    } });
 }
 
 fn mappingProperty(_: void, input: []const u8) !void {

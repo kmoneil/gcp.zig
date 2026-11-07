@@ -256,7 +256,7 @@ test "regression: an error inside batchGet's answer fails it with that error" {
     }, .{});
     defer h.deinit();
     try testing.expectError(error.DeadlineExceeded, h.client.batchGet(&.{ "c/a", "c/b" }, .{}));
-    try testing.expectEqualStrings("DEADLINE_EXCEEDED", h.diag.status());
+    try testing.expectEqualStrings("DEADLINE_EXCEEDED", h.diag.code());
     try h.expectDiag("The operation exceeded the deadline during execution.");
     // Document.get reads through batchGet.
     try testing.expectError(error.DeadlineExceeded, h.client.doc("c/a").get(.{ .read_time = .{ .nanoseconds = 1_791_202_542_000_000_000 } }));

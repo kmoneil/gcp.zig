@@ -58,7 +58,7 @@ fn engine(client: *Client) Engine {
         .request_timeout_ms = client.request_timeout_ms,
         .diagnostics = client.diagnostics,
         .server_delay_out = &client.server_delay_ms,
-        .classify_refusal = classify,
+        .refusal = refusal,
     };
 }
 
@@ -110,12 +110,19 @@ pub fn firstReason(scratch: Allocator, body: []const u8) Allocator.Error!?[]cons
     return if (reason == .string) reason.string else null;
 }
 
-/// For the engine: the reasons Google's clients retry are transient
-/// whatever the status they come with.
-fn classify(scratch: Allocator, http_status: u16, body: []const u8) Allocator.Error!?core.rpc.Error {
+/// For the engine: Google's reading of a refusal, except that the reasons
+/// Google's clients retry are transient whatever the status they come with.
+fn refusal(scratch: Allocator, res: core.transport.Response, diagnostics: ?*core.Diagnostics) (core.ApiError || Allocator.Error) {
+    const err = core.rpc.Google.refusal(scratch, res, diagnostics);
+    if (err == error.OutOfMemory) return err;
+    return try classify(scratch, res.status, res.body) orelse err;
+}
+
+/// The reasons Google's clients retry, as the errors that retry.
+fn classify(scratch: Allocator, http_status: u16, body: []const u8) Allocator.Error!?core.ApiError {
     _ = http_status;
     const reason = try firstReason(scratch, body) orelse return null;
-    const map = std.StaticStringMap(core.rpc.Error).initComptime(.{
+    const map = std.StaticStringMap(core.ApiError).initComptime(.{
         .{ "rateLimitExceeded", error.ResourceExhausted },
         .{ "backendError", error.Unavailable },
         .{ "badGateway", error.Unavailable },

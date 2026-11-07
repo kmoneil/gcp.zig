@@ -314,11 +314,11 @@ test "Cache: an expired token is not returned when the refresh fails" {
     defer s.deinit();
     var source: FakeSource = .{ .replies = &.{
         .{ .token = .{ "ya29.one", 3600 } },
-        .{ .fail = error.RefreshTokenInvalid },
+        .{ .fail = error.ReauthenticationRequired },
     } };
     _ = try s.get(&source);
     s.advance(3600);
-    try testing.expectError(error.RefreshTokenInvalid, s.get(&source));
+    try testing.expectError(error.ReauthenticationRequired, s.get(&source));
 }
 
 test "Cache: after invalidate, the token is fetched again and never reused" {
@@ -511,7 +511,7 @@ const outcomes = [_]Outcome{
     .{ .token = -5 },
     .{ .token = 1_000_000_000 },
     .{ .fail = error.ConnectionRefused },
-    .{ .fail = error.RefreshTokenInvalid },
+    .{ .fail = error.ReauthenticationRequired },
     .{ .fail = error.Canceled },
     .{ .fail = error.OutOfMemory },
 };

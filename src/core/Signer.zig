@@ -8,7 +8,7 @@ const Signer = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const TokenProvider = @import("TokenProvider.zig");
+const TokenProvider = @import("rest_core").TokenProvider;
 const test_util = @import("testing.zig");
 
 ptr: *anyopaque,

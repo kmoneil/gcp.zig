@@ -1,170 +1,26 @@
-//! Retry policy: which failures are retried and how long to wait in between.
+//! Which failures Google's APIs may be retried on: rest-core's transport
+//! failures, and the retryable API statuses. How long to wait in between is
+//! rest-core's `RetryPolicy`.
 
 const std = @import("std");
-const test_util = @import("testing.zig");
+const rest_core = @import("rest_core");
 
-pub const RetryPolicy = struct {
-    /// Attempts in total, including the first. 1 disables retries.
-    max_attempts: u8 = 5,
-    initial_backoff_ms: u32 = 100,
-    max_backoff_ms: u32 = 10_000,
-    /// At least 1.
-    multiplier: f32 = 2.0,
-
-    pub fn isValid(p: RetryPolicy) bool {
-        return p.max_attempts >= 1 and std.math.isFinite(p.multiplier) and p.multiplier >= 1.0;
-    }
-
-    /// The longest wait before retry number `retry`, where 1 is the first
-    /// retry: `min(max_backoff_ms, initial_backoff_ms * multiplier^(retry - 1))`.
-    /// Total over every input; an invalid multiplier counts as 1.
-    pub fn backoffCapMs(p: RetryPolicy, retry: u32) u32 {
-        // Checked first: 0 * inf would be NaN.
-        if (p.initial_backoff_ms == 0) return 0;
-        const multiplier: f64 = if (std.math.isFinite(p.multiplier) and p.multiplier >= 1.0) p.multiplier else 1.0;
-        const exponent: f64 = @floatFromInt(@max(retry, 1) - 1);
-        // At least `initial_backoff_ms`, possibly +inf, never NaN.
-        const cap = @as(f64, @floatFromInt(p.initial_backoff_ms)) * std.math.pow(f64, multiplier, exponent);
-        return if (cap < @as(f64, @floatFromInt(p.max_backoff_ms))) @intFromFloat(cap) else p.max_backoff_ms;
-    }
-
-    /// Full jitter: a wait in `[0, backoffCapMs(retry)]`, chosen by `entropy`,
-    /// which should be uniformly random.
-    pub fn backoffMs(p: RetryPolicy, retry: u32, entropy: u64) u32 {
-        const cap = p.backoffCapMs(retry);
-        return @intCast(entropy % (@as(u64, cap) + 1));
-    }
-
-    /// The wait before retry number `retry`, given the delay the refused
-    /// response asked for (`core.retry_after.serverDelayMs`), or null to
-    /// stop retrying. With no delay, `backoffMs`. With one, the larger of
-    /// the two, since a server's delay is a floor and nothing is taken off
-    /// it; and when it is longer than `max_backoff_ms`, null: the failure
-    /// goes back to the caller at once, its delay in `Diagnostics`, rather
-    /// than holding the task asleep for it.
-    pub fn waitMs(p: RetryPolicy, retry: u32, entropy: u64, server_delay_ms: ?u32) ?u32 {
-        const backoff = p.backoffMs(retry, entropy);
-        const server = server_delay_ms orelse return backoff;
-        if (server > p.max_backoff_ms) return null;
-        return @max(backoff, server);
-    }
-};
+pub const RetryPolicy = rest_core.RetryPolicy;
 
 /// Whether a failed attempt may be retried: the retryable API statuses
 /// (RESOURCE_EXHAUSTED, INTERNAL, BAD_GATEWAY and UNAVAILABLE, both mapped to
 /// `Unavailable`, and DEADLINE_EXCEEDED) and connections that dropped, timed
-/// out or could not be made. Everything else is returned as is.
-///
-/// `TlsFailure` is retried because std.http reports a connection dropped
-/// mid-handshake the same way as a certificate problem; a real certificate
-/// problem fails again on every attempt.
+/// out or could not be made (`rest_core.isRetryable`). Everything else is
+/// returned as is.
 pub fn isRetryable(err: anyerror) bool {
     return switch (err) {
         error.ResourceExhausted,
         error.Internal,
         error.Unavailable,
         error.DeadlineExceeded,
-        error.ConnectionRefused,
-        error.ConnectionResetByPeer,
-        error.ConnectionTimedOut,
-        error.NetworkUnreachable,
-        error.NameServerFailure,
-        error.TlsFailure,
-        // A request that outlived its own deadline: the next attempt may
-        // find the server healthy again.
-        error.TimedOut,
         => true,
-        else => false,
+        else => rest_core.isRetryable(err),
     };
-}
-
-const testing = std.testing;
-
-test "default backoff caps grow and saturate" {
-    const p: RetryPolicy = .{};
-    try testing.expect(p.isValid());
-    try testing.expectEqual(100, p.backoffCapMs(1));
-    try testing.expectEqual(200, p.backoffCapMs(2));
-    try testing.expectEqual(400, p.backoffCapMs(3));
-    try testing.expectEqual(800, p.backoffCapMs(4));
-    try testing.expectEqual(10_000, p.backoffCapMs(8));
-    try testing.expectEqual(10_000, p.backoffCapMs(std.math.maxInt(u32)));
-    // Retry 0 is treated as the first retry.
-    try testing.expectEqual(100, p.backoffCapMs(0));
-}
-
-test "full jitter spans zero to the cap" {
-    const p: RetryPolicy = .{};
-    try testing.expectEqual(0, p.backoffMs(3, 0));
-    try testing.expectEqual(400, p.backoffMs(3, 400));
-    try testing.expectEqual(0, p.backoffMs(3, 401));
-    try testing.expect(p.backoffMs(3, std.math.maxInt(u64)) <= 400);
-}
-
-test "odd policies stay total" {
-    try testing.expect(!(RetryPolicy{ .max_attempts = 0 }).isValid());
-    try testing.expect(!(RetryPolicy{ .multiplier = 0.5 }).isValid());
-    try testing.expect(!(RetryPolicy{ .multiplier = std.math.nan(f32) }).isValid());
-    try testing.expect(!(RetryPolicy{ .multiplier = std.math.inf(f32) }).isValid());
-    const nan: RetryPolicy = .{ .multiplier = std.math.nan(f32) };
-    try testing.expectEqual(100, nan.backoffCapMs(5));
-    const huge: RetryPolicy = .{ .multiplier = std.math.floatMax(f32), .max_backoff_ms = std.math.maxInt(u32) };
-    try testing.expectEqual(std.math.maxInt(u32), huge.backoffCapMs(50));
-    const inverted: RetryPolicy = .{ .initial_backoff_ms = 5000, .max_backoff_ms = 10 };
-    try testing.expectEqual(10, inverted.backoffCapMs(1));
-    const zero: RetryPolicy = .{ .initial_backoff_ms = 0 };
-    try testing.expectEqual(0, zero.backoffMs(4, 12345));
-    // Regression: 0 * inf is NaN, which once made the cap jump to the maximum.
-    const zero_huge: RetryPolicy = .{ .initial_backoff_ms = 0, .multiplier = std.math.floatMax(f32) };
-    try testing.expectEqual(0, zero_huge.backoffCapMs(1000));
-}
-
-test "waitMs: the backoff, or the server's delay when longer, or stop past the cap" {
-    const p: RetryPolicy = .{};
-    // No delay: the backoff, unchanged.
-    try testing.expectEqual(p.backoffMs(3, 12345), p.waitMs(3, 12345, null).?);
-    // A delay longer than the backoff is waited in full; a shorter one
-    // leaves the backoff as it was.
-    try testing.expectEqual(5_000, p.waitMs(1, 0, 5_000).?);
-    try testing.expectEqual(400, p.waitMs(3, 400, 1).?);
-    try testing.expectEqual(0, p.waitMs(1, 0, 0).?);
-    // At the cap it waits; one millisecond past it, it stops.
-    try testing.expectEqual(10_000, p.waitMs(1, 0, 10_000).?);
-    try testing.expectEqual(null, p.waitMs(1, 0, 10_001));
-    try testing.expectEqual(null, p.waitMs(8, std.math.maxInt(u64), std.math.maxInt(u32)));
-    // A policy that never backs off stops at any delay but zero.
-    const none: RetryPolicy = .{ .initial_backoff_ms = 0, .max_backoff_ms = 0 };
-    try testing.expectEqual(0, none.waitMs(1, 99, 0).?);
-    try testing.expectEqual(null, none.waitMs(1, 99, 1));
-}
-
-fn waitProperty(_: void, input: []const u8) !void {
-    var g: test_util.ByteGen = .init(input);
-    const p: RetryPolicy = .{
-        .initial_backoff_ms = g.intRange(u32, 0, 5_000),
-        .max_backoff_ms = g.intRange(u32, 0, 60_000),
-        .multiplier = g.pick(f32, &.{ 1.0, 1.3, 2.0, 10.0 }),
-    };
-    const retry = g.intRange(u32, 1, 20);
-    const entropy = g.int(u64);
-    const delay: ?u32 = if (g.boolean()) g.intRange(u32, 0, 120_000) else null;
-    const got = p.waitMs(retry, entropy, delay);
-    if (delay) |d| {
-        if (d > p.max_backoff_ms) {
-            try testing.expectEqual(null, got);
-        } else {
-            // Never shorter than the server asked, never past the cap.
-            try testing.expect(got.? >= d);
-            try testing.expect(got.? <= p.max_backoff_ms);
-            try testing.expectEqual(@max(d, p.backoffMs(retry, entropy)), got.?);
-        }
-    } else {
-        try testing.expectEqual(p.backoffMs(retry, entropy), got.?);
-    }
-}
-
-test "fuzz waitMs: never shorter than the server's delay, never past the cap, stopped beyond it" {
-    try test_util.fuzzBytes({}, waitProperty, .{ .corpus = &.{ "", "\x00\x00\x00\x00\x00\x00\x00\x00\x01" } });
 }
 
 test "retryable errors are exactly the transient ones" {
@@ -173,39 +29,14 @@ test "retryable errors are exactly the transient ones" {
         error.DeadlineExceeded,  error.ConnectionRefused,  error.ConnectionResetByPeer,
         error.TimedOut,          error.ConnectionTimedOut, error.NetworkUnreachable,
         error.NameServerFailure, error.TlsFailure,
-    }) |err| try testing.expect(isRetryable(err));
+    }) |err| {
+        try std.testing.expect(isRetryable(err));
+    }
     for ([_]anyerror{
-        error.InvalidArgument,      error.FailedPrecondition, error.Unauthenticated,
-        error.PermissionDenied,     error.NotFound,           error.AlreadyExists,
-        error.ServerCancelled,      error.Canceled,           error.Aborted,
-        error.Unknown,              error.InvalidResponse,    error.InvalidEndpoint,
-        error.UnknownHostName,      error.ResponseTooLarge,   error.OutOfMemory,
-        error.InvalidMessage,       error.TokenUnavailable,   error.HttpProtocolError,
-        error.InvalidRequestHeader,
-    }) |err| try testing.expect(!isRetryable(err));
-}
-
-fn backoffProperty(_: void, input: []const u8) !void {
-    var g: test_util.ByteGen = .init(input);
-    const p: RetryPolicy = .{
-        .max_attempts = g.int(u8),
-        .initial_backoff_ms = g.int(u32),
-        .max_backoff_ms = g.int(u32),
-        .multiplier = @bitCast(g.int(u32)),
-    };
-    const retry = g.int(u32);
-    const cap = p.backoffCapMs(retry);
-    try testing.expect(cap <= p.max_backoff_ms);
-    try testing.expect(cap >= @min(p.initial_backoff_ms, p.max_backoff_ms));
-    try testing.expect(p.backoffMs(retry, g.int(u64)) <= cap);
-    // Caps never shrink from one retry to the next.
-    if (retry < std.math.maxInt(u32)) try testing.expect(p.backoffCapMs(retry + 1) >= cap);
-}
-
-test "fuzz backoff: bounded, monotonic, total for any policy" {
-    try test_util.fuzzBytes({}, backoffProperty, .{ .corpus = &.{
-        "\x05\x00\x00\x00\x64\x00\x00\x27\x10\x40\x00\x00\x00\x00\x00\x00\x03",
-        "\x05\x00\x00\x00\x64\x00\x00\x27\x10\x7f\xc0\x00\x00\x00\x00\x00\x03",
-        "\x05\xff\xff\xff\xff\xff\xff\xff\xff\x7f\x7f\xff\xff\xff\xff\xff\xff",
-    } });
+        error.NotFound,          error.PermissionDenied,       error.InvalidArgument,
+        error.FailedPrecondition, error.Unauthenticated,       error.AlreadyExists,
+        error.OutOfMemory,       error.ConcurrencyUnavailable, error.HttpProtocolError,
+    }) |err| {
+        try std.testing.expect(!isRetryable(err));
+    }
 }

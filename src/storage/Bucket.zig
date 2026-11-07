@@ -779,9 +779,9 @@ test "an error body maps by HTTP code and keeps the reason" {
 
     try testing.expectError(error.NotFound, h.client.bucket("zigps-missing").get());
     try testing.expectEqual(404, h.diag.http_status);
-    try testing.expectEqualStrings("notFound", h.diag.status());
+    try testing.expectEqualStrings("notFound", h.diag.code());
     try testing.expectEqualStrings("No such bucket: zigps-missing", h.diag.message());
 
     try testing.expectError(error.AlreadyExists, h.client.bucket("zigps-b").create(.{}));
-    try testing.expectEqualStrings("conflict", h.diag.status());
+    try testing.expectEqualStrings("conflict", h.diag.code());
 }

@@ -31,6 +31,8 @@ pub const Harness = struct {
     clock: FakeClock,
     diag: Diagnostics,
     token: FakeTokenProvider,
+    /// `Options.quota_project`, as the header the fake credential adds.
+    quota: core.rpc.QuotaProjectHeader,
     client: Client,
 
     pub const Options = struct {
@@ -45,9 +47,11 @@ pub const Harness = struct {
             .fake = .init(std.testing.allocator, script),
             .clock = .{},
             .diag = .{},
-            .token = .{ .token = "ya29.test-token", .quota_project = options.quota_project },
+            .token = .{ .token = "ya29.test-token" },
+            .quota = .init(options.quota_project),
             .client = undefined,
         };
+        h.token.credential_headers = h.quota.slice();
         errdefer h.fake.deinit();
         h.client = try .init(std.testing.allocator, h.clock.io(), .{
             .project_id = "my-project",
