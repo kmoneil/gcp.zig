@@ -32,10 +32,10 @@ runs:
             zigvet-darwin-arm64) want=149d724e18ee1396e77e3ab96ee13c629f52d5b314f234e1d9068ca71d1991d1 ;;
             zigvet-darwin-amd64) want=bc3aa5570f836546fd8a8b4f7d4834d8b81e56d585f8ff2fbe645e77c5a9c6f9 ;;
             zigvet-windows-amd64) want=6a988bf438b4a81c7da16890dd7995f45e4155e4574b7b506e1a734f831ca238 ;;
-            gnarl-linux-amd64) want=3b98843a610e74862a2e62edf3dbb2d35be3e74485718e703429c84f2b8e57f3 ;;
-            gnarl-darwin-arm64) want=82ccdb87a5ef91ea2eff5b1e9cdc58f26e6a9563622bbadf457fb37f6f3311e8 ;;
-            gnarl-darwin-amd64) want=64a94697c2abbc7f4fe9500ba68ce70e1e2954726f32939f665c9f3083b84b68 ;;
-            gnarl-windows-amd64) want=e150110d613e77ff109404b4addd36f550bc87d89b48b7e52d95003d209a8918 ;;
+            gnarl-linux-amd64) want=e2f26c637e4e67d25bc9883c502cbda6e9dbaee9380ae4633cdd5a2fc7967b52 ;;
+            gnarl-darwin-arm64) want=730ecb5a551415878877ba96f2ebcadcfe414ec3dee3973526560a0d959e9193 ;;
+            gnarl-darwin-amd64) want=84bb62c6e2c85ed4e3b45f1e90284295f8226cb587d5ff902b49ad8f9c0c87d6 ;;
+            gnarl-windows-amd64) want=f0a2d152f60a33b23a3b944215ca571137824c997a64a8dfc12e131a419cae24 ;;
           esac
           curl -fsSLo "$dir/$name$exe" "https://github.com/kmoneil/$name/releases/download/$version/$name-$platform$exe"
           # The file on stdin: given a path with a backslash, as Windows'
@@ -51,6 +51,6 @@ runs:
           "$dir/$name$exe" --version
         }
         install zigvet v0.25.1
-        install gnarl v0.7.0
+        install gnarl v0.7.1
 
         if [ "$RUNNER_OS" = Windows ]; then cygpath -w "$dir"; else echo "$dir"; fi >> "$GITHUB_PATH"
