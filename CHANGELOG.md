@@ -7,7 +7,7 @@ including the ones that did not change.
 ## 0.69.0 (2026-11-07)
 
 - core: **Breaking:** built on
-  [rest-core](https://github.com/kmoneil/rest-core.zig) 0.3.0, the
+  [rest-core](https://github.com/kmoneil/rest-core.zig) 0.4.0, the
   package's first dependency, which needs nothing beyond the Zig
   standard library. The cloud-neutral half of core moved there, so that
   this package and other clouds' clients share one copy: the HTTP
@@ -56,13 +56,16 @@ including the ones that did not change.
   request with a time limit on an `Io` that cannot run a second task is
   `error.ConcurrencyUnavailable`, where it was sent with no limit. A URL
   with a control byte, a space, a backslash, userinfo or a
-  percent-encoded host is `error.InvalidEndpoint`, and a header the
-  transport writes itself (Host, Content-Length, Accept-Encoding and the
-  like) is `error.InvalidRequestHeader`, both before connecting. A
-  response with both Transfer-Encoding and Content-Length, and a
-  compressed body with bytes after its stream or a trailer that does not
-  match, is `error.HttpProtocolError`, where the extra bytes were dropped
-  in silence. A refusal's body is read for its error to at most 64 KiB.
+  percent-encoded host, or a host std will not name (`a_b.example`, or
+  an IPv6 literal over HTTPS), is `error.InvalidEndpoint`, and a header
+  the transport writes itself (Host, Content-Length, Accept-Encoding and
+  the like) is `error.InvalidRequestHeader`, both before connecting. A
+  response with both Transfer-Encoding and Content-Length, a status that
+  is not three digits, and a compressed body with bytes after its stream
+  or a trailer that does not match, is `error.HttpProtocolError`, where
+  the extra bytes were dropped in silence. A gzip body with its trailer
+  checked decodes in about half the time it did in rest-core 0.3.0. A
+  refusal's body is read for its error to at most 64 KiB.
   A canceled call is never retried. The bearer token is zeroed in the
   response arena once the request is sent. `timestamp.parse` refuses an
   instant that `format` cannot write (the year 0000, or an offset that

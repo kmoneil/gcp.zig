@@ -7,8 +7,8 @@
     .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .rest_core = .{
-            .url = "https://github.com/kmoneil/rest-core.zig/archive/refs/tags/v0.3.0.tar.gz",
-            .hash = "rest_core-0.3.0-rTJs5FCeCQCnKRKwxkX5NvlCH7bV67jlHOeJs_IL6n_b",
+            .url = "https://github.com/kmoneil/rest-core.zig/archive/refs/tags/v0.4.0.tar.gz",
+            .hash = "rest_core-0.4.0-rTJs5MoGCgDgBq4TUR4MBMbCoPEHnLDHfe8jS5l-JASJ",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "LICENSE", "README.md", "CHANGELOG.md" },
