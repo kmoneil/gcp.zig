@@ -220,7 +220,7 @@ test "billing: a requester pays refusal of an unbilled call says how to bill one
     }, .{});
     defer h.deinit();
     try testing.expectError(error.InvalidArgument, h.client.bucket("b").object("a").get(.{}));
-    try testing.expectEqualStrings("required", h.diag.status());
+    try testing.expectEqualStrings("required", h.diag.code());
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "withBillingProject") != null);
     // A billed call keeps the server's own words.
     try testing.expectError(error.InvalidArgument, h.client.bucket("b").object("a").withBillingProject(project).get(.{}));
@@ -504,7 +504,7 @@ test "against the fake: an uploadFile resumed through any handle bills the proje
         fake.faults = null;
         try testing.expectEqual(1, fake.openSessions());
 
-        var token: test_util.FakeTokenProvider = .{ .token = "ya29.t", .quota_project = "credentials-project" };
+        var token: test_util.FakeTokenProvider = .{ .token = "ya29.t", .credential_headers = core.testing.quotaProject("credentials-project") };
         var diag: core.Diagnostics = .{};
         var second = try clientOn(&fake, token.provider(), &diag);
         defer second.deinit();

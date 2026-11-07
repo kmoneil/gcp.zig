@@ -363,7 +363,7 @@ test "bucket IAM: the stale etag's 412 is Aborted, and a grant starts over on it
         try testing.expectError(case[1], h.client.bucket("b").addIamBinding("roles/storage.objectViewer", "allUsers"));
         // Not a concurrent change: no second round.
         try h.expectRequestCount(2);
-        try testing.expectEqualStrings("conditionNotMet", h.diag.status());
+        try testing.expectEqualStrings("conditionNotMet", h.diag.code());
     }
     {
         // The same 412 on an object write stays a failed precondition.

@@ -50,7 +50,7 @@ pub fn parse(arena: Allocator, body: []const u8) DecodeError!Element {
 
 /// Reads an `<Error>` body into the status and message `Diagnostics` keep:
 /// its `Code` and `Message`. Null for a body that is not one, which then
-/// becomes the message whole. Shaped for `core.rpc.StreamCall.decode_error`.
+/// becomes the message whole. Shaped for `core.rpc.refusalReading`.
 pub fn decodeError(arena: Allocator, body: []const u8) Allocator.Error!?core.errors.ErrorBody {
     const root = parse(arena, body) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

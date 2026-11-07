@@ -5,26 +5,21 @@
 // nothing is excluded.
 .{
     // What runs per request, message, chunk or row on an application's
-    // main path, held to the tightest limits: core's transport, retries,
-    // checksums and codecs, the Pub/Sub publisher and subscriber and their
+    // main path, held to the tightest limits: core's request loop, retries,
+    // checksums and codecs (the transport is rest-core's, held to its own
+    // limits there), the Pub/Sub publisher and subscriber and their
     // wire codec, Cloud Storage's streamed transfers, Firestore's document
     // codec and streams, BigQuery's row values, a log entry written or
     // tailed, and a metric point recorded.
     .hot = .{
-        "src/core/transport.zig",
         "src/core/rpc.zig",
         "src/core/retry.zig",
         "src/core/retry_after.zig",
         "src/core/PreparedRequest.zig",
-        "src/core/TokenProvider.zig",
-        "src/core/query.zig",
         "src/core/crc32c.zig",
-        "src/core/base64.zig",
         "src/core/gzip.zig",
         "src/core/flate.zig",
         "src/core/JsonArraySplitter.zig",
-        "src/core/CountingWriter.zig",
-        "src/core/timestamp.zig",
         "src/core/duration.zig",
         "src/pubsub/Publisher.zig",
         "src/pubsub/Subscriber.zig",

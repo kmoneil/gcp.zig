@@ -72,7 +72,7 @@ Every call returns its module's error set: `pubsub.Error`,
 `storage.Error`, `secret_manager.Error` or `firestore.Error`. Each is closed: one error per
 API status (`error.NotFound`, `error.AlreadyExists`, ...), the
 transport's errors (`error.ConnectionRefused`, `error.TlsFailure`, ...),
-the token provider's (`error.RefreshTokenInvalid`,
+the token provider's (`error.ReauthenticationRequired`,
 `error.TokenUnavailable`, ...), and the module's own checks
 (`error.InvalidMessage`, `error.InvalidObjectName`, ...). Errors carry
 no payload; the details of the last failed call go to `Diagnostics`:
@@ -87,7 +87,7 @@ var client = try pubsub.Client.init(gpa, io, .{
 defer client.deinit();
 
 client.topic("orders").create(.{}) catch |err| {
-    std.debug.print("{t}: HTTP {d} {s}: {s}\n", .{ err, diag.http_status, diag.status(), diag.message() });
+    std.debug.print("{t}: HTTP {d} {s}: {s}\n", .{ err, diag.http_status, diag.code(), diag.message() });
 };
 ```
 
@@ -103,7 +103,7 @@ schedules its own next try. Measured on 2026-10-17, none of the services
 these modules call sends one; Google's front end does for some APIs.
 
 Cloud Storage's error bodies carry no canonical status, so there the
-HTTP code decides the error, and `Diagnostics.status()` keeps the
+HTTP code decides the error, and `Diagnostics.code()` keeps the
 server's `reason`, such as `notFound`. A few refusals are told apart by
 Cloud Storage's words as well: an object kept by retention or a hold is
 `error.ObjectRetained`, and a notification topic Cloud Storage cannot

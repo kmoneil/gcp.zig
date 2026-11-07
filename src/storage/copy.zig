@@ -580,7 +580,7 @@ test "copyTo: a 412 on a pinned copy names both causes" {
         .{ .storage_class = "NEARLINE" },
     ));
     try testing.expectEqual(412, h.diag.http_status);
-    try testing.expectEqualStrings("conditionNotMet", h.diag.status());
+    try testing.expectEqualStrings("conditionNotMet", h.diag.code());
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "destination's condition") != null);
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "metageneration 3") != null);
     // Not retried, so no ambiguity to mention.

@@ -167,7 +167,7 @@ fn run(w: *std.Io.Writer, handle: anytype, command: Command, rest: []const []con
 
 fn refused(w: *std.Io.Writer, err: anyerror, diag: anytype) anyerror {
     try w.print("error.{t}", .{err});
-    if (diag.http_status != 0) try w.print(" (HTTP {d} {s})", .{ diag.http_status, diag.status() });
+    if (diag.http_status != 0) try w.print(" (HTTP {d} {s})", .{ diag.http_status, diag.code() });
     if (diag.message().len != 0) try w.print(": {s}", .{diag.message()});
     try w.writeAll("\n");
     return err;

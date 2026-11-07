@@ -95,7 +95,7 @@ pub const InitError = error{
 pub const Error = error{
     /// Nothing answered, the answer was not the metadata server's, or no
     /// service account is attached to this workload.
-    MetadataUnavailable,
+    CredentialSourceUnavailable,
     /// The server stayed busy or broken for every attempt.
     TokenUnavailable,
     /// The metadata server refused the request.
@@ -104,7 +104,7 @@ pub const Error = error{
 
 /// `projectId` either reads the project or finds no metadata server; the
 /// token errors above cannot come from it.
-pub const ProjectIdError = error{MetadataUnavailable} || core.transport.Error;
+pub const ProjectIdError = error{CredentialSourceUnavailable} || core.transport.Error;
 
 /// What a probe can report instead of an answer. Everything else, from a
 /// refused connection to a reply from something that is not a metadata
@@ -220,7 +220,6 @@ pub fn provider(self: *MetadataServer) TokenProvider {
     return .{ .ptr = self, .vtable = &.{
         .getToken = getToken,
         .invalidate = invalidate,
-        .quotaProject = quotaProject,
     } };
 }
 
@@ -260,7 +259,7 @@ pub fn probeChecked(self: *MetadataServer, io: std.Io) ProbeError!bool {
 pub fn projectId(self: *MetadataServer, io: std.Io, arena: Allocator) ProjectIdError![]const u8 {
     const res = self.getRetrying(io, arena, self.project_url, .account, self.request_timeout_ms) catch |err| switch (err) {
         // Any refusal means no metadata server this code can use.
-        error.TokenUnavailable, error.TokenEndpointRejected => return error.MetadataUnavailable,
+        error.TokenUnavailable, error.TokenEndpointRejected => return error.CredentialSourceUnavailable,
         else => |e| return e,
     };
     // Plain text, and short. Anything else did not come from the project
@@ -268,7 +267,7 @@ pub fn projectId(self: *MetadataServer, io: std.Io, arena: Allocator) ProjectIdE
     const id = std.mem.trim(u8, res.body, " \t\r\n");
     if (!isProjectId(id)) {
         if (self.diagnostics) |d| d.set(res.status, "", "the metadata server's project id is not one");
-        return error.MetadataUnavailable;
+        return error.CredentialSourceUnavailable;
     }
     logging.debug("metadata server: project {s}", .{id});
     return arena.dupe(u8, id);
@@ -284,7 +283,7 @@ pub fn email(self: *MetadataServer, io: std.Io, arena: Allocator) EmailError![]c
     const res, const address = try self.askEmail(io, arena);
     if (!iam_credentials.isEmail(address)) {
         if (self.diagnostics) |d| d.set(res.status, "", "the metadata server's service account email is not one");
-        return error.MetadataUnavailable;
+        return error.CredentialSourceUnavailable;
     }
     logging.debug("metadata server: service account {s}", .{address});
     return arena.dupe(u8, address);
@@ -305,7 +304,7 @@ pub fn account(self: *MetadataServer, io: std.Io, arena: Allocator) EmailError![
         const pool = iam_credentials.isPrincipal(name) and std.mem.endsWith(u8, name, ".svc.id.goog") and name.len > ".svc.id.goog".len;
         if (!iam_credentials.isEmail(name) and !pool) {
             if (self.diagnostics) |d| d.set(res.status, "", "the metadata server's service account is neither an email nor a workload pool");
-            return error.MetadataUnavailable;
+            return error.CredentialSourceUnavailable;
         }
         self.account_name = try self.gpa.dupe(u8, name);
     }
@@ -316,7 +315,7 @@ pub fn account(self: *MetadataServer, io: std.Io, arena: Allocator) EmailError![
 /// server this code can use.
 fn askEmail(self: *MetadataServer, io: std.Io, arena: Allocator) EmailError!struct { Response, []const u8 } {
     const res = self.getRetrying(io, arena, self.email_url, .account, self.request_timeout_ms) catch |err| switch (err) {
-        error.TokenUnavailable, error.TokenEndpointRejected => return error.MetadataUnavailable,
+        error.TokenUnavailable, error.TokenEndpointRejected => return error.CredentialSourceUnavailable,
         else => |e| return e,
     };
     return .{ res, std.mem.trim(u8, res.body, " \t\r\n") };
@@ -325,7 +324,7 @@ fn askEmail(self: *MetadataServer, io: std.Io, arena: Allocator) EmailError!stru
 /// What reading a key can fail with.
 pub const GetError = error{
     /// Nothing answered, or the answer was not the metadata server's.
-    MetadataUnavailable,
+    CredentialSourceUnavailable,
     /// 404: the key is not set, or there is no such path. The metadata
     /// server sends this one itself, flavor header and all, so it says
     /// nothing about whether this is Google Cloud.
@@ -376,7 +375,7 @@ pub fn preempted(self: *MetadataServer, io: std.Io) GetError!bool {
     if (std.mem.eql(u8, value, "TRUE")) return true;
     if (std.mem.eql(u8, value, "FALSE")) return false;
     if (self.diagnostics) |d| d.set(200, "", "the metadata server's instance/preempted is neither TRUE nor FALSE");
-    return error.MetadataUnavailable;
+    return error.CredentialSourceUnavailable;
 }
 
 pub const WatchOptions = struct {
@@ -419,7 +418,7 @@ pub fn watch(self: *MetadataServer, io: std.Io, arena: Allocator, path: []const 
     const etag = std.mem.trim(u8, res.header("ETag") orelse "", " \t");
     if (!isValidEtag(etag)) {
         if (self.diagnostics) |d| d.set(res.status, "", "the metadata server's answer has no usable ETag");
-        return error.MetadataUnavailable;
+        return error.CredentialSourceUnavailable;
     }
     return .{ .value = res.body, .etag = etag };
 }
@@ -496,12 +495,6 @@ fn getToken(ptr: *anyopaque, io: std.Io, arena: Allocator, scopes: []const []con
 
 fn invalidate(ptr: *anyopaque) void {
     fromPtr(ptr).cache.invalidate();
-}
-
-fn quotaProject(ptr: *anyopaque) ?[]const u8 {
-    // A service account bills its own project; there is nothing to send.
-    _ = ptr;
-    return null;
 }
 
 /// Asks the metadata server for the attached account's token. `arena` is
@@ -594,7 +587,7 @@ fn getOnce(self: *MetadataServer, io: std.Io, arena: Allocator, url: []const u8,
     };
     if (!isFromMetadataServer(res)) {
         if (self.diagnostics) |d| d.set(res.status, "", "the answer carries no Metadata-Flavor header, so it is not the metadata server's");
-        return .{ .fail = error.MetadataUnavailable };
+        return .{ .fail = error.CredentialSourceUnavailable };
     }
     if (res.status == 200) return .{ .ok = res };
     const outcome = self.describeRefusal(res, asking);
@@ -636,7 +629,7 @@ const Refusal = enum {
     fn attempt(r: Refusal, comptime asking: Asking) Attempt(asking) {
         return switch (asking) {
             .account => switch (r) {
-                .not_found, .redirect => .{ .fail = error.MetadataUnavailable },
+                .not_found, .redirect => .{ .fail = error.CredentialSourceUnavailable },
                 .busy => .{ .retry = error.TokenUnavailable },
                 .refused => .{ .fail = error.TokenEndpointRejected },
             },
@@ -851,7 +844,7 @@ test "MetadataServer: the token request carries Metadata-Flavor and no token of 
     try testing.expectEqual(null, req.bearer);
     try testing.expectEqual(null, req.body);
     // A service account bills its own project.
-    try testing.expectEqual(null, h.metadata.provider().quotaProject());
+    try testing.expectEqual(null, core.rpc.quotaProjectOf(h.metadata.provider()));
 }
 
 test "MetadataServer: requests carry a deadline, and the probe a shorter one" {
@@ -871,7 +864,7 @@ test "MetadataServer: an answer without Metadata-Flavor is not the metadata serv
     var h: Harness = undefined;
     try h.init(&.{.{ .respond = .{ .body = "{\"access_token\":\"ya29.imposter\",\"expires_in\":3599}" } }});
     defer h.deinit();
-    try testing.expectError(error.MetadataUnavailable, h.get());
+    try testing.expectError(error.CredentialSourceUnavailable, h.get());
     // Not retried: the answer was prompt, it was just not the right server.
     try testing.expectEqual(1, h.fake.requests.items.len);
     try testing.expectEqualStrings(
@@ -889,7 +882,7 @@ test "MetadataServer: a wrong Metadata-Flavor value is refused, any case is acce
         var h: Harness = undefined;
         try h.init(&.{.{ .respond = .{ .body = "{\"access_token\":\"t\",\"expires_in\":1}", .headers = headers } }});
         defer h.deinit();
-        try testing.expectError(error.MetadataUnavailable, h.get());
+        try testing.expectError(error.CredentialSourceUnavailable, h.get());
     }
     var h: Harness = undefined;
     try h.init(&.{.{ .respond = .{
@@ -904,7 +897,7 @@ test "MetadataServer: 404 means no service account is attached" {
     var h: Harness = undefined;
     try h.init(&.{.{ .respond = .{ .status = 404, .body = "Not Found", .headers = flavor } }});
     defer h.deinit();
-    try testing.expectError(error.MetadataUnavailable, h.get());
+    try testing.expectError(error.CredentialSourceUnavailable, h.get());
     try testing.expectEqual(1, h.fake.requests.items.len);
     try testing.expectEqual(404, h.diag.http_status);
     try testing.expectEqualStrings("no service account is attached to this workload", h.diag.message());
@@ -918,7 +911,7 @@ test "MetadataServer: a redirect is refused, not followed" {
         .headers = &.{ .{ .name = "Metadata-Flavor", .value = "Google" }, .{ .name = "Location", .value = "http://evil.example/" } },
     } }});
     defer h.deinit();
-    try testing.expectError(error.MetadataUnavailable, h.get());
+    try testing.expectError(error.CredentialSourceUnavailable, h.get());
     try testing.expectEqual(1, h.fake.requests.items.len);
     try testing.expectEqualStrings("the metadata server answered with a redirect, which is never followed", h.diag.message());
 }
@@ -958,7 +951,7 @@ test "MetadataServer: the metadata server's delay is waited, one past the cap re
     try testing.expectEqual(30_000, h.diag.retry_after_ms.?);
     // Without Metadata-Flavor the answer is not the metadata server's, and
     // neither is its delay.
-    try testing.expectError(error.MetadataUnavailable, h.get());
+    try testing.expectError(error.CredentialSourceUnavailable, h.get());
     try testing.expectEqual(null, h.diag.retry_after_ms);
 }
 
@@ -1016,11 +1009,11 @@ test "MetadataServer: projectId reads the project id, and refuses what is not on
         "http://metadata.google.internal/computeMetadata/v1/project/project-id",
         (try h.fake.request(0)).url,
     );
-    try testing.expectError(error.MetadataUnavailable, h.metadata.projectId(io, a));
+    try testing.expectError(error.CredentialSourceUnavailable, h.metadata.projectId(io, a));
     try testing.expectEqualStrings("the metadata server's project id is not one", h.diag.message());
-    try testing.expectError(error.MetadataUnavailable, h.metadata.projectId(io, a));
+    try testing.expectError(error.CredentialSourceUnavailable, h.metadata.projectId(io, a));
     // Even a refusal is only ever "no metadata server to read this from".
-    try testing.expectError(error.MetadataUnavailable, h.metadata.projectId(io, a));
+    try testing.expectError(error.CredentialSourceUnavailable, h.metadata.projectId(io, a));
 }
 
 const email_ok: Reply = .{ .respond = .{ .body = "worker@my-project.iam.gserviceaccount.com\n", .headers = flavor } };
@@ -1041,11 +1034,11 @@ test "MetadataServer: email reads the attached account, and refuses what is not 
     const req = try h.fake.request(0);
     try testing.expectEqualStrings("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email", req.url);
     try testing.expectEqualStrings("Google", req.header("Metadata-Flavor").?);
-    try testing.expectError(error.MetadataUnavailable, h.metadata.email(h.clock.io(), h.arena.allocator()));
+    try testing.expectError(error.CredentialSourceUnavailable, h.metadata.email(h.clock.io(), h.arena.allocator()));
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "email is not one") != null);
     // Even a refusal is only ever "no metadata server to read this from".
-    try testing.expectError(error.MetadataUnavailable, h.metadata.email(h.clock.io(), h.arena.allocator()));
-    try testing.expectError(error.MetadataUnavailable, h.metadata.email(h.clock.io(), h.arena.allocator()));
+    try testing.expectError(error.CredentialSourceUnavailable, h.metadata.email(h.clock.io(), h.arena.allocator()));
+    try testing.expectError(error.CredentialSourceUnavailable, h.metadata.email(h.clock.io(), h.arena.allocator()));
 }
 
 test "MetadataServer.account: the attached account or GKE's workload pool, asked once and kept" {
@@ -1065,7 +1058,7 @@ test "MetadataServer.account: the attached account or GKE's workload pool, asked
         try h.init(&.{ pool, pool });
         defer h.deinit();
         try testing.expectEqualStrings("my-project.svc.id.goog", try h.metadata.account(h.clock.io(), h.arena.allocator()));
-        try testing.expectError(error.MetadataUnavailable, h.metadata.email(h.clock.io(), h.arena.allocator()));
+        try testing.expectError(error.CredentialSourceUnavailable, h.metadata.email(h.clock.io(), h.arena.allocator()));
     }
     {
         var h: Harness = undefined;
@@ -1077,11 +1070,11 @@ test "MetadataServer.account: the attached account or GKE's workload pool, asked
             email_ok,
         });
         defer h.deinit();
-        try testing.expectError(error.MetadataUnavailable, h.metadata.account(h.clock.io(), h.arena.allocator()));
+        try testing.expectError(error.CredentialSourceUnavailable, h.metadata.account(h.clock.io(), h.arena.allocator()));
         try testing.expectEqualStrings("the metadata server's service account is neither an email nor a workload pool", h.diag.message());
         // Nor a bare suffix, nor a name that could not be one; a 404 says
         // no account is attached.
-        for (0..3) |_| try testing.expectError(error.MetadataUnavailable, h.metadata.account(h.clock.io(), h.arena.allocator()));
+        for (0..3) |_| try testing.expectError(error.CredentialSourceUnavailable, h.metadata.account(h.clock.io(), h.arena.allocator()));
         try testing.expectEqualStrings("no service account is attached to this workload", h.diag.message());
         // A refusal is not kept: the next call asks again.
         try testing.expectEqualStrings("worker@my-project.iam.gserviceaccount.com", try h.metadata.account(h.clock.io(), h.arena.allocator()));
@@ -1127,7 +1120,7 @@ test "MetadataServer: a signer with no metadata server fails like the provider d
     var h: Harness = undefined;
     try h.init(&.{.{ .respond = .{ .status = 404, .body = "Not Found", .headers = flavor } }});
     defer h.deinit();
-    try testing.expectError(error.MetadataUnavailable, h.metadata.signer().sign(h.clock.io(), h.arena.allocator(), "x"));
+    try testing.expectError(error.CredentialSourceUnavailable, h.metadata.signer().sign(h.clock.io(), h.arena.allocator(), "x"));
     try testing.expectEqual(1, h.fake.requests.items.len);
 }
 
@@ -1491,7 +1484,7 @@ test "MetadataServer.get: a 404 without the flavor header is not the metadata se
     var h: Harness = undefined;
     try h.init(&.{.{ .respond = .{ .status = 404, .body = "Not Found" } }});
     defer h.deinit();
-    try testing.expectError(error.MetadataUnavailable, h.metadata.get(h.clock.io(), h.arena.allocator(), "instance/zone"));
+    try testing.expectError(error.CredentialSourceUnavailable, h.metadata.get(h.clock.io(), h.arena.allocator(), "instance/zone"));
 }
 
 test "MetadataServer.get: 400, 403, 405 and a redirect are refusals, not retried" {
@@ -1590,7 +1583,7 @@ test "MetadataServer.preempted: TRUE and FALSE, trimmed; anything else is not th
     try testing.expectEqualStrings("http://metadata.google.internal/computeMetadata/v1/instance/preempted", (try h.fake.request(0)).url);
     try testing.expect(try h.metadata.preempted(io));
     try testing.expect(try h.metadata.preempted(io));
-    try testing.expectError(error.MetadataUnavailable, h.metadata.preempted(io));
+    try testing.expectError(error.CredentialSourceUnavailable, h.metadata.preempted(io));
     try testing.expectEqualStrings("the metadata server's instance/preempted is neither TRUE nor FALSE", h.diag.message());
     // Not Compute Engine: Cloud Run's server has no such key.
     try testing.expectError(error.NotFound, h.metadata.preempted(io));
@@ -1664,7 +1657,7 @@ test "MetadataServer.watch: an answer with no usable ETag is not the metadata se
         var h: Harness = undefined;
         try h.init(&.{.{ .respond = .{ .body = "FALSE", .headers = headers } }});
         defer h.deinit();
-        try testing.expectError(error.MetadataUnavailable, h.metadata.watch(h.clock.io(), h.arena.allocator(), "instance/preempted", .{}));
+        try testing.expectError(error.CredentialSourceUnavailable, h.metadata.watch(h.clock.io(), h.arena.allocator(), "instance/preempted", .{}));
         try testing.expectEqualStrings("the metadata server's answer has no usable ETag", h.diag.message());
     }
 }
@@ -1685,7 +1678,7 @@ test "MetadataServer: the account calls keep 404 as no account, beside the key c
     var h: Harness = undefined;
     try h.init(&.{ keyReply(404, ""), keyReply(404, "") });
     defer h.deinit();
-    try testing.expectError(error.MetadataUnavailable, h.metadata.email(h.clock.io(), h.arena.allocator()));
+    try testing.expectError(error.CredentialSourceUnavailable, h.metadata.email(h.clock.io(), h.arena.allocator()));
     try testing.expectEqualStrings("no service account is attached to this workload", h.diag.message());
     try testing.expectError(error.NotFound, h.metadata.get(h.clock.io(), h.arena.allocator(), "instance/service-accounts/default/email"));
 }

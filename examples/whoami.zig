@@ -73,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn fail(err: anyerror, diag: *const pubsub.Diagnostics) anyerror {
     std.debug.print("error.{t}", .{err});
-    if (diag.http_status != 0) std.debug.print(" (HTTP {d} {s})", .{ diag.http_status, diag.status() });
+    if (diag.http_status != 0) std.debug.print(" (HTTP {d} {s})", .{ diag.http_status, diag.code() });
     if (diag.message().len != 0) std.debug.print(": {s}", .{diag.message()});
     std.debug.print("\n", .{});
     return err;

@@ -209,8 +209,8 @@ pub fn meetsOwnWrite(err: anyerror, precondition: ?types.Precondition) bool {
 /// Adds `note` to the failed call's message, keeping its statuses.
 pub fn appendNote(client: *Client, note: []const u8) void {
     const d = client.diagnostics orelse return;
-    var status_buf: [core.Diagnostics.max_status_len]u8 = undefined;
-    const status_text = d.status();
+    var status_buf: [core.Diagnostics.max_code_len]u8 = undefined;
+    const status_text = d.code();
     @memcpy(status_buf[0..status_text.len], status_text);
     var message_buf: [640]u8 = undefined;
     const message = std.fmt.bufPrint(&message_buf, "{s}{s}", .{ d.message(), note }) catch d.message();

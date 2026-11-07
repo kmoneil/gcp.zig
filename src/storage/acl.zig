@@ -517,7 +517,7 @@ test "production's refusals arrive as their own errors, and are never retried" {
             .predefined_acl = .private,
             .preconditions = .does_not_exist,
         }));
-        try testing.expectEqualStrings("invalid", h.diag.status());
+        try testing.expectEqualStrings("invalid", h.diag.code());
         try testing.expectEqual(1, h.fake.stream_requests.items.len);
     }
     {

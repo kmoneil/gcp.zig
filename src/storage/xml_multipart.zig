@@ -112,7 +112,7 @@ pub fn start(client: *Client, arena: Allocator, bucket: []const u8, object: []co
         .headers = headers,
         // Content-Length: 0, which the start needs.
         .body = .{ .segments = &.{} },
-        .decode_error = xml.decodeError,
+        .refusal = core.rpc.refusalReading(xml.decodeError),
     }) catch |err| switch (err) {
         // The sink is a buffer; there is no caller writer to fail.
         error.WriteFailed => unreachable,
@@ -182,7 +182,7 @@ pub fn sendPart(
     var key: encryption.KeyHeaders = undefined;
     key.init(client.encryption_key, .object);
     defer key.wipe();
-    const call: rpc.StreamCall = .{ .method = .PUT, .path = path, .headers = key.slice(), .decode_error = xml.decodeError };
+    const call: rpc.StreamCall = .{ .method = .PUT, .path = path, .headers = key.slice(), .refusal = core.rpc.refusalReading(xml.decodeError) };
     var response: std.heap.ArenaAllocator = .init(client.gpa);
     defer response.deinit();
     const res = switch (body) {
@@ -253,7 +253,7 @@ pub fn finish(
         .headers = key.slice(),
         .body = .{ .segments = &.{body} },
         .timeout_ms = timeout_ms,
-        .decode_error = xml.decodeError,
+        .refusal = core.rpc.refusalReading(xml.decodeError),
     }) catch |err| switch (err) {
         error.WriteFailed => unreachable,
         else => |e| return e,
@@ -336,7 +336,7 @@ pub fn listParts(
         const res = rpc.executeXml(client, &response, .{
             .method = .GET,
             .path = path,
-            .decode_error = xml.decodeError,
+            .refusal = core.rpc.refusalReading(xml.decodeError),
         }) catch |err| switch (err) {
             error.WriteFailed => unreachable,
             else => |e| return e,
@@ -374,7 +374,7 @@ pub fn abort(client: *Client, bucket: []const u8, object: []const u8, upload_id:
     _ = rpc.executeXml(client, &response, .{
         .method = .DELETE,
         .path = path,
-        .decode_error = xml.decodeError,
+        .refusal = core.rpc.refusalReading(xml.decodeError),
     }) catch |err| switch (err) {
         error.WriteFailed => unreachable,
         error.NotFound => {
@@ -389,7 +389,7 @@ pub fn abort(client: *Client, bucket: []const u8, object: []const u8, upload_id:
 pub fn uploadIsGone(client: *const Client, err: Error) bool {
     if (err != error.NotFound) return false;
     const d = client.diagnostics orelse return false;
-    return std.mem.eql(u8, d.status(), "NoSuchUpload");
+    return std.mem.eql(u8, d.code(), "NoSuchUpload");
 }
 
 fn decodeFailed(client: *Client, err: xml.DecodeError, what: []const u8) Error {
@@ -522,7 +522,7 @@ test "start: answers that name no upload" {
     try testing.expectError(error.InvalidResponse, start(&h.client, arena.allocator(), "b", "o", .{ .content_type = "x/y" }));
     // An XML error fills the diagnostics as a JSON one would.
     try testing.expectError(error.PermissionDenied, start(&h.client, arena.allocator(), "b", "o", .{ .content_type = "x/y" }));
-    try testing.expectEqualStrings("AccessDenied", h.diag.status());
+    try testing.expectEqualStrings("AccessDenied", h.diag.code());
     try testing.expectEqualStrings("no storage.multipartUploads.create", h.diag.message());
 }
 
@@ -634,7 +634,7 @@ test "finish: a 200 that carries an error, one that carries nothing, and a gone 
     defer h.deinit();
     const parts = [_]xml.CompletedPart{.{ .number = 1, .etag = "\"a\"" }};
     try testing.expectError(error.Internal, finish(&h.client, "b", "o", "u", &parts, 0));
-    try testing.expectEqualStrings("InternalError", h.diag.status());
+    try testing.expectEqualStrings("InternalError", h.diag.code());
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "try again") != null);
     try testing.expectError(error.Unknown, finish(&h.client, "b", "o", "u", &parts, 0));
     // No checksum and no generation named: both null, for the caller to judge.

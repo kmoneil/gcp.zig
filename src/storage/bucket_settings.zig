@@ -1094,7 +1094,7 @@ test "update: a stale condition is FailedPrecondition, and a current not-match N
         "https://storage.googleapis.com/storage/v1/b/zigps-b?projection=noAcl&ifMetagenerationMatch=1",
         "{\"versioning\":{\"enabled\":true}}",
     );
-    try testing.expectEqualStrings("conditionNotMet", h.diag.status());
+    try testing.expectEqualStrings("conditionNotMet", h.diag.code());
     // Measured: Cloud Storage answers such a patch 304, and changes nothing.
     try testing.expectError(error.NotModified, b.update(.{ .versioning = true, .if_metageneration_not_match = 2 }));
     try h.expectRequest(

@@ -400,8 +400,8 @@ test "IamSigner: the token's failure is the signer's" {
     var h: Harness = undefined;
     try h.init(&.{signed}, &.{});
     defer h.deinit();
-    h.token.fail = error.RefreshTokenInvalid;
-    try testing.expectError(error.RefreshTokenInvalid, h.sign());
+    h.token.fail = error.ReauthenticationRequired;
+    try testing.expectError(error.ReauthenticationRequired, h.sign());
     try testing.expectEqual(0, h.fake.requests.items.len);
 }
 

@@ -166,8 +166,8 @@ fn hintBilling(client: *Client, err: anyerror) void {
     if (err != error.InvalidArgument or client.billing_project != null) return;
     const d = client.diagnostics orelse return;
     if (std.ascii.findIgnoreCase(d.message(), "requester pays") == null) return;
-    var status_buf: [core.Diagnostics.max_status_len]u8 = undefined;
-    const status_text = d.status();
+    var status_buf: [core.Diagnostics.max_code_len]u8 = undefined;
+    const status_text = d.code();
     @memcpy(status_buf[0..status_text.len], status_text);
     d.set(d.http_status, status_buf[0..status_text.len], "the bucket has requester pays on and this request named no project to bill: Bucket.withBillingProject or Object.withBillingProject names one");
 }
@@ -192,8 +192,8 @@ fn hintKeys(client: *Client, err: anyerror) void {
         "permission denied on the Cloud KMS key: it must exist in the bucket's location, and the project's Cloud Storage service agent, which Client.serviceAgent names, needs roles/cloudkms.cryptoKeyEncrypterDecrypter on it"
     else
         return;
-    var status_buf: [core.Diagnostics.max_status_len]u8 = undefined;
-    const status_text = d.status();
+    var status_buf: [core.Diagnostics.max_code_len]u8 = undefined;
+    const status_text = d.code();
     @memcpy(status_buf[0..status_text.len], status_text);
     d.set(d.http_status, status_buf[0..status_text.len], message_hint);
 }
@@ -383,8 +383,8 @@ pub fn ambiguous412(client: *Client, retried: bool) Error {
 /// is copied out first.
 pub fn replace412(client: *Client, message: []const u8) void {
     const d = client.diagnostics orelse return;
-    var status_buf: [core.Diagnostics.max_status_len]u8 = undefined;
-    const status_text = d.status();
+    var status_buf: [core.Diagnostics.max_code_len]u8 = undefined;
+    const status_text = d.code();
     @memcpy(status_buf[0..status_text.len], status_text);
     d.set(412, status_buf[0..status_text.len], message);
 }

@@ -1132,8 +1132,8 @@ test "signedUrl: a signer's failure is the call's, and an empty answer is Signin
     const object = h.object("photos", "o");
     h.signer.fail = error.SigningRejected;
     try testing.expectError(error.SigningRejected, object.signedUrl(.{ .rsa = h.signer.signer() }, .{ .expires_in_s = 60 }));
-    h.signer.fail = error.MetadataUnavailable;
-    try testing.expectError(error.MetadataUnavailable, object.signedUrl(.{ .rsa = h.signer.signer() }, .{ .expires_in_s = 60 }));
+    h.signer.fail = error.CredentialSourceUnavailable;
+    try testing.expectError(error.CredentialSourceUnavailable, object.signedUrl(.{ .rsa = h.signer.signer() }, .{ .expires_in_s = 60 }));
     h.signer.fail = null;
     h.signer.account = "";
     try testing.expectError(error.SigningFailed, object.signedUrl(.{ .rsa = h.signer.signer() }, .{ .expires_in_s = 60 }));

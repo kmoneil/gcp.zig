@@ -35,7 +35,7 @@ const core = @import("core");
 /// holds.
 pub fn isRetained(err: anyerror, diag: *const core.Diagnostics) bool {
     if (err != error.PermissionDenied) return false;
-    const reason = diag.status();
+    const reason = diag.code();
     const message = diag.message();
     // The JSON API's `retentionPolicyNotMet` and the XML API's
     // `RetentionPolicyNotMet`.
@@ -142,7 +142,7 @@ test "ObjectRetained: from a delete, an upload and a resumable upload's final PU
     try testing.expectError(error.ObjectRetained, obj.delete(.{ .generation = 7 }));
     // The server's words stay, time and all.
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "cannot be deleted or overwritten until 2026-09-30T15:58:01.185839-07:00") != null);
-    try testing.expectEqualStrings("retentionPolicyNotMet", h.diag.status());
+    try testing.expectEqualStrings("retentionPolicyNotMet", h.diag.code());
     try testing.expectError(error.ObjectRetained, obj.upload("data", .{ .preconditions = .{ .if_generation_match = 7 } }));
     // Never retried.
     try testing.expectEqual(2, h.fake.requests.items.len + h.fake.stream_requests.items.len);
@@ -764,7 +764,7 @@ test "a parallel upload over a retained object is refused at its finish; a hold 
     var data: [9000]u8 = undefined;
     @memset(&data, 'v');
     try testing.expectError(error.ObjectRetained, f.object("o").uploadParallel(.{ .data = &data }, .{ .part_size = 4096 }));
-    try testing.expectEqualStrings("RetentionPolicyNotMet", f.diag.status());
+    try testing.expectEqualStrings("RetentionPolicyNotMet", f.diag.code());
     try testing.expectEqual(0, f.fake.openUploads());
     try testing.expectError(error.FailedPrecondition, f.object("o").updateMetadata(.{
         .temporary_hold = true,

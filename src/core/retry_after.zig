@@ -1,16 +1,10 @@
 //! A server's retry delay: how long a refused response asked its client to
-//! wait before trying again. Three forms are read, and the largest valid one
-//! is kept, since each means "at least this long":
-//!
-//! - `Retry-After`, RFC 9110 section 10.2.3: delay-seconds, or an HTTP-date
-//!   in any of the three formats a recipient must accept, read against the
-//!   response's own `Date` when it has one (RFC 9111 measures a server's
-//!   dates that way, to cancel clock skew), else against when the response
-//!   arrived;
-//! - `retry-after-ms`, milliseconds, which Google's front end sends beside
-//!   `Retry-After` and Azure defines;
-//! - `google.rpc.RetryInfo` in a JSON error body's `details`, whose
-//!   `retryDelay` is a Duration such as "30s" or "0.830956646s".
+//! wait before trying again. rest-core reads the headers (`Retry-After`, in
+//! delay-seconds or as an HTTP-date, and `retry-after-ms`, which Google's
+//! front end sends beside it); this adds `google.rpc.RetryInfo` in a JSON
+//! error body's `details`, whose `retryDelay` is a Duration such as "30s"
+//! or "0.830956646s". The largest valid one is kept, since each means "at
+//! least this long".
 //!
 //! A malformed, negative or empty value is ignored, never an error, and a
 //! delay past `maxInt(u32)` milliseconds (49.7 days) saturates there with no
@@ -26,73 +20,18 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const duration = @import("duration.zig");
 const errors = @import("errors.zig");
-const transport = @import("transport.zig");
+const rest_core = @import("rest_core");
+const transport = rest_core.transport;
+const neutral = rest_core.retry_after;
 
 const max_ms = std.math.maxInt(u32);
 
 /// The delay a refused response asked for, in milliseconds, from its
-/// headers and, when it is Google's JSON error shape, its body; null when
-/// it asked for none. `received_at` is the wall clock when it arrived.
+/// headers, as rest-core reads them, and, when it is Google's JSON error
+/// shape, its body; null when it asked for none. `received_at` is the wall
+/// clock when it arrived.
 pub fn serverDelayMs(arena: Allocator, headers: []const transport.Header, body: []const u8, received_at: std.Io.Timestamp) Allocator.Error!?u32 {
-    var best: ?u32 = null;
-    const date = header(headers, "date");
-    for (headers) |h| {
-        const found: ?u32 = if (std.ascii.eqlIgnoreCase(h.name, "retry-after"))
-            retryAfterMs(h.value, date, received_at)
-        else if (std.ascii.eqlIgnoreCase(h.name, "retry-after-ms"))
-            millisecondsMs(h.value)
-        else
-            continue;
-        best = larger(best, found);
-    }
-    return larger(best, try errors.decodeRetryDelayMs(arena, body));
-}
-
-fn larger(a: ?u32, b: ?u32) ?u32 {
-    const x = a orelse return b;
-    const y = b orelse return x;
-    return @max(x, y);
-}
-
-fn header(headers: []const transport.Header, name: []const u8) ?[]const u8 {
-    for (headers) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
-    return null;
-}
-
-const ows = " \t";
-
-/// A `Retry-After` value: delay-seconds, or an HTTP-date measured from the
-/// response's `Date` (`date`, when present and valid) or else from
-/// `received_at`. A date in the past is 0.
-pub fn retryAfterMs(value: []const u8, date: ?[]const u8, received_at: std.Io.Timestamp) ?u32 {
-    const text = std.mem.trim(u8, value, ows);
-    if (digitsMs(text, 1000)) |ms| return ms;
-    const target = httpDate(text) orelse return null;
-    const base: i64 = if (date) |d| httpDate(std.mem.trim(u8, d, ows)) orelse nowSeconds(received_at) else nowSeconds(received_at);
-    if (target <= base) return 0;
-    const seconds: u64 = @intCast(target - base);
-    return saturate(@as(u128, seconds) * 1000);
-}
-
-fn nowSeconds(t: std.Io.Timestamp) i64 {
-    return @intCast(@divFloor(t.nanoseconds, std.time.ns_per_s));
-}
-
-/// A `retry-after-ms` value: a non-negative integer of milliseconds.
-pub fn millisecondsMs(value: []const u8) ?u32 {
-    return digitsMs(std.mem.trim(u8, value, ows), 1);
-}
-
-/// `1*DIGIT` times `unit_ms`, saturating; null for anything else.
-fn digitsMs(text: []const u8, unit_ms: u32) ?u32 {
-    if (text.len == 0) return null;
-    var n: u128 = 0;
-    for (text) |c| {
-        if (!std.ascii.isDigit(c)) return null;
-        // Past this the result saturates whatever digits follow.
-        if (n <= max_ms) n = n * 10 + (c - '0');
-    }
-    return saturate(n * unit_ms);
+    return neutral.larger(neutral.serverDelayMs(transport.Header, headers, received_at), try errors.decodeRetryDelayMs(arena, body));
 }
 
 fn saturate(n: u128) u32 {
@@ -108,103 +47,6 @@ pub fn durationMs(text: []const u8) ?u32 {
     if (d.nanoseconds < 0) return null;
     const ns: u128 = @intCast(d.nanoseconds);
     return saturate((ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms);
-}
-
-const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-const day_names = [_][]const u8{ "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" };
-const long_day_names = [_][]const u8{ "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday" };
-
-/// An HTTP-date in Unix seconds, in any of RFC 9110's three formats:
-/// IMF-fixdate "Sun, 06 Nov 1994 08:49:37 GMT", rfc850-date
-/// "Sunday, 06-Nov-94 08:49:37 GMT", and asctime-date
-/// "Sun Nov  6 08:49:37 1994". Case-sensitive, as RFC 9110 says. The
-/// weekday is not checked against the date. A two-digit year is read in
-/// 1950 to 2049, which is RFC 9110's rule ("more than 50 years in the
-/// future" is the past) for any year this library will run in.
-pub fn httpDate(text: []const u8) ?i64 {
-    if (imfFixdate(text)) |t| return t;
-    if (rfc850Date(text)) |t| return t;
-    return asctimeDate(text);
-}
-
-fn imfFixdate(t: []const u8) ?i64 {
-    // "Sun, 06 Nov 1994 08:49:37 GMT"
-    if (t.len != 29 or !isOneOf(t[0..3], &day_names) or !std.mem.eql(u8, t[3..5], ", ") or t[7] != ' ' or t[11] != ' ' or t[16] != ' ' or !std.mem.eql(u8, t[25..], " GMT")) return null;
-    const day = number(t[5..7]) orelse return null;
-    const month = monthOf(t[8..11]) orelse return null;
-    const year = number(t[12..16]) orelse return null;
-    return civil(year, month, day, t[17..25]);
-}
-
-fn rfc850Date(t: []const u8) ?i64 {
-    // "Sunday, 06-Nov-94 08:49:37 GMT"
-    const comma = std.mem.indexOfScalar(u8, t, ',') orelse return null;
-    if (!isOneOf(t[0..comma], &long_day_names)) return null;
-    const rest = t[comma..];
-    if (rest.len != 24 or rest[1] != ' ' or rest[4] != '-' or rest[8] != '-' or rest[11] != ' ' or !std.mem.eql(u8, rest[20..], " GMT")) return null;
-    const day = number(rest[2..4]) orelse return null;
-    const month = monthOf(rest[5..8]) orelse return null;
-    const yy = number(rest[9..11]) orelse return null;
-    const year = if (yy < 50) 2000 + yy else 1900 + yy;
-    return civil(year, month, day, rest[12..20]);
-}
-
-fn asctimeDate(t: []const u8) ?i64 {
-    // "Sun Nov  6 08:49:37 1994"
-    if (t.len != 24 or !isOneOf(t[0..3], &day_names) or t[3] != ' ' or t[7] != ' ' or t[10] != ' ' or t[19] != ' ') return null;
-    const month = monthOf(t[4..7]) orelse return null;
-    const day = if (t[8] == ' ') number(t[9..10]) orelse return null else number(t[8..10]) orelse return null;
-    const year = number(t[20..24]) orelse return null;
-    return civil(year, month, day, t[11..19]);
-}
-
-fn isOneOf(text: []const u8, names: []const []const u8) bool {
-    for (names) |n| if (std.mem.eql(u8, text, n)) return true;
-    return false;
-}
-
-fn monthOf(text: []const u8) ?i64 {
-    for (months, 1..) |m, i| if (std.mem.eql(u8, text, m)) return @intCast(i);
-    return null;
-}
-
-fn number(text: []const u8) ?i64 {
-    var n: i64 = 0;
-    for (text) |c| {
-        if (!std.ascii.isDigit(c)) return null;
-        n = n * 10 + (c - '0');
-    }
-    return n;
-}
-
-/// "08:49:37" on a date, in Unix seconds; a leap second (60) is read as 59.
-fn civil(year: i64, month: i64, day: i64, time: []const u8) ?i64 {
-    if (time.len != 8 or time[2] != ':' or time[5] != ':') return null;
-    const hour = number(time[0..2]) orelse return null;
-    const minute = number(time[3..5]) orelse return null;
-    const second = number(time[6..8]) orelse return null;
-    if (hour > 23 or minute > 59 or second > 60) return null;
-    if (day < 1 or day > daysIn(year, month)) return null;
-    return daysFromCivil(year, month, day) * std.time.s_per_day + hour * 3600 + minute * 60 + @min(second, 59);
-}
-
-fn daysIn(year: i64, month: i64) i64 {
-    return switch (month) {
-        2 => if (@mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0)) 29 else 28,
-        4, 6, 9, 11 => 30,
-        else => 31,
-    };
-}
-
-/// Days since 1970-01-01, Howard Hinnant's algorithm, as core.timestamp's.
-fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
-    const y = if (month <= 2) year - 1 else year;
-    const era = @divFloor(y, 400);
-    const yoe = y - era * 400;
-    const mp = if (month > 2) month - 3 else month + 9;
-    const doy = @divFloor(153 * mp + 2, 5) + day - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146097 + doe - 719468;
 }
 
 /// A delay a server asks for, and the form or forms it asks in: what the
@@ -288,74 +130,6 @@ const test_util = @import("testing.zig");
 
 fn at(seconds: i64) std.Io.Timestamp {
     return .{ .nanoseconds = @as(i96, seconds) * std.time.ns_per_s };
-}
-
-/// 1994-11-06T08:49:37Z, RFC 9110's example.
-const example: i64 = 784111777;
-
-test "httpDate: RFC 9110's three formats, its example, and what is not one" {
-    try testing.expectEqual(example, httpDate("Sun, 06 Nov 1994 08:49:37 GMT").?);
-    try testing.expectEqual(example, httpDate("Sunday, 06-Nov-94 08:49:37 GMT").?);
-    try testing.expectEqual(example, httpDate("Sun Nov  6 08:49:37 1994").?);
-    try testing.expectEqual(example, httpDate("Sun Nov 06 08:49:37 1994").?);
-    // Two-digit years: 49 is 2049, 50 is 1950.
-    try testing.expectEqual(httpDate("Wed, 01 Jan 2049 00:00:00 GMT").?, httpDate("Wednesday, 01-Jan-49 00:00:00 GMT").?);
-    try testing.expectEqual(httpDate("Sun, 01 Jan 1950 00:00:00 GMT").?, httpDate("Sunday, 01-Jan-50 00:00:00 GMT").?);
-    try testing.expectEqual(@as(i64, 0), httpDate("Thu, 01 Jan 1970 00:00:00 GMT").?);
-    // Leap days, century years by the Gregorian rule, and a leap second
-    // read as the second before.
-    try testing.expect(httpDate("Thu, 29 Feb 2024 12:00:00 GMT") != null);
-    try testing.expect(httpDate("Tue, 29 Feb 2000 12:00:00 GMT") != null);
-    try testing.expectEqual(null, httpDate("Thu, 29 Feb 2100 12:00:00 GMT"));
-    try testing.expectEqual(null, httpDate("Thu, 29 Feb 1900 12:00:00 GMT"));
-    try testing.expectEqual(httpDate("Wed, 31 Dec 2025 23:59:59 GMT").?, httpDate("Wed, 31 Dec 2025 23:59:60 GMT").?);
-    for ([_][]const u8{
-        "",                                 "Sun, 06 Nov 1994 08:49:37 UTC",  "sun, 06 Nov 1994 08:49:37 GMT",
-        "Sun, 06 nov 1994 08:49:37 GMT",    "Sun, 6 Nov 1994 08:49:37 GMT",   "Sun, 06 Nov 1994 8:49:37 GMT",
-        "Sun, 31 Feb 1994 08:49:37 GMT",    "Sun, 29 Feb 2023 08:49:37 GMT",  "Sun, 06 Nov 1994 24:00:00 GMT",
-        "Sun, 06 Nov 1994 08:60:00 GMT",    "Sun, 06 Nov 1994 08:49:61 GMT",  "Sun, 00 Nov 1994 08:49:37 GMT",
-        "Sunday, 06-Nov-1994 08:49:37 GMT", "Sun, 06-Nov-94 08:49:37 GMT",    "Sun Nov 6 08:49:37 1994",
-        "Sun Nov  6 08:49:37 94",           "Sun, 06 Nov 1994 08:49:37 GMT ", "Sun, 06 Nov 1994 08:49:37 GMTX",
-        "120",                              "Funday, 06-Nov-94 08:49:37 GMT", "Sun, 06 Nov 19x4 08:49:37 GMT",
-    }) |bad| {
-        if (httpDate(bad) != null) {
-            std.debug.print("read: {s}\n", .{bad});
-            return error.TestExpectedNull;
-        }
-    }
-}
-
-test "retryAfterMs: seconds, saturating; a date against the response's Date, else the clock" {
-    const now = at(example);
-    try testing.expectEqual(120_000, retryAfterMs("120", null, now).?);
-    try testing.expectEqual(0, retryAfterMs("0", null, now).?);
-    try testing.expectEqual(1_000, retryAfterMs(" 1\t", null, now).?);
-    try testing.expectEqual(5_000, retryAfterMs("0005", null, now).?);
-    // GoDaddy's, and far past it: saturated, never wrapped.
-    try testing.expectEqual(std.math.maxInt(u32), retryAfterMs("9223372037", null, now).?);
-    try testing.expectEqual(std.math.maxInt(u32), retryAfterMs("99999999999999999999999999999999999999999", null, now).?);
-    try testing.expectEqual(4_294_967_000, retryAfterMs("4294967", null, now).?);
-    try testing.expectEqual(std.math.maxInt(u32), retryAfterMs("4294968", null, now).?);
-    for ([_][]const u8{ "", " ", "-1", "1.5", "+1", "1e3", "1 2", "soon" }) |bad| try testing.expectEqual(null, retryAfterMs(bad, null, now));
-
-    // A date: from the response's Date when it has one, which cancels a
-    // client clock that is an hour fast.
-    const date = "Sun, 06 Nov 1994 08:49:37 GMT";
-    const later = "Sun, 06 Nov 1994 08:50:07 GMT";
-    try testing.expectEqual(30_000, retryAfterMs(later, date, at(example + 3600)).?);
-    try testing.expectEqual(30_000, retryAfterMs(later, null, now).?);
-    // A broken Date falls back to the clock; a date in the past is now.
-    try testing.expectEqual(30_000, retryAfterMs(later, "yesterday", now).?);
-    try testing.expectEqual(0, retryAfterMs(date, null, at(example + 1)).?);
-    try testing.expectEqual(0, retryAfterMs(date, later, now).?);
-    try testing.expectEqual(std.math.maxInt(u32), retryAfterMs("Fri, 31 Dec 9999 23:59:59 GMT", null, now).?);
-}
-
-test "millisecondsMs" {
-    try testing.expectEqual(831, millisecondsMs("831").?);
-    try testing.expectEqual(0, millisecondsMs("0").?);
-    try testing.expectEqual(std.math.maxInt(u32), millisecondsMs("4294967296").?);
-    for ([_][]const u8{ "", "-1", "1.5", "831ms" }) |bad| try testing.expectEqual(null, millisecondsMs(bad));
 }
 
 test "durationMs: ProtoJSON Durations, rounded up to milliseconds" {
@@ -549,52 +323,12 @@ test "fuzz durationMs: a plain model of seconds and nanoseconds, and arbitrary t
     try test_util.fuzzBytes({}, durationProperty, .{ .corpus = &.{ "", "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x03" } });
 }
 
-fn dateProperty(_: void, input: []const u8) !void {
-    var g: test_util.ByteGen = .init(input);
-    // Any second from 1950 to 2049, written in each format, reads back.
-    const t: i64 = -631152000 + @as(i64, @intCast(g.intRange(u32, 0, 3155759999)));
-    const days = @divFloor(t, std.time.s_per_day);
-    const secs = @mod(t, std.time.s_per_day);
-    const c = civilFromDays(days);
-    const weekday: usize = @intCast(@mod(days + 3, 7)); // 1970-01-01 was a Thursday.
-    var buf: [64]u8 = undefined;
-    const hh = @divFloor(secs, 3600);
-    const mm = @divFloor(@mod(secs, 3600), 60);
-    const ss = @mod(secs, 60);
-    const imf = std.fmt.bufPrint(&buf, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{ day_names[weekday], @as(u64, @intCast(c.day)), months[@intCast(c.month - 1)], @as(u64, @intCast(c.year)), @as(u64, @intCast(hh)), @as(u64, @intCast(mm)), @as(u64, @intCast(ss)) }) catch unreachable;
-    try testing.expectEqual(t, httpDate(imf).?);
-    var buf2: [64]u8 = undefined;
-    const rfc850 = std.fmt.bufPrint(&buf2, "{s}, {d:0>2}-{s}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{ long_day_names[weekday], @as(u64, @intCast(c.day)), months[@intCast(c.month - 1)], @as(u64, @intCast(@mod(c.year, 100))), @as(u64, @intCast(hh)), @as(u64, @intCast(mm)), @as(u64, @intCast(ss)) }) catch unreachable;
-    try testing.expectEqual(t, httpDate(rfc850).?);
-    var buf3: [64]u8 = undefined;
-    const asc = std.fmt.bufPrint(&buf3, "{s} {s} {d: >2} {d:0>2}:{d:0>2}:{d:0>2} {d:0>4}", .{ day_names[weekday], months[@intCast(c.month - 1)], @as(u64, @intCast(c.day)), @as(u64, @intCast(hh)), @as(u64, @intCast(mm)), @as(u64, @intCast(ss)), @as(u64, @intCast(c.year)) }) catch unreachable;
-    try testing.expectEqual(t, httpDate(asc).?);
-    _ = httpDate(g.rest());
-}
-
-/// The inverse of `daysFromCivil`, for the property alone.
-fn civilFromDays(days: i64) struct { year: i64, month: i64, day: i64 } {
-    const z = days + 719468;
-    const era = @divFloor(z, 146097);
-    const doe = z - era * 146097;
-    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153);
-    const day = doy - @divFloor(153 * mp + 2, 5) + 1;
-    const month = if (mp < 10) mp + 3 else mp - 9;
-    return .{ .year = yoe + era * 400 + (if (month <= 2) @as(i64, 1) else 0), .month = month, .day = day };
-}
-
-test "fuzz httpDate: any second from 1950 to 2049 reads back in all three formats" {
-    try test_util.fuzzBytes({}, dateProperty, .{ .corpus = &.{ "", "\xff\xff\xff\xff", "\x00\x00\x00\x00" } });
-}
-
 fn delayProperty(_: void, input: []const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(std.heap.smp_allocator);
     defer arena.deinit();
     var g: test_util.ByteGen = .init(input);
     // Arbitrary headers and body: never a crash, and the answer is the
-    // largest each source gives alone.
+    // larger of what the headers ask and what the body does.
     var headers: [4]transport.Header = undefined;
     const n = g.intRange(usize, 0, headers.len);
     for (headers[0..n]) |*h| h.* = .{
@@ -604,12 +338,10 @@ fn delayProperty(_: void, input: []const u8) !void {
     const body = g.rest();
     const now = at(1_792_255_951);
     const got = try serverDelayMs(arena.allocator(), headers[0..n], body, now);
-    var want: ?u32 = try errors.decodeRetryDelayMs(arena.allocator(), body);
-    const date = header(headers[0..n], "date");
-    for (headers[0..n]) |h| {
-        const one = if (std.mem.eql(u8, h.name, "Retry-After")) retryAfterMs(h.value, date, now) else if (std.mem.eql(u8, h.name, "retry-after-ms")) millisecondsMs(h.value) else null;
-        want = larger(want, one);
-    }
+    const want = neutral.larger(
+        neutral.serverDelayMs(transport.Header, headers[0..n], now),
+        try errors.decodeRetryDelayMs(arena.allocator(), body),
+    );
     try testing.expectEqual(want, got);
 }
 

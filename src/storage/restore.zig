@@ -307,7 +307,7 @@ test "restore: retried only under if_generation_match, and a repeat that meets i
     }));
     try conditional.expectRequestCount(2);
     try testing.expect(std.mem.indexOf(u8, conditional.diag.message(), "may have restored the object") != null);
-    try testing.expectEqualStrings("conditionNotMet", conditional.diag.status());
+    try testing.expectEqualStrings("conditionNotMet", conditional.diag.code());
 
     var opted_in: test_util.Harness = undefined;
     try opted_in.init(&.{

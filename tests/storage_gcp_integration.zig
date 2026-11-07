@@ -196,7 +196,7 @@ const Fixture = struct {
     /// Prints the server's own words when a call fails unexpectedly.
     fn report(f: *const Fixture, err: anyerror) anyerror {
         std.debug.print("error.{t}", .{err});
-        if (f.diag.http_status != 0) std.debug.print(" (HTTP {d} {s})", .{ f.diag.http_status, f.diag.status() });
+        if (f.diag.http_status != 0) std.debug.print(" (HTTP {d} {s})", .{ f.diag.http_status, f.diag.code() });
         if (f.diag.message().len != 0) std.debug.print(": {s}", .{f.diag.message()});
         std.debug.print("\n", .{});
         return err;
@@ -403,7 +403,7 @@ test "1. preconditions: create-only once, a stale generation refused, the curren
     // against what is live is 304, an answer rather than a failure.
     try testing.expectError(error.FailedPrecondition, obj.get(.{ .preconditions = .{ .if_generation_match = gen1 } }));
     try testing.expectEqual(412, f.diag.http_status);
-    try testing.expectEqualStrings("conditionNotMet", f.diag.status());
+    try testing.expectEqualStrings("conditionNotMet", f.diag.code());
     try testing.expectError(error.NotModified, obj.get(.{ .preconditions = .{ .if_generation_not_match = gen2 } }));
     try testing.expectEqual(304, f.diag.http_status);
     try testing.expectError(error.NotModified, obj.get(.{ .preconditions = .{ .if_metageneration_not_match = second.value.metageneration } }));
@@ -2192,7 +2192,7 @@ test "28. create-only parallel upload: an object that appears before the move is
         .preconditions = .does_not_exist,
     }));
     try testing.expect(creator.created);
-    std.debug.print("the move, refused: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.status(), diag.message() });
+    std.debug.print("the move, refused: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.code(), diag.message() });
     try f.expectContent(f.bucket().object(name), "another writer's bytes\n");
     try testing.expectEqual(0, try tempObjects(&f));
     try testing.expectEqual(0, try openTempUploads(&f));
@@ -2644,7 +2644,7 @@ test "33. sessions: a create-only session is refused with 412 at its last chunk 
         std.debug.print("the session finished over the other writer's object\n", .{});
         return error.TestExpectedFailure;
     } else |err| {
-        std.debug.print("the last chunk, refused: error.{t} (HTTP {d} {s}: {s})\n", .{ err, f.diag.http_status, f.diag.status(), f.diag.message() });
+        std.debug.print("the last chunk, refused: error.{t} (HTTP {d} {s}: {s})\n", .{ err, f.diag.http_status, f.diag.code(), f.diag.message() });
         try testing.expectEqual(error.FailedPrecondition, err);
     }
     const exchanges = f.faults.exchanges.items[before..];
@@ -3518,7 +3518,7 @@ const BucketFixture = struct {
     /// Prints the server's own words when a call fails unexpectedly.
     fn report(f: *const BucketFixture, err: anyerror) anyerror {
         std.debug.print("error.{t}", .{err});
-        if (f.diag.http_status != 0) std.debug.print(" (HTTP {d} {s})", .{ f.diag.http_status, f.diag.status() });
+        if (f.diag.http_status != 0) std.debug.print(" (HTTP {d} {s})", .{ f.diag.http_status, f.diag.code() });
         if (f.diag.message().len != 0) std.debug.print(": {s}", .{f.diag.message()});
         std.debug.print("\n", .{});
         return err;
@@ -3537,7 +3537,7 @@ const BucketFixture = struct {
     fn update(f: *BucketFixture, changes: storage.BucketUpdate) !storage.Owned(storage.BucketInfo) {
         try testing.io.sleep(.fromMilliseconds(1100), .awake);
         return f.bucket().update(changes) catch |err| {
-            std.debug.print("update: error.{t} (HTTP {d} {s}): {s}\n", .{ err, f.diag.http_status, f.diag.status(), f.diag.message() });
+            std.debug.print("update: error.{t} (HTTP {d} {s}): {s}\n", .{ err, f.diag.http_status, f.diag.code(), f.diag.message() });
             return err;
         };
     }
@@ -4009,7 +4009,7 @@ test "54. requester pays: another principal is refused without a project to bill
 
     // Unbilled: refused, and told how to bill.
     try testing.expectError(error.InvalidArgument, plain.object("one").upload("x", .{}));
-    try testing.expectEqualStrings("required", diag.status());
+    try testing.expectEqualStrings("required", diag.code());
     try testing.expect(std.mem.indexOf(u8, diag.message(), "withBillingProject") != null);
     try testing.expectError(error.InvalidArgument, plain.listObjects(.{}));
     // A project that does not exist.
@@ -4347,7 +4347,7 @@ test "59. retention: a policy and holds keep objects as measured, refused as Obj
     try testing.expect(kept.value.retention_expiration_time != null);
     kept.deinit();
     try testing.expectError(error.ObjectRetained, b.object("kept").delete(.{}));
-    try testing.expectEqualStrings("retentionPolicyNotMet", f.diag.status());
+    try testing.expectEqualStrings("retentionPolicyNotMet", f.diag.code());
     try testing.expect(std.mem.indexOf(u8, f.diag.message(), "cannot be deleted or overwritten until") != null);
     try testing.expectError(error.ObjectRetained, b.object("kept").upload("over", .{}));
     var stream: std.Io.Reader = .fixed("over it, resumably");
@@ -4360,7 +4360,7 @@ test "59. retention: a policy and holds keep objects as measured, refused as Obj
     const data = try pattern(gpa, 59, 6 * 1024 * 1024);
     defer gpa.free(data);
     try testing.expectError(error.ObjectRetained, b.object("kept").uploadParallel(.{ .data = data }, .{ .part_size = 5 * 1024 * 1024 }));
-    try testing.expectEqualStrings("RetentionPolicyNotMet", f.diag.status());
+    try testing.expectEqualStrings("RetentionPolicyNotMet", f.diag.code());
     var whole = b.object("whole.bin").uploadParallel(.{ .data = data }, .{ .part_size = 5 * 1024 * 1024, .preconditions = .does_not_exist }) catch |err| return f.report(err);
     whole.deinit();
     try f.expectContent(b.object("whole.bin"), data);
@@ -4400,7 +4400,7 @@ test "59. retention: a policy and holds keep objects as measured, refused as Obj
     try testing.expect(held.value.temporary_hold);
     held.deinit();
     try testing.expectError(error.ObjectRetained, b.object("held").delete(.{}));
-    try testing.expectEqualStrings("forbidden", f.diag.status());
+    try testing.expectEqualStrings("forbidden", f.diag.code());
     try testing.expect(std.mem.indexOf(u8, f.diag.message(), "under active Temporary hold") != null);
     var released = b.object("held").updateMetadata(.{ .temporary_hold = false }) catch |err| return f.report(err);
     try testing.expect(!released.value.temporary_hold);
@@ -4500,7 +4500,7 @@ test "60. IAM: a bucket's policy read, granted once in any case, tested, revoked
     var labelled = try f.update(.{ .labels = .{ .change = &.{.{ .key = "zigps", .value = "iam" }} } });
     labelled.deinit();
     try testing.expectError(error.Aborted, b.setIamPolicy(before.value));
-    try testing.expectEqualStrings("conditionNotMet", f.diag.status());
+    try testing.expectEqualStrings("conditionNotMet", f.diag.code());
 
     // Refused by Cloud Storage, in its own words.
     try testing.expectError(error.PublicAccessPrevented, b.addIamBinding(role, "allUsers"));

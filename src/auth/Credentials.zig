@@ -182,7 +182,7 @@ pub fn signer(self: Credentials) ?core.Signer {
 /// The project to charge for quota: `GOOGLE_CLOUD_QUOTA_PROJECT` if it was
 /// set, otherwise whatever the credentials name.
 pub fn quotaProjectId(self: Credentials) ?[]const u8 {
-    return self.held.provider().quotaProject();
+    return core.rpc.quotaProjectOf(self.held.provider());
 }
 
 /// The project this workload runs in, when the credentials can say: the
@@ -237,6 +237,8 @@ const Held = struct {
     impl: Impl,
     /// `GOOGLE_CLOUD_QUOTA_PROJECT`, which wins over the credential's own.
     quota_project: ?[]u8,
+    /// `quota_project`, as the header the provider adds to its requests.
+    quota_header: core.rpc.QuotaProjectHeader,
 
     const Impl = union(enum) {
         user: AuthorizedUser,
@@ -250,7 +252,7 @@ const Held = struct {
         return .{ .ptr = self, .vtable = &.{
             .getToken = getToken,
             .invalidate = invalidate,
-            .quotaProject = quotaProject,
+            .headers = credentialHeaders,
         } };
     }
 
@@ -288,19 +290,21 @@ const Held = struct {
         fromPtr(ptr).inner().invalidate();
     }
 
-    fn quotaProject(ptr: *anyopaque) ?[]const u8 {
+    fn credentialHeaders(ptr: *anyopaque) []const core.transport.Header {
         const self = fromPtr(ptr);
-        if (self.quota_project) |q| return q;
-        return self.inner().quotaProject();
+        if (self.quota_project != null) return self.quota_header.slice();
+        return self.inner().headers();
     }
 };
 
 fn hold(gpa: Allocator, source: Source, impl: Held.Impl, lookup: Lookup) Allocator.Error!Credentials {
     const held = try gpa.create(Held);
     errdefer gpa.destroy(held);
+    const quota_project = if (lookup.quota_project) |q| try gpa.dupe(u8, q) else null;
     held.* = .{
         .impl = impl,
-        .quota_project = if (lookup.quota_project) |q| try gpa.dupe(u8, q) else null,
+        .quota_project = quota_project,
+        .quota_header = .init(quota_project),
     };
     logging.debug("credentials: using {s}", .{source.description()});
     return .{ .gpa = gpa, .source = source, .held = held };
@@ -1024,7 +1028,7 @@ test "findDefault: GOOGLE_CLOUD_QUOTA_PROJECT wins over the file's own project" 
     defer creds.deinit();
     try testing.expectEqualStrings("billing-elsewhere", creds.quotaProjectId().?);
     // Which is also what a service asks the provider for.
-    try testing.expectEqualStrings("billing-elsewhere", creds.provider().quotaProject().?);
+    try testing.expectEqualStrings("billing-elsewhere", core.rpc.quotaProjectOf(creds.provider()).?);
 }
 
 test "findDefault: a quota project that could break a header is refused" {
@@ -1066,7 +1070,7 @@ test "findDefault: what it found can be moved, and its provider still works" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     try testing.expectEqualStrings("ya29.from-file", try moved.provider().getToken(testing.io, arena.allocator(), test_scopes));
-    try testing.expectEqualStrings("billing-elsewhere", moved.provider().quotaProject().?);
+    try testing.expectEqualStrings("billing-elsewhere", core.rpc.quotaProjectOf(moved.provider()).?);
     moved.provider().invalidate();
 }
 
@@ -1090,7 +1094,7 @@ test "findDefault: the file's secrets reach neither the log nor Diagnostics" {
     defer creds.deinit();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    try testing.expectError(error.RefreshTokenInvalid, creds.provider().getToken(testing.io, arena.allocator(), test_scopes));
+    try testing.expectError(error.ReauthenticationRequired, creds.provider().getToken(testing.io, arena.allocator(), test_scopes));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "SECRET") == null);
     try testing.expect(std.mem.indexOf(u8, logging.capture.text(), "SECRET") == null);
     // It does say where the credentials came from.

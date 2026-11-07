@@ -1968,7 +1968,7 @@ test "preconditioned writes retry; a 412 after retries names the ambiguity" {
 
     try testing.expectError(error.FailedPrecondition, obj.upload("data", .{ .preconditions = .does_not_exist }));
     try testing.expectEqual(412, h.diag.http_status);
-    try testing.expectEqualStrings("conditionNotMet", h.diag.status());
+    try testing.expectEqualStrings("conditionNotMet", h.diag.code());
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "an earlier attempt may have succeeded") != null);
 }
 

@@ -37,7 +37,10 @@ credentials file, a compromised machine, and the behavior of the emulator
 itself.
 
 Every claim below names the test that holds it. The tests live next to the
-code in `src/`.
+code in `src/`, except those for the HTTP transport, the token check and
+`WipingAllocator`, which live next to theirs in
+[rest-core](https://github.com/kmoneil/rest-core.zig)'s `src/`, the layer
+this package is built on, and run in its CI.
 
 ## Credentials
 
@@ -72,12 +75,12 @@ code in `src/`.
   for TLS: every request carries `Metadata-Flavor: Google`, which nothing
   can be tricked into sending by accident, and an answer without it is
   refused, whatever it contains. A redirect is refused too, and its
-  answers are read to at most 64 KiB.
+  answers are read to at most 512 KiB.
   `MetadataServer: the token request carries Metadata-Flavor and no token
   of its own`, `MetadataServer: an answer without Metadata-Flavor is not
   the metadata server's`, `MetadataServer: a wrong Metadata-Flavor value is
   refused, any case is accepted`, `MetadataServer: a redirect is refused,
-  not followed`, `MetadataServer: its own transport reads at most 64 KiB
+  not followed`, `MetadataServer: its own transport reads at most 512 KiB
   from the answer`.
 - **A header cannot smuggle a second request:** every name and value is
   checked against RFC 9110 before the transport connects.
@@ -249,7 +252,11 @@ decrypt leaves no copy of the plaintext behind.
 
 ## Supply chain
 
-- **No dependencies** beyond the Zig standard library.
+- **One dependency:** [rest-core](https://github.com/kmoneil/rest-core.zig)
+  (MIT, by the same author), the HTTP transport, request loop, RSA signing
+  and the other parts of a REST client that no cloud owns. `build.zig.zon`
+  pins a release by its content hash, so an archive that changed fails the
+  build. It has no dependencies of its own beyond the Zig standard library.
 - **CI runs with a read-only token** and pins its actions to full commit
   SHAs, which Dependabot keeps current. The coverage job's container image
   is pinned by digest. CodeQL scans the workflows.

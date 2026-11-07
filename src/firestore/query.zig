@@ -671,7 +671,7 @@ test "a streamed error, inside the array, as production sends it" {
     defer h.deinit();
     try testing.expectError(error.FailedPrecondition, h.client.runQuery(.{ .from = .{ .collection = "c" }, .order_by = &.{.{ .field = "__name__", .direction = .descending }} }, .{}));
     try h.expectDiag("The query requires an index.");
-    try testing.expectEqualStrings("FAILED_PRECONDITION", h.diag.status());
+    try testing.expectEqualStrings("FAILED_PRECONDITION", h.diag.code());
 }
 
 /// A query's document as production streams it, pretty-printed.
@@ -686,7 +686,7 @@ test "regression: an error after a query's documents fails it, rather than answe
     try h.init(&.{.{ .respond = .{ .body = test_util.streamed(&.{ prettyQueryElement("c/a"), prettyQueryElement("c/b"), test_util.deadline_element }) } }}, .{});
     defer h.deinit();
     try testing.expectError(error.DeadlineExceeded, h.client.runQuery(.{ .from = .{ .collection = "c" } }, .{}));
-    try testing.expectEqualStrings("DEADLINE_EXCEEDED", h.diag.status());
+    try testing.expectEqualStrings("DEADLINE_EXCEEDED", h.diag.code());
     try h.expectDiag("The operation exceeded the deadline during execution.");
     try testing.expectEqual(504, h.diag.http_status);
     // It came inside a 200, past the engine's retries, and is not retried.
@@ -709,7 +709,7 @@ test "an error inside an aggregation's answer, or as a query's only message, fai
     try testing.expectEqual(503, h.diag.http_status);
     try testing.expectError(error.Unknown, h.client.runQuery(q, .{}));
     try testing.expectEqual(0, h.diag.http_status);
-    try testing.expectEqualStrings("", h.diag.status());
+    try testing.expectEqualStrings("", h.diag.code());
     try testing.expectError(error.Unknown, h.client.runQuery(q, .{}));
     try h.expectRequestCount(4);
 }

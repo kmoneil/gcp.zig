@@ -3548,7 +3548,7 @@ fn modelProperty(_: void, input: []const u8) !void {
                 const result = h.client.runQuery(.{ .from = .{ .collection = "c" } }, .{});
                 if (cut) {
                     try testing.expectError(error.DeadlineExceeded, result);
-                    try testing.expectEqualStrings("DEADLINE_EXCEEDED", h.diag.status());
+                    try testing.expectEqualStrings("DEADLINE_EXCEEDED", h.diag.code());
                 } else {
                     var r = try result;
                     defer r.deinit();

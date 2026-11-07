@@ -37,7 +37,7 @@ test "a real refresh: the token endpoint trades the refresh token for an access 
     if (!std.mem.eql(u8, kind, "authorized_user")) return error.SkipZigTest;
     const path = env.get("AUTH_TEST_CREDENTIALS").?;
     var diag: auth.Diagnostics = .{};
-    errdefer std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.status(), diag.message() });
+    errdefer std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.code(), diag.message() });
 
     var user: auth.AuthorizedUser = try .initFromFile(testing.allocator, testing.io, path, .{ .diagnostics = &diag });
     defer user.deinit();
@@ -64,7 +64,7 @@ test "a real refresh, then a Pub/Sub call with the token" {
     const path = env.get("AUTH_TEST_CREDENTIALS").?;
     const project = env.get("PUBSUB_TEST_PROJECT") orelse return error.SkipZigTest;
     var diag: auth.Diagnostics = .{};
-    errdefer std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.status(), diag.message() });
+    errdefer std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.code(), diag.message() });
 
     var user: auth.AuthorizedUser = try .initFromFile(testing.allocator, testing.io, path, .{ .diagnostics = &diag });
     defer user.deinit();
@@ -87,7 +87,7 @@ test "a real assertion: the token endpoint trades a signed JWT for an access tok
     if (!std.mem.eql(u8, kind, "service_account")) return error.SkipZigTest;
     const path = env.get("AUTH_TEST_CREDENTIALS").?;
     var diag: auth.Diagnostics = .{};
-    errdefer std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.status(), diag.message() });
+    errdefer std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.code(), diag.message() });
 
     var account: auth.ServiceAccount = try .initFromFile(testing.allocator, testing.io, path, .{ .diagnostics = &diag });
     defer account.deinit();
@@ -116,7 +116,7 @@ test "a real assertion, then a Pub/Sub call the token authenticates" {
     const path = env.get("AUTH_TEST_CREDENTIALS").?;
     const project = env.get("PUBSUB_TEST_PROJECT") orelse return error.SkipZigTest;
     var diag: auth.Diagnostics = .{};
-    errdefer std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.status(), diag.message() });
+    errdefer std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.code(), diag.message() });
 
     var account: auth.ServiceAccount = try .initFromFile(testing.allocator, testing.io, path, .{ .diagnostics = &diag });
     defer account.deinit();
@@ -144,7 +144,7 @@ test "a real exchange: the STS trades a real subject token for an access token" 
     if (!std.mem.eql(u8, kind, "external_account")) return error.SkipZigTest;
     const path = env.get("AUTH_TEST_CREDENTIALS").?;
     var diag: auth.Diagnostics = .{};
-    errdefer std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.status(), diag.message() });
+    errdefer std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.code(), diag.message() });
 
     var account: auth.ExternalAccount = try .initFromFile(testing.allocator, testing.io, path, .{ .diagnostics = &diag });
     defer account.deinit();
@@ -191,7 +191,7 @@ test "a real STS refusal: Google's token exchange rejects a fabricated subject t
         &.{"https://www.googleapis.com/auth/cloud-platform"},
     ));
     try testing.expectEqual(400, diag.http_status);
-    try testing.expect(diag.status().len > 0);
+    try testing.expect(diag.code().len > 0);
     try testing.expect(diag.message().len > 0);
 }
 
@@ -203,7 +203,7 @@ test "on Google Cloud: the metadata server hands out a token for the attached ac
     // Off Google Cloud there is nothing to talk to, and this is how a
     // caller finds that out.
     if (!metadata.probe(io)) return error.SkipZigTest;
-    errdefer std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.status(), diag.message() });
+    errdefer std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.code(), diag.message() });
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -236,7 +236,7 @@ test "a real impersonation: IAM trades the source's token for one that is the se
     if (!std.mem.eql(u8, kind, "impersonated_service_account")) return error.SkipZigTest;
     const path = env.get("AUTH_TEST_CREDENTIALS").?;
     var diag: auth.Diagnostics = .{};
-    errdefer std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.status(), diag.message() });
+    errdefer std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.code(), diag.message() });
 
     var account: auth.ImpersonatedServiceAccount = try .initFromFile(testing.allocator, testing.io, path, .{ .diagnostics = &diag });
     defer account.deinit();
@@ -295,7 +295,7 @@ test "a real impersonation, then a Pub/Sub call as the service account" {
         owned.deinit();
     } else |err| {
         if (err != error.PermissionDenied) {
-            std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.status(), diag.message() });
+            std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.code(), diag.message() });
             return err;
         }
     }
@@ -306,7 +306,7 @@ test "findDefault: the file the environment names, used against Google" {
     defer env.deinit();
     const path = env.get("AUTH_TEST_CREDENTIALS") orelse return error.SkipZigTest;
     var diag: auth.Diagnostics = .{};
-    errdefer std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.status(), diag.message() });
+    errdefer std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.code(), diag.message() });
 
     // The whole chain, as an application would run it, with the first
     // source pointed at a real credentials file.

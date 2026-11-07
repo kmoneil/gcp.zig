@@ -547,7 +547,7 @@ test "a refusal naming the version's state is that state's error" {
     defer h.deinit();
     try testing.expectError(error.KeyVersionDestroyed, h.client.keyRing("r").key("k").version(1).enable());
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), v1) != null);
-    try testing.expectEqualStrings("FAILED_PRECONDITION", h.diag.status());
+    try testing.expectEqualStrings("FAILED_PRECONDITION", h.diag.code());
 }
 
 test "waitUntilEnabled: a version that failed to generate says why" {

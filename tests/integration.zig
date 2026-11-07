@@ -117,7 +117,7 @@ const Fixture = struct {
     }
 
     fn fail(f: *Fixture, err: anyerror) anyerror {
-        std.debug.print("{t}: HTTP {d} {s}: {s}\n", .{ err, f.diag.http_status, f.diag.status(), f.diag.message() });
+        std.debug.print("{t}: HTTP {d} {s}: {s}\n", .{ err, f.diag.http_status, f.diag.code(), f.diag.message() });
         return err;
     }
 
@@ -283,7 +283,7 @@ test "topic: create, get, find in list, delete, then NotFound" {
     };
     try eventually(&f, 30, topic, Check.gone);
     try testing.expectEqual(404, f.diag.http_status);
-    try testing.expectEqualStrings("NOT_FOUND", f.diag.status());
+    try testing.expectEqualStrings("NOT_FOUND", f.diag.code());
 }
 
 // 2.
@@ -294,7 +294,7 @@ test "topic: creating the same topic twice is AlreadyExists" {
     const topic = try f.createTopic("twice");
     try testing.expectError(error.AlreadyExists, topic.create(.{}));
     try testing.expectEqual(409, f.diag.http_status);
-    try testing.expectEqualStrings("ALREADY_EXISTS", f.diag.status());
+    try testing.expectEqualStrings("ALREADY_EXISTS", f.diag.code());
     try testing.expect(f.diag.message().len > 0);
 }
 
@@ -305,7 +305,7 @@ test "subscription: creating one on a missing topic is NotFound" {
     defer f.deinit();
     const sub = f.client.subscription(f.id("orphan"));
     try testing.expectError(error.NotFound, sub.create(.{ .topic_id = f.id("no-such-topic") }));
-    try testing.expectEqualStrings("NOT_FOUND", f.diag.status());
+    try testing.expectEqualStrings("NOT_FOUND", f.diag.code());
 }
 
 test "subscription: on a topic in another project, named in full" {
@@ -1693,7 +1693,7 @@ test "detach: in production, one whose answer was lost is read back and succeeds
     // The first attempt lands and its answer is lost. The second finds
     // the subscription detached already, which the read after it confirms.
     client.subscription(sub.id).detach() catch |err| {
-        std.debug.print("{t}: HTTP {d} {s}: {s}\n", .{ err, diag.http_status, diag.status(), diag.message() });
+        std.debug.print("{t}: HTTP {d} {s}: {s}\n", .{ err, diag.http_status, diag.code(), diag.message() });
         return err;
     };
     try testing.expectEqual(1, lossy.lost);

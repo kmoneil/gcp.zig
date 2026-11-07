@@ -471,7 +471,7 @@ test "addVersion: every allocation failure is OutOfMemory without leaks" {
             var fake: test_util.FakeTransport = .init(testing.allocator, &.{version_1});
             defer fake.deinit();
             var clock: test_util.FakeClock = .{};
-            var token: test_util.FakeTokenProvider = .{ .quota_project = "billing-project" };
+            var token: test_util.FakeTokenProvider = .{ .credential_headers = core.testing.quotaProject("billing-project") };
             var client = try Client.init(gpa, clock.io(), .{
                 .project_id = "extractctl",
                 .token_provider = token.provider(),
@@ -617,7 +617,7 @@ test "secret administration: every allocation failure is OutOfMemory without lea
             });
             defer fake.deinit();
             var clock: test_util.FakeClock = .{};
-            var token: test_util.FakeTokenProvider = .{ .quota_project = "billing-project" };
+            var token: test_util.FakeTokenProvider = .{ .credential_headers = core.testing.quotaProject("billing-project") };
             var client = try Client.init(gpa, clock.io(), .{
                 .project_id = "extractctl",
                 .token_provider = token.provider(),
@@ -844,7 +844,7 @@ test "update and deleteIf: every allocation failure is OutOfMemory without leaks
             var fake: test_util.FakeTransport = .init(testing.allocator, &.{ updated_secret, stale_etag_reply, .{ .respond = .{ .body = "{}" } } });
             defer fake.deinit();
             var clock: test_util.FakeClock = .{};
-            var token: test_util.FakeTokenProvider = .{ .quota_project = "billing-project" };
+            var token: test_util.FakeTokenProvider = .{ .credential_headers = core.testing.quotaProject("billing-project") };
             var client = try Client.init(gpa, clock.io(), .{
                 .project_id = "extractctl",
                 .token_provider = token.provider(),
