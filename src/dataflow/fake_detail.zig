@@ -312,9 +312,10 @@ pub fn writeSteps(jw: *Stringify, steps: []const types.Step, level: Level) Strin
     try jw.endArray();
 }
 
-/// getMetrics' answer: the updates made at or after `start`. With none
-/// left, the time is `start` itself, as production echoed a time past
-/// every update (measured 2026-11-07).
+/// getMetrics' answer: the updates made at or after `start`, which an
+/// update put with no `update_time` is not (production dates every
+/// one). With none left, the time is `start` itself, as production
+/// echoed a time past every update (measured 2026-11-07).
 pub fn metricsReply(arena: Allocator, metrics: types.JobMetrics, start: ?std.Io.Timestamp) Allocator.Error![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     var jw: Stringify = .{ .writer = &out.writer };
@@ -325,7 +326,10 @@ pub fn metricsReply(arena: Allocator, metrics: types.JobMetrics, start: ?std.Io.
 fn writeMetrics(jw: *Stringify, arena: Allocator, metrics: types.JobMetrics, start: ?std.Io.Timestamp) !void {
     var kept: std.ArrayList(types.MetricUpdate) = .empty;
     for (metrics.updates) |u| {
-        if (start) |s| if (u.update_time) |t| if (t.nanoseconds < s.nanoseconds) continue;
+        if (start) |s| {
+            const t = u.update_time orelse continue;
+            if (t.nanoseconds < s.nanoseconds) continue;
+        }
         try kept.append(arena, u);
     }
     const time = if (start != null and kept.items.len == 0) start else metrics.metric_time;

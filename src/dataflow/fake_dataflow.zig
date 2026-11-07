@@ -56,7 +56,8 @@
 //!   JOB_VIEW_DESCRIPTION the rest of the environment and the pipeline;
 //!   JOB_VIEW_ALL the steps. A view outside the enum is 400 in
 //!   production's words. getMetrics answers the updates made at or after
-//!   its `startTime`; with none left, the time asked for and no
+//!   its `startTime` (an update put with no time is not, as production
+//!   dates every one); with none left, the time asked for and no
 //!   `metrics`, as production echoed a time past every update; a
 //!   `startTime` that is no timestamp is 400 in production's words.
 //! - Faults a test asks for: refusals, dropped connections, and a lost
@@ -1791,6 +1792,20 @@ test "a job's metrics, all of them, from a time, and past every update" {
     try testing.expectEqualStrings("And", odd.value.updates[0].kind);
     try testing.expectEqualStrings("{\"meanSum\":12.5,\"meanCount\":\"5\"}", odd.value.updates[1].value.other.json);
     try testing.expectEqualStrings("{\"count\":3}", odd.value.updates[2].value.other.json);
+
+    // An update put with no time is left out once a start time is asked:
+    // production dates every one.
+    try b.fake.setMetrics(bare, .{ .updates = &.{
+        .{ .name = "undated", .value = .{ .integer = 1 } },
+        .{ .name = "dated", .value = .{ .integer = 2 }, .update_time = ts("2026-11-07T20:17:30Z") },
+    } });
+    var everything = try b.client.getJobMetrics("europe-west1", bare, .{});
+    defer everything.deinit();
+    try testing.expectEqual(2, everything.value.updates.len);
+    var since = try b.client.getJobMetrics("europe-west1", bare, .{ .start_time = ts("2026-11-07T20:00:00Z") });
+    defer since.deinit();
+    try testing.expectEqual(1, since.value.updates.len);
+    try testing.expectEqualStrings("dated", since.value.updates[0].name);
 
     // The flag alone marks an update tentative, as production's context
     // would.
