@@ -216,7 +216,7 @@ test "notifications against Google: a topic Cloud Storage cannot publish to" {
     var made_topic = try f.ps.topic(&f.name).create(.{});
     made_topic.deinit();
     try testing.expectError(error.TopicNotPublishable, bucket.createNotification(.{ .topic = .{ .project = f.project, .topic = &f.name } }));
-    try testing.expectEqualStrings("forbidden", f.gcs_diag.status());
+    try testing.expectEqualStrings("forbidden", f.gcs_diag.code());
 }
 
 test "an import topic against Google: an uploaded object's lines arrive as messages" {

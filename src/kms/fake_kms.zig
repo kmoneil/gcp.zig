@@ -957,9 +957,9 @@ pub const FakeKms = struct {
                 if (pss) {
                     var salt: [64]u8 = undefined;
                     f.io.random(&salt);
-                    return key.signPss(hash, input, salt[0..input.len], out) catch null;
+                    return key.signPss(f.io, hash, input, salt[0..input.len], out) catch null;
                 }
-                return key.signDigest(hash, input, out) catch null;
+                return key.signDigest(f.io, hash, input, out) catch null;
             },
             else => return null,
         }

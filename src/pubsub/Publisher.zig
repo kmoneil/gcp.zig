@@ -1667,7 +1667,7 @@ test "deadlines: transient failures are retried until the deadline, then the las
     s.advance(10);
     try s.publisher.sendDue();
     try testing.expectError(error.Unavailable, idOf(receipt));
-    try testing.expectEqualStrings("UNAVAILABLE", receipt.diagnostics().status());
+    try testing.expectEqualStrings("UNAVAILABLE", receipt.diagnostics().code());
     const attempts = s.fake.requestCount();
     try testing.expect(attempts > 3);
     try testing.expectEqual(attempts, s.publisher.stats().requests);
@@ -2259,14 +2259,14 @@ test "pause: a failed batch fails what is queued behind it, and the key waits fo
     // Never sent, and each says why.
     try testing.expectError(error.OrderingKeyPaused, idOf(a2));
     try testing.expectError(error.OrderingKeyPaused, idOf(a3));
-    try testing.expectEqualStrings("NOT_FOUND", a3.diagnostics().status());
+    try testing.expectEqualStrings("NOT_FOUND", a3.diagnostics().code());
     // The first id: the failed request stored nothing.
     try testing.expectEqualStrings("1", try idOf(b1));
     try testing.expectEqual(2, s.fake.requestCount());
 
     var diag: Diagnostics = .{};
     try testing.expectError(error.OrderingKeyPaused, s.publisher.publish(.{ .data = "a4" }, .{ .ordering_key = "user-42", .diagnostics = &diag }));
-    try testing.expectEqualStrings("NOT_FOUND", diag.status());
+    try testing.expectEqualStrings("NOT_FOUND", diag.code());
     // The other key carries on.
     const b2 = try s.publishKeyed("b2", "user-7");
     defer b2.release();

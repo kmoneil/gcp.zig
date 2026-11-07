@@ -3743,7 +3743,7 @@ test "corners: two refusal codes in one summary, falling doubles, layouts, displ
     try testing.expectEqual(1, both.value.refused[0].points);
     try testing.expectEqual(error.InvalidArgument, both.value.refused[1].reason);
     try testing.expectEqual(2, both.value.refused[1].points);
-    try testing.expectEqualStrings("FAILED_PRECONDITION", b.diag.status());
+    try testing.expectEqualStrings("FAILED_PRECONDITION", b.diag.code());
 
     // A cumulative double, and a distribution, whose totals fell: taken.
     const cum: types.TimeSeries = .{ .metric_type = "custom.googleapis.com/seconds", .resource = probe_task, .kind = .cumulative, .start = b.at(-60_000), .end = b.at(-30_000), .value = .{ .double = 2.5 } };

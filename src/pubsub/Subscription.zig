@@ -524,7 +524,7 @@ const Tally = struct {
     other: usize = 0,
     first: ?Error = null,
     http_status: u16 = 0,
-    status_buf: [Diagnostics.max_status_len]u8 = undefined,
+    status_buf: [Diagnostics.max_code_len]u8 = undefined,
     status_len: usize = 0,
     reason_buf: [64]u8 = undefined,
     reason_len: usize = 0,
@@ -552,8 +552,8 @@ const Tally = struct {
         t.reason_len = r.len;
         const d = diag orelse return;
         t.http_status = d.http_status;
-        @memcpy(t.status_buf[0..d.status().len], d.status());
-        t.status_len = d.status().len;
+        @memcpy(t.status_buf[0..d.code().len], d.code());
+        t.status_len = d.code().len;
         const m = core.errors.truncateUtf8(d.message(), t.message_buf.len);
         @memcpy(t.message_buf[0..m.len], m);
         t.message_len = m.len;
@@ -738,7 +738,7 @@ test "ack chunking: a refused chunk stops nothing; the call fails once every chu
     // refused request's business.
     try h.expectRequestCount(3);
     try testing.expectEqualStrings("2500 of 5001 ack ids were refused: Invalid ack id", h.diag.message());
-    try testing.expectEqualStrings("INVALID_ARGUMENT", h.diag.status());
+    try testing.expectEqualStrings("INVALID_ARGUMENT", h.diag.code());
     try testing.expectEqual(400, h.diag.http_status);
 }
 
@@ -869,7 +869,7 @@ test "ackWithResults: an exactly-once refusal names what it refused, and the res
     // for good cannot succeed.
     try h.expectRequestCount(1);
     try testing.expectEqual(400, h.diag.http_status);
-    try testing.expectEqualStrings("INVALID_ARGUMENT", h.diag.status());
+    try testing.expectEqualStrings("INVALID_ARGUMENT", h.diag.code());
     try testing.expect(std.mem.startsWith(u8, h.diag.message(), "2 of 4 ack ids were refused (PERMANENT_FAILURE_INVALID_ACK_ID): Some acknowledgement ids"));
 
     // `ack` says the same as an error.
@@ -962,7 +962,7 @@ test "ackWithResults: a refusal that names no ids, as the emulator's, applies to
 
     try work.nackWithResults(&.{ "a", "b" }, &results);
     try testing.expectEqualSlices(types.AckResult, &.{ .other, .other }, &results);
-    try testing.expectEqualStrings("FAILED_PRECONDITION", h.diag.status());
+    try testing.expectEqualStrings("FAILED_PRECONDITION", h.diag.code());
 
     try work.modifyAckDeadlineWithResults(&.{ "a", "b" }, 30, &results);
     try testing.expectEqualSlices(types.AckResult, &.{ .ok, .ok }, &results);
@@ -977,7 +977,7 @@ test "nack: a refusal naming no ids fails with its own status" {
     }, .{});
     defer h.deinit();
     try testing.expectError(error.FailedPrecondition, h.client.subscription("work").nack(&.{ "a", "b" }));
-    try testing.expectEqualStrings("FAILED_PRECONDITION", h.diag.status());
+    try testing.expectEqualStrings("FAILED_PRECONDITION", h.diag.code());
     try testing.expectEqualStrings("2 of 2 ack ids were refused", h.diag.message());
 }
 

@@ -105,7 +105,7 @@ fn parseRef(version: ?[]const u8) secret_manager.VersionRef {
 
 fn fail(err: anyerror, diag: *const secret_manager.Diagnostics) anyerror {
     std.debug.print("error.{t}", .{err});
-    if (diag.http_status != 0) std.debug.print(" (HTTP {d} {s})", .{ diag.http_status, diag.status() });
+    if (diag.http_status != 0) std.debug.print(" (HTTP {d} {s})", .{ diag.http_status, diag.code() });
     if (diag.message().len != 0) std.debug.print(": {s}", .{diag.message()});
     std.debug.print("\n", .{});
     return err;

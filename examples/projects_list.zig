@@ -145,7 +145,7 @@ fn usage(out: *std.Io.Writer, why: []const u8) !void {
 
 fn fail(err: anyerror, diag: *const rm.Diagnostics, client: ?*const rm.Client) anyerror {
     std.debug.print("error.{t}", .{err});
-    if (diag.http_status != 0) std.debug.print(" (HTTP {d} {s})", .{ diag.http_status, diag.status() });
+    if (diag.http_status != 0) std.debug.print(" (HTTP {d} {s})", .{ diag.http_status, diag.code() });
     if (diag.message().len != 0) std.debug.print(": {s}", .{diag.message()});
     std.debug.print("\n", .{});
     if (client) |c| if (c.lastConsumerRefusal()) |r| switch (r.reason) {

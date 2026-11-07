@@ -266,7 +266,7 @@ test "set: retried after a lost answer, with the ambiguity said when a precondit
     try testing.expectError(error.AlreadyExists, la.set(&.{}, .{ .precondition = .{ .exists = false } }));
     try h.expectDiag("Document already exists");
     try h.expectDiag("an earlier attempt may have landed");
-    try testing.expectEqualStrings("ALREADY_EXISTS", h.diag.status());
+    try testing.expectEqualStrings("ALREADY_EXISTS", h.diag.code());
     try testing.expectEqual(409, h.diag.http_status);
     // An unconditional set retries too, and succeeds.
     _ = try la.set(&.{}, .{});

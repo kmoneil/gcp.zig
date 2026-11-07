@@ -9,7 +9,7 @@ const PreparedRequest = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const rpc = @import("rpc.zig");
-const transport = @import("transport.zig");
+const transport = @import("rest_core").transport;
 
 method: transport.Method,
 /// The whole URL, the client's endpoint included.

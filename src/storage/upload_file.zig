@@ -369,7 +369,7 @@ test "golden: uploadFile reads at offsets, and the final chunk carries the whole
         try testing.expectEqualStrings(session_uri, put.url);
         try testing.expectEqual(null, put.bearer);
         try testing.expectEqualStrings(range, put.header("Content-Range").?);
-        try testing.expectEqual(core.crc32c.hash(data[(i - 1) * chunk_size .. @min(i * chunk_size, data.len)]), put.body_crc32c);
+        try testing.expectEqual(std.hash.Crc32.hash(data[(i - 1) * chunk_size .. @min(i * chunk_size, data.len)]), put.body_crc32);
         if (i < 3) {
             try testing.expectEqual(null, put.header("X-Goog-Hash"));
         } else {

@@ -473,10 +473,10 @@ const Fixture = struct {
         std.debug.print("{t}: proxied HTTP {d} {s}: {s}; direct HTTP {d} {s}: {s}\n", .{
             err,
             f.diag.http_status,
-            f.diag.status(),
+            f.diag.code(),
             f.diag.message(),
             f.direct_diag.http_status,
-            f.direct_diag.status(),
+            f.direct_diag.code(),
             f.direct_diag.message(),
         });
         return err;

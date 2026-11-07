@@ -24,3 +24,5 @@ GEMINI.md
 # Zig build output
 .zig-cache/
 zig-out/
+# Dependencies Zig fetched (rest_core), unpacked by hash.
+zig-pkg/

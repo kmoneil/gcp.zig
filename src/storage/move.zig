@@ -179,8 +179,8 @@ fn settle(
 /// answer was lost may have moved the object, keeping the status.
 fn mayHaveMoved(client: *Client, err: Error) Error {
     const d = client.diagnostics orelse return err;
-    var status_buf: [core.Diagnostics.max_status_len]u8 = undefined;
-    const status_text = d.status();
+    var status_buf: [core.Diagnostics.max_code_len]u8 = undefined;
+    const status_text = d.code();
     @memcpy(status_buf[0..status_text.len], status_text);
     d.set(d.http_status, status_buf[0..status_text.len], "the move was repeated after an attempt whose answer was lost, and that attempt may have moved the object: read the destination to tell");
     return err;

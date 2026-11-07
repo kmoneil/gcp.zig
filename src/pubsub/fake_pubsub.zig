@@ -912,7 +912,7 @@ pub const FakePubSub = struct {
                     .GET => f.getTopic(arena, route),
                     .PATCH => f.updateTopic(arena, route, body),
                     .DELETE => f.deleteTopic(arena, route),
-                    .POST => notModelled(arena, "this call on a topic"),
+                    .POST, .HEAD => notModelled(arena, "this call on a topic"),
                 };
                 if (method == .POST and std.mem.eql(u8, route.rest, ":publish")) return f.publish(arena, route, body);
                 if (method == .GET and std.mem.eql(u8, route.rest, "/subscriptions")) return f.listTopicSubscriptions(arena, route);
@@ -926,7 +926,7 @@ pub const FakePubSub = struct {
                     .GET => f.getSubscription(arena, route),
                     .PATCH => f.updateSubscription(arena, route, body),
                     .DELETE => f.deleteSubscription(arena, route),
-                    .POST => notModelled(arena, "this call on a subscription"),
+                    .POST, .HEAD => notModelled(arena, "this call on a subscription"),
                 };
                 if (method == .POST and std.mem.eql(u8, route.rest, ":pull")) return f.pull(arena, route, body);
                 if (method == .POST and std.mem.eql(u8, route.rest, ":acknowledge")) return f.acknowledge(arena, route, body);
@@ -943,7 +943,7 @@ pub const FakePubSub = struct {
                     .GET => f.getSnapshot(arena, route),
                     .PATCH => f.updateSnapshot(arena, route, body),
                     .DELETE => f.deleteSnapshot(arena, route),
-                    .POST => notModelled(arena, "this call on a snapshot"),
+                    .POST, .HEAD => notModelled(arena, "this call on a snapshot"),
                 };
                 return notModelled(arena, route.rest);
             },
@@ -952,7 +952,7 @@ pub const FakePubSub = struct {
                     if (none) return switch (method) {
                         .GET => f.listSchemas(arena, route),
                         .POST => f.createSchema(arena, route, body),
-                        .PUT, .PATCH, .DELETE => notModelled(arena, "this call on schemas"),
+                        .PUT, .PATCH, .DELETE, .HEAD => notModelled(arena, "this call on schemas"),
                     };
                     if (method == .POST and std.mem.eql(u8, route.rest, ":validate")) return f.validateSchema(arena, body);
                     if (method == .POST and std.mem.eql(u8, route.rest, ":validateMessage")) return f.validateMessage(arena, body);
@@ -961,7 +961,7 @@ pub const FakePubSub = struct {
                 if (none) return switch (method) {
                     .GET => f.getSchema(arena, route),
                     .DELETE => f.deleteSchema(arena, route),
-                    .PUT, .PATCH, .POST => notModelled(arena, "this call on a schema"),
+                    .PUT, .PATCH, .POST, .HEAD => notModelled(arena, "this call on a schema"),
                 };
                 if (method == .POST and std.mem.eql(u8, route.rest, ":commit")) return f.commitSchema(arena, body);
                 if (method == .POST and std.mem.eql(u8, route.rest, ":rollback")) return f.rollbackSchema(arena, route, body);

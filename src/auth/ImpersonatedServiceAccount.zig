@@ -49,6 +49,8 @@ sign_url: []u8,
 refused: []u8,
 lifetime_s: u32,
 quota_project_id: ?[]u8,
+/// `quota_project_id`, as the header the provider adds to its requests.
+quota_header: core.rpc.QuotaProjectHeader,
 request_timeout_ms: u32,
 retry: core.RetryPolicy,
 diagnostics: ?*Diagnostics,
@@ -245,6 +247,7 @@ pub fn initFromJson(gpa: Allocator, io: std.Io, json: []const u8, options: Optio
         .refused = refused,
         .lifetime_s = options.lifetime_s,
         .quota_project_id = quota,
+        .quota_header = .init(quota),
         .request_timeout_ms = options.request_timeout_ms,
         .retry = options.retry,
         .diagnostics = diag,
@@ -282,7 +285,7 @@ pub fn provider(self: *ImpersonatedServiceAccount) TokenProvider {
     return .{ .ptr = self, .vtable = &.{
         .getToken = getToken,
         .invalidate = invalidate,
-        .quotaProject = quotaProject,
+        .headers = credentialHeaders,
     } };
 }
 
@@ -350,8 +353,8 @@ fn invalidate(ptr: *anyopaque) void {
     fromPtr(ptr).cache.invalidate();
 }
 
-fn quotaProject(ptr: *anyopaque) ?[]const u8 {
-    return fromPtr(ptr).quota_project_id;
+fn credentialHeaders(ptr: *anyopaque) []const core.transport.Header {
+    return fromPtr(ptr).quota_header.slice();
 }
 
 /// One whole fetch: a source token, then the trade at IAM. `arena` is the
@@ -676,7 +679,7 @@ test "ImpersonatedServiceAccount: the source's own failure is the caller's" {
         .body = "{\"error\":\"invalid_grant\",\"error_description\":\"Token has been expired or revoked.\"}",
     } }}, user_file);
     defer h.deinit();
-    try testing.expectError(error.RefreshTokenInvalid, h.get());
+    try testing.expectError(error.ReauthenticationRequired, h.get());
     // Nothing went to IAM without a source token.
     try testing.expectEqual(1, h.fake.requests.items.len);
 }
@@ -733,7 +736,7 @@ test "ImpersonatedServiceAccount: quota project, and the file types it refuses" 
     var with_quota: ImpersonatedServiceAccount = try .initFromJson(testing.allocator, testing.io, fileJson(google_url, user_source, ", \"quota_project_id\": \"billing-project\""), options);
     defer with_quota.deinit();
     try testing.expectEqualStrings("billing-project", with_quota.quotaProjectId().?);
-    try testing.expectEqualStrings("billing-project", with_quota.provider().quotaProject().?);
+    try testing.expectEqualStrings("billing-project", core.rpc.quotaProjectOf(with_quota.provider()).?);
 
     try testing.expectError(error.UnsupportedCredentialType, ImpersonatedServiceAccount.initFromJson(testing.allocator, testing.io, user_source, options));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "use AuthorizedUser") != null);

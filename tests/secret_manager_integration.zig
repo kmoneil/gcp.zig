@@ -140,7 +140,7 @@ const Fixture = struct {
     /// Prints the server's own words when a call fails unexpectedly.
     fn report(f: *const Fixture, err: anyerror) anyerror {
         std.debug.print("error.{t}", .{err});
-        if (f.diag.http_status != 0) std.debug.print(" (HTTP {d} {s})", .{ f.diag.http_status, f.diag.status() });
+        if (f.diag.http_status != 0) std.debug.print(" (HTTP {d} {s})", .{ f.diag.http_status, f.diag.code() });
         if (f.diag.message().len != 0) std.debug.print(": {s}", .{f.diag.message()});
         std.debug.print("\n", .{});
         return err;

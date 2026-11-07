@@ -939,9 +939,9 @@ test "clean run: a large upload takes the resumable path, chunk by chunk" {
         try testing.expectEqualStrings(range, put.header("Content-Range").?);
     }
     // Each chunk carried exactly its slice of the data.
-    try testing.expectEqual(core.crc32c.hash(data[0..chunk_size]), (try h.fake.streamRequest(1)).body_crc32c);
-    try testing.expectEqual(core.crc32c.hash(data[chunk_size .. 2 * chunk_size]), (try h.fake.streamRequest(2)).body_crc32c);
-    try testing.expectEqual(core.crc32c.hash(data[2 * chunk_size ..]), (try h.fake.streamRequest(3)).body_crc32c);
+    try testing.expectEqual(std.hash.Crc32.hash(data[0..chunk_size]), (try h.fake.streamRequest(1)).body_crc32);
+    try testing.expectEqual(std.hash.Crc32.hash(data[chunk_size .. 2 * chunk_size]), (try h.fake.streamRequest(2)).body_crc32);
+    try testing.expectEqual(std.hash.Crc32.hash(data[2 * chunk_size ..]), (try h.fake.streamRequest(3)).body_crc32);
 }
 
 test "the server keeping less than was sent moves the resend point back" {
@@ -955,7 +955,7 @@ test "the server keeping less than was sent moves the resend point back" {
     defer info.deinit();
     // The second request starts at what the server kept, not at what was sent.
     try testing.expectEqualStrings("bytes 131072-393215/614400", (try h.fake.streamRequest(2)).header("Content-Range").?);
-    try testing.expectEqual(core.crc32c.hash(data[128 * 1024 .. 128 * 1024 + chunk_size]), (try h.fake.streamRequest(2)).body_crc32c);
+    try testing.expectEqual(std.hash.Crc32.hash(data[128 * 1024 .. 128 * 1024 + chunk_size]), (try h.fake.streamRequest(2)).body_crc32);
 }
 
 test "a 503 mid-chunk leads to a status query, then a resume" {

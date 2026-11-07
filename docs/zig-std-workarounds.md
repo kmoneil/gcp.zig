@@ -2,10 +2,16 @@
 
 # Zig 0.17 standard library issues handled here
 
-Each of these is worked around here, and covered by a regression test in
-`src/core/transport.zig` unless it says otherwise. Each was checked
-against Zig 0.17.0's source when the library moved to it, and against
-0.17.1's when it moved to that.
+Each was checked against Zig 0.17.0's source when the library moved to
+it, and against 0.17.1's when it moved to that.
+
+## In the transport
+
+The HTTP transport is [rest-core](https://github.com/kmoneil/rest-core.zig)'s,
+which this package is built on. Each of these is worked around there and
+covered by a regression test in its `src/transport.zig`; its
+[docs/zig-std-workarounds.md](https://github.com/kmoneil/rest-core.zig/blob/main/docs/zig-std-workarounds.md)
+lists them, and the ones found while moving the transport there.
 
 - A chunk size near 2^64 overflows `std.http`'s chunked decoder (a
   panic in a safe build), so the transport decodes chunked bodies
@@ -31,6 +37,9 @@ against Zig 0.17.0's source when the library moved to it, and against
   unmapped, and Zig 0.17.0 `0xC000013B` (the peer hung up) on a read
   or write; Zig 0.17 maps the first to `error.ConnectionRefused`, and
   0.17.1 the second to `error.ConnectionResetByPeer`.
+
+## In this package
+
 - `std.compress.flate.Decompress` reads each gzip member's trailer, its
   CRC-32 and length, and checks neither, so a corrupted member
   decompresses to wrong bytes without complaint. `storage`'s downloads

@@ -29,6 +29,8 @@ client_id: []u8,
 client_secret: []u8,
 refresh_token: []u8,
 quota_project_id: ?[]u8,
+/// `quota_project_id`, as the header the provider adds to its requests.
+quota_header: core.rpc.QuotaProjectHeader,
 token_url: []u8,
 user_agent: []u8,
 request_timeout_ms: u32,
@@ -166,6 +168,7 @@ pub fn initFromJson(gpa: Allocator, io: std.Io, json: []const u8, options: Optio
         .client_secret = client_secret,
         .refresh_token = refresh_token,
         .quota_project_id = quota_project_id,
+        .quota_header = .init(quota_project_id),
         .token_url = token_url,
         .user_agent = user_agent,
         .request_timeout_ms = options.request_timeout_ms,
@@ -254,7 +257,7 @@ pub fn provider(self: *AuthorizedUser) TokenProvider {
     return .{ .ptr = self, .vtable = &.{
         .getToken = getToken,
         .invalidate = invalidate,
-        .quotaProject = quotaProject,
+        .headers = credentialHeaders,
     } };
 }
 
@@ -278,8 +281,8 @@ fn invalidate(ptr: *anyopaque) void {
     fromPtr(ptr).cache.invalidate();
 }
 
-fn quotaProject(ptr: *anyopaque) ?[]const u8 {
-    return fromPtr(ptr).quota_project_id;
+fn credentialHeaders(ptr: *anyopaque) []const core.transport.Header {
+    return fromPtr(ptr).quota_header.slice();
 }
 
 /// Trades the refresh token for an access token. `arena` is the cache's
@@ -378,7 +381,7 @@ fn exchange(self: *AuthorizedUser, io: std.Io, arena: Allocator, body: []const u
     }
     asked.* = token_response.askedDelayMs(io, arena, res, self.diagnostics) catch return .{ .fail = error.OutOfMemory };
     if (res.status == 429 or res.status >= 500) return .{ .retry = error.TokenUnavailable };
-    if (oauth) |e| if (std.mem.eql(u8, e.code, "invalid_grant")) return .{ .fail = error.RefreshTokenInvalid };
+    if (oauth) |e| if (std.mem.eql(u8, e.code, "invalid_grant")) return .{ .fail = error.ReauthenticationRequired };
     return .{ .fail = error.TokenEndpointRejected };
 }
 
@@ -496,17 +499,17 @@ test "AuthorizedUser: the token is kept until it goes stale" {
     try testing.expectEqual(2, h.fake.requests.items.len);
 }
 
-test "AuthorizedUser: invalid_grant is RefreshTokenInvalid, not retried, and says how to fix it" {
+test "AuthorizedUser: invalid_grant is ReauthenticationRequired, not retried, and says how to fix it" {
     var h: Harness = undefined;
     try h.init(&.{.{ .respond = .{
         .status = 400,
         .body = "{\"error\":\"invalid_grant\",\"error_description\":\"Token has been expired or revoked.\"}",
     } }});
     defer h.deinit();
-    try testing.expectError(error.RefreshTokenInvalid, h.get());
+    try testing.expectError(error.ReauthenticationRequired, h.get());
     try testing.expectEqual(1, h.fake.requests.items.len);
     try testing.expectEqual(400, h.diag.http_status);
-    try testing.expectEqualStrings("invalid_grant", h.diag.status());
+    try testing.expectEqualStrings("invalid_grant", h.diag.code());
     try testing.expectEqualStrings("Token has been expired or revoked. Run `gcloud auth application-default login` again.", h.diag.message());
 }
 
@@ -520,7 +523,7 @@ test "AuthorizedUser: invalid_grant without a usable description still says how 
         var h: Harness = undefined;
         try h.init(&.{.{ .respond = .{ .status = 400, .body = body } }});
         defer h.deinit();
-        try testing.expectError(error.RefreshTokenInvalid, h.get());
+        try testing.expectError(error.ReauthenticationRequired, h.get());
         try testing.expectEqualStrings("The refresh token no longer works. Run `gcloud auth application-default login` again.", h.diag.message());
     }
 }
@@ -534,7 +537,7 @@ test "AuthorizedUser: another refusal is TokenEndpointRejected, not retried" {
     });
     defer h.deinit();
     try testing.expectError(error.TokenEndpointRejected, h.get());
-    try testing.expectEqualStrings("invalid_client", h.diag.status());
+    try testing.expectEqualStrings("invalid_client", h.diag.code());
     try testing.expectEqualStrings("The OAuth client was not found.", h.diag.message());
     try testing.expectError(error.TokenEndpointRejected, h.get());
     try testing.expectEqualStrings("the token endpoint refused the request", h.diag.message());
@@ -723,7 +726,7 @@ test "AuthorizedUser: the quota project is the file's" {
     var h: Harness = undefined;
     try h.init(&.{});
     defer h.deinit();
-    try testing.expectEqualStrings("billing-project", h.user.provider().quotaProject().?);
+    try testing.expectEqualStrings("billing-project", core.rpc.quotaProjectOf(h.user.provider()).?);
     try testing.expectEqualStrings("billing-project", h.user.quotaProjectId().?);
 }
 
@@ -800,7 +803,7 @@ test "AuthorizedUser: secrets reach neither the log nor Diagnostics" {
     defer h.deinit();
     _ = try h.get();
     h.user.provider().invalidate();
-    try testing.expectError(error.RefreshTokenInvalid, h.get());
+    try testing.expectError(error.ReauthenticationRequired, h.get());
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "SECRET") == null);
     h.user.provider().invalidate();
     try testing.expectError(error.TokenUnavailable, h.get());
@@ -840,7 +843,7 @@ test "AuthorizedUser: every allocation failure is OutOfMemory without leaks" {
 
         fn refused(gpa: Allocator, reply: Reply) !void {
             get(gpa, reply) catch |err| switch (err) {
-                error.RefreshTokenInvalid => return,
+                error.ReauthenticationRequired => return,
                 else => return err,
             };
             return error.TestExpectedRefusal;

@@ -160,7 +160,7 @@ fn write(jw: *Stringify, config: types.NotificationConfig, topic: []const u8) St
 pub fn isNotPublishable(err: anyerror, diag: *const core.Diagnostics) bool {
     const message = diag.message();
     return switch (err) {
-        error.PermissionDenied => std.mem.eql(u8, diag.status(), "forbidden") and
+        error.PermissionDenied => std.mem.eql(u8, diag.code(), "forbidden") and
             std.mem.indexOf(u8, message, "does not have permission to publish messages to") != null,
         error.InvalidArgument => std.mem.startsWith(u8, message, "Cloud Pub/Sub topic '") and
             std.mem.indexOf(u8, message, "' not found") != null,
@@ -719,7 +719,7 @@ test "against production's rules: a topic Cloud Storage cannot publish to, and t
     try testing.expectError(error.TopicNotPublishable, b.createNotification(.{ .topic = .{ .project = "extractctl", .topic = "zigps-missing" } }));
     try testing.expect(std.mem.indexOf(u8, f.diag.message(), "not found") != null);
     try testing.expectError(error.TopicNotPublishable, b.createNotification(.{ .topic = .{ .project = "extractctl", .topic = "zigps-ungranted" } }));
-    try testing.expectEqualStrings("forbidden", f.diag.status());
+    try testing.expectEqualStrings("forbidden", f.diag.code());
     try testing.expect(std.mem.indexOf(u8, f.diag.message(), "service-82150720798@gs-project-accounts.iam.gserviceaccount.com") != null);
     // Refused, not sent twice.
     try testing.expectEqual(2, f.fake.buckets.counts.notification_creates);

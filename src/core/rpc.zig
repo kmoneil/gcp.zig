@@ -1,34 +1,121 @@
-//! One API call, from URL to body: attach credentials, send it through the
-//! transport, map a failure to an error, retry the transient ones with
-//! jittered backoff, and keep `Diagnostics` and the log current.
+//! One API call, from URL to body: rest-core's request loop with Google's
+//! hook. The loop attaches credentials, sends the call through the
+//! transport, retries the transient failures with jittered backoff, and
+//! keeps `Diagnostics` and the log current; `Google` says how Google's
+//! refusals read, which of them are retried, and what delay their bodies
+//! carry.
 //!
 //! Every service module runs this same loop. `Engine(scope)` binds it to the
 //! module's log scope; the struct it returns holds the settings the loop
-//! reads, and a client fills one in for each call it makes.
+//! reads, and a client fills one in for each call it makes. What it adds to
+//! rest-core's is Google's quota project: a call's own, sent as
+//! `x-goog-user-project` in place of the credentials', and the rule that
+//! either is a project id.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const WipingAllocator = @import("WipingAllocator.zig");
+const rest_core = @import("rest_core");
 const errors = @import("errors.zig");
-const logging = @import("logging.zig");
 const names = @import("names.zig");
 const retry = @import("retry.zig");
-const retry_after = @import("retry_after.zig");
-const transport = @import("transport.zig");
-const Diagnostics = errors.Diagnostics;
+const loop = rest_core.loop;
+const transport = rest_core.transport;
+const Diagnostics = rest_core.Diagnostics;
 const Response = transport.Response;
-const RetryPolicy = retry.RetryPolicy;
-const TokenProvider = @import("TokenProvider.zig");
+const RetryPolicy = rest_core.RetryPolicy;
+const TokenProvider = rest_core.TokenProvider;
 const Transport = transport.Transport;
-const isRetryable = retry.isRetryable;
+
+/// The header that names the project a request bills for quota.
+pub const quota_project_header = "x-goog-user-project";
+
+/// A credential's quota project as the header its `TokenProvider` adds to
+/// every request it authorizes (`TokenProvider.VTable.headers`). Kept in the
+/// credential, so the slice lives as long as the provider does; the project
+/// itself is the credential's memory.
+pub const QuotaProjectHeader = struct {
+    header: [1]transport.Header = undefined,
+    len: usize = 0,
+
+    /// `project` as `x-goog-user-project`, or no header when it is null.
+    pub fn init(project: ?[]const u8) QuotaProjectHeader {
+        const p = project orelse return .{};
+        return .{ .header = .{.{ .name = quota_project_header, .value = p }}, .len = 1 };
+    }
+
+    pub fn slice(q: *const QuotaProjectHeader) []const transport.Header {
+        return q.header[0..q.len];
+    }
+};
+
+/// The quota project `provider` sends with its token, read from the headers
+/// it adds; null when it names none.
+pub fn quotaProjectOf(provider: TokenProvider) ?[]const u8 {
+    for (provider.headers()) |h| if (std.ascii.eqlIgnoreCase(h.name, quota_project_header)) return h.value;
+    return null;
+}
 
 /// Every error the loop itself returns. A service module's error set adds
 /// what its own validation and decoding raise.
 pub const Error = errors.ApiError || transport.Error || TokenProvider.Error || error{
-    /// The credentials name a quota project that is not a project id.
+    /// The call or the credentials name a quota project that is not a
+    /// project id.
     InvalidResourceId,
 };
+
+/// Google's hook for rest-core's request loop: how a refusal reads, which
+/// failures are retried, and the delay a refusal's body asks for.
+pub const Google = struct {
+    pub const RefusalError = errors.ApiError;
+
+    /// Reads a refused response's Google API error body into `diagnostics`,
+    /// and returns the error its status stands for.
+    pub fn refusal(scratch: Allocator, res: Response, diagnostics: ?*Diagnostics) (RefusalError || Allocator.Error) {
+        return refuse(scratch, res, diagnostics, errors.decodeErrorBody);
+    }
+
+    /// `retry.isRetryable`: the transport's transient failures, and the
+    /// retryable API statuses.
+    pub fn retryable(err: anyerror, http_status: u16) bool {
+        _ = http_status;
+        return retry.isRetryable(err);
+    }
+
+    /// The `google.rpc.RetryInfo` delay in an error body's details.
+    pub fn bodyDelayMs(scratch: Allocator, body: []const u8) Allocator.Error!?u32 {
+        return errors.decodeRetryDelayMs(scratch, body);
+    }
+};
+
+/// A refusal read in place of `Google.refusal`.
+pub const RefusalFn = *const fn (scratch: Allocator, res: Response, diagnostics: ?*Diagnostics) (errors.ApiError || Allocator.Error);
+
+/// `Google.refusal`, with the body read by `decode` rather than as Google's
+/// JSON shape, for a service whose errors are not in it, as Cloud Storage's
+/// XML API's are not. A body `decode` cannot read becomes the message whole.
+pub fn refusalReading(comptime decode: fn (arena: Allocator, body: []const u8) Allocator.Error!?errors.ErrorBody) RefusalFn {
+    return struct {
+        fn read(scratch: Allocator, res: Response, diagnostics: ?*Diagnostics) (errors.ApiError || Allocator.Error) {
+            return refuse(scratch, res, diagnostics, decode);
+        }
+    }.read;
+}
+
+fn refuse(
+    scratch: Allocator,
+    res: Response,
+    diagnostics: ?*Diagnostics,
+    comptime decode: fn (arena: Allocator, body: []const u8) Allocator.Error!?errors.ErrorBody,
+) (errors.ApiError || Allocator.Error) {
+    const body = try decode(scratch, res.body);
+    const status = if (body) |b| b.status else "";
+    // A body that is not the standard error shape, such as a proxy's page,
+    // is the best message there is.
+    const message = if (body) |b| b.message else res.body;
+    if (diagnostics) |d| d.set(res.status, status, message);
+    return errors.fromResponse(res.status, status);
+}
 
 /// One request, as a service module describes it.
 pub const Call = struct {
@@ -36,15 +123,23 @@ pub const Call = struct {
     /// Path and query, starting with `/v1/`. Appended to the base URL.
     path: []const u8,
     body: ?[]const u8 = null,
+    /// How `body` is encoded, sent as its Content-Type.
+    content_type: transport.ContentType = .json,
     /// Extra request headers, such as the `Content-Encoding` of a compressed
     /// body. The quota project's goes after them.
     headers: []const transport.Header = &.{},
+    /// Pointed at each attempt's response status and headers, a success's
+    /// or a refusal's, for a caller that reads more of an answer than its
+    /// body, as a long-running write's `Location`. Null when the latest
+    /// attempt got no response. The headers stay in `response` until the
+    /// caller resets it; always null from `executeDiscard`.
+    head_out: ?*?transport.StreamRequest.Head = null,
     /// False where the caller opted out of retries, as a publish does.
     retry: bool = true,
     /// Whether a failed attempt is worth another. `http_status` is the
     /// response's status, or 0 when the attempt got no response. The
     /// default is `isRetryable`; a call can widen it, as a publish does.
-    retryable: *const fn (err: anyerror, http_status: u16) bool = retryableByDefault,
+    retryable: loop.RetryableFn = retryableByDefault,
     /// This call carries secrets. What the loop allocates for it, the URL
     /// and the bearer token, is wiped when the call returns, and a failed
     /// attempt's response memory is freed at once rather than kept for the
@@ -57,6 +152,10 @@ pub const Call = struct {
     /// the call succeeds or its last attempt got no response, and always
     /// null from `executeDiscard`, which frees the response as it returns.
     error_body_out: ?*?[]const u8 = null,
+    /// How long one attempt may take, instead of the engine's
+    /// `request_timeout_ms`, for a request that is slow by nature. 0 removes
+    /// the limit.
+    timeout_ms: ?u32 = null,
     /// The project this call bills, sent as `x-goog-user-project` in place
     /// of the credentials' quota project, as a request to a requester pays
     /// bucket names the project it bills. Held to the same rule as the
@@ -91,7 +190,7 @@ pub const StreamCall = struct {
     /// cannot be taken back, so it is returned instead. Resuming is the
     /// caller's business.
     retry: bool = true,
-    retryable: *const fn (err: anyerror, http_status: u16) bool = retryableByDefault,
+    retryable: loop.RetryableFn = retryableByDefault,
     /// A writer sink that can take the body again from its first byte, as
     /// a `JsonArraySplitter` that has handed nothing on can: after a
     /// transport failure mid-body the engine asks it to start over, and
@@ -106,34 +205,26 @@ pub const StreamCall = struct {
     /// `request_timeout_ms`, for a request that is slow by nature, such as
     /// the one that assembles a multipart upload. 0 removes the limit.
     timeout_ms: ?u32 = null,
-    /// Reads a failed response's body into a status and message, for a
-    /// service whose errors are not Google's JSON shape, as Cloud Storage's
-    /// XML API's are not. Null reads the JSON shape. Either way a body it
-    /// cannot read becomes the message whole.
-    decode_error: ?*const fn (arena: Allocator, body: []const u8) Allocator.Error!?errors.ErrorBody = null,
+    /// Reads a refusal in place of the engine's, for a service whose errors
+    /// are not Google's JSON shape, as Cloud Storage's XML API's are not
+    /// (`refusalReading(xml.decodeError)`). Null: the engine's.
+    refusal: ?RefusalFn = null,
     /// As `Call.quota_project`.
     quota_project: ?[]const u8 = null,
     /// As `Call.retry_window_ms`.
     retry_window_ms: ?u32 = null,
+    /// As `Call.wipe`. What a writer sink was handed is the caller's.
+    wipe: bool = false,
+    /// As `Call.error_body_out`: a refused response's body is buffered
+    /// whatever the sink.
+    error_body_out: ?*?[]const u8 = null,
 
-    pub const Body = union(enum) {
-        none,
-        /// Sent back to back with an exact Content-Length; replayable.
-        segments: []const []const u8,
-    };
-
-    pub const Restart = struct {
-        ptr: *anyopaque,
-        /// Whether the sink has made itself ready for the body again.
-        restart: *const fn (ptr: *anyopaque) bool,
-    };
+    pub const Body = loop.StreamCall.Body;
+    pub const Restart = loop.StreamCall.Restart;
 };
 
 /// A request body read from a stream: exactly `len` bytes from `reader`.
-pub const StreamBody = struct {
-    reader: *std.Io.Reader,
-    len: u64,
-};
+pub const StreamBody = loop.StreamBody;
 
 /// `Error`, plus the caller's sink writer failing, with the detail wherever
 /// that concrete writer keeps it.
@@ -158,6 +249,8 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
         /// This endpoint must never receive credentials: an emulator speaks
         /// plain HTTP and needs none.
         unauthenticated: bool = false,
+        /// Whether a quota project goes with the token: the call's own, or
+        /// the credentials' (their `x-goog-user-project` header).
         send_quota_project: bool = true,
         retry: RetryPolicy = .{},
         request_timeout_ms: u32 = 0,
@@ -167,107 +260,28 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
         /// with `retry` off and waits with `RetryPolicy.waitMs`. A module
         /// points it at its client, which one task uses at a time.
         server_delay_out: ?*?u32 = null,
-        /// For a service whose refusals name their kind in the body more
-        /// truly than in the status, as BigQuery's `errors[].reason` does
-        /// (it may send a rate limit as 403): the error a refusal stands
-        /// for, or null to map it by its status as usual. What it returns
-        /// is the call's error, and decides the retry as any mapped error
-        /// does. `Diagnostics` keep the body's words either way.
-        classify_refusal: ?*const fn (scratch: Allocator, http_status: u16, body: []const u8) Allocator.Error!?Error = null,
+        /// In place of `Google.refusal`, for a service whose refusals name
+        /// their kind in the body more truly than in the status, as
+        /// BigQuery's `errors[].reason` does (it may send a rate limit as
+        /// 403). What it returns is the call's error, and decides the retry
+        /// as any refusal's error does.
+        refusal: ?RefusalFn = null,
 
         const Self = @This();
-        const log = logging.Scoped(log_scope);
+        const Inner = rest_core.Engine(log_scope, Google);
 
         /// Starts a public call: `Diagnostics` describe only the latest one.
         pub fn begin(self: Self) void {
-            if (self.diagnostics) |d| d.clear();
+            self.inner(null).begin();
         }
 
         /// Sends `call`, retrying transient failures, and returns the body of
         /// the first 2xx response. The body lives in `response`, which is
         /// reset between attempts and so must hold nothing else.
         pub fn execute(self: Self, response: *std.heap.ArenaAllocator, call: Call) Error![]const u8 {
-            var wiping: WipingAllocator = .init(self.gpa);
-            var scratch: std.heap.ArenaAllocator = .init(if (call.wipe) wiping.allocator() else self.gpa);
-            defer scratch.deinit();
-            const url = try std.mem.concat(scratch.allocator(), u8, &.{ self.base_url, call.path });
-            // Query strings carry page tokens and filters; they stay out of the log.
-            const log_path = call.path[0 .. std.mem.indexOfScalar(u8, call.path, '?') orelse call.path.len];
-            var max_attempts: u32 = if (call.retry) self.retry.max_attempts else 1;
-
-            // The call's headers, plus the quota project when there is one.
-            var headers: []const transport.Header = call.headers;
-            if (try self.quotaProject(call.quota_project)) |project| {
-                const all = try scratch.allocator().alloc(transport.Header, call.headers.len + 1);
-                @memcpy(all[0..call.headers.len], call.headers);
-                all[call.headers.len] = .{ .name = "x-goog-user-project", .value = project };
-                headers = all;
-            }
-
-            var reauthenticated = false;
-            const first_started = std.Io.Clock.awake.now(self.io);
-            var attempt: u32 = 1;
-            while (true) : (attempt += 1) {
-                // Each attempt starts over: a reset arena no longer holds
-                // the previous attempt's body.
-                if (call.error_body_out) |out| out.* = null;
-                if (self.server_delay_out) |out| out.* = null;
-                const bearer = try self.bearerToken(scratch.allocator());
-                const started = std.Io.Clock.awake.now(self.io);
-                const outcome = self.transport.send(.{
-                    .method = call.method,
-                    .url = url,
-                    .bearer = bearer,
-                    .body = call.body,
-                    .headers = headers,
-                    .timeout_ms = self.request_timeout_ms,
-                }, response.allocator());
-                const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds();
-
-                var http_status: u16 = 0;
-                var server_delay: ?u32 = null;
-                const err: Error = if (outcome) |res| e: {
-                    http_status = res.status;
-                    log.debug("{t} {s} -> {d} in {d} ms (attempt {d} of {d})", .{
-                        call.method, log_path, res.status, elapsed_ms, attempt, max_attempts,
-                    });
-                    if (res.status >= 200 and res.status < 300) {
-                        if (self.diagnostics) |d| d.clear();
-                        return res.body;
-                    }
-                    if (call.error_body_out) |out| out.* = res.body;
-                    const failed = self.failure(scratch.allocator(), res, null);
-                    server_delay = try self.serverDelay(scratch.allocator(), res);
-                    break :e failed;
-                } else |err| e: {
-                    log.debug("{t} {s} -> {t} in {d} ms (attempt {d} of {d})", .{
-                        call.method, log_path, err, elapsed_ms, attempt, max_attempts,
-                    });
-                    if (self.diagnostics) |d| d.print("{t}", .{err});
-                    break :e err;
-                };
-
-                // A 401 usually means the token died between being fetched
-                // and being used. The server refused the request before
-                // acting on it, so trying again with a fresh token is safe
-                // even for a call that otherwise never retries.
-                if (err == error.Unauthenticated and !reauthenticated and self.dropCachedToken()) {
-                    reauthenticated = true;
-                    max_attempts += 1;
-                    log.warn("{t} {s} was refused as unauthenticated; retrying once with a fresh token", .{ call.method, log_path });
-                    self.resetResponse(response, call);
-                    continue;
-                }
-
-                if (attempt >= max_attempts or !call.retryable(err, http_status)) return err;
-                const delay_ms = self.waitMs(attempt, server_delay, call.method, log_path, err) orelse return err;
-                if (self.pastWindow(call.retry_window_ms, first_started, delay_ms, call.method, log_path, err)) return err;
-                log.warn("{t} {s} failed with {t}; retrying in {d} ms (attempt {d} of {d})", .{
-                    call.method, log_path, err, delay_ms, attempt + 1, max_attempts,
-                });
-                self.resetResponse(response, call);
-                try self.io.sleep(.fromMilliseconds(delay_ms), .awake);
-            }
+            const added = try self.quotaHeaders(call.headers, call.quota_project);
+            defer if (added) |a| self.gpa.free(a);
+            return self.inner(null).execute(response, neutralCall(call, added orelse call.headers));
         }
 
         /// Sends `call` through the transport's streaming entry, retrying
@@ -275,16 +289,10 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
         /// status, headers, and the body, buffered or already delivered to
         /// the sink writer. Everything returned lives in `response`, which
         /// is reset between attempts and so must hold nothing else.
-        pub fn executeStream(
-            self: Self,
-            response: *std.heap.ArenaAllocator,
-            call: StreamCall,
-        ) StreamCallError!transport.StreamResponse {
-            return self.stream(response, call, null) catch |err| switch (err) {
-                // Only a streamed body reads.
-                error.ReadFailed, error.EndOfStream => unreachable,
-                else => |e| e,
-            };
+        pub fn executeStream(self: Self, response: *std.heap.ArenaAllocator, call: StreamCall) StreamCallError!transport.StreamResponse {
+            const added = try self.quotaHeaders(call.headers, call.quota_project);
+            defer if (added) |a| self.gpa.free(a);
+            return self.inner(call.refusal).executeStream(response, neutralStreamCall(call, added orelse call.headers));
         }
 
         /// `executeStream` with the body read from `body`, which cannot go
@@ -292,292 +300,121 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
         /// transient failure comes back for the caller to try again with a
         /// fresh reader. A 401 drops the cached token, so that next attempt
         /// gets a new one. `call.body` must be `.none`.
-        pub fn executeStreamBody(
-            self: Self,
-            response: *std.heap.ArenaAllocator,
-            call: StreamCall,
-            body: StreamBody,
-        ) StreamBodyError!transport.StreamResponse {
-            std.debug.assert(call.body == .none);
-            return self.stream(response, call, body);
-        }
-
-        fn stream(
-            self: Self,
-            response: *std.heap.ArenaAllocator,
-            call: StreamCall,
-            streamed: ?StreamBody,
-        ) StreamBodyError!transport.StreamResponse {
-            var scratch: std.heap.ArenaAllocator = .init(self.gpa);
-            defer scratch.deinit();
-            const url = try std.mem.concat(scratch.allocator(), u8, &.{ self.base_url, call.path });
-            // Query strings carry page tokens and object names; they stay
-            // out of the log.
-            const log_path = call.path[0 .. std.mem.indexOfScalar(u8, call.path, '?') orelse call.path.len];
-            // A streamed body is spent by its first attempt.
-            var max_attempts: u32 = if (call.retry and streamed == null) self.retry.max_attempts else 1;
-
-            // The caller's headers, plus the quota project when there is one.
-            var headers = try scratch.allocator().alloc(transport.Header, call.headers.len + 1);
-            @memcpy(headers[0..call.headers.len], call.headers);
-            var header_count = call.headers.len;
-            if (try self.quotaProject(call.quota_project)) |project| {
-                headers[header_count] = .{ .name = "x-goog-user-project", .value = project };
-                header_count += 1;
-            }
-
-            var reauthenticated = false;
-            const first_started = std.Io.Clock.awake.now(self.io);
-            var attempt: u32 = 1;
-            while (true) : (attempt += 1) {
-                if (self.server_delay_out) |out| out.* = null;
-                const bearer = try self.bearerToken(scratch.allocator());
-                const started = std.Io.Clock.awake.now(self.io);
-                const outcome = self.transport.sendStream(.{
-                    .method = call.method,
-                    .url = url,
-                    .bearer = bearer,
-                    .content_type = call.content_type,
-                    .headers = headers[0..header_count],
-                    .body = if (streamed) |s| .{ .stream = .{ .reader = s.reader, .len = s.len } } else switch (call.body) {
-                        .none => .none,
-                        .segments => |segments| .{ .segments = segments },
-                    },
-                    .sink = call.sink,
-                    .accept_encoding = call.accept_encoding,
-                    .timeout_ms = call.timeout_ms orelse self.request_timeout_ms,
-                    .head_out = call.head_out,
-                }, response.allocator());
-                const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds();
-
-                var http_status: u16 = 0;
-                var server_delay: ?u32 = null;
-                var mid_body = false;
-                const err: StreamBodyError = if (outcome) |res| e: {
-                    http_status = res.status;
-                    log.debug("{t} {s} -> {d} in {d} ms (attempt {d} of {d})", .{
-                        call.method, log_path, res.status, elapsed_ms, attempt, max_attempts,
-                    });
-                    if (res.status >= 200 and res.status < 300) {
-                        if (self.diagnostics) |d| d.clear();
-                        return res;
-                    }
-                    const buffered: Response = .{ .status = res.status, .body = res.body, .headers = res.headers };
-                    const failed = self.failure(scratch.allocator(), buffered, call.decode_error);
-                    server_delay = try self.serverDelay(scratch.allocator(), buffered);
-                    break :e failed;
-                } else |err| e: {
-                    log.debug("{t} {s} -> {t} in {d} ms (attempt {d} of {d})", .{
-                        call.method, log_path, err, elapsed_ms, attempt, max_attempts,
-                    });
-                    if (self.diagnostics) |d| d.print("{t}", .{err});
-                    break :e switch (err) {
-                        // The caller's sink writer failed; nothing to retry.
-                        error.WriteFailed => return error.WriteFailed,
-                        // The caller's body reader failed or ran short. Only
-                        // a streamed body reads, and it is never retried.
-                        error.ReadFailed, error.EndOfStream => |e| if (streamed != null) return e else unreachable,
-                        else => |e| b: {
-                            // A transport failure may have delivered part of
-                            // the body to a writer sink already, which only a
-                            // sink that can start over takes back.
-                            if (call.sink == .writer) {
-                                mid_body = if (call.restart) |r| !r.restart(r.ptr) else true;
-                            }
-                            break :b e;
-                        },
-                    };
-                };
-
-                // A 401 response is buffered whatever the sink, so retrying
-                // it once with a fresh token is safe even there. A streamed
-                // body is spent, so it only gets the token dropped, for the
-                // caller's next attempt.
-                if (err == error.Unauthenticated and streamed != null) {
-                    _ = self.dropCachedToken();
-                    return err;
-                }
-                if (err == error.Unauthenticated and !reauthenticated and self.dropCachedToken()) {
-                    reauthenticated = true;
-                    max_attempts += 1;
-                    log.warn("{t} {s} was refused as unauthenticated; retrying once with a fresh token", .{ call.method, log_path });
-                    _ = response.reset(.retain_capacity);
-                    continue;
-                }
-
-                if (mid_body or attempt >= max_attempts or !call.retryable(err, http_status)) return err;
-                const delay_ms = self.waitMs(attempt, server_delay, call.method, log_path, err) orelse return err;
-                if (self.pastWindow(call.retry_window_ms, first_started, delay_ms, call.method, log_path, err)) return err;
-                log.warn("{t} {s} failed with {t}; retrying in {d} ms (attempt {d} of {d})", .{
-                    call.method, log_path, err, delay_ms, attempt + 1, max_attempts,
-                });
-                _ = response.reset(.retain_capacity);
-                try self.io.sleep(.fromMilliseconds(delay_ms), .awake);
-            }
+        pub fn executeStreamBody(self: Self, response: *std.heap.ArenaAllocator, call: StreamCall, body: StreamBody) StreamBodyError!transport.StreamResponse {
+            const added = try self.quotaHeaders(call.headers, call.quota_project);
+            defer if (added) |a| self.gpa.free(a);
+            return self.inner(call.refusal).executeStreamBody(response, neutralStreamCall(call, added orelse call.headers), body);
         }
 
         /// `execute` for calls whose response body is not needed.
         pub fn executeDiscard(self: Self, call: Call) Error!void {
-            var wiping: WipingAllocator = .init(self.gpa);
-            var response: std.heap.ArenaAllocator = .init(if (call.wipe) wiping.allocator() else self.gpa);
-            defer response.deinit();
-            // The response goes before this returns, and a failed body with it.
-            var discarding = call;
-            if (discarding.error_body_out) |out| out.* = null;
-            discarding.error_body_out = null;
-            _ = try self.execute(&response, discarding);
+            const added = try self.quotaHeaders(call.headers, call.quota_project);
+            defer if (added) |a| self.gpa.free(a);
+            return self.inner(null).executeDiscard(neutralCall(call, added orelse call.headers));
         }
 
-        /// The delay a refused response asked for, kept in `Diagnostics`
-        /// whether or not the call is retried.
-        fn serverDelay(self: Self, scratch: Allocator, res: Response) Error!?u32 {
-            const ms = try retry_after.serverDelayMs(scratch, res.headers, res.body, std.Io.Clock.real.now(self.io));
-            if (self.diagnostics) |d| d.retry_after_ms = ms;
-            if (self.server_delay_out) |out| out.* = ms;
-            return ms;
+        fn inner(self: Self, refusal: ?RefusalFn) Inner {
+            return .{
+                .gpa = self.gpa,
+                .io = self.io,
+                .transport = self.transport,
+                .base_url = self.base_url,
+                .auth_scope = self.auth_scope,
+                .token_provider = self.token_provider,
+                .unauthenticated = self.unauthenticated,
+                .send_credential_headers = self.send_quota_project,
+                .retry = self.retry,
+                .request_timeout_ms = self.request_timeout_ms,
+                .diagnostics = self.diagnostics,
+                .server_delay_out = self.server_delay_out,
+                .refusal = refusal orelse self.refusal,
+            };
         }
 
-        /// The wait before the next attempt, or null, logged, when the
-        /// server asked for longer than the policy waits.
-        fn waitMs(self: Self, attempt: u32, server_delay: ?u32, method: transport.Method, log_path: []const u8, err: StreamBodyError) ?u32 {
-            if (self.retry.waitMs(attempt, entropy(self.io), server_delay)) |ms| return ms;
-            log.warn("{t} {s} failed with {t}; not retried: the server asked to wait {d} ms, longer than max_backoff_ms ({d} ms)", .{
-                method, log_path, err, server_delay.?, self.retry.max_backoff_ms,
-            });
+        /// The call's headers with its own quota project added, in
+        /// `self.gpa`, when it names one and this engine sends quota
+        /// projects; null to send the call's headers as they are. The
+        /// credentials' quota project goes as their own header, which
+        /// rest-core sends after the call's and never beside a call's of
+        /// the same name; it is held to the same rule here first.
+        fn quotaHeaders(self: Self, call_headers: []const transport.Header, call_project: ?[]const u8) Error!?[]transport.Header {
+            if (self.unauthenticated or !self.send_quota_project) return null;
+            if (call_project) |project| {
+                try self.checkQuotaProject(project);
+                const all = try self.gpa.alloc(transport.Header, call_headers.len + 1);
+                @memcpy(all[0..call_headers.len], call_headers);
+                all[call_headers.len] = .{ .name = quota_project_header, .value = project };
+                return all;
+            }
+            const provider = self.token_provider orelse return null;
+            for (provider.headers()) |h| {
+                if (std.ascii.eqlIgnoreCase(h.name, quota_project_header)) try self.checkQuotaProject(h.value);
+            }
             return null;
         }
 
-        /// Whether a retry `delay_ms` from now would begin past the call's
-        /// window, counted from its first attempt; logged when it would.
-        fn pastWindow(
-            self: Self,
-            window_ms: ?u32,
-            first_started: std.Io.Timestamp,
-            delay_ms: u32,
-            method: transport.Method,
-            log_path: []const u8,
-            err: anyerror,
-        ) bool {
-            const window = window_ms orelse return false;
-            const elapsed = first_started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds();
-            if (elapsed + delay_ms <= window) return false;
-            log.warn("{t} {s} failed with {t}; not retried: {d} ms after its first attempt, past its {d} ms window", .{
-                method, log_path, err, elapsed + delay_ms, window,
-            });
-            return true;
-        }
-
-        /// Clears the failed attempt's body. A call that carries secrets
-        /// gives the memory back, so the wrapping allocator wipes it now;
-        /// every other call keeps it for the next attempt.
-        fn resetResponse(self: Self, response: *std.heap.ArenaAllocator, call: Call) void {
-            _ = self;
-            // The body it pointed at goes with the reset.
-            if (call.error_body_out) |out| out.* = null;
-            _ = response.reset(if (call.wipe) .free_all else .retain_capacity);
-        }
-
-        /// Maps a non-2xx response and records its details.
-        fn failure(
-            self: Self,
-            scratch: Allocator,
-            res: Response,
-            decode_error: ?*const fn (arena: Allocator, body: []const u8) Allocator.Error!?errors.ErrorBody,
-        ) Error {
-            const decode = decode_error orelse errors.decodeErrorBody;
-            const body = decode(scratch, res.body) catch |err| return err;
-            const status = if (body) |b| b.status else "";
-            // A body that is not the standard error shape, such as a proxy's
-            // page, is the best message there is.
-            const message = if (body) |b| b.message else res.body;
-            if (self.diagnostics) |d| d.set(res.status, status, message);
-            if (self.classify_refusal) |classify| {
-                if (try classify(scratch, res.status, res.body)) |classified| return classified;
-            }
-            return errors.fromResponse(res.status, status);
-        }
-
-        /// The token for one attempt, copied into `scratch`, which outlives
-        /// the request and is freed when the call returns.
-        fn bearerToken(self: Self, scratch: Allocator) Error!?[]const u8 {
-            // Never send credentials to an endpoint that speaks plain HTTP.
-            if (self.unauthenticated) return null;
-            const provider = self.token_provider orelse return null;
-            // A provider given these same diagnostics explains its own
-            // failures better than this loop can, such as which role an
-            // impersonation lacks. Start clean, so that if it fails, what
-            // is left is what it said about this attempt.
-            if (self.diagnostics) |d| d.clear();
-            const token = provider.getToken(self.io, scratch, &.{self.auth_scope}) catch |err| {
-                if (self.diagnostics) |d| if (d.message().len == 0) d.print("the token provider failed: {t}", .{err});
-                return err;
-            };
-            if (!TokenProvider.isValidToken(token)) {
-                if (self.diagnostics) |d| d.print("the token provider returned an empty token, or one with spaces, newlines or non-ASCII bytes", .{});
-                return error.TokenUnavailable;
-            }
-            return token;
-        }
-
-        /// The project to charge for quota, sent as `x-goog-user-project`:
-        /// the call's own, else the credentials'. User credentials name one;
-        /// a service account bills its own project. An unauthenticated
-        /// endpoint never sees it, and `send_quota_project` turns it off.
-        fn quotaProject(self: Self, call_project: ?[]const u8) Error!?[]const u8 {
-            if (self.unauthenticated or !self.send_quota_project) return null;
-            const project = call_project orelse project: {
-                const provider = self.token_provider orelse return null;
-                break :project provider.quotaProject() orelse return null;
-            };
-            if (!names.isProjectId(project)) {
-                if (self.diagnostics) |d| d.print(
-                    "invalid quota project: expected a project id, from the call, the credentials or GOOGLE_CLOUD_QUOTA_PROJECT",
-                    .{},
-                );
-                return error.InvalidResourceId;
-            }
-            return project;
-        }
-
-        /// Drops the cached token after a 401, so the next attempt fetches a
-        /// new one. False when there is no provider to ask, which makes a
-        /// second attempt pointless.
-        fn dropCachedToken(self: Self) bool {
-            if (self.unauthenticated) return false;
-            const provider = self.token_provider orelse return false;
-            provider.invalidate();
-            return true;
+        fn checkQuotaProject(self: Self, project: []const u8) Error!void {
+            if (names.isProjectId(project)) return;
+            if (self.diagnostics) |d| d.print(
+                "invalid quota project: expected a project id, from the call, the credentials or GOOGLE_CLOUD_QUOTA_PROJECT",
+                .{},
+            );
+            return error.InvalidResourceId;
         }
     };
 }
 
+fn neutralCall(call: Call, headers: []const transport.Header) loop.Call {
+    return .{
+        .method = call.method,
+        .path = call.path,
+        .body = call.body,
+        .content_type = call.content_type,
+        .headers = headers,
+        .head_out = call.head_out,
+        .retry = call.retry,
+        .retryable = call.retryable,
+        .wipe = call.wipe,
+        .error_body_out = call.error_body_out,
+        .timeout_ms = call.timeout_ms,
+        .retry_window_ms = call.retry_window_ms,
+    };
+}
+
+fn neutralStreamCall(call: StreamCall, headers: []const transport.Header) loop.StreamCall {
+    return .{
+        .method = call.method,
+        .path = call.path,
+        .content_type = call.content_type,
+        .headers = headers,
+        .body = call.body,
+        .sink = call.sink,
+        .accept_encoding = call.accept_encoding,
+        .retry = call.retry,
+        .retryable = call.retryable,
+        .restart = call.restart,
+        .head_out = call.head_out,
+        .timeout_ms = call.timeout_ms,
+        .retry_window_ms = call.retry_window_ms,
+        .wipe = call.wipe,
+        .error_body_out = call.error_body_out,
+    };
+}
+
 fn retryableByDefault(err: anyerror, http_status: u16) bool {
-    _ = http_status;
-    return isRetryable(err);
+    return Google.retryable(err, http_status);
 }
 
 /// Whether a failed attempt may be tried again when a repeat would act
 /// again, as a create makes something new or a run dispatches a job once
 /// more: only a failure raised before the request left, a refused
-/// connection or a name lookup that failed. A TLS failure or an
-/// unreachable network can also come after the request went, on a
-/// connection already open. For `Call.retryable`.
-pub fn unsentOnly(err: anyerror, http_status: u16) bool {
-    _ = http_status;
-    return switch (err) {
-        error.ConnectionRefused, error.NameServerFailure => true,
-        else => false,
-    };
-}
+/// connection or a name lookup that failed. For `Call.retryable`.
+pub const unsentOnly = loop.unsentOnly;
 
 /// Randomness for a jittered backoff. Public so a module that retries a call
 /// of its own, as Secret Manager does after a checksum mismatch, waits the
 /// same way the loop does.
-pub fn entropy(io: std.Io) u64 {
-    var bytes: [8]u8 = undefined;
-    io.random(&bytes);
-    return std.mem.readInt(u64, &bytes, .little);
-}
+pub const entropy = loop.entropy;
 
 // The service modules drive this loop through their own public calls, and
 // their tests cover it end to end. These tests drive it directly, so its
@@ -585,6 +422,90 @@ pub fn entropy(io: std.Io) u64 {
 
 const testing = std.testing;
 const test_util = @import("testing.zig");
+const isRetryable = retry.isRetryable;
+const WipingAllocator = rest_core.WipingAllocator;
+
+// A field rest-core adds to its calls reaches the modules only through these
+// structs; a bump that adds one, or changes one's type, fails here until it
+// is carried. `retryable` alone differs: rest-core's is optional, null
+// meaning the cloud's, and ours is never null, defaulting to Google's.
+fn expectCounterparts(comptime Ours: type, comptime Theirs: type) !void {
+    inline for (comptime std.meta.fieldNames(Theirs)) |name| {
+        try testing.expect(@hasField(Ours, name));
+        if (comptime std.mem.eql(u8, name, "retryable")) {
+            try testing.expect(@FieldType(Theirs, name) == ?@FieldType(Ours, name));
+        } else {
+            try testing.expect(@FieldType(Ours, name) == @FieldType(Theirs, name));
+        }
+    }
+}
+
+test "every rest_core.loop.Call field has a counterpart in Call, of its type" {
+    try expectCounterparts(Call, loop.Call);
+}
+
+test "every rest_core.loop.StreamCall field has a counterpart in StreamCall, of its type" {
+    try expectCounterparts(StreamCall, loop.StreamCall);
+}
+
+test "neutralCall and neutralStreamCall carry every field across" {
+    var head: ?transport.StreamRequest.Head = null;
+    var error_body: ?[]const u8 = null;
+    const headers: []const transport.Header = &.{.{ .name = "x-a", .value = "1" }};
+    const c = neutralCall(.{
+        .method = .PUT,
+        .path = "/v1/x",
+        .body = "b",
+        .content_type = .form,
+        .head_out = &head,
+        .retry = false,
+        .retryable = unsentOnly,
+        .wipe = true,
+        .error_body_out = &error_body,
+        .timeout_ms = 7,
+        .retry_window_ms = 9,
+    }, headers);
+    try testing.expectEqual(.PUT, c.method);
+    try testing.expectEqualStrings("/v1/x", c.path);
+    try testing.expectEqualStrings("b", c.body.?);
+    try testing.expectEqual(.form, c.content_type);
+    try testing.expectEqual(headers.ptr, c.headers.ptr);
+    try testing.expectEqual(&head, c.head_out.?);
+    try testing.expect(!c.retry);
+    try testing.expectEqual(unsentOnly, c.retryable.?);
+    try testing.expect(c.wipe);
+    try testing.expectEqual(&error_body, c.error_body_out.?);
+    try testing.expectEqual(7, c.timeout_ms.?);
+    try testing.expectEqual(9, c.retry_window_ms.?);
+
+    const s = neutralStreamCall(.{
+        .method = .POST,
+        .path = "/v1/y",
+        .content_type = "text/plain",
+        .body = .{ .segments = &.{"s"} },
+        .accept_encoding = .compressed,
+        .retry = false,
+        .retryable = unsentOnly,
+        .head_out = &head,
+        .timeout_ms = 3,
+        .retry_window_ms = 4,
+        .wipe = true,
+        .error_body_out = &error_body,
+    }, headers);
+    try testing.expectEqual(.POST, s.method);
+    try testing.expectEqualStrings("/v1/y", s.path);
+    try testing.expectEqualStrings("text/plain", s.content_type.?);
+    try testing.expectEqual(headers.ptr, s.headers.ptr);
+    try testing.expectEqualStrings("s", s.body.segments[0]);
+    try testing.expectEqual(.compressed, s.accept_encoding);
+    try testing.expect(!s.retry);
+    try testing.expectEqual(unsentOnly, s.retryable.?);
+    try testing.expectEqual(&head, s.head_out.?);
+    try testing.expectEqual(3, s.timeout_ms.?);
+    try testing.expectEqual(4, s.retry_window_ms.?);
+    try testing.expect(s.wipe);
+    try testing.expectEqual(&error_body, s.error_body_out.?);
+}
 const FakeTransport = test_util.FakeTransport;
 const PreparedRequest = @import("PreparedRequest.zig");
 const Reply = FakeTransport.Reply;
@@ -693,16 +614,17 @@ test "retry: 503, 503, 200 succeeds on the third attempt within the backoff boun
     try testing.expectEqual(0, h.token.invalidations);
 }
 
-test "classify_refusal: a refusal named by its body is that error, and retried as one" {
+test "refusal: a refusal named by its body is that error, and retried as one" {
     const rate_limited: FakeTransport.Reply = .{ .respond = .{
         .status = 403,
         .body = "{\"error\":{\"code\":403,\"message\":\"Exceeded rate limits\",\"errors\":[{\"reason\":\"rateLimitExceeded\"}],\"status\":\"PERMISSION_DENIED\"}}",
     } };
     const Classify = struct {
-        fn classify(scratch: Allocator, http_status: u16, body: []const u8) Allocator.Error!?Error {
-            _ = scratch;
-            if (http_status == 403 and std.mem.indexOf(u8, body, "\"rateLimitExceeded\"") != null) return @as(?Error, error.ResourceExhausted);
-            return null;
+        fn refusal(scratch: Allocator, res: Response, diagnostics: ?*Diagnostics) (errors.ApiError || Allocator.Error) {
+            const err = Google.refusal(scratch, res, diagnostics);
+            if (err == error.OutOfMemory) return err;
+            if (res.status == 403 and std.mem.indexOf(u8, res.body, "\"rateLimitExceeded\"") != null) return error.ResourceExhausted;
+            return err;
         }
     };
     // Classified, the 403 is transient and the next attempt succeeds.
@@ -711,7 +633,7 @@ test "classify_refusal: a refusal named by its body is that error, and retried a
         h.init(&.{ rate_limited, .{ .respond = .{ .body = "{}" } } });
         defer h.deinit();
         var e = h.engine();
-        e.classify_refusal = Classify.classify;
+        e.refusal = Classify.refusal;
         _ = try e.execute(&h.arena, .{ .method = .GET, .path = "/v1/things" });
         try testing.expectEqual(2, h.fake.requests.items.len);
     }
@@ -732,7 +654,7 @@ test "classify_refusal: a refusal named by its body is that error, and retried a
         h.init(&.{.{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"Not found\",\"status\":\"NOT_FOUND\"}}" } }});
         defer h.deinit();
         var e = h.engine();
-        e.classify_refusal = Classify.classify;
+        e.refusal = Classify.refusal;
         try testing.expectError(error.NotFound, e.execute(&h.arena, .{ .method = .GET, .path = "/v1/things" }));
         try testing.expectEqualStrings("Not found", h.diag.message());
     }
@@ -748,7 +670,7 @@ test "retry: gives up after max_attempts and reports the last failure" {
     try testing.expectEqual(3, h.fake.requests.items.len);
     try testing.expectEqual(2, h.clock.sleep_count);
     try testing.expectEqual(503, h.diag.http_status);
-    try testing.expectEqualStrings("UNAVAILABLE", h.diag.status());
+    try testing.expectEqualStrings("UNAVAILABLE", h.diag.code());
     try testing.expectEqualStrings("The service is currently unavailable.", h.diag.message());
 }
 
@@ -887,7 +809,7 @@ test "server delay: longer than max_backoff_ms, the call returns at once with th
     try testing.expectEqual(1, h.fake.requests.items.len);
     try testing.expectEqual(0, h.clock.sleep_count);
     try testing.expectEqual(429, h.diag.http_status);
-    try testing.expectEqualStrings("RESOURCE_EXHAUSTED", h.diag.status());
+    try testing.expectEqualStrings("RESOURCE_EXHAUSTED", h.diag.code());
     try testing.expectEqual(30_000, h.diag.retry_after_ms.?);
 
     // With the default policy, 30 s is past its 10 s cap too.
@@ -1030,7 +952,7 @@ test "a body that is not the standard error shape maps by HTTP status and keeps 
     e.retry = .{ .max_attempts = 1 };
     try testing.expectError(error.Unavailable, e.execute(&h.arena, .{ .method = .GET, .path = "/v1/things" }));
     try testing.expectEqual(502, h.diag.http_status);
-    try testing.expectEqualStrings("", h.diag.status());
+    try testing.expectEqualStrings("", h.diag.code());
     try testing.expectEqualStrings("<html>Bad Gateway</html>", h.diag.message());
 }
 
@@ -1075,7 +997,7 @@ test "credentials: an unauthenticated endpoint gets no token and nothing to inva
     var e = h.engine();
     e.unauthenticated = true;
     e.token_provider = h.token.provider();
-    h.token.quota_project = "billing-project";
+    h.token.credential_headers = &.{.{ .name = quota_project_header, .value = "billing-project" }};
 
     try testing.expectError(error.Unauthenticated, e.execute(&h.arena, .{ .method = .GET, .path = "/v1/things" }));
     try testing.expectEqual(1, h.fake.requests.items.len);
@@ -1104,7 +1026,6 @@ test "credentials: a provider's own explanation survives in shared diagnostics" 
             return .{ .ptr = self, .vtable = &.{
                 .getToken = getTokenFn,
                 .invalidate = invalidateFn,
-                .quotaProject = quotaProjectFn,
             } };
         }
         fn getTokenFn(ptr: *anyopaque, io: std.Io, arena: Allocator, scopes: []const []const u8) TokenProvider.Error![]const u8 {
@@ -1116,9 +1037,6 @@ test "credentials: a provider's own explanation survives in shared diagnostics" 
             return error.TokenEndpointRejected;
         }
         fn invalidateFn(_: *anyopaque) void {}
-        fn quotaProjectFn(_: *anyopaque) ?[]const u8 {
-            return null;
-        }
     };
     var h: Harness = undefined;
     h.init(&.{ok});
@@ -1137,8 +1055,8 @@ test "credentials: the provider's own failure is returned, not retried" {
     var h: Harness = undefined;
     h.init(&.{ok});
     defer h.deinit();
-    h.token.fail = error.RefreshTokenInvalid;
-    try testing.expectError(error.RefreshTokenInvalid, h.get());
+    h.token.fail = error.ReauthenticationRequired;
+    try testing.expectError(error.ReauthenticationRequired, h.get());
     try testing.expectEqual(0, h.fake.requests.items.len);
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "token provider failed") != null);
 }
@@ -1147,7 +1065,7 @@ test "quota: the credentials' project rides along, and one that is not a project
     var h: Harness = undefined;
     h.init(&.{ ok, ok });
     defer h.deinit();
-    h.token.quota_project = "billing-project";
+    h.token.credential_headers = &.{.{ .name = quota_project_header, .value = "billing-project" }};
     _ = try h.get();
     try testing.expectEqualStrings("billing-project", (try h.fake.request(0)).header("x-goog-user-project").?);
 
@@ -1158,7 +1076,7 @@ test "quota: the credentials' project rides along, and one that is not a project
     try testing.expectEqual(null, (try h.fake.request(1)).header("x-goog-user-project"));
 
     // A project that is not one never reaches the wire.
-    h.token.quota_project = "not a project\r\nX-Injected: 1";
+    h.token.credential_headers = &.{.{ .name = quota_project_header, .value = "not a project\r\nX-Injected: 1" }};
     try testing.expectError(error.InvalidResourceId, h.get());
     try testing.expectEqual(2, h.fake.requests.items.len);
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "invalid quota project") != null);
@@ -1168,7 +1086,7 @@ test "quota: a call's own project goes in place of the credentials', on both ent
     var h: Harness = undefined;
     h.init(&.{ ok, ok, ok, ok, ok });
     defer h.deinit();
-    h.token.quota_project = "billing-project";
+    h.token.credential_headers = &.{.{ .name = quota_project_header, .value = "billing-project" }};
     var e = h.engine();
     _ = try e.execute(&h.arena, .{ .method = .GET, .path = "/v1/things", .quota_project = "requester-project" });
     const sent = try h.fake.request(0);
@@ -1181,7 +1099,7 @@ test "quota: a call's own project goes in place of the credentials', on both ent
     try testing.expectEqual(1, count);
 
     // Credentials that name none still send the call's.
-    h.token.quota_project = null;
+    h.token.credential_headers = &.{};
     _ = try e.execute(&h.arena, .{ .method = .GET, .path = "/v1/things", .quota_project = "requester-project" });
     try testing.expectEqualStrings("requester-project", (try h.fake.request(1)).header("x-goog-user-project").?);
     // The streaming entry too.
@@ -1386,7 +1304,7 @@ test "executeStream: a non-2xx maps by status and fills the diagnostics" {
     e.begin();
     try testing.expectError(error.NotFound, e.executeStream(&h.arena, .{ .method = .GET, .path = "/v1/o" }));
     try testing.expectEqual(404, h.diag.http_status);
-    try testing.expectEqualStrings("notFound", h.diag.status());
+    try testing.expectEqualStrings("notFound", h.diag.code());
     try testing.expectEqualStrings("No such object", h.diag.message());
 }
 
@@ -1604,17 +1522,17 @@ test "a call's own error decoder fills the diagnostics, and its status still map
     try testing.expectError(error.NotFound, e.executeStream(&h.arena, .{
         .method = .POST,
         .path = "/b/o?uploadId=u",
-        .decode_error = decodeTestXmlError,
+        .refusal = refusalReading(decodeTestXmlError),
     }));
-    try testing.expectEqualStrings("NoSuchUpload", h.diag.status());
+    try testing.expectEqualStrings("NoSuchUpload", h.diag.code());
     try testing.expectEqualStrings("decoded by the call's own reader", h.diag.message());
     // A body the decoder cannot read is the message whole, as for JSON.
     try testing.expectError(error.NotFound, e.executeStream(&h.arena, .{
         .method = .POST,
         .path = "/b/o?uploadId=u",
-        .decode_error = decodeTestXmlError,
+        .refusal = refusalReading(decodeTestXmlError),
     }));
-    try testing.expectEqualStrings("", h.diag.status());
+    try testing.expectEqualStrings("", h.diag.code());
     try testing.expectEqualStrings("not xml at all", h.diag.message());
 }
 
@@ -1697,7 +1615,7 @@ test "a call's own headers go first, then the quota project's" {
     var h: Harness = undefined;
     h.init(&.{ ok, ok });
     defer h.deinit();
-    h.token.quota_project = "billing-project";
+    h.token.credential_headers = &.{.{ .name = quota_project_header, .value = "billing-project" }};
     const e = h.engine();
     const gzip: []const transport.Header = &.{.{ .name = "Content-Encoding", .value = "gzip" }};
     _ = try e.execute(&h.arena, .{ .method = .POST, .path = "/v1/a", .body = "x", .headers = gzip });
@@ -1707,7 +1625,7 @@ test "a call's own headers go first, then the quota project's" {
     try testing.expectEqualStrings("gzip", sent.headers[0].value);
     try testing.expectEqualStrings("billing-project", sent.header("x-goog-user-project").?);
     // Without a quota project, the call's own alone.
-    h.token.quota_project = null;
+    h.token.credential_headers = &.{};
     _ = try e.execute(&h.arena, .{ .method = .POST, .path = "/v1/b", .body = "x", .headers = gzip });
     try testing.expectEqual(1, (try h.fake.request(1)).headers.len);
 }

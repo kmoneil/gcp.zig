@@ -37,6 +37,8 @@ client_email: []u8,
 private_key_id: ?[]u8,
 key: rsa.PrivateKey,
 quota_project_id: ?[]u8,
+/// `quota_project_id`, as the header the provider adds to its requests.
+quota_header: core.rpc.QuotaProjectHeader,
 project_id: ?[]u8,
 token_url: []u8,
 user_agent: []u8,
@@ -185,6 +187,7 @@ pub fn initFromJson(gpa: Allocator, io: std.Io, json: []const u8, options: Optio
         .private_key_id = private_key_id,
         .key = key,
         .quota_project_id = quota_project_id,
+        .quota_header = .init(quota_project_id),
         .project_id = project_id,
         .token_url = token_url,
         .user_agent = user_agent,
@@ -222,7 +225,7 @@ pub fn provider(self: *ServiceAccount) TokenProvider {
     return .{ .ptr = self, .vtable = &.{
         .getToken = getToken,
         .invalidate = invalidate,
-        .quotaProject = quotaProject,
+        .headers = credentialHeaders,
     } };
 }
 
@@ -268,8 +271,8 @@ fn invalidate(ptr: *anyopaque) void {
     fromPtr(ptr).cache.invalidate();
 }
 
-fn quotaProject(ptr: *anyopaque) ?[]const u8 {
-    return fromPtr(ptr).quota_project_id;
+fn credentialHeaders(ptr: *anyopaque) []const core.transport.Header {
+    return fromPtr(ptr).quota_header.slice();
 }
 
 fn signerEmail(ptr: *anyopaque, io: std.Io, arena: Allocator) core.Signer.Error![]const u8 {
@@ -279,10 +282,9 @@ fn signerEmail(ptr: *anyopaque, io: std.Io, arena: Allocator) core.Signer.Error!
 
 /// `rsa.PrivateKey.sign` only reads the key, so tasks can sign at once.
 fn sign(ptr: *anyopaque, io: std.Io, arena: Allocator, message: []const u8) core.Signer.Error![]const u8 {
-    _ = io;
     const self = fromPtr(ptr);
     const out = try arena.alloc(u8, self.key.len);
-    return self.key.sign(message, out) catch {
+    return self.key.sign(io, message, out) catch {
         // The key is corrupt in a way parsing could not see; signing again
         // would fail the same way.
         if (self.diagnostics) |d| d.print("signing failed: the private key does not verify against itself", .{});
@@ -377,7 +379,7 @@ fn assertion(self: *ServiceAccount, io: std.Io, arena: Allocator) TokenProvider.
         try base64Url(arena, claims.written()),
     });
     var sig_buf: [rsa.max_modulus_bytes]u8 = undefined;
-    const sig = self.key.sign(signing_input, &sig_buf) catch {
+    const sig = self.key.sign(io, signing_input, &sig_buf) catch {
         // The self-check failed: the key is corrupt in a way parsing
         // could not see. Retrying would fail the same way.
         if (self.diagnostics) |d| d.print("signing the JWT failed: the private key does not verify against itself", .{});
@@ -588,7 +590,7 @@ test "ServiceAccount: the exchange is a form POST with a signed, decodable JWT" 
     defer key.deinit();
     const dot = std.mem.lastIndexOfScalar(u8, jwt, '.').?;
     var expected: [rsa.max_modulus_bytes]u8 = undefined;
-    try testing.expectEqualSlices(u8, try key.sign(jwt[0..dot], &expected), signature);
+    try testing.expectEqualSlices(u8, try key.sign(testing.io, jwt[0..dot], &expected), signature);
 }
 
 test "ServiceAccount: without a private_key_id there is no kid header" {
@@ -661,7 +663,7 @@ test "ServiceAccount: invalid_grant is TokenEndpointRejected and says what to ch
     try testing.expectError(error.TokenEndpointRejected, h.get());
     try testing.expectEqual(1, h.fake.requests.items.len);
     try testing.expectEqual(400, h.diag.http_status);
-    try testing.expectEqualStrings("invalid_grant", h.diag.status());
+    try testing.expectEqualStrings("invalid_grant", h.diag.code());
     try testing.expectEqualStrings("Invalid JWT Signature. Check this machine's clock, and that the key and its service account still exist and are enabled.", h.diag.message());
 }
 
@@ -714,7 +716,7 @@ test "ServiceAccount: a dropped connection is retried; a rejected client is not"
     try testing.expectEqual(2, h.fake.requests.items.len);
     h.account.provider().invalidate();
     try testing.expectError(error.TokenEndpointRejected, h.get());
-    try testing.expectEqualStrings("invalid_client", h.diag.status());
+    try testing.expectEqualStrings("invalid_client", h.diag.code());
 }
 
 test "ServiceAccount: init refuses what cannot work, and says why" {
@@ -847,7 +849,7 @@ test "ServiceAccount: the file's projects are reported" {
     defer h.deinit();
     try testing.expectEqualStrings("my-project", h.account.projectId().?);
     try testing.expectEqual(null, h.account.quotaProjectId());
-    try testing.expectEqual(null, h.account.provider().quotaProject());
+    try testing.expectEqual(null, core.rpc.quotaProjectOf(h.account.provider()));
 }
 
 test "ServiceAccount: the signer signs as client_email, on this machine, as OpenSSL does" {
