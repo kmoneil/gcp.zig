@@ -48,13 +48,24 @@
 //!   is 400 INVALID_ARGUMENT; a get at JOB_VIEW_ALL of a job put in
 //!   with a `provisioning_error` is 400 FAILED_PRECONDITION carrying
 //!   that text, as production answered the job that failed its launch.
+//! - A job in full and its metrics (#310, measured 2026-11-07): `putJob`
+//!   takes the pipeline, environment, SDK and steps a test gives, and
+//!   `setMetrics` its metrics. Each read carries what production's did:
+//!   a list the summary and the SDK; a plain get adds labels, stage
+//!   states and the environment's shuffle mode and public IPs;
+//!   JOB_VIEW_DESCRIPTION the rest of the environment and the pipeline;
+//!   JOB_VIEW_ALL the steps. A view outside the enum is 400 in
+//!   production's words. getMetrics answers the updates made at or after
+//!   its `startTime`; with none left, the time asked for and no
+//!   `metrics`, as production echoed a time past every update; a
+//!   `startTime` that is no timestamp is 400 in production's words.
 //! - Faults a test asks for: refusals, dropped connections, and a lost
 //!   answer.
 //!
 //! Not modelled, answered 501 with the reason: every other write
 //! (creating, updating with a mask, pausing, launching templates),
-//! metrics, snapshots, the legacy no-location paths, and another
-//! project's paths.
+//! snapshots, the legacy no-location paths, and another project's
+//! paths.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -63,6 +74,7 @@ const core = @import("core");
 const tp = core.transport;
 const types = @import("types.zig");
 const validate = @import("validate.zig");
+const detail = @import("fake_detail.zig");
 
 pub const FakeDataflow = struct {
     gpa: Allocator,
@@ -109,6 +121,11 @@ pub const FakeDataflow = struct {
         labels: []const types.Label,
         stage_states: []const types.StageState,
         provisioning_error: ?[]const u8,
+        pipeline: types.Pipeline = .{},
+        environment: types.Environment = .{},
+        sdk: types.Sdk = .{},
+        steps: []const types.Step = &.{},
+        metrics: types.JobMetrics = .{},
         messages: std.ArrayList(FakeMessage) = .empty,
         events: std.ArrayList(FakeEvent) = .empty,
     };
@@ -240,6 +257,17 @@ pub const FakeDataflow = struct {
         /// FAILED_PRECONDITION carrying this text, as production
         /// answered the job that failed its launch.
         provisioning_error: ?[]const u8 = null,
+        /// The job's graph and launch settings, which a get at
+        /// JOB_VIEW_DESCRIPTION or JOB_VIEW_ALL answers.
+        pipeline: types.Pipeline = .{},
+        /// Its environment: a plain get answers the shuffle mode and
+        /// public IPs, DESCRIPTION and ALL the rest.
+        environment: types.Environment = .{},
+        /// Its SDK, which every read answers.
+        sdk: types.Sdk = .{},
+        /// Its steps, which only JOB_VIEW_ALL answers. Each step's
+        /// properties must be a JSON object, or "".
+        steps: []const types.Step = &.{},
     };
 
     /// Puts a job in and returns its id, owned by the fake.
@@ -255,6 +283,11 @@ pub const FakeDataflow = struct {
         if (!f.locations.contains(job.location)) return error.InvalidEntry;
         if (!validate.isJobId(job.id)) return error.InvalidEntry;
         if (f.jobs.contains(job.id)) return error.InvalidEntry;
+        {
+            var scratch: std.heap.ArenaAllocator = .init(f.gpa);
+            defer scratch.deinit();
+            if (!try detail.stepsValid(scratch.allocator(), job.steps)) return error.InvalidEntry;
+        }
         const s = f.store.allocator();
         const held = try s.create(FakeJob);
         held.* = .{
@@ -270,9 +303,28 @@ pub const FakeDataflow = struct {
             .labels = try dupeLabels(s, job.labels),
             .stage_states = try dupeStages(s, job.stage_states),
             .provisioning_error = if (job.provisioning_error) |text| try s.dupe(u8, text) else null,
+            .pipeline = try detail.deepCopy(s, types.Pipeline, job.pipeline),
+            .environment = try detail.deepCopy(s, types.Environment, job.environment),
+            .sdk = try detail.deepCopy(s, types.Sdk, job.sdk),
+            .steps = try detail.deepCopy(s, []const types.Step, job.steps),
         };
         try f.jobs.put(f.gpa, held.id, held);
         return held.id;
+    }
+
+    /// Sets a job's metrics, as the service computes them, in place of
+    /// any set before. `error.InvalidEntry`, with nothing kept, for a job
+    /// nobody put, or a value kept as JSON text that is not JSON (a mean
+    /// must be an object of `meanSum` and `meanCount`, as the decoder
+    /// keeps one).
+    pub fn setMetrics(f: *FakeDataflow, id: []const u8, metrics: types.JobMetrics) PutError!void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        const job = f.jobs.get(id) orelse return error.InvalidEntry;
+        var scratch: std.heap.ArenaAllocator = .init(f.gpa);
+        defer scratch.deinit();
+        if (!try detail.metricsValid(scratch.allocator(), metrics)) return error.InvalidEntry;
+        job.metrics = try detail.deepCopy(f.store.allocator(), types.JobMetrics, metrics);
     }
 
     /// Moves a job along, as the service does: PENDING to RUNNING to
@@ -395,16 +447,23 @@ pub const FakeDataflow = struct {
             .aggregated => return f.listJobs(arena, null, params, true),
             .jobs => |location| return f.listJobs(arena, f.resolve(location), params, false),
             .job => |job| {
+                const view = paramOf(params, "view");
+                const level = detail.Level.ofView(view) orelse return fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Invalid value at 'view' (type.googleapis.com/google.dataflow.v1beta3.JobView), \"{s}\"", .{view.?}));
                 const held = f.find(f.resolve(job.location), job.id) orelse return unknownJob(arena, job.id);
-                if (paramOf(params, "view")) |view| {
-                    if (std.mem.eql(u8, view, "JOB_VIEW_ALL")) if (held.provisioning_error) |text| {
-                        return fail(arena, 400, "FAILED_PRECONDITION", text);
-                    };
-                }
+                if (level == .all) if (held.provisioning_error) |text| {
+                    return fail(arena, 400, "FAILED_PRECONDITION", text);
+                };
                 var out: std.Io.Writer.Allocating = .init(arena);
                 var jw: Stringify = .{ .writer = &out.writer };
-                writeJob(f, &jw, held, true) catch return error.OutOfMemory;
+                writeJob(f, &jw, held, level) catch return error.OutOfMemory;
                 return .{ .status = 200, .body = out.written() };
+            },
+            .metrics => |job| {
+                var start: ?std.Io.Timestamp = null;
+                if (paramOf(params, "startTime")) |text| start = core.timestamp.parse(text) catch
+                    return fail(arena, 400, "INVALID_ARGUMENT", "Invalid value at 'start_time' (type.googleapis.com/google.protobuf.Timestamp), Field 'start_time', Illegal timestamp format; timestamps must end with 'Z' or have a valid timezone offset.");
+                const held = f.find(f.resolve(job.location), job.id) orelse return unknownJob(arena, job.id);
+                return .{ .status = 200, .body = try detail.metricsReply(arena, held.metrics, start) };
             },
             .messages => |job| {
                 const held = f.find(f.resolve(job.location), job.id) orelse return unknownJob(arena, job.id);
@@ -580,7 +639,7 @@ pub const FakeDataflow = struct {
             if (window.to > window.from) {
                 jw.objectField("jobs") catch break :write;
                 jw.beginArray() catch break :write;
-                for (matched.items[window.from..window.to]) |job| writeJob(f, &jw, job, false) catch break :write;
+                for (matched.items[window.from..window.to]) |job| writeJob(f, &jw, job, .summary) catch break :write;
                 jw.endArray() catch break :write;
             }
             if (window.next) |n| {
@@ -693,9 +752,11 @@ pub const FakeDataflow = struct {
         return error.OutOfMemory;
     }
 
-    /// `full` is a get's answer; a list's is the summary, without
-    /// labels or stage states, as production answered them.
-    fn writeJob(f: *FakeDataflow, jw: *Stringify, job: *const FakeJob, full: bool) Stringify.Error!void {
+    /// A job at `level`: a list's summary carries no labels, stage
+    /// states, requested state or environment, as production answered
+    /// them; a get adds those, and its view the rest (`detail.Level`).
+    fn writeJob(f: *FakeDataflow, jw: *Stringify, job: *const FakeJob, level: detail.Level) Stringify.Error!void {
+        const full = level != .summary;
         var buf: [core.timestamp.max_len]u8 = undefined;
         try jw.beginObject();
         if (job.create_time) |t| {
@@ -710,8 +771,10 @@ pub const FakeDataflow = struct {
             try jw.objectField("currentStateTime");
             try jw.write(core.timestamp.format(&buf, t));
         }
+        try detail.writeEnvironment(jw, job.environment, level);
         try jw.objectField("id");
         try jw.write(job.id);
+        try detail.writeSdk(jw, job.sdk);
         if (full and job.labels.len > 0) {
             try jw.objectField("labels");
             try jw.beginObject();
@@ -727,6 +790,7 @@ pub const FakeDataflow = struct {
             try jw.objectField("name");
             try jw.write(job.name);
         }
+        try detail.writePipeline(jw, job.pipeline, level);
         try jw.objectField("projectId");
         try jw.write(f.options.project_id);
         // A get carries it; a list's summary never did (measured).
@@ -757,6 +821,7 @@ pub const FakeDataflow = struct {
             try jw.objectField("startTime");
             try jw.write(core.timestamp.format(&buf, t));
         }
+        try detail.writeSteps(jw, job.steps, level);
         if (job.type != .unspecified) {
             try jw.objectField("type");
             try jw.write(switch (job.type) {
@@ -797,6 +862,7 @@ pub const FakeDataflow = struct {
             jobs: []const u8,
             job: struct { location: []const u8, id: []const u8 },
             messages: struct { location: []const u8, id: []const u8 },
+            metrics: struct { location: []const u8, id: []const u8 },
         },
     };
 
@@ -820,10 +886,11 @@ pub const FakeDataflow = struct {
         const location = parts.next() orelse return null;
         if (!std.mem.eql(u8, parts.next() orelse return null, "jobs")) return null;
         const id = parts.next() orelse return .{ .project = project, .kind = .{ .jobs = location } };
-        const messages_word = parts.next() orelse return .{ .project = project, .kind = .{ .job = .{ .location = location, .id = id } } };
-        if (!std.mem.eql(u8, messages_word, "messages")) return null;
+        const word = parts.next() orelse return .{ .project = project, .kind = .{ .job = .{ .location = location, .id = id } } };
         if (parts.next() != null) return null;
-        return .{ .project = project, .kind = .{ .messages = .{ .location = location, .id = id } } };
+        if (std.mem.eql(u8, word, "messages")) return .{ .project = project, .kind = .{ .messages = .{ .location = location, .id = id } } };
+        if (std.mem.eql(u8, word, "metrics")) return .{ .project = project, .kind = .{ .metrics = .{ .location = location, .id = id } } };
+        return null;
     }
 
     const Param = struct { name: []const u8, value: []const u8 };
@@ -1597,4 +1664,193 @@ test "slow property stops: any sequence of cancels, drains, lost answers and sta
             "",
         },
     });
+}
+
+/// Production's job in full and its metrics, put into the fake as the
+/// decoder read them, from memory freed once they are in, so whatever
+/// the fake failed to copy reads back as the test allocator's poison;
+/// the caller compares against a second decode in `a`.
+fn seedDetail(b: *Bench, a: Allocator) !struct { id: []const u8, job: types.Job, metrics: types.JobMetrics } {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const s = scratch.allocator();
+    const job = try codec.decodeJob(s, s, production.job_detail_all);
+    const metrics = try codec.decodeMetrics(s, s, production.metrics_done);
+    try b.fake.putLocation("us-central1");
+    const id = try b.fake.putJob(.{
+        .location = job.location,
+        .id = job.id,
+        .name = job.name,
+        .type = job.type,
+        .current_state = job.current_state,
+        .labels = job.labels,
+        .stage_states = job.stage_states,
+        .pipeline = job.pipeline,
+        .environment = job.environment,
+        .sdk = job.sdk,
+        .steps = job.steps,
+    });
+    try b.fake.setMetrics(id, metrics);
+    return .{
+        .id = id,
+        .job = try codec.decodeJob(a, a, production.job_detail_all),
+        .metrics = try codec.decodeMetrics(a, a, production.metrics_done),
+    };
+}
+
+test "a job put in full answers each view as production did" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const seeded = try seedDetail(&b, arena.allocator());
+    const prod = seeded.job;
+
+    // A plain get: the SDK, the template's labels and the environment's
+    // few, but no pipeline, pools or steps.
+    var plain = try b.client.getJob("us-central1", seeded.id);
+    defer plain.deinit();
+    try testing.expectEqualDeep(prod.sdk, plain.value.sdk);
+    try testing.expectEqualStrings("word_count", plain.value.template().?.name);
+    try testing.expectEqualStrings("SERVICE_BASED", plain.value.environment.shuffle_mode);
+    try testing.expectEqual(true, plain.value.environment.use_public_ips.?);
+    try testing.expectEqual(0, plain.value.environment.worker_pools.len);
+    try testing.expectEqualStrings("", plain.value.environment.service_account);
+    try testing.expectEqual(0, plain.value.pipeline.display_data.len);
+    try testing.expectEqual(0, plain.value.steps.len);
+
+    // DESCRIPTION: all of it but the steps and their names' hash, as
+    // production's decode reads.
+    var described = try b.client.getJobView("us-central1", seeded.id, .description);
+    defer described.deinit();
+    var without_hash = prod.pipeline;
+    without_hash.step_names_hash = "";
+    try testing.expectEqualDeep(without_hash, described.value.pipeline);
+    try testing.expectEqualDeep(prod.environment, described.value.environment);
+    try testing.expectEqualDeep(prod.sdk, described.value.sdk);
+    try testing.expectEqual(0, described.value.steps.len);
+    try testing.expectEqualStrings("gs://dataflow-samples/shakespeare/kinglear.txt", described.value.parameter("inputFile").?.string);
+
+    // ALL: the steps too, their properties reading back as production's.
+    var all = try b.client.getJobView("us-central1", seeded.id, .all);
+    defer all.deinit();
+    try testing.expectEqualDeep(prod.steps, all.value.steps);
+    try testing.expectEqualDeep(prod.pipeline, all.value.pipeline);
+    try testing.expectEqualDeep(prod.environment, all.value.environment);
+
+    // A list's summary: of the detail, the SDK alone.
+    var listed = try b.client.listJobs("us-central1", .{});
+    defer listed.deinit();
+    try testing.expectEqualDeep(prod.sdk, listed.value.jobs[0].sdk);
+    try testing.expectEqualStrings("", listed.value.jobs[0].environment.shuffle_mode);
+    try testing.expectEqual(0, listed.value.jobs[0].pipeline.transforms.len);
+}
+
+test "a job's metrics, all of them, from a time, and past every update" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const seeded = try seedDetail(&b, arena.allocator());
+
+    var got = try b.client.getJobMetrics("us-central1", seeded.id, .{});
+    defer got.deinit();
+    try testing.expectEqualDeep(seeded.metrics, got.value);
+
+    var from = try b.client.getJobMetrics("us-central1", seeded.id, .{ .start_time = ts("2026-11-07T20:00:00Z") });
+    defer from.deinit();
+    try testing.expectEqual(seeded.metrics.updates.len, from.value.updates.len);
+
+    // Past every update: none, and the time asked for, as production
+    // answered 2030-01-01.
+    const later = ts("2030-01-01T00:00:00Z");
+    var none = try b.client.getJobMetrics("us-central1", seeded.id, .{ .start_time = later });
+    defer none.deinit();
+    try testing.expectEqual(0, none.value.updates.len);
+    try testing.expectEqual(later, none.value.metric_time.?);
+
+    // A job with none set: just the time it was asked at, or nothing.
+    try b.fake.putLocation("europe-west1");
+    const bare = try b.fake.putJob(.{ .location = "europe-west1", .id = "2026-11-07_00_00_01-1" });
+    var empty = try b.client.getJobMetrics("europe-west1", bare, .{});
+    defer empty.deinit();
+    try testing.expectEqual(0, empty.value.updates.len);
+
+    // The value forms production did not send round-trip too.
+    try b.fake.setMetrics(bare, .{ .updates = &.{
+        .{ .name = "allOk", .value = .{ .boolean = true }, .kind = "And", .cumulative = true },
+        .{ .name = "latency", .value = .{ .other = .{ .field = "mean", .json = "{\"meanSum\":12.5,\"meanCount\":\"5\"}" } } },
+        .{ .name = "sizes", .value = .{ .other = .{ .field = "distribution", .json = "{\"count\":3}" } } },
+    } });
+    var odd = try b.client.getJobMetrics("europe-west1", bare, .{});
+    defer odd.deinit();
+    try testing.expect(!odd.value.updates[0].tentative);
+    try testing.expect(odd.value.updates[0].value.boolean);
+    try testing.expectEqualStrings("And", odd.value.updates[0].kind);
+    try testing.expectEqualStrings("{\"meanSum\":12.5,\"meanCount\":\"5\"}", odd.value.updates[1].value.other.json);
+    try testing.expectEqualStrings("{\"count\":3}", odd.value.updates[2].value.other.json);
+
+    // The flag alone marks an update tentative, as production's context
+    // would.
+    try b.fake.setMetrics(bare, .{ .updates = &.{.{ .name = "TotalVcpuTime", .tentative = true, .value = .{ .integer = 103 } }} });
+    var flagged = try b.client.getJobMetrics("europe-west1", bare, .{});
+    defer flagged.deinit();
+    try testing.expect(flagged.value.updates[0].tentative);
+    try testing.expectEqualStrings("true", flagged.value.updates[0].contextValue("tentative").?);
+}
+
+/// A refusal's message, without the request id production puts first.
+fn refusalMessage(a: Allocator, body: []const u8) ![]const u8 {
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
+    const message = parsed.object.get("error").?.object.get("message").?.string;
+    if (message.len > 0 and message[0] == '(') if (std.mem.indexOf(u8, message, "): ")) |at| return message[at + 3 ..];
+    return message;
+}
+
+test "the detail's and the metrics' refusals are production's words" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const seeded = try seedDetail(&b, a);
+    const job_path = try a.print("/v1b3/projects/my-project/locations/us-central1/jobs/{s}", .{seeded.id});
+
+    const bad_start = try b.raw(a, .GET, try a.print("{s}/metrics?startTime=yesterday", .{job_path}));
+    try testing.expectEqual(production.metrics_bad_start_status, bad_start.status);
+    try testing.expectEqualStrings(try refusalMessage(a, production.metrics_bad_start), try refusalMessage(a, bad_start.body));
+
+    const bad_view = try b.raw(a, .GET, try a.print("{s}?view=JOB_VIEW_NONSENSE", .{job_path}));
+    try testing.expectEqual(production.detail_bad_view_status, bad_view.status);
+    try testing.expectEqualStrings(try refusalMessage(a, production.detail_bad_view), try refusalMessage(a, bad_view.body));
+
+    const unknown = try b.raw(a, .GET, "/v1b3/projects/my-project/locations/us-central1/jobs/2026-11-07_00_00_00-1234567890123456789/metrics");
+    try testing.expectEqual(production.metrics_unknown_status, unknown.status);
+    try testing.expectEqualStrings(try refusalMessage(a, production.metrics_unknown), try refusalMessage(a, unknown.body));
+
+    // A summary or unknown view is a plain get, as the enum has them.
+    const summary = try b.raw(a, .GET, try a.print("{s}?view=JOB_VIEW_SUMMARY", .{job_path}));
+    try testing.expectEqual(200, summary.status);
+    try testing.expect(std.mem.indexOf(u8, summary.body, "pipelineDescription") == null);
+}
+
+test "what setMetrics and a step's properties refuse, nothing kept" {
+    var b: Bench = undefined;
+    try b.init(.{});
+    defer b.deinit();
+    try b.fake.putLocation("us-central1");
+    for ([_][]const u8{ "[1]", "not json", "1" }) |props| {
+        try testing.expectError(error.InvalidEntry, b.fake.putJob(.{ .location = "us-central1", .id = "j", .steps = &.{.{ .kind = "ParallelDo", .properties = props }} }));
+    }
+    try testing.expectEqual(0, b.fake.jobCount());
+    const id = try b.fake.putJob(.{ .location = "us-central1", .id = "j", .steps = &.{ .{ .kind = "ParallelDo", .properties = "{\"a\":1}" }, .{ .kind = "ParallelRead" } } });
+    try testing.expectError(error.InvalidEntry, b.fake.setMetrics("nobody", .{}));
+    try testing.expectError(error.InvalidEntry, b.fake.setMetrics(id, .{ .updates = &.{.{ .value = .{ .other = .{ .field = "set", .json = "[1," } } }} }));
+    try testing.expectError(error.InvalidEntry, b.fake.setMetrics(id, .{ .updates = &.{.{ .value = .{ .other = .{ .field = "mean", .json = "[1]" } } }} }));
+    var none = try b.client.getJobMetrics("us-central1", id, .{});
+    defer none.deinit();
+    try testing.expectEqual(0, none.value.updates.len);
 }

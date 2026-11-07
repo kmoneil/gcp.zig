@@ -868,7 +868,7 @@ pub fn build(b: *std.Build) void {
         .{ &.{"service_usage_list"}, &.{ .{ .name = "service_usage", .module = service_usage }, .{ .name = "auth", .module = auth } } },
         .{ &.{ "scheduler_jobs", "scheduler_run" }, &.{ .{ .name = "scheduler", .module = scheduler }, .{ .name = "auth", .module = auth } } },
         .{ &.{ "run_revisions", "run_actions", "run_service" }, &.{ .{ .name = "run", .module = cloud_run }, .{ .name = "auth", .module = auth } } },
-        .{ &.{ "dataflow_jobs", "dataflow_stop" }, &.{ .{ .name = "dataflow", .module = dataflow }, .{ .name = "auth", .module = auth } } },
+        .{ &.{ "dataflow_jobs", "dataflow_stop", "dataflow_job" }, &.{ .{ .name = "dataflow", .module = dataflow }, .{ .name = "auth", .module = auth } } },
         .{ &.{"bigquery_query"}, &.{ .{ .name = "bigquery", .module = bigquery }, .{ .name = "auth", .module = auth } } },
         .{ &.{"datatransfer_runs"}, &.{ .{ .name = "datatransfer", .module = datatransfer }, .{ .name = "auth", .module = auth } } },
         .{ &.{"compute"}, &.{ .{ .name = "compute", .module = compute }, .{ .name = "auth", .module = auth } } },
@@ -876,13 +876,14 @@ pub fn build(b: *std.Build) void {
         .{ &.{ "gcs_notify", "quickstart" }, &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } } },
         .{ &.{"spot_worker"}, &.{.{ .name = "auth", .module = auth }} },
     };
-    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "gcs_mv", "gcs_bucket", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "monitoring_policies", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "run_actions", "dataflow_jobs", "dataflow_stop", "bigquery_query", "datatransfer_runs", "permissions", "run_service", "compute", "billing_prices", "service_usage_list", "spot_worker" }) |name| {
+    inline for (.{ "publish", "publisher", "worker", "in_memory", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "gcs_mv", "gcs_bucket", "quickstart", "iam", "secret_rotation", "firestore", "logs_read", "logs_tail", "projects_list", "error_dashboard", "monitoring", "monitoring_alerts", "monitoring_policies", "pubsub_metrics", "kms", "scheduler_jobs", "scheduler_run", "run_revisions", "run_actions", "dataflow_jobs", "dataflow_stop", "dataflow_job", "bigquery_query", "datatransfer_runs", "permissions", "run_service", "compute", "billing_prices", "service_usage_list", "spot_worker" }) |name| {
         // whoami, secret, gcs_cp, gcs_sign, gcs_notify, gcs_mv, gcs_bucket, quickstart, iam,
         // secret_rotation, firestore, logs_read, logs_tail, projects_list,
         // error_dashboard, monitoring, monitoring_alerts,
         // monitoring_policies, pubsub_metrics,
         // kms, scheduler_jobs, scheduler_run, run_revisions, run_actions, run_service,
-        // dataflow_jobs, dataflow_stop, bigquery_query, datatransfer_runs,
+        // dataflow_jobs, dataflow_stop, dataflow_job, bigquery_query,
+        // datatransfer_runs,
         // permissions, compute, billing_prices and service_usage_list pick
         // their own credentials; spot_worker reads the metadata server
         // alone.

@@ -160,22 +160,37 @@ Each as production answered when measured on 2026-10-20:
   in with a `provisioning_error` answers a get at `.all` with a 400
   FAILED_PRECONDITION carrying that text, as production answered the
   job that failed its launch.
+- **A job in full and its metrics**, as production answered them on
+  2026-11-07: `putJob` takes the `pipeline`, `environment`, `sdk` and
+  `steps` a test gives, and `setMetrics` its metrics. A list answers
+  the summary and the SDK; a plain get adds the environment's shuffle
+  mode and public IPs; `.description` the rest of the environment and
+  the pipeline; `.all` the steps and the pipeline's `step_names_hash`.
+  It answers in the order a test put things in, where production
+  shuffles transforms, step properties and contexts from one read to
+  the next. Metrics answer from `start_time` on,
+  and with none left the time asked for, as production echoed a time
+  past every update; a bad view or `startTime` is 400 in production's
+  words. An update put as `tentative` is marked so in its context, as
+  production marks one.
 - Faults a test asks for: `refuseNext`, `dropNext` and `loseNext`, as
   the other fakes have them.
 
-`putJob`, `putMessage` and `putAutoscalingEvent` refuse, with nothing
-kept, what production could not hold: a location or job nobody put, a
-job id taken or malformed.
+`putJob`, `putMessage`, `putAutoscalingEvent` and `setMetrics` refuse,
+with nothing kept, what production could not hold: a location or job
+nobody put, a job id taken or malformed, a step's properties that are
+not a JSON object, a metric value kept as JSON text that is not JSON.
 
 Not modelled, answered 501 with the reason: every other write
 (creating, updating with a mask, pausing, launching templates),
-metrics, snapshots, the legacy no-location paths, and another
-project's paths.
+snapshots, the legacy no-location paths, and another project's paths.
 
 A gated production suite (`tests/dataflow_gcp_integration.zig`,
 `DATAFLOW_TEST=1`, a cent or two per run) launches a real `zigps-`
 Word_Count template job, seeds the fake with everything production
-lists, and holds the fake to production's answer for every read. The
+lists, its job in full and its metrics, and holds the fake to
+production's answer for every read, each view and the metrics
+included. The
 writes have their own gate, `DATAFLOW_WRITES_TEST=1` (about 3 cents a
 run): a batch job cancelled and a streaming job drained through the
 client, every refusal on the way, every preview held byte for byte to

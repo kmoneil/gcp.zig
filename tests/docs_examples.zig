@@ -2735,6 +2735,58 @@ test "the pipelines widget, a failed job called out with its error" {
 }
 // end snippet
 
+// snippet: dataflow-job-page
+test "a job page: its template and parameters, its workers, its committed metrics" {
+    var fake: dataflow.testing.FakeDataflow = .init(std.testing.allocator, std.testing.io, .{ .project_id = "my-project" });
+    defer fake.deinit();
+    try fake.putLocation("us-central1");
+    // A done Word_Count job, recorded as production records one.
+    const id = try fake.putJob(.{
+        .location = "us-central1",
+        .id = "2026-11-07_12_14_27-5029885235339452204",
+        .name = "nightly-wordcount",
+        .current_state = .done,
+        .labels = &.{.{ .key = "goog-dataflow-provided-template-name", .value = "word_count" }},
+        .pipeline = .{ .display_data = &.{
+            .{ .key = "region", .namespace = "org.apache.beam.runners.dataflow.options.DataflowPipelineOptions", .value = .{ .string = "us-central1" } },
+            .{ .key = "inputFile", .value = .{ .string = "gs://dataflow-samples/shakespeare/kinglear.txt" } },
+        } },
+        .environment = .{ .worker_pools = &.{.{ .machine_type = "n1-standard-1", .num_workers = 2 }} },
+    });
+    try fake.setMetrics(id, .{ .updates = &.{
+        .{ .name = "TotalVcpuTime", .tentative = true, .value = .{ .integer = 103 } },
+        .{ .name = "TotalVcpuTime", .value = .{ .integer = 103 } },
+    } });
+
+    var token: dataflow.StaticToken = .{ .token = "none" };
+    var client = try dataflow.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    // DESCRIPTION carries all a page shows; ALL adds only the steps.
+    var got = try client.getJobView("us-central1", id, .description);
+    defer got.deinit();
+    const job = got.value;
+    try std.testing.expectEqualStrings("word_count", job.template().?.name);
+    // A template's parameters are the display data with no namespace.
+    try std.testing.expectEqualStrings("gs://dataflow-samples/shakespeare/kinglear.txt", job.parameter("inputFile").?.string);
+    try std.testing.expectEqual(null, job.parameter("region"));
+    try std.testing.expectEqualStrings("n1-standard-1", job.environment.worker_pools[0].machine_type);
+    // Each metric comes twice, once tentative: a page shows the other.
+    var metrics = try client.getJobMetrics("us-central1", id, .{});
+    defer metrics.deinit();
+    var committed: usize = 0;
+    for (metrics.value.updates) |update| {
+        if (update.tentative) continue;
+        committed += 1;
+        try std.testing.expectEqual(103, update.value.integer);
+    }
+    try std.testing.expectEqual(1, committed);
+}
+// end snippet
+
 // snippet: dataflow-confirm
 test "the exact request a cancel would send, for the user to confirm" {
     var fake: dataflow.testing.FakeDataflow = .init(std.testing.allocator, std.testing.io, .{ .project_id = "my-project" });

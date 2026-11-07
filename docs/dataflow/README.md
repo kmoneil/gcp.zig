@@ -4,11 +4,12 @@
 
 A client for Dataflow's v1b3 API: the jobs a project runs, across every
 region in one call or one region at a time, with their states and their
-error messages, for a health view's pipelines widget, and two writes a
-console confirms first: [cancelling a job and draining a streaming
-one](#cancel-and-drain). Nothing here creates or updates a job in any
-other way, and nothing launches a template. **Experimental**: new in
-0.50.0.
+error messages, for a health view's pipelines widget; a job page's
+detail and metrics ([A job in full](#a-job-in-full-and-its-metrics));
+and two writes a console confirms first: [cancelling a job and
+draining a streaming one](#cancel-and-drain). Nothing here creates or
+updates a job in any other way, and nothing launches a template.
+**Experimental**: new in 0.50.0.
 
 ```zig
 const std = @import("std");
@@ -40,7 +41,8 @@ pub fn main(init: std.process.Init) !void {
 | `Client.aggregatedJobs(options)` | One page of every region's jobs: the widget's one call. Each job carries the `location` a get needs, and `failed_locations` names any region that did not answer, without which a partial page looks complete |
 | `Client.listJobs(location, options)` | One page of a region's jobs; the only list that filters by `name` (the aggregated list accepts and ignores one, as its documentation says) |
 | `Client.getJob(location, id)` | One job, as the summary every list answers, plus the labels and stage states the lists leave out |
-| `Client.getJobView(location, id, view)` | One job at a chosen view: `.description` adds the pipeline description, `.all` the steps |
+| `Client.getJobView(location, id, view)` | One job at a chosen view: `.description` adds the pipeline (its graph and launch settings), the environment and the labels, `.all` the steps too ([A job in full](#a-job-in-full-and-its-metrics)) |
+| `Client.getJobMetrics(location, id, options)` | A job's metrics: the service's own and the pipeline's counters, each named, with its context and value, from `start_time` on |
 | `Client.listMessages(location, id, options)` | One page of a job's story; `minimum_importance = .@"error"` is "why is it red", and the autoscaling events come regardless of the filter |
 | `Client.cancelJob(location, id)` | Asks the service to cancel the job, batch or streaming; answers nothing, so read the job to watch it stop ([Cancel and drain](#cancel-and-drain)) |
 | `Client.drainJob(location, id)` | Asks a streaming job to drain: stop pulling, finish what is in flight, end drained |
@@ -54,6 +56,10 @@ A `Job` carries its service-assigned `id`, `name`, `location`, `type`
 failed, cancelled, updated, drained) and **`Job.failing()`** is the
 widget's red. **`Job.cancellable()`** and **`Job.drainable()`** say
 whether production takes a cancel or a drain of the job as it stands.
+Read at a view, a `Job` also carries its `pipeline`, `environment` and
+`steps`, and every read its `sdk`; **`Job.template()`** and
+**`Job.parameter(key)`** read the template it was launched from and the
+parameters it was given.
 
 ## The scope
 
@@ -87,6 +93,111 @@ gated suite repeats one):
 - Messages at ERROR on a clean job answer no messages but still the
   autoscaling events; production answered every message past a
   `pageSize` of 5.
+
+## A job in full, and its metrics
+
+A console's job page asks for one job at `.description`. That view
+carries everything a page shows:
+
+- **`pipeline`**: the graph as the user wrote it (`transforms`, each
+  with its input and output collections) and as the service runs it
+  (`stages`, each with its inputs and outputs and their estimated
+  sizes, the stages it waits on, and the transforms fused into it; the
+  `stage_states` name these), and `display_data`, every setting the job
+  was launched with, typed.
+- **`environment`**: the service account, worker region and zone,
+  experiments, shuffle mode, and each worker pool's machine type,
+  workers, autoscaling cap, disk, network and harness image.
+- **`sdk`**, which every read carries, lists included.
+- **`Job.template()`**, the Google-provided template, from the job's
+  `goog-dataflow-provided-template-*` labels; **`Job.parameter(key)`**,
+  a parameter given at launch, which production records as display data
+  with no namespace, where Beam's own options carry theirs.
+
+`.all` adds only `steps`, the compiled steps, whose properties have no
+schema and are kept as JSON text. `Client.getJobMetrics` answers every
+metric the service holds, each **twice**: once marked `tentative` and
+once committed, so a page shows the committed ones.
+
+<!-- snippet: tests/docs_examples.zig#dataflow-job-page -->
+```zig
+test "a job page: its template and parameters, its workers, its committed metrics" {
+    var fake: dataflow.testing.FakeDataflow = .init(std.testing.allocator, std.testing.io, .{ .project_id = "my-project" });
+    defer fake.deinit();
+    try fake.putLocation("us-central1");
+    // A done Word_Count job, recorded as production records one.
+    const id = try fake.putJob(.{
+        .location = "us-central1",
+        .id = "2026-11-07_12_14_27-5029885235339452204",
+        .name = "nightly-wordcount",
+        .current_state = .done,
+        .labels = &.{.{ .key = "goog-dataflow-provided-template-name", .value = "word_count" }},
+        .pipeline = .{ .display_data = &.{
+            .{ .key = "region", .namespace = "org.apache.beam.runners.dataflow.options.DataflowPipelineOptions", .value = .{ .string = "us-central1" } },
+            .{ .key = "inputFile", .value = .{ .string = "gs://dataflow-samples/shakespeare/kinglear.txt" } },
+        } },
+        .environment = .{ .worker_pools = &.{.{ .machine_type = "n1-standard-1", .num_workers = 2 }} },
+    });
+    try fake.setMetrics(id, .{ .updates = &.{
+        .{ .name = "TotalVcpuTime", .tentative = true, .value = .{ .integer = 103 } },
+        .{ .name = "TotalVcpuTime", .value = .{ .integer = 103 } },
+    } });
+
+    var token: dataflow.StaticToken = .{ .token = "none" };
+    var client = try dataflow.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    // DESCRIPTION carries all a page shows; ALL adds only the steps.
+    var got = try client.getJobView("us-central1", id, .description);
+    defer got.deinit();
+    const job = got.value;
+    try std.testing.expectEqualStrings("word_count", job.template().?.name);
+    // A template's parameters are the display data with no namespace.
+    try std.testing.expectEqualStrings("gs://dataflow-samples/shakespeare/kinglear.txt", job.parameter("inputFile").?.string);
+    try std.testing.expectEqual(null, job.parameter("region"));
+    try std.testing.expectEqualStrings("n1-standard-1", job.environment.worker_pools[0].machine_type);
+    // Each metric comes twice, once tentative: a page shows the other.
+    var metrics = try client.getJobMetrics("us-central1", id, .{});
+    defer metrics.deinit();
+    var committed: usize = 0;
+    for (metrics.value.updates) |update| {
+        if (update.tentative) continue;
+        committed += 1;
+        try std.testing.expectEqual(103, update.value.integer);
+    }
+    try std.testing.expectEqual(1, committed);
+}
+```
+
+### What production showed
+
+Measured on 2026-11-07 with one Word_Count template job:
+
+- The job at `.description` was **766 KB**, at `.all` 858 KB, the same
+  while it ran and once it was done. About 600 KB of it is the worker
+  pool's metadata and staged packages and the raw pipeline options,
+  which the client skips, keeping the named fields; the pipeline is
+  about 128 KB. A plain get stays small.
+- **The transforms come in another order on every read**, even of a job
+  that has ended, and between `.description` and `.all`: join them by
+  `id` and by their collections, not by position. So do the members of
+  some objects: a step's properties and a metric's context, whose
+  entries `MetricUpdate.contextValue` looks up by key. `.all` alone
+  carries the pipeline's `stepNamesHash`.
+- The parameters' values are in the display data, with no namespace
+  (`inputFile`, `output`); the raw pipeline options name them but do not
+  hold the values given at launch. The template service's own settings
+  carry `google.dataflow.v1beta3.TemplatesService`.
+- 42 metric updates 20 s in, **374 once done** (152 KB): the service's
+  (`dataflow/v1b3`: vCPU time, memory, disk, shuffle, elements per
+  collection) and the template's own counters (`user`), each with
+  `scalar` values only, integers and floats, and no `kind`.
+- A `start_time` past every update answers none, its own time as
+  `metric_time`; a job nobody has is a 404 whose words name
+  `projects.locations.jobs.get`, even for metrics.
 
 ## Cancel and drain
 
@@ -219,6 +330,7 @@ cannot stop.
 In tests, `dataflow.testing.FakeDataflow` holds locations, jobs and
 messages a test puts in, and takes cancels and drains as production
 did: [Testing](testing.md). `examples/dataflow_jobs.zig --fake` draws
-the pipelines widget offline, and `examples/dataflow_stop.zig --fake`
+the pipelines widget offline, `examples/dataflow_job.zig --fake` a job
+page, and `examples/dataflow_stop.zig --fake`
 says whether the job takes the write, shows its request, sends it with
 `--yes`, and reads the job until it has ended.

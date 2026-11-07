@@ -27,8 +27,17 @@ including the ones that did not change.
   integer, a float or a Boolean, any other form as JSON text), its time,
   and whether it is tentative, since production sent every metric twice,
   once tentative and once committed. `options.start_time` keeps the
-  updates made at or after it. No call changes: `Job` gains fields,
-  empty on lists and plain gets, except `sdk`, which every read carries.
+  updates made at or after it. `dataflow.testing.FakeDataflow` holds
+  them: `putJob` takes a job's pipeline, environment, SDK and steps,
+  and `setMetrics` its metrics, and each read answers what production's
+  did (a list the summary and the SDK, a plain get the environment's
+  shuffle mode and public IPs, DESCRIPTION the rest and the pipeline,
+  ALL the steps), metrics from a start time on, and a bad view or start
+  time refused in production's words. The production suite holds the
+  fake to production's job at each view and its metrics, and
+  `examples/dataflow_job.zig` draws a job page, offline with `--fake`.
+  No call changes: `Job` gains fields, empty on lists and plain gets,
+  except `sdk`, which every read carries.
 - auth, billing, bigquery, compute, core, datatransfer,
   error_reporting, firestore, kms, logging, monitoring, pubsub,
   resource_manager, run, scheduler, secret_manager, service_usage and
