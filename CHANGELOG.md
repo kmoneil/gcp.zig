@@ -4,6 +4,36 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.70.0 (unreleased)
+
+- dataflow: a job in full, and its metrics, for issue #310. A
+  `getJobView` at `.description` or `.all` now decodes what those views
+  add, on `Job`: `pipeline`, the graph as the user wrote it
+  (`transforms`, with their collections and display data) and as the
+  service runs it (`stages`, with their inputs and outputs, the stages
+  each waits on, and the transforms fused into each), and
+  `display_data`, every setting the job was launched with, typed;
+  `environment`, the service account, region and zone, experiments,
+  shuffle mode and worker pools (machine type, workers, autoscaling cap,
+  disk, network, harness image); `sdk`; and at `.all`, `steps`, each
+  step's properties kept as JSON text. `Job.template()` names the
+  Google-provided template from the job's labels, and
+  `Job.parameter(key)` reads a template parameter, which production
+  records as display data with no namespace. A small Word_Count job was
+  766 KB at `.description` and 858 KB at `.all`, most of it worker
+  metadata and staged packages, which the decode skips (measured
+  2026-11-07). `Client.getJobMetrics(location, id, options)` reads a
+  job's metrics: each update's origin, name and context, its value (an
+  integer, a float or a Boolean, any other form as JSON text), its time,
+  and whether it is tentative, since production sent every metric twice,
+  once tentative and once committed. `options.start_time` keeps the
+  updates made at or after it. No call changes: `Job` gains fields,
+  empty on lists and plain gets, except `sdk`, which every read carries.
+- auth, billing, bigquery, compute, core, datatransfer,
+  error_reporting, firestore, kms, logging, monitoring, pubsub,
+  resource_manager, run, scheduler, secret_manager, service_usage and
+  storage: unchanged.
+
 ## 0.69.0 (2026-11-07)
 
 - core: **Breaking:** built on

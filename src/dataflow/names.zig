@@ -43,6 +43,16 @@ pub fn messages(arena: Allocator, project: []const u8, location: []const u8, id:
     return w.written();
 }
 
+/// `/v1b3/projects/P/locations/L/jobs/ID/metrics`.
+pub fn metrics(arena: Allocator, project: []const u8, location: []const u8, id: []const u8) Allocator.Error![]const u8 {
+    var w: Writer.Allocating = .init(arena);
+    writeJobs(&w.writer, project, location) catch return error.OutOfMemory;
+    w.writer.writeByte('/') catch return error.OutOfMemory;
+    core.query.writeSegment(&w.writer, id) catch return error.OutOfMemory;
+    w.writer.writeAll("/metrics") catch return error.OutOfMemory;
+    return w.written();
+}
+
 fn writeJobs(w: *Writer, project: []const u8, location: []const u8) Writer.Error!void {
     try w.writeAll("/v1b3/projects/");
     try core.query.writeSegment(w, project);
