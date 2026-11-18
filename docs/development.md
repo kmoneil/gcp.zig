@@ -64,29 +64,54 @@ branches, and sees only code the compiler kept.
 
 ## Continuous integration
 
-CI runs the unit tests on Linux, macOS and Windows, with zigvet and
-gnarl (the releases `.github/actions/vet-tools` pins, each checked
-against its binary's digest), and on Linux also in ReleaseSafe and
-ReleaseFast, and core's on a baseline CPU, whose build computes CRC-32C
-with tables rather than instructions; the docs check; the integration
-tests and examples against the emulators; and coverage, whose summary
-and report are attached to each run.
+A pull request is held to `tools/local_ci.py`, run on a Mac: the merge
+gate. It runs what CI's jobs run, in the same order, against a Pub/Sub
+emulator, a Firestore emulator and fake-gcs-server it starts for the run
+on free ports and stops after: the format and docs checks, the tools'
+self-tests, the unit tests with zigvet and gnarl (the releases
+`.github/actions/vet-tools` pins, each checked against its binary's
+digest, fetched once into `_tmp/local-ci/`), core's on a baseline CPU,
+the integration tests, the two fakes against their emulators, the
+examples (`tools/ci_examples.sh`), the unit tests in ReleaseSafe and
+ReleaseFast, and coverage. It tests HEAD, refuses a tree with changes or
+a commit not yet pushed, and posts the result on the commit as the
+`local-ci` status, which `main`'s ruleset requires and
+`tools/await_pr.py` waits for. `--no-post` runs it on any tree, and
+`--only unit,examples` runs the steps it names; neither posts. Each
+step's output is in `_tmp/local-ci/runs/<commit>/`.
 
-Every night it also fuzzes for about 10 minutes a job, one job per
-module, each starting from the corpus that earlier nights built up for
-it (kept for 30 days as the
-artifact `fuzz-corpus-<job>`), and jobs of their own for
-the properties too slow to share one: auth's RSA signing
-(`slow-auth`), pubsub's Publisher and Subscriber models (`slow-pubsub`,
-`slow-subscriber`) and its heavy properties (`heavy-pubsub`), storage's
-slow and heavy properties (`slow-storage`, `heavy-storage`), and its
-fault properties, which drive whole transfers through injected faults
-(`fault-storage`, `fault-gzip`), Firestore's model of writes against
-its fake (`heavy-firestore`), Logging's tail by polling against its
-fake (`slow-logging`), Resource Manager's walk of every page against its
-fake (`slow-resource_manager`), and KMS's model of calls against its fake
-with checksum faults injected (`slow-kms`). A test that fails while
-being fuzzed fails its job, and the input is attached to the run as
+```sh
+python3 -I tools/local_ci.py
+```
+
+The tests' variables that point at production (`GCP_TEST_*`,
+`AUTH_TEST_CREDENTIALS` and the rest) are dropped from what the steps
+see, as they are absent in CI, so the gate never reaches Google.
+
+`.github/workflows/ci.yml` runs only by hand (`gh workflow run ci.yml`),
+before a release: the unit tests on Linux, macOS and Windows, and on
+Linux also in ReleaseSafe and ReleaseFast, the integration tests and
+examples against the emulators in containers, and coverage, whose
+summary and report are attached to the run. On every pull request and
+push it took about 17,000 runner minutes a month, which a private
+repository would pay for.
+
+`fuzz_iterations` adds the fuzz jobs to such a run: `default` fuzzes
+for about 10 minutes a job, one job per module, each starting from the
+corpus the last run built up for it (kept for 30 days as the artifact
+`fuzz-corpus-<job>`), and jobs of their own for the properties too slow
+to share one: auth's RSA signing (`slow-auth`), pubsub's Publisher and
+Subscriber models (`slow-pubsub`, `slow-subscriber`) and its heavy
+properties (`heavy-pubsub`), storage's slow and heavy properties
+(`slow-storage`, `heavy-storage`), and its fault properties, which drive
+whole transfers through injected faults (`fault-storage`,
+`fault-gzip`), Firestore's model of writes against its fake
+(`heavy-firestore`), Logging's tail by polling against its fake
+(`slow-logging`), Resource Manager's walk of every page against its fake
+(`slow-resource_manager`), and KMS's model of calls against its fake
+with checksum faults injected (`slow-kms`). A count such as `20K` runs
+every job at that count instead. A test that fails while being fuzzed
+fails its job, and the input is attached to the run as
 `fuzz-failure-<job>`, such as `fuzz-failure-pubsub`.
 
 ## Integration tests

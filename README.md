@@ -7,7 +7,7 @@
 **Google Cloud clients for Zig, written against the REST APIs.**<br>
 Pub/Sub, Cloud Storage, Secret Manager and Firestore, with credentials that find themselves.
 
-[![CI](https://github.com/kmoneil/gcp.zig/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/kmoneil/gcp.zig/actions/workflows/ci.yml)
+[![CI](https://github.com/kmoneil/gcp.zig/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kmoneil/gcp.zig/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/kmoneil/gcp.zig?sort=semver&color=4285F4)](https://github.com/kmoneil/gcp.zig/releases)
 [![Zig 0.17.1](https://img.shields.io/badge/zig-0.17.1-F7A41D?logo=zig&logoColor=white)](https://ziglang.org/download/)
 [![Dependencies: rest-core](https://img.shields.io/badge/dependencies-rest--core-34A853)](build.zig.zon)
