@@ -208,7 +208,7 @@ pub fn build(b: *std.Build) void {
         .{ "billing", billing },
         .{ "service_usage", service_usage },
     };
-    // The nightly fuzz job runs one module per job, so each gets the whole
+    // CI's fuzz job runs one module per job, so each gets the whole
     // time budget: `--fuzz=N` fuzzes every property N times, and the
     // properties of all the modules together outgrew one job.
     const only_module = b.option(
