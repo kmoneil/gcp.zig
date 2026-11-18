@@ -7,11 +7,8 @@ on:
   workflow_dispatch:
     inputs:
       fuzz_iterations:
-        description: "Also run the fuzz job for this many iterations, such as 20K or 2M"
+        description: "Also run the fuzz jobs: default for each job's own count, or one count for all, such as 20K or 2M"
         default: ""
-  schedule:
-    # Nightly: a longer coverage-guided fuzzing run.
-    - cron: "17 3 * * *"
 
 # The workflow only reads the repository.
 permissions:
@@ -390,10 +387,14 @@ jobs:
   # finish. pubsub's Publisher property plays a whole script against a
   # publisher and costs about 1.4 ms a run, more than the rest of pubsub's
   # together, so it is a slow property too, and so are the two signed URL
-  # properties in storage that build whole requests. A manual run's
-  # fuzz_iterations overrides every count.
+  # properties in storage that build whole requests.
+  #
+  # Only by hand, since 2026-11-18. Until then a nightly schedule ran these
+  # jobs, about 400 runner minutes a night at the counts below, which a
+  # private repository would pay for. Run the workflow with fuzz_iterations
+  # set to default for those counts, or to one count for every job.
   fuzz:
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.fuzz_iterations != '')
+    if: github.event_name == 'workflow_dispatch' && inputs.fuzz_iterations != ''
     name: fuzz (${{ matrix.job }})
     strategy:
       fail-fast: false
@@ -401,8 +402,9 @@ jobs:
         # `--fuzz=N` runs every matching property N times, so a job takes N
         # times the sum of its properties' costs per run. Since 2026-11-07
         # each count is about a ninth of the one that sized its job to 90
-        # minutes, so a job takes about 10: the nightly keeps every property
-        # fuzzed and its corpus fresh, and is not where long campaigns run.
+        # minutes, so a job takes about 10: a run at these counts fuzzes
+        # every property and refreshes its corpus, and is not where long
+        # campaigns run.
         # The counts' history, from the CI timings that set them, is in git
         # (this comment as of ecf4700). A job's cost moves from night to
         # night as its corpus grows, by up to three times at one count, so
@@ -498,7 +500,7 @@ jobs:
       - name: Coverage-guided fuzzing
         timeout-minutes: 25
         env:
-          ITERATIONS: ${{ inputs.fuzz_iterations || matrix.iterations }}
+          ITERATIONS: ${{ inputs.fuzz_iterations == 'default' && matrix.iterations || inputs.fuzz_iterations }}
           MODULE: ${{ matrix.module }}
           FILTER: ${{ matrix.filter }}
           JOB: ${{ matrix.job }}

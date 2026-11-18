@@ -85,32 +85,34 @@ run `zig build coverage`; the report is `zig-out/coverage/index.html`.
   `platforms (windows-latest)` and `coverage`. Renaming one of those jobs,
   or changing a matrix value that appears in its name, leaves every pull
   request waiting for a check that will never report; change the rule for
-  `main` in the same breath. The nightly `fuzz` jobs, one per module and
-  one per slow property, are not required, because they do not run on
-  pull requests.
+  `main` in the same breath. The `fuzz` jobs, one per module and one per
+  slow property, are not required, because they run only when the
+  workflow is run by hand with `fuzz_iterations` set:
+  `gh workflow run ci.yml -f fuzz_iterations=default` runs each job at
+  its own count, and a count such as `20K` runs every job at that one.
 - A bug fix comes with a test that fails without it. When the fuzzer finds
   a failing input, add that input to the property's corpus. The fuzzer
-  saves it as `.zig-cache/f/crash`, and the nightly CI run attaches it as
+  saves it as `.zig-cache/f/crash`, and a CI fuzz run attaches it as
   the `fuzz-failure-<job>` artifact: a 4-byte little-endian length, then
   the input. `zig build test -Dfuzz-runner -Dmodule=<module>
   -Dtest-filter=fuzz --fuzz` fuzzes one module the way its job does. A
   test that fails while being fuzzed does not fail `zig build`, which
   exits 0 all the same; the saved input and the `input saved to` line
-  are the signs, and the nightly job fails on either. A fuzzer that
+  are the signs, and the CI fuzz job fails on either. A fuzzer that
   stalls saves nothing and holds its job until the fuzzing step's 25
   minutes run out; then the job attaches gdb to whatever is still
   running, and the same artifact holds every thread's backtrace
   (`fuzz-stacks.txt`) and the input each fuzzer was on (`in<N>`: a
   20-byte header whose last four bytes are the length, then the input).
-- Name a property test `fuzz <what>: <what it holds>`, and the nightly job
-  fuzzes it. A property that costs more than a few milliseconds a run,
+- Name a property test `fuzz <what>: <what it holds>`, and its module's
+  fuzz job fuzzes it. A property that costs more than a few milliseconds a run,
   such as one that signs with RSA every time, is named `slow property
   <what>: …` instead, so the module's job skips it, and it gets a job of
   its own in `.github/workflows/ci.yml`, filtered by its name. One that
   builds a client and a fake server every run, a millisecond or more, is a
   `heavy property <what>: …`, and storage's and pubsub's run in jobs of
   their own. A `fault property` drives whole transfers through injected
-  faults and costs more still; storage's run nightly in two jobs of their
+  faults and costs more still; storage's are fuzzed in two jobs of their
   own, `fault-storage` and `fault-gzip`, and every test run still runs
   them, under that run's seed. `--fuzz=N`
   runs every matching property N times, so size a job from its
@@ -118,7 +120,7 @@ run `zig build coverage`; the report is `zig-out/coverage/index.html`.
   `fuzz_iterations` at two counts such as 2K and 20K, and each job's
   cost per run is the difference in its fuzzing step's time over the
   difference in runs, the build cancelled out. Aim at about 10 minutes:
-  the nightly is a short run. A local run can be three times faster than
+  a run at the jobs' own counts is a short one. A local run can be three times faster than
   CI, so it only compares properties with each other.
   `zig build test` runs both kinds alike.
 - A function over a critical complexity limit for its class fails
