@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Waits for a pull request to merge, then checks that what landed is
-what CI tested: the merged commit's tree equals the tested head's, and
+what was tested: the merged commit's tree equals the tested head's, and
 the base branch holds the merged commit. It merges nothing itself; auto-
 merge, or a person, does that. When every check is green and auto-merge
 is not armed, nothing will merge it, so it says so and stops (exit 6)
 with the head to merge; run it again after the merge to check it.
 
     python3 -I tools/await_pr.py PR [--repo OWNER/NAME] [--interval SECONDS]
-                                    [--timeout MINUTES]
+                                    [--timeout MINUTES] [--require NAME ...]
     python3 -I tools/await_pr.py --self-test
+
+A check or status named by --require must be on the head and green
+before it is ready: `local-ci` unless told otherwise, the status
+tools/local_ci.py posts, since CI no longer runs on pull requests and a
+head with no checks at all, or only CodeQL's, has not been tested.
 
 It prints a line when the checks move, and one at the end. Exit codes:
 
@@ -37,7 +42,8 @@ import subprocess
 import sys
 import time
 
-FAILED = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+FAILED = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"}
+REQUIRED = ("local-ci",)
 FIELDS = "state,headRefOid,mergeCommit,statusCheckRollup,baseRefName,autoMergeRequest"
 
 
@@ -56,19 +62,25 @@ def run(argv):
 
 
 def checks_of(pr):
-    """(name, status, conclusion) for every check, a status context too."""
+    """(name, status, conclusion) for every check, a status context too. A
+    status context has only a state, and is finished unless it is pending."""
     out = []
     for c in pr.get("statusCheckRollup") or []:
         name = c.get("name") or c.get("context") or "?"
-        status = c.get("status") or ("COMPLETED" if c.get("state") else "")
-        conclusion = c.get("conclusion") or c.get("state") or ""
+        if c.get("status"):
+            status, conclusion = c["status"], c.get("conclusion") or ""
+        else:
+            state = c.get("state") or ""
+            status = "PENDING" if state.upper() in ("", "PENDING", "EXPECTED") else "COMPLETED"
+            conclusion = "" if status == "PENDING" else state
         out.append((name, status, conclusion))
     return out
 
 
-def classify(pr):
+def classify(pr, required=()):
     """What a PR's state says to do: ("merged" | "closed" | "failed" |
-    "open", detail). Detail names failed checks, or what is pending."""
+    "open", detail). Detail names failed checks, or what is pending: a
+    required name with no check yet is pending too."""
     state = pr.get("state")
     if state == "MERGED":
         return "merged", (pr.get("mergeCommit") or {}).get("oid") or ""
@@ -79,14 +91,16 @@ def classify(pr):
     if failed:
         return "failed", ", ".join(failed)
     pending = sorted(n for n, status, conclusion in checks if status.upper() != "COMPLETED" and conclusion.upper() not in ("SUCCESS", "SKIPPED", "NEUTRAL"))
+    present = {n for n, _, _ in checks}
+    pending += [f"{n} (not posted yet)" for n in required if n not in present]
     return "open", ", ".join(pending)
 
 
-def progress(pr):
+def progress(pr, required=()):
     """A line on the checks, for when it changes."""
     checks = checks_of(pr)
     done = sum(1 for _, status, conclusion in checks if status.upper() == "COMPLETED" or conclusion.upper() in ("SUCCESS", "SKIPPED", "NEUTRAL"))
-    _, pending = classify(pr)
+    _, pending = classify(pr, required)
     line = f"{done}/{len(checks)} checks done"
     if pending:
         line += f"; waiting on: {pending}"
@@ -95,12 +109,13 @@ def progress(pr):
     return line
 
 
-def ready_head(pr):
+def ready_head(pr, required=()):
     """The head to merge when nothing else will: open, at least one check,
-    none failed or pending, auto-merge not armed. Empty otherwise."""
+    every required one there, none failed or pending, auto-merge not
+    armed. Empty otherwise."""
     if pr.get("autoMergeRequest") or not checks_of(pr):
         return ""
-    if classify(pr) != ("open", ""):
+    if classify(pr, required) != ("open", ""):
         return ""
     return pr.get("headRefOid") or ""
 
@@ -142,12 +157,13 @@ def await_pr(args, gh, git, sleep=time.sleep, clock=time.monotonic, say=None):
     base_cmd = ["pr", "view", str(args.pr), "--json", FIELDS]
     if args.repo:
         base_cmd += ["--repo", args.repo]
+    required = tuple(getattr(args, "require", None) or ())
     deadline = clock() + args.timeout * 60
     last = None
     ready_before = ""
     while True:
         pr = json.loads(gh(base_cmd))
-        verdict, detail = classify(pr)
+        verdict, detail = classify(pr, required)
         if verdict == "merged":
             code, message = verify(args.pr, pr, git)
             say(message)
@@ -158,11 +174,11 @@ def await_pr(args, gh, git, sleep=time.sleep, clock=time.monotonic, say=None):
         if verdict == "failed":
             say(f"failed: {detail}")
             return 1
-        line = progress(pr)
+        line = progress(pr, required)
         if line != last:
             say(line)
             last = line
-        head = ready_head(pr)
+        head = ready_head(pr, required)
         if head and head == ready_before:
             say(f"ready to merge: every check is green on {head} and auto-merge is not armed; "
                 f"merge it with gh pr merge {args.pr} --rebase --match-head-commit {head}, then run this again to check what landed")
@@ -262,6 +278,35 @@ def self_test():
     assert ready_head(green("h1")) == "h1"
     assert ready_head({"state": "OPEN", "headRefOid": "h1", "statusCheckRollup": [ok("test"), running("lint")]}) == ""
     assert ready_head({"state": "OPEN", "headRefOid": "h1", "statusCheckRollup": [ok("a"), {"name": "z", "status": "COMPLETED", "conclusion": "FAILURE"}]}) == ""
+
+    # A commit status: pending is not finished, error is a failure.
+    status = lambda context, state: {"context": context, "state": state}
+    assert classify({"state": "OPEN", "statusCheckRollup": [status("local-ci", "PENDING")]}) == ("open", "local-ci")
+    assert classify({"state": "OPEN", "statusCheckRollup": [status("local-ci", "ERROR")]}) == ("failed", "local-ci")
+    assert classify({"state": "OPEN", "statusCheckRollup": [status("local-ci", "SUCCESS")]}) == ("open", "")
+    assert progress({"state": "OPEN", "autoMergeRequest": {}, "statusCheckRollup": [status("local-ci", "PENDING")]}) == "0/1 checks done; waiting on: local-ci"
+    # A required name: missing is pending, green is ready, whatever else
+    # is green beside it.
+    codeql = ok("Analyze (python)")
+    need = ("local-ci",)
+    assert classify({"state": "OPEN", "statusCheckRollup": [codeql]}, need) == ("open", "local-ci (not posted yet)")
+    assert ready_head({"state": "OPEN", "headRefOid": "h1", "statusCheckRollup": [codeql]}, need) == ""
+    assert ready_head({"state": "OPEN", "headRefOid": "h1", "statusCheckRollup": [codeql, status("local-ci", "PENDING")]}, need) == ""
+    assert ready_head({"state": "OPEN", "headRefOid": "h1", "statusCheckRollup": [codeql, status("local-ci", "SUCCESS")]}, need) == "h1"
+    assert ready_head({"state": "OPEN", "headRefOid": "h1", "statusCheckRollup": [status("local-ci", "SUCCESS")]}, need) == "h1"
+    # The whole wait: CodeQL green alone is not ready; the status posted,
+    # pending, then green, is.
+    class Gated(Args):
+        require = ["local-ci"]
+
+    head = lambda *rollup: {"state": "OPEN", "headRefOid": "h1", "statusCheckRollup": list(rollup)}
+    said.clear()
+    answers = [head(codeql), head(codeql), head(codeql, status("local-ci", "PENDING")),
+               head(codeql, status("local-ci", "SUCCESS")), head(codeql, status("local-ci", "SUCCESS"))]
+    assert await_pr(Gated, scripted(answers), fake_git(), sleep=quiet, say=say) == 6
+    assert said[0] == "1/1 checks done; waiting on: local-ci (not posted yet)", said
+    assert said[-1].startswith("ready to merge: every check is green on h1"), said
+    assert await_pr(Gated, scripted([head(codeql), head(codeql, status("local-ci", "FAILURE"))]), fake_git(), sleep=quiet, say=say) == 1
     print("await_pr self-test: ok")
 
 
@@ -274,12 +319,14 @@ class Parser(argparse.ArgumentParser):
 
 
 def main():
-    parser = Parser(description="Wait for a pull request to merge, then check that what landed is what CI tested; "
+    parser = Parser(description="Wait for a pull request to merge, then check that what landed is what was tested; "
                     "stop at exit 6 when it is green with nothing armed to merge it.")
     parser.add_argument("pr", nargs="?", type=int, help="the pull request's number")
     parser.add_argument("--repo", help="OWNER/NAME; the current repository's when absent")
     parser.add_argument("--interval", type=int, default=30, help="seconds between polls (default 30)")
     parser.add_argument("--timeout", type=int, default=60, help="minutes before giving up (default 60)")
+    parser.add_argument("--require", action="append", metavar="NAME",
+                        help=f"a check or status that must be green before it is ready; repeatable (default: {', '.join(REQUIRED)})")
     parser.add_argument("--self-test", action="store_true", help="check the decisions on canned answers, and exit")
     args = parser.parse_args()
     if args.self_test:
@@ -287,6 +334,8 @@ def main():
         return 0
     if args.pr is None:
         parser.error("the pull request's number is required")
+    if not args.require:
+        args.require = list(REQUIRED)
     try:
         return await_pr(args, lambda argv: run(["gh"] + argv), lambda argv: run(["git"] + argv))
     except ToolFailed as e:

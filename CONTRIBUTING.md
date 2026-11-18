@@ -37,7 +37,7 @@ emulator, through a proxy that drops, cuts, delays and rewrites responses.
 Those tests need the emulator specifically and never target production.
 
 Each integration suite prints a line as every test starts, and `OK` when it
-passes. In CI the step gives up after ten minutes; if it does, the log's
+passes. In CI and in `tools/local_ci.py` the step gives up after ten minutes; if it does, the log's
 last line, a test name with no `OK` after it, is the test that hung.
 
 The auth integration tests run against Google when `AUTH_TEST_CREDENTIALS`
@@ -79,17 +79,18 @@ run `zig build coverage`; the report is `zig-out/coverage/index.html`.
 
 ## Changes
 
-- `main` is protected: open a pull request, and CI must pass before it
-  merges. Six checks are required by name: `test`, `release (ReleaseSafe)`,
-  `release (ReleaseFast)`, `platforms (macos-latest)`,
-  `platforms (windows-latest)` and `coverage`. Renaming one of those jobs,
-  or changing a matrix value that appears in its name, leaves every pull
-  request waiting for a check that will never report; change the rule for
-  `main` in the same breath. The `fuzz` jobs, one per module and one per
-  slow property, are not required, because they run only when the
-  workflow is run by hand with `fuzz_iterations` set:
-  `gh workflow run ci.yml -f fuzz_iterations=default` runs each job at
-  its own count, and a count such as `20K` runs every job at that one.
+- `main` is protected: open a pull request, and it merges once the
+  `local-ci` status on its head is green. `python3 -I tools/local_ci.py`
+  posts it: run from a clean checkout of the pushed head on a Mac, it
+  runs what CI's jobs run, against emulators it starts and stops itself,
+  and posts the result ([docs/development.md](docs/development.md#continuous-integration)
+  says what it needs). For a pull request from a fork, a maintainer runs
+  it on `gh pr checkout N`. `.github/workflows/ci.yml` runs only by hand,
+  before a release, for Linux and Windows. Its `fuzz` jobs, one per
+  module and one per slow property, run when it is run with
+  `fuzz_iterations` set: `gh workflow run ci.yml -f
+  fuzz_iterations=default` runs each job at its own count, and a count
+  such as `20K` runs every job at that one.
 - A bug fix comes with a test that fails without it. When the fuzzer finds
   a failing input, add that input to the property's corpus. The fuzzer
   saves it as `.zig-cache/f/crash`, and a CI fuzz run attaches it as
